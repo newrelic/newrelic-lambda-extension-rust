@@ -2,7 +2,7 @@
 
 ## Overview
 
-The New Relic Lambda Extension now includes a comprehensive event bus system that processes telemetry events from AWS Lambda and forwards them to New Relic's endpoints. This system is based on the DataDog Lambda Extension architecture but customized for New Relic.
+The New Relic Lambda Extension now includes a comprehensive event bus system that processes telemetry events from AWS Lambda and forwards them to New Relic's endpoints.
 
 ## Architecture
 
