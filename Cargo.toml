@@ -9,22 +9,15 @@ repository = "https://github.com/yourusername/newrelic-lambda-extension"
 readme = "README.md"
 
 [dependencies]
-lambda-extension = "0.12.2"
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-tower = "0.5"
-hyper = { version = "0.14", features = ["full"] }
-hyper-util = { version = "0.1", features = ["full"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12", "logging", "ring", "webpki-roots"] }
-http-body-util = "0.1"
+reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tikv-jemallocator = "0.5"
-bytes = "1.0"
-futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hyper = { version = "0.14", features = ["full"] }
+flate2 = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]
 lto = true

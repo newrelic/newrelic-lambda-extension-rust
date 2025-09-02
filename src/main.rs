@@ -3,25 +3,28 @@
 #![deny(clippy::unwrap_used)]
 #![deny(missing_debug_implementations)]
 
+mod config;
 mod telemetry;
+mod logs;
+mod platform;
+mod newrelic;
 
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    env,
     io::{Error, Result},
     time::Duration,
+    sync::Arc,
 };
-use tracing::{info};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
+use crate::logs::processor::LogProcessor;
+use crate::platform::processor::PlatformProcessor;
 use crate::telemetry::listener::setup_telemetry_listener;
-
-// --- AWS Lambda Runtime Environment Variables ---
-const LAMBDA_RUNTIME_API: &str = "AWS_LAMBDA_RUNTIME_API";
+use crate::newrelic::client::NewRelicClient;
 
 // --- Extension Constants ---
-const EXTENSION_NAME: &str = "newrelic-lambda-extension";
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
@@ -57,48 +60,76 @@ enum NextEventResponse {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // --- 1. Initialize Logging ---
-    let env_filter = "info";
+    // --- 1. Initialize Configuration & Logging ---
+    let config = config::init_config();
+
+    // Initialize logging AFTER config is loaded
+    let env_filter = EnvFilter::try_new(&config.new_relic.extension_log_level)
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(EnvFilter::try_new(env_filter).unwrap())
+        .with_env_filter(env_filter)
         .with_level(true)
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    info!("Starting extension: {}", EXTENSION_NAME);
 
-    // --- 2. Create HTTP Client ---
+
     let client = Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
-    // --- 3. Register the Extension ---
-    let response = register(&client).await?;
-    let ext_id = response.extension_id.clone();
-    info!("Extension registered with ID: {}", ext_id);
+    if !config.new_relic.extension_enabled {
+        // --- NO-OP MODE ---
+        info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
+        
+        let response = register(&client).await?;
+        let ext_id = response.extension_id.clone();
+        info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
-    // --- 4. Set up Telemetry Subscription ---
-    let telemetry_addr = setup_telemetry_listener().await?;
-    subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
-    info!(
-        "Successfully subscribed to telemetry on port {}",
-        telemetry_addr.port()
-    );
-
-    // --- 5. Start the Main Event Loop ---
-    loop {
-        let event = next_event(&client, &ext_id).await?;
-        match event {
-            NextEventResponse::Invoke { request_id } => {
-                info!("Received INVOKE event for request ID: {}", request_id);
-            }
-            NextEventResponse::Shutdown { shutdown_reason } => {
-                info!("Received SHUTDOWN event: {}", shutdown_reason);
-                // Add a brief delay to allow the telemetry listener to process final events.
-                // This is crucial for newer runtimes like AL2023.
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                info!("Shutting down extension.");
+        loop {
+            let event = next_event(&client, &ext_id).await?;
+            if let NextEventResponse::Shutdown { shutdown_reason } = event {
+                info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
                 break;
+            }
+        }
+    } else {
+        // --- ACTIVE MODE ---
+        info!("Starting extension: {}", &config.extension.name);
+
+        // Create the New Relic client and processors
+        let newrelic_client = Arc::new(NewRelicClient::new());
+        let log_processor = Arc::new(LogProcessor::new());
+        let platform_processor = Arc::new(PlatformProcessor::new(
+            Arc::clone(&log_processor),
+            Arc::clone(&newrelic_client),
+            Arc::new(config.clone()),
+        ));
+
+        let response = register(&client).await?;
+        let ext_id = response.extension_id.clone();
+        info!("Extension registered with ID: {}", ext_id);
+
+        let telemetry_addr = setup_telemetry_listener(log_processor, Arc::clone(&platform_processor)).await?;
+        subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
+        info!(
+            "Successfully subscribed to telemetry on port {}",
+            telemetry_addr.port()
+        );
+
+        loop {
+            match next_event(&client, &ext_id).await? {
+                NextEventResponse::Invoke { request_id } => {
+                    info!("Received INVOKE event for request ID: {}", request_id);
+                }
+                NextEventResponse::Shutdown { shutdown_reason } => {
+                    info!("Received SHUTDOWN event: {}", shutdown_reason);
+                    // Final harvest before shutting down
+                    platform_processor.final_harvest().await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    info!("Shutting down extension.");
+                    break;
+                }
             }
         }
     }
@@ -106,20 +137,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+
 // --- Helper Functions ---
 
 /// Registers the extension with the Lambda Runtime API.
 async fn register(client: &Client) -> Result<RegisterResponse> {
-    let base_url = env::var(LAMBDA_RUNTIME_API)
-        .map_err(|e| Error::new(std::io::ErrorKind::NotFound, e))?;
-    let url = format!("http://{base_url}/2020-01-01/extension/register");
+    let config = config::get_config();
+    let url = format!("http://{}/2020-01-01/extension/register", &config.aws.runtime_api);
 
     let mut map = HashMap::new();
     map.insert("events", vec!["INVOKE", "SHUTDOWN"]);
 
     let resp = client
         .post(&url)
-        .header(EXTENSION_NAME_HEADER, EXTENSION_NAME)
+        .header(EXTENSION_NAME_HEADER, &config.extension.name)
         .json(&map)
         .send()
         .await
@@ -149,21 +180,20 @@ async fn register(client: &Client) -> Result<RegisterResponse> {
 
 /// Subscribes to the Lambda Telemetry API.
 async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Result<()> {
-    let base_url = env::var(LAMBDA_RUNTIME_API)
-        .map_err(|e| Error::new(std::io::ErrorKind::NotFound, e))?;
-    let url = format!("http://{base_url}/2022-07-01/telemetry");
+    let config = config::get_config();
+    let url = format!("http://{}/2022-07-01/telemetry", &config.aws.runtime_api);
 
     let body = serde_json::json!({
         "schemaVersion": "2022-07-01",
         "destination": {
             "protocol": "HTTP",
-            "URI": format!("http://sandbox:{port}"),
+            "URI": format!("http://sandbox:{}", port),
         },
         "types": ["platform", "function", "extension"],
         "buffering": {
-            "maxItems": 1000,
-            "maxBytes": 262144,
-            "timeoutMs": 100,
+            "maxItems": config.extension.max_batch_items,
+            "maxBytes": config.extension.max_batch_size,
+            "timeoutMs": config.extension.telemetry_timeout,
         }
     });
 
@@ -185,9 +215,8 @@ async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Res
 
 /// Fetches the next event from the Lambda Runtime API.
 async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> {
-    let base_url = env::var(LAMBDA_RUNTIME_API)
-        .map_err(|e| Error::new(std::io::ErrorKind::NotFound, e))?;
-    let url = format!("http://{base_url}/2020-01-01/extension/event/next");
+    let config = config::get_config();
+    let url = format!("http://{}/2020-01-01/extension/event/next", &config.aws.runtime_api);
 
     let resp = client
         .get(&url)
