@@ -1,15 +1,15 @@
+use crate::{
+    logs::processor::LogProcessor,
+    platform::processor::PlatformProcessor,
+};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use std::{
     io::{Error, Result},
     net::{SocketAddr, TcpListener},
     sync::Arc,
 };
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
 use tracing::{error, info};
-use crate::{
-    logs::processor::LogProcessor,
-    platform::processor::PlatformProcessor,
-};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct TelemetryRecord {
@@ -25,8 +25,7 @@ pub async fn setup_telemetry_listener(
     platform_processor: Arc<PlatformProcessor>,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
-    let listener = TcpListener::bind(addr)
-        .map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
+    let listener = TcpListener::bind(addr).map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
     let local_addr = listener.local_addr()?;
 
     tokio::spawn(async move {
@@ -65,23 +64,55 @@ async fn handle_telemetry_request(
     let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
 
+    tracing::debug!("Received telemetry data: {} bytes", body_str.len());
+
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
+            tracing::info!("Successfully parsed {} telemetry records", records.len());
+            let mut function_completed = false;
+            
             for record in records {
+                tracing::debug!("Processing telemetry record: type={}", record.record_type);
                 match record.record_type.as_str() {
-                    "function" | "extension" => {
+                    "function" => {
+                        tracing::debug!("Routing function log to LogProcessor");
                         log_processor.process_record(record);
-                        // After processing a log, check if a batch is ready to be harvested
-                        platform_processor.harvest();
+                    }
+                    "extension" => {
+                        tracing::debug!("Routing extension log to LogProcessor");
+                        log_processor.process_record(record);
+                    }
+                    "platform.report" | "platform.end" => {
+                        tracing::debug!("Function execution completed, will flush after processing");
+                        platform_processor.process_record(record);
+                        function_completed = true;
                     }
                     _ => {
+                        tracing::debug!("Routing platform event ({}) to PlatformProcessor", record.record_type);
                         platform_processor.process_record(record);
                     }
                 }
             }
+            
+            // If function execution completed, send all accumulated data immediately
+            if function_completed {
+                tracing::info!("🚀 Function execution completed, flushing all data immediately!");
+                let log_proc_clone = Arc::clone(&log_processor);
+                let platform_proc_clone = Arc::clone(&platform_processor);
+                
+                tokio::spawn(async move {
+                    if let Err(e) = log_proc_clone.send_and_clear_batch_simple().await {
+                        tracing::error!("Failed to send logs after function completion: {}", e);
+                    }
+                    if let Err(e) = platform_proc_clone.send_and_clear_batch_simple().await {
+                        tracing::error!("Failed to send platform events after function completion: {}", e);
+                    }
+                });
+            }
         }
         Err(e) => {
             error!("Failed to parse telemetry records: {}", e);
+            tracing::debug!("Raw telemetry data that failed to parse: {}", body_str);
         }
     }
 

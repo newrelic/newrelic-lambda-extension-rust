@@ -4,3 +4,4 @@
 pub mod client;
 pub mod harvester;
 pub mod payload;
+pub mod flush;

@@ -8,26 +8,31 @@ mod telemetry;
 mod logs;
 mod platform;
 mod newrelic;
+mod context;
+
+#[cfg(debug_assertions)]
+mod test_telemetry;
 
 use reqwest::Client;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     io::{Error, Result},
+    sync::{Arc, Mutex},
     time::Duration,
-    sync::Arc,
 };
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use crate::logs::processor::LogProcessor;
-use crate::platform::processor::PlatformProcessor;
-use crate::telemetry::listener::setup_telemetry_listener;
-use crate::newrelic::client::NewRelicClient;
+use crate::{
+    context::InvocationContext,
+    logs::processor::LogProcessor,
+    platform::processor::PlatformProcessor,
+    telemetry::listener::setup_telemetry_listener,
+    newrelic::{client::NewRelicClient, harvester::Harvester},
+};
 
 // --- Extension Constants ---
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
-
 
 // --- Structs for API Responses ---
 
@@ -48,6 +53,8 @@ enum NextEventResponse {
     Invoke {
         #[serde(rename(deserialize = "requestId"))]
         request_id: String,
+        #[serde(rename(deserialize = "invokedFunctionArn"))]
+        invoked_function_arn: String,
     },
     #[serde(rename(deserialize = "SHUTDOWN"))]
     Shutdown {
@@ -61,73 +68,129 @@ enum NextEventResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     // --- 1. Initialize Configuration & Logging ---
-    let config = config::init_config();
+    let config = Arc::new(config::init_config().clone());
+    info!("Starting extension: {}", &config.extension.name);
 
-    // Initialize logging AFTER config is loaded
-    let env_filter = EnvFilter::try_new(&config.new_relic.extension_log_level)
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-        .with_env_filter(env_filter)
-        .with_level(true)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-
-
-    let client = Client::builder()
+    let client = Arc::new(Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?);
+
+    // Check for test mode
+    if std::env::var("NR_EXTENSION_TEST_MODE").unwrap_or_default() == "true" {
+        info!("Running in TEST MODE - will simulate telemetry events instead of connecting to Lambda Runtime API");
+        
+        let newrelic_client = Arc::new(NewRelicClient::new());
+        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        let log_processor = Arc::new(LogProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+        let platform_processor = Arc::new(PlatformProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+
+        // Set up a test function context
+        {
+            let mut context = invocation_context.lock().unwrap();
+            context.request_id = "test-request-12345".to_string();
+            context.invoked_function_arn = "arn:aws:lambda:us-east-1:123456789012:function:test-function".to_string();
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            // Simulate some telemetry events
+            test_telemetry::simulate_telemetry_processing(&log_processor, &platform_processor).await;
+            
+            // Send the data immediately
+            info!("Sending test data to New Relic...");
+            if let Err(e) = log_processor.send_and_clear_batch_simple().await {
+                tracing::error!("Error sending test logs: {}", e);
+            }
+            if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
+                tracing::error!("Error sending test platform events: {}", e);
+            }
+            
+            info!("Test mode completed. Check the logs above for any issues.");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        
+        return Ok(());
+    }
 
     if !config.new_relic.extension_enabled {
         // --- NO-OP MODE ---
         info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
-        
         let response = register(&client).await?;
         let ext_id = response.extension_id.clone();
         info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
         loop {
-            let event = next_event(&client, &ext_id).await?;
-            if let NextEventResponse::Shutdown { shutdown_reason } = event {
+            if let NextEventResponse::Shutdown { shutdown_reason } = next_event(&client, &ext_id).await? {
                 info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
                 break;
             }
         }
     } else {
         // --- ACTIVE MODE ---
-        info!("Starting extension: {}", &config.extension.name);
-
-        // Create the New Relic client and processors
         let newrelic_client = Arc::new(NewRelicClient::new());
-        let log_processor = Arc::new(LogProcessor::new());
-        let platform_processor = Arc::new(PlatformProcessor::new(
-            Arc::clone(&log_processor),
+        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        let log_processor = Arc::new(LogProcessor::new(
             Arc::clone(&newrelic_client),
-            Arc::new(config.clone()),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
         ));
+        let platform_processor = Arc::new(PlatformProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+
+        let harvester = Harvester::new(
+            vec![log_processor.clone(), platform_processor.clone()],
+            config.new_relic.harvest_interval,
+        );
+        let harvester_handle = tokio::spawn(async move {
+            harvester.run().await;
+        });
 
         let response = register(&client).await?;
         let ext_id = response.extension_id.clone();
         info!("Extension registered with ID: {}", ext_id);
 
-        let telemetry_addr = setup_telemetry_listener(log_processor, Arc::clone(&platform_processor)).await?;
+        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone()).await?;
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
-        info!(
-            "Successfully subscribed to telemetry on port {}",
-            telemetry_addr.port()
-        );
+        info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
         loop {
             match next_event(&client, &ext_id).await? {
-                NextEventResponse::Invoke { request_id } => {
-                    info!("Received INVOKE event for request ID: {}", request_id);
+                NextEventResponse::Invoke { request_id, invoked_function_arn } => {
+                    info!("🔥 Received INVOKE event for request ID: {}", request_id);
+                    platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                 }
                 NextEventResponse::Shutdown { shutdown_reason } => {
-                    info!("Received SHUTDOWN event: {}", shutdown_reason);
-                    // Final harvest before shutting down
-                    platform_processor.final_harvest().await;
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    info!("Shutting down extension.");
+                    info!("🛑 Received SHUTDOWN event: {}", shutdown_reason);
+                    
+                    // Stop the harvester
+                    harvester_handle.abort();
+                    
+                    // Perform final flush of all data immediately
+                    info!("🚀 Performing FINAL flush of all logs and platform events...");
+                    if let Err(e) = log_processor.send_and_clear_batch_simple().await {
+                        tracing::error!("❌ Error during final log flush: {}", e);
+                    }
+                    if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
+                        tracing::error!("❌ Error during final platform events flush: {}", e);
+                    }
+                    
+                    // Give time for final requests to complete
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    info!("✅ Extension shutdown complete.");
                     break;
                 }
             }
@@ -136,7 +199,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
 
 // --- Helper Functions ---
 
@@ -221,9 +283,18 @@ async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> 
     let resp = client
         .get(&url)
         .header(EXTENSION_ID_HEADER, ext_id)
+        .timeout(Duration::from_secs(300)) // Increase timeout to 5 minutes
         .send()
         .await
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(|e| {
+            // Log more details about timeout errors
+            if e.is_timeout() {
+                tracing::warn!("⏰ Timeout waiting for next Lambda event (this is normal during idle periods)");
+            } else {
+                tracing::error!("🌐 Network error getting next event: {}", e);
+            }
+            Error::new(std::io::ErrorKind::Other, e)
+        })?;
 
     if !resp.status().is_success() {
         let err_msg = format!("Failed to get next event: {}", resp.status());
