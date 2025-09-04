@@ -5,6 +5,6 @@
 //! management.
 
 pub mod listener;
-pub mod events;
+// pub mod events;
 
-pub use listener::TelemetryServer;
+// pub use listener::TelemetryServer;

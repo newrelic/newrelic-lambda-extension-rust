@@ -1,277 +1,311 @@
-//! New Relic Lambda Extension
-//! 
-//! This is the main binary for the New Relic Lambda Extension that collects
-//! telemetry data (logs, metrics, traces) from AWS Lambda functions and
-//! forwards them to New Relic's APIs.
+#![deny(clippy::all)]
+#![deny(clippy::pedantic)]
+#![deny(clippy::unwrap_used)]
+#![deny(missing_debug_implementations)]
 
-// Use jemalloc as the global allocator for better memory management
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
-
-#[cfg(not(target_env = "msvc"))]
-#[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
-
-mod telemetry;
 mod config;
-mod event_bus;
+mod telemetry;
+mod logs;
+mod platform;
+mod newrelic;
+mod context;
 
-use lambda_extension::{service_fn, Extension, LambdaEvent, NextEvent, Error as LambdaError};
-use tracing_subscriber;
-use hyper::{Method, Request, Uri};
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
-use http_body_util::BodyExt;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
-use telemetry::TelemetryServer;
-use config::{init_config, get_config};
-use event_bus::{EventBus, Event};
+#[cfg(debug_assertions)]
+mod test_telemetry;
 
-/// Global telemetry initialization tracker
-static TELEMETRY_INITIALIZED: OnceCell<()> = OnceCell::const_new();
+use reqwest::Client;
+use serde::Deserialize;
+use std::{
+    collections::HashMap,
+    io::{Error, Result},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tracing::info;
+use crate::{
+    context::InvocationContext,
+    logs::processor::LogProcessor,
+    platform::processor::PlatformProcessor,
+    telemetry::listener::setup_telemetry_listener,
+    newrelic::{client::NewRelicClient, harvester::Harvester},
+};
 
-/// Verify telemetry server is ready to accept connections
-// async fn verify_telemetry_server_ready() -> bool {
-//     let client = Client::builder(TokioExecutor::new()).build_http::<String>();
-    
-//     for attempt in 1..=10 {
-//         match client.get("http://127.0.0.1:4243/health".parse().unwrap()).await {
-//             Ok(response) if response.status().is_success() => {
-//                 tracing::info!("✅ [TelemetryServer] Health check passed on attempt {}", attempt);
-//                 return true;
-//             }
-//             Ok(response) => {
-//                 tracing::debug!("⚠️ [TelemetryServer] Health check failed with status: {}", response.status());
-//             }
-//             Err(e) => {
-//                 tracing::debug!("⚠️ [TelemetryServer] Health check attempt {} failed: {}", attempt, e);
-//             }
-//         }
-        
-//         // Wait 50ms between attempts
-//         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-//     }
-    
-//     tracing::error!("❌ [TelemetryServer] Health check failed after 10 attempts");
-//     false
-// }
+// --- Extension Constants ---
+const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
+const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
-/// Initialize telemetry with actual extension ID from registration
-async fn initialize_telemetry_with_extension_id(extension_id: String) {
-    let _ = TELEMETRY_INITIALIZED.get_or_init(|| async {
-        tracing::info!("🔧 Starting telemetry subscription with extension ID: {}", &extension_id[..8.min(extension_id.len())]);
-        
-        // Retry logic with intelligent backoff
-        let max_retries = 5;
-        let base_delay = 200; // Start with 200ms
-        
-        for attempt in 1..=max_retries {
-            // Calculate delay with exponential backoff but cap at 2 seconds
-            let delay = std::cmp::min(base_delay * (1 << (attempt - 1)), 2000);
-            
-            tracing::info!("🔄 Telemetry subscription attempt {}/{} (delay: {}ms)", attempt, max_retries, delay);
-            
-            // Try to subscribe
-            match subscribe_to_lambda_telemetry_api_with_id(&extension_id).await {
-                Ok(()) => {
-                    tracing::info!("✅ Telemetry subscription successful on attempt {}", attempt);
-                    return;
-                }
-                Err(e) => {
-                    if attempt == max_retries {
-                        tracing::error!("❌ Telemetry subscription failed after {} attempts: {}", max_retries, e);
-                        tracing::error!("🚨 Extension will continue without telemetry - this significantly reduces functionality!");
-                        return;
-                    } else {
-                        tracing::warn!("⚠️ Telemetry subscription attempt {} failed: {}", attempt, e);
-                        
-                        // Wait before retry
-                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
-                    }
-                }
-            }
-        }
-    }).await;
-}
-/// Subscribe to AWS Lambda Telemetry API with extension ID
-async fn subscribe_to_lambda_telemetry_api_with_id(
-    extension_id: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create a simple HTTP client for telemetry subscription
-    let client = Client::builder(TokioExecutor::new())
-        .build_http::<String>();
-    let config = get_config();
-    
-    tracing::info!("[NewRelicExtension] Subscribing to telemetry with extension ID: {}", &extension_id[..8.min(extension_id.len())]);
-    
-    let telemetry_api_url = config.telemetry_subscription_url();
-    let destination_uri = config.telemetry_destination_uri();
-    
-    let subscription_request = serde_json::json!({
-        "schemaVersion": "2022-07-01",
-        "types": ["platform", "function", "extension"],
-        "buffering": {
-            "maxBytes": config.extension.max_batch_size,
-            "maxItems": config.extension.max_batch_items,
-            "timeoutMs": config.extension.telemetry_timeout
-        },
-        "destination": {
-            "protocol": "HTTP",
-            "URI": destination_uri
-        }
-    });
-    
-    tracing::info!("[NewRelicExtension] Telemetry subscription to: {}", telemetry_api_url);
-    tracing::info!("[NewRelicExtension] Destination: {}", destination_uri);
-    
-    let body = serde_json::to_string(&subscription_request)?;
-    let uri: Uri = telemetry_api_url.parse()?;
-    
-    let request = Request::builder()
-        .method(Method::PUT)
-        .uri(uri)
-        .header("Lambda-Extension-Identifier", extension_id)
-        .header("Content-Type", "application/json")
-        .body(body)?;
-    
-    let response = client.request(request).await?;
-    let status = response.status();
-    
-    if status.is_success() {
-        tracing::info!("✅ [NewRelicExtension] Successfully subscribed to Lambda Telemetry API");
-        tracing::info!("📡 [NewRelicExtension] Will receive events: platform, function, extension logs");
-        tracing::info!("🎯 [NewRelicExtension] Telemetry events will be sent to: {}", destination_uri);
-        Ok(())
-    } else {
-        let body_bytes = response.into_body().collect().await?.to_bytes();
-        let error_body = String::from_utf8_lossy(&body_bytes);
-        tracing::error!("⚠️ [NewRelicExtension] Failed to subscribe to telemetry. Status: {}, Body: {}", status, error_body);
-        Err(format!("Telemetry subscription failed with status: {}", status).into())
-    }
+// --- Structs for API Responses ---
+
+#[derive(Clone, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct RegisterResponse {
+    #[serde(skip_deserializing)]
+    extension_id: String,
+    function_name: String,
+    function_version: String,
+    handler: String,
 }
 
-async fn newrelic_handler(event: LambdaEvent) -> Result<(), LambdaError> {
-    match event.next {
-        NextEvent::Invoke(invoke_event) => {
-            tracing::info!("🚀 Lambda invocation started: {}", invoke_event.request_id);
-            tracing::info!("✅ Lambda invocation completed: {}", invoke_event.request_id);
-        }
-        NextEvent::Shutdown(shutdown_event) => {
-            tracing::info!("🛑 Lambda shutdown requested: {:?}", shutdown_event.shutdown_reason);
-            
-            // Send shutdown signal to event bus
-            // Note: We would need access to the event bus sender here for clean shutdown
-            // For now, just give some time for cleanup
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-    }
-    
-    Ok(())
+#[derive(Deserialize, Debug)]
+#[serde(tag = "eventType")]
+enum NextEventResponse {
+    #[serde(rename(deserialize = "INVOKE"))]
+    Invoke {
+        #[serde(rename(deserialize = "requestId"))]
+        request_id: String,
+        #[serde(rename(deserialize = "invokedFunctionArn"))]
+        invoked_function_arn: String,
+    },
+    #[serde(rename(deserialize = "SHUTDOWN"))]
+    Shutdown {
+        #[serde(rename(deserialize = "shutdownReason"))]
+        shutdown_reason: String,
+    },
 }
+
+// --- Main Application Logic ---
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .compact()
-        .init();
+async fn main() -> Result<()> {
+    // --- 1. Initialize Configuration & Logging ---
+    let config = Arc::new(config::init_config().clone());
+    info!("Starting extension: {}", &config.extension.name);
 
-    tracing::info!("🚀 Starting New Relic Lambda Extension with jemalloc allocator");
+    let client = Arc::new(Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?);
 
-    // Initialize configuration from environment variables
-    let config = init_config();
-    
-    // Check if extension is enabled
-    if !config.new_relic.extension_enabled {
-        tracing::warn!("⚠️ New Relic Lambda Extension is disabled via NEW_RELIC_LAMBDA_EXTENSION_ENABLED");
+    // Check for test mode
+    if std::env::var("NR_EXTENSION_TEST_MODE").unwrap_or_default() == "true" {
+        info!("Running in TEST MODE - will simulate telemetry events instead of connecting to Lambda Runtime API");
+        
+        let newrelic_client = Arc::new(NewRelicClient::new());
+        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        let log_processor = Arc::new(LogProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+        let platform_processor = Arc::new(PlatformProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+
+        // Set up a test function context
+        {
+            let mut context = invocation_context.lock().unwrap();
+            context.request_id = "test-request-12345".to_string();
+            context.invoked_function_arn = "arn:aws:lambda:us-east-1:123456789012:function:test-function".to_string();
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            // Simulate some telemetry events
+            test_telemetry::simulate_telemetry_processing(&log_processor, &platform_processor).await;
+            
+            // Send the data immediately
+            info!("Sending test data to New Relic...");
+            if let Err(e) = log_processor.send_and_clear_batch_simple().await {
+                tracing::error!("Error sending test logs: {}", e);
+            }
+            if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
+                tracing::error!("Error sending test platform events: {}", e);
+            }
+            
+            info!("Test mode completed. Check the logs above for any issues.");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        
         return Ok(());
     }
 
-    // Create and start the event bus
-    let config_arc = Arc::new(config.clone());
-    let event_bus = EventBus::new(Arc::clone(&config_arc));
-    let event_bus_sender = event_bus.get_sender();
-    
-    // Start the event bus processing loop in background
-    let event_bus_handle = tokio::spawn(async move {
-        tracing::info!("🚌 [EventBus] Starting event bus processing");
-        event_bus.run().await;
-    });
+    if !config.new_relic.extension_enabled {
+        // --- NO-OP MODE ---
+        info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
+        let response = register(&client).await?;
+        let ext_id = response.extension_id.clone();
+        info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
-    // Start the telemetry HTTP server with event bus integration
-    let telemetry_server = Arc::new(TelemetryServer::with_event_bus(event_bus_sender.clone()));
-    let server_addr = config.telemetry_socket_addr();
-    
-    let server_clone = Arc::clone(&telemetry_server);
-    let telemetry_handle = tokio::spawn(async move {
-        if let Err(e) = server_clone.start_server(server_addr).await {
-            tracing::error!("[NewRelicExtension] Failed to start telemetry server: {}", e);
+        loop {
+            if let NextEventResponse::Shutdown { shutdown_reason } = next_event(&client, &ext_id).await? {
+                info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
+                break;
+            }
+        }
+    } else {
+        // --- ACTIVE MODE ---
+        let newrelic_client = Arc::new(NewRelicClient::new());
+        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        let log_processor = Arc::new(LogProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+        let platform_processor = Arc::new(PlatformProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+            Arc::clone(&invocation_context),
+        ));
+
+        let harvester = Harvester::new(
+            vec![log_processor.clone(), platform_processor.clone()],
+            config.new_relic.harvest_interval,
+        );
+        let harvester_handle = tokio::spawn(async move {
+            harvester.run().await;
+        });
+
+        let response = register(&client).await?;
+        let ext_id = response.extension_id.clone();
+        info!("Extension registered with ID: {}", ext_id);
+
+        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone()).await?;
+        subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
+        info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
+
+        loop {
+            match next_event(&client, &ext_id).await? {
+                NextEventResponse::Invoke { request_id, invoked_function_arn } => {
+                    info!("🔥 Received INVOKE event for request ID: {}", request_id);
+                    platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
+                }
+                NextEventResponse::Shutdown { shutdown_reason } => {
+                    info!("🛑 Received SHUTDOWN event: {}", shutdown_reason);
+                    
+                    // Stop the harvester
+                    harvester_handle.abort();
+                    
+                    // Perform final flush of all data immediately
+                    info!("🚀 Performing FINAL flush of all logs and platform events...");
+                    if let Err(e) = log_processor.send_and_clear_batch_simple().await {
+                        tracing::error!("❌ Error during final log flush: {}", e);
+                    }
+                    if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
+                        tracing::error!("❌ Error during final platform events flush: {}", e);
+                    }
+                    
+                    // Give time for final requests to complete
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    info!("✅ Extension shutdown complete.");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// --- Helper Functions ---
+
+/// Registers the extension with the Lambda Runtime API.
+async fn register(client: &Client) -> Result<RegisterResponse> {
+    let config = config::get_config();
+    let url = format!("http://{}/2020-01-01/extension/register", &config.aws.runtime_api);
+
+    let mut map = HashMap::new();
+    map.insert("events", vec!["INVOKE", "SHUTDOWN"]);
+
+    let resp = client
+        .post(&url)
+        .header(EXTENSION_NAME_HEADER, &config.extension.name)
+        .json(&map)
+        .send()
+        .await
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+
+    if !resp.status().is_success() {
+        let err_msg = format!("Failed to register extension: {}", resp.status());
+        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
+    }
+
+    let extension_id = resp
+        .headers()
+        .get(EXTENSION_ID_HEADER)
+        .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "Extension ID header not found"))?
+        .to_str()
+        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?
+        .to_string();
+
+    let mut register_response: RegisterResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    register_response.extension_id = extension_id;
+    Ok(register_response)
+}
+
+/// Subscribes to the Lambda Telemetry API.
+async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Result<()> {
+    let config = config::get_config();
+    let url = format!("http://{}/2022-07-01/telemetry", &config.aws.runtime_api);
+
+    let body = serde_json::json!({
+        "schemaVersion": "2022-07-01",
+        "destination": {
+            "protocol": "HTTP",
+            "URI": format!("http://sandbox:{}", port),
+        },
+        "types": ["platform", "function", "extension"],
+        "buffering": {
+            "maxItems": config.extension.max_batch_items,
+            "maxBytes": config.extension.max_batch_size,
+            "timeoutMs": config.extension.telemetry_timeout,
         }
     });
 
-    // CRITICAL: Wait for telemetry server to be fully ready
-    // tracing::info!("⏳ Waiting for telemetry server to be ready...");
-    // if !verify_telemetry_server_ready().await {
-    //     return Err("Failed to start telemetry server".into());
-    // }
-    // tracing::info!("✅ Telemetry server is ready and accepting connections");
+    let resp = client
+        .put(&url)
+        .header(EXTENSION_ID_HEADER, ext_id)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
 
-    tracing::info!("📝 Registering extension with AWS Lambda Extensions API");
-    
-    // Step 1: Create and register the extension to get the extension ID
-    let extension = Extension::new()
-        .with_extension_name(&config.extension.name)
-        .with_events(&["INVOKE", "SHUTDOWN"])
-        .with_events_processor(service_fn(newrelic_handler));
-
-    // Register the extension and get the RegisteredExtension with extension_id
-    let registered_extension = extension.register().await.map_err(|e| {
-        tracing::error!("❌ Failed to register extension: {}", e);
-        e
-    })?;
-
-    let extension_id = registered_extension.extension_id.clone();
-    tracing::info!("✅ Extension registered successfully with ID: {}", &extension_id[..8.min(extension_id.len())]);
-    tracing::info!("📋 Extension details - Function: {}, Version: {}", 
-        registered_extension.function_name,
-        registered_extension.function_version
-    );
-
-    // Step 2: Initialize telemetry with the actual extension ID
-    tracing::info!("🔌 Initializing telemetry subscription with registered extension ID");
-    
-    // CRITICAL: Wait for telemetry subscription to complete BEFORE starting event loop
-    initialize_telemetry_with_extension_id(extension_id.clone()).await;
-    tracing::info!("✅ Telemetry initialization completed - ready for events");
-
-    tracing::info!("🔄 Starting Lambda extension event loop");
-
-    // Step 3: Run the registered extension event loop
-    let extension_result = registered_extension.run().await;
-
-    // Handle extension completion
-    match extension_result {
-        Ok(()) => tracing::info!("✅ Extension completed successfully"),
-        Err(e) => tracing::error!("❌ Extension error: {}", e),
+    if !resp.status().is_success() {
+        let err_msg = format!("Failed to subscribe to telemetry: {}", resp.status());
+        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
     }
 
-    // Send shutdown signal to event bus
-    if let Err(e) = event_bus_sender.send(Event::Shutdown).await {
-        tracing::warn!("⚠️ Failed to send shutdown signal to event bus: {}", e);
-    }
-
-    // Wait for event bus and telemetry server to shutdown
-    tracing::info!("⏳ Waiting for event bus shutdown...");
-    if let Err(e) = tokio::time::timeout(std::time::Duration::from_secs(5), event_bus_handle).await {
-        tracing::warn!("⚠️ Event bus shutdown timeout: {}", e);
-    }
-
-    tracing::info!("⏳ Waiting for telemetry server shutdown...");
-    telemetry_handle.abort(); // Force shutdown of telemetry server
-    
-    tracing::info!("👋 New Relic Lambda Extension shutdown complete");
     Ok(())
 }
+
+/// Fetches the next event from the Lambda Runtime API.
+async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> {
+    let config = config::get_config();
+    let url = format!("http://{}/2020-01-01/extension/event/next", &config.aws.runtime_api);
+
+    let resp = client
+        .get(&url)
+        .header(EXTENSION_ID_HEADER, ext_id)
+        .timeout(Duration::from_secs(300)) // Increase timeout to 5 minutes
+        .send()
+        .await
+        .map_err(|e| {
+            // Log more details about timeout errors
+            if e.is_timeout() {
+                tracing::warn!("⏰ Timeout waiting for next Lambda event (this is normal during idle periods)");
+            } else {
+                tracing::error!("🌐 Network error getting next event: {}", e);
+            }
+            Error::new(std::io::ErrorKind::Other, e)
+        })?;
+
+    if !resp.status().is_success() {
+        let err_msg = format!("Failed to get next event: {}", resp.status());
+        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
+    }
+
+    let event = resp
+        .json()
+        .await
+        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    Ok(event)
+}
+
