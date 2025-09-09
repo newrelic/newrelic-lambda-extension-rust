@@ -5,3 +5,4 @@ pub mod client;
 pub mod harvester;
 pub mod payload;
 pub mod flush;
+pub mod agent_payload_processor;

@@ -1,6 +1,6 @@
 use std::{env, time::Duration};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, fmt::SubscriberBuilder};
 
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
@@ -126,6 +126,8 @@ impl ExtensionConfig {
             config.new_relic.telemetry_endpoint = endpoint;
         } else if let Some("eu") = license_key_prefix {
             config.new_relic.telemetry_endpoint = "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
+        } else {
+            config.new_relic.telemetry_endpoint = "https://cloud-collector.newrelic.com/aws/lambda/v1".to_string();
         }
 
         if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
@@ -155,8 +157,12 @@ pub fn init_config() -> &'static ExtensionConfig {
     unsafe {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
-            
-            let env_filter = EnvFilter::try_new(&env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())).unwrap();
+
+            let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
+                .or_else(|_| env::var("RUST_LOG"))
+                .unwrap_or_else(|_| "info".to_string());
+
+            let env_filter = EnvFilter::try_new(&log_level).unwrap();
             let subscriber = tracing_subscriber::fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
                 .with_level(true)
@@ -165,7 +171,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             
             info!("[Config] New Relic Lambda Extension configuration loaded");
             info!("[Config] Extension enabled: {}", config.new_relic.extension_enabled);
-            info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "✅ Set" } else { "❌ Not set" });
+            info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "Set" } else { "Not set" });
 
             GLOBAL_CONFIG = Some(config);
         });

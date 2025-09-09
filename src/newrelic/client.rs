@@ -28,7 +28,10 @@ impl NewRelicClient {
             header::HeaderValue::from_static("application/json"),
         );
 
-        let client = Client::builder().default_headers(headers).build().unwrap();
+        let client = Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(10))  // Add 10 second timeout
+            .build().unwrap();
 
         Self { client }
     }
@@ -84,6 +87,25 @@ impl NewRelicClient {
         self.send_payload(&config.new_relic.telemetry_endpoint, &payload).await
     }
 
+    /// Sends agent payload data directly to New Relic telemetry endpoint.
+    /// This is used for compressed APM agent data (Node.js, Python, etc.)
+    pub async fn send_agent_payload(
+        &self,
+        config: &ExtensionConfig,
+        payload_data: &str,
+    ) -> Result<(), Error> {
+        // Validate license key
+        if config.new_relic.license_key.is_none() {
+            warn!("New Relic license key is not set, skipping agent payload send");
+            return Ok(());
+        }
+
+        info!("Sending agent payload to New Relic telemetry endpoint: {}", &config.new_relic.telemetry_endpoint);
+        
+        // Send the decompressed agent payload directly as JSON
+        self.send_raw_payload(&config.new_relic.telemetry_endpoint, payload_data).await
+    }
+
     /// Sends a JSON payload to a specified endpoint.
     async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<(), Error> {
         let body = match serde_json::to_string(payload) {
@@ -94,23 +116,23 @@ impl NewRelicClient {
             }
         };
 
-        info!("🚀 Sending payload to endpoint: {}", endpoint);
-        info!("📦 Payload size: {} bytes", body.len());
+        info!("Sending payload to endpoint: {}", endpoint);
+        //info!("Payload size: {} bytes", body.len());
         
         // Log first 500 chars of payload for debugging (be careful with sensitive data)
-        if body.len() > 500 {
-            info!("📄 Payload preview: {}...", &body[..500]);
-        } else {
-            info!("📄 Full payload: {}", body);
-        }
+        // if body.len() > 500 {
+        //     info!("Payload preview: {}...", &body[..500]);
+        // } else {
+        //     info!("Full payload: {}", body);
+        // }
 
         // Retry logic with exponential backoff
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
         
         loop {
-            info!("🔄 Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
-            
+            info!("Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
+
             let res = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
@@ -121,18 +143,18 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    info!("📡 Received response with status: {}", status);
+                    info!("Received response with status: {}", status);
                     
                     if status.is_success() {
-                        info!("✅ Successfully sent data to New Relic! Status: {}", status);
+                        info!("Successfully sent data to New Relic! Status: {}", status);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        warn!("❌ Failed to send data to New Relic. Status: {}, Response: {}", status, response_text);
-                        
+                        warn!("Failed to send data to New Relic. Status: {}, Response: {}", status, response_text);
+
                         // Don't retry on client errors (4xx)
                         if status.is_client_error() {
-                            warn!("🚫 Client error (4xx), not retrying");
+                            warn!("Client error (4xx), not retrying");
                             return Ok(());
                         }
                         
@@ -140,26 +162,116 @@ impl NewRelicClient {
                         if retries < MAX_RETRIES {
                             retries += 1;
                             let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                            warn!("⏳ Retrying in {}ms...", delay.as_millis());
+                            warn!("Retrying in {}ms...", delay.as_millis());
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
-                            warn!("🔥 Max retries exceeded, giving up");
+                            warn!("Max retries exceeded, giving up");
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("🌐 Network error sending data to New Relic: {}", e);
-                    
+                    warn!("Network error sending data to New Relic: {}", e);
+
                     if retries < MAX_RETRIES {
                         retries += 1;
                         let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                        warn!("⏳ Network error, retrying in {}ms...", delay.as_millis());
+                        warn!("Network error, retrying in {}ms...", delay.as_millis());
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
-                        warn!("🔥 Max network retries exceeded, giving up");
+                        warn!("Max network retries exceeded, giving up");
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends raw payload data (already serialized JSON) to a specified endpoint.
+    async fn send_raw_payload(&self, endpoint: &str, payload_data: &str) -> Result<(), Error> {
+        info!("Sending raw payload to endpoint: {}", endpoint);
+        info!("Payload size: {} bytes", payload_data.len());
+        
+        // Log first 200 chars of payload for debugging
+        let preview = if payload_data.len() > 200 {
+            format!("{}...", &payload_data[..200])
+        } else {
+            payload_data.to_string()
+        };
+        info!("Payload preview: {}", preview);
+
+        // Retry logic with exponential backoff
+        let mut retries = 0;
+        const MAX_RETRIES: usize = 3;
+        
+        loop {
+            info!("Attempt {} of {} to send agent data to New Relic", retries + 1, MAX_RETRIES + 1);
+            info!("Making HTTP POST request to: {}", endpoint);
+
+            let res = self.client
+                .post(endpoint)
+                .header("Content-Type", "application/json")
+                .body(payload_data.to_string())
+                .send()
+                .await;
+
+            info!("HTTP request completed, processing response...");
+
+            match res {
+                Ok(response) => {
+                    let status = response.status();
+                    info!("Received response with status: {}", status);
+                    if status.is_success() {
+                        info!("Successfully sent agent payload to New Relic");
+                        return Ok(());
+                    } else {
+                        let response_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        warn!("Failed to send agent payload to New Relic. Status: {}, Response: {}", status, response_text);
+
+                        // Don't retry on client errors (4xx)
+                        if status.is_client_error() {
+                            warn!("Client error (4xx), not retrying");
+                            return Ok(());
+                        }
+                        
+                        // Retry on server errors (5xx) or other issues
+                        if retries < MAX_RETRIES {
+                            retries += 1;
+                            let delay = std::time::Duration::from_millis(1000 * retries as u64);
+                            warn!("Retrying in {}ms...", delay.as_millis());
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        } else {
+                            warn!("Max retries exceeded, giving up");
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Network error sending agent payload to New Relic: {}", e);
+                    info!("Error details: {:?}", e);
+                    
+                    // Check if it's a timeout error
+                    if e.is_timeout() {
+                        warn!("Request timed out");
+                    } else if e.is_connect() {
+                        warn!("Connection failed");
+                    } else if e.is_request() {
+                        warn!("Request building failed");
+                    } else {
+                        warn!("Other network error: {}", e);
+                    }
+
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        let delay = std::time::Duration::from_millis(1000 * retries as u64);
+                        warn!("Network error, retrying in {}ms...", delay.as_millis());
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        warn!("Max network retries exceeded, giving up");
                         return Err(e);
                     }
                 }

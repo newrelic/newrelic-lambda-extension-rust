@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::Arc,
 };
-use tracing::{error, info};
+use tracing::{error, info, debug};
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct TelemetryRecord {
@@ -64,31 +64,32 @@ async fn handle_telemetry_request(
     let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
 
-    tracing::debug!("Received telemetry data: {} bytes", body_str.len());
+    debug!("Received telemetry data: {} bytes", body_str.len());
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
-            tracing::info!("Successfully parsed {} telemetry records", records.len());
+            info!("Successfully parsed {} telemetry records", records.len());
             let mut function_completed = false;
             
             for record in records {
-                tracing::debug!("Processing telemetry record: type={}", record.record_type);
+                debug!("Processing telemetry record: type={}", record.record_type);
+                
                 match record.record_type.as_str() {
                     "function" => {
-                        tracing::debug!("Routing function log to LogProcessor");
+                        debug!("Routing function log to LogProcessor");
                         log_processor.process_record(record);
                     }
                     "extension" => {
-                        tracing::debug!("Routing extension log to LogProcessor");
+                        debug!("Routing extension log to LogProcessor");
                         log_processor.process_record(record);
                     }
                     "platform.report" | "platform.end" => {
-                        tracing::debug!("Function execution completed, will flush after processing");
+                        debug!("Function execution completed, will flush after processing");
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
                     _ => {
-                        tracing::debug!("Routing platform event ({}) to PlatformProcessor", record.record_type);
+                        debug!("Routing platform event ({}) to PlatformProcessor", record.record_type);
                         platform_processor.process_record(record);
                     }
                 }
@@ -96,23 +97,23 @@ async fn handle_telemetry_request(
             
             // If function execution completed, send all accumulated data immediately
             if function_completed {
-                tracing::info!("🚀 Function execution completed, flushing all data immediately!");
+                info!("Function execution completed, flushing all data immediately!");
                 let log_proc_clone = Arc::clone(&log_processor);
                 let platform_proc_clone = Arc::clone(&platform_processor);
                 
                 tokio::spawn(async move {
                     if let Err(e) = log_proc_clone.send_and_clear_batch_simple().await {
-                        tracing::error!("Failed to send logs after function completion: {}", e);
+                        error!("Failed to send logs after function completion: {}", e);
                     }
                     if let Err(e) = platform_proc_clone.send_and_clear_batch_simple().await {
-                        tracing::error!("Failed to send platform events after function completion: {}", e);
+                        error!("Failed to send platform events after function completion: {}", e);
                     }
                 });
             }
         }
         Err(e) => {
             error!("Failed to parse telemetry records: {}", e);
-            tracing::debug!("Raw telemetry data that failed to parse: {}", body_str);
+            debug!("Raw telemetry data that failed to parse: {}", body_str);
         }
     }
 

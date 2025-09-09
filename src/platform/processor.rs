@@ -9,6 +9,7 @@ use std::{
     io::Result,
     sync::{Arc, Mutex},
 };
+use tracing::{info, debug, error};
 
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
@@ -36,16 +37,16 @@ impl PlatformProcessor {
 
     /// Processes a single platform telemetry record.
     pub fn process_record(&self, record: TelemetryRecord) {
-        tracing::debug!("Processing platform record: type={}, time={}", record.record_type, record.time);
-        
+        debug!("Processing platform record: type={}, time={}", record.record_type, record.time);
+
         let mut batch = self.platform_events_batch.lock().unwrap();
         batch.push(serde_json::json!({
             "type": record.record_type,
             "record": record.record,
             "time": record.time,
         }));
-        
-        tracing::debug!("Added platform event to batch. Current batch size: {}", batch.len());
+
+        debug!("Added platform event to batch. Current batch size: {}", batch.len());
     }
 
     /// Updates the invocation context with the latest invoke event details.
@@ -63,11 +64,11 @@ impl PlatformProcessor {
         };
 
         if batch.is_empty() {
-            tracing::debug!("[PlatformProcessor] No platform events to send");
+            debug!("[PlatformProcessor] No platform events to send");
             return Ok(());
         }
 
-        tracing::info!("[PlatformProcessor] 🚀 Sending {} platform events to New Relic NOW", batch.len());
+        info!("[PlatformProcessor] Sending {} platform events to New Relic NOW", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -87,11 +88,11 @@ impl PlatformProcessor {
         // Send directly without spawning
         match client.send_platform_events(&config, payload).await {
             Ok(()) => {
-                tracing::info!("[PlatformProcessor] ✅ Successfully sent platform events to New Relic");
+                info!("[PlatformProcessor] Successfully sent platform events to New Relic");
                 Ok(())
             },
             Err(e) => {
-                tracing::error!("[PlatformProcessor] ❌ Failed to send platform events: {}", e);
+                error!("[PlatformProcessor] Failed to send platform events: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }

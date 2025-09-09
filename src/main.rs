@@ -21,13 +21,13 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::info;
+use tracing::{info, warn, error};
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     telemetry::listener::setup_telemetry_listener,
-    newrelic::{client::NewRelicClient, harvester::Harvester},
+    newrelic::{client::NewRelicClient, harvester::Harvester, agent_payload_processor::AgentPayloadProcessor},
 };
 
 // --- Extension Constants ---
@@ -109,10 +109,10 @@ async fn main() -> Result<()> {
             // Send the data immediately
             info!("Sending test data to New Relic...");
             if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                tracing::error!("Error sending test logs: {}", e);
+                error!("Error sending test logs: {}", e);
             }
             if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                tracing::error!("Error sending test platform events: {}", e);
+                error!("Error sending test platform events: {}", e);
             }
             
             info!("Test mode completed. Check the logs above for any issues.");
@@ -139,6 +139,22 @@ async fn main() -> Result<()> {
         // --- ACTIVE MODE ---
         let newrelic_client = Arc::new(NewRelicClient::new());
         let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        // Initialize agent payload processor for APM agent data
+        info!("Starting agent payload processor pipeline...");
+        let agent_processor = AgentPayloadProcessor::new(
+            Arc::clone(&newrelic_client),
+            Arc::clone(&config),
+        );
+        
+        // Start the agent payload pipeline in background (fire-and-forget)
+        tokio::spawn(async move {
+            if let Err(e) = agent_processor.start_pipeline().await {
+                error!("Agent payload pipeline failed: {}", e);
+            }
+        });
+        
+        info!("Agent payload processor pipeline started successfully");
 
         let log_processor = Arc::new(LogProcessor::new(
             Arc::clone(&newrelic_client),
@@ -167,30 +183,37 @@ async fn main() -> Result<()> {
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
         info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
+        // Initialize agent payload processor (but don't start listening yet)
+        info!("Agent payload processor initialized successfully");
+
         loop {
             match next_event(&client, &ext_id).await? {
                 NextEventResponse::Invoke { request_id, invoked_function_arn } => {
-                    info!("🔥 Received INVOKE event for request ID: {}", request_id);
+                    info!("Received INVOKE event for request ID: {}", request_id);
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
+                    
+                    // Agent payload processing now runs in background pipeline
+                    // No need to explicitly process here
                 }
                 NextEventResponse::Shutdown { shutdown_reason } => {
-                    info!("🛑 Received SHUTDOWN event: {}", shutdown_reason);
-                    
+                    info!("Received SHUTDOWN event: {}", shutdown_reason);
+
                     // Stop the harvester
                     harvester_handle.abort();
                     
+                    // Agent payload processing continues in background
+                    // No need to explicitly process pending data
+                    
                     // Perform final flush of all data immediately
-                    info!("🚀 Performing FINAL flush of all logs and platform events...");
+                    info!("Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                        tracing::error!("❌ Error during final log flush: {}", e);
+                        error!("Error during final log flush: {}", e);
                     }
                     if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                        tracing::error!("❌ Error during final platform events flush: {}", e);
+                        error!("Error during final platform events flush: {}", e);
                     }
                     
-                    // Give time for final requests to complete
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
-                    info!("✅ Extension shutdown complete.");
+                    info!("Extension shutdown complete.");
                     break;
                 }
             }
@@ -289,9 +312,9 @@ async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> 
         .map_err(|e| {
             // Log more details about timeout errors
             if e.is_timeout() {
-                tracing::warn!("⏰ Timeout waiting for next Lambda event (this is normal during idle periods)");
+                warn!("⏰ Timeout waiting for next Lambda event (this is normal during idle periods)");
             } else {
-                tracing::error!("🌐 Network error getting next event: {}", e);
+                error!("🌐 Network error getting next event: {}", e);
             }
             Error::new(std::io::ErrorKind::Other, e)
         })?;
