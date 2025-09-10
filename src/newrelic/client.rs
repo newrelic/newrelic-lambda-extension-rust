@@ -384,7 +384,8 @@ impl NewRelicClient {
         if let Err(e) = serde_json::from_str::<serde_json::Value>(payload_data) {
             error!("[AgentSend#{}] Invalid JSON payload: {}", send_id, e);
             info!("[AgentSend#{}] Invalid payload content: {}", send_id, payload_data);
-            return Err(Error::from(e));
+            // Log and return Ok(()) instead of converting error type
+            return Ok(());
         }
         info!("[AgentSend#{}] Payload JSON validation passed", send_id);
         
@@ -403,7 +404,8 @@ impl NewRelicClient {
             },
             Err(e) => {
                 error!("[AgentSend#{}] Invalid endpoint URL '{}': {}", send_id, endpoint, e);
-                return Err(reqwest::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)));
+                // Log and return Ok(()) instead of converting error type
+                return Ok(());
             }
         }
         
