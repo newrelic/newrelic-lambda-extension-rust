@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
         let agent_processor = AgentPayloadProcessor::new(
             Arc::clone(&newrelic_client),
             Arc::clone(&config),
+            Arc::clone(&invocation_context),
         );
         
         // Start the agent payload pipeline in background and keep handle for shutdown coordination

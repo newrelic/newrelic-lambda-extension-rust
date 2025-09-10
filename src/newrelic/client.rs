@@ -1,5 +1,7 @@
 use crate::{config, config::ExtensionConfig, newrelic::payload};
 use reqwest::{header, Client, Error};
+use flate2::{write::GzEncoder, Compression};
+use std::io::Write;
 use serde::Serialize;
 use tracing::{info, warn, error};
 use std::collections::VecDeque;
@@ -34,17 +36,11 @@ impl NewRelicClient {
     /// Creates a new New Relic client.
     pub fn new() -> Self {
         let mut headers = header::HeaderMap::new();
-        headers.insert(
-            "Api-Key",
-            header::HeaderValue::from_str(
-                config::get_config()
-                    .new_relic
-                    .license_key
-                    .as_deref()
-                    .unwrap_or(""),
-            )
-            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
-        );
+        // Provide both Api-Key and X-License-Key to maximize compatibility with NR endpoints
+        if let Some(license) = config::get_config().new_relic.license_key.clone() {
+            if let Ok(v) = header::HeaderValue::from_str(&license) { headers.insert("Api-Key", v.clone()); }
+            if let Ok(v) = header::HeaderValue::from_str(&license) { headers.insert("X-License-Key", v); }
+        }
 
         Self {
             client: Client::builder()
@@ -560,7 +556,7 @@ impl NewRelicClient {
 
     /// Sends a JSON payload to a specified endpoint.
     async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<(), Error> {
-        let body = match serde_json::to_string(payload) {
+        let json_body = match serde_json::to_string(payload) {
             Ok(json) => json,
             Err(e) => {
                 warn!("Failed to serialize payload to JSON: {}", e);
@@ -568,7 +564,23 @@ impl NewRelicClient {
             }
         };
 
-        info!("Sending payload to endpoint: {}", endpoint);
+        // Gzip compress (mirrors Go BuildVortexRequest/CompressedJsonPayload)
+        let original_len = json_body.len();
+        let compressed_body: Vec<u8> = {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            if let Err(e) = encoder.write_all(json_body.as_bytes()) {
+                warn!("Failed to write payload to gzip encoder: {}", e);
+                return Ok(());
+            }
+            match encoder.finish() {
+                Ok(buf) => buf,
+                Err(e) => {
+                    warn!("Failed to finish gzip compression: {}", e);
+                    return Ok(());
+                }
+            }
+        };
+        info!("Sending payload to endpoint: {} (original={}B compressed={}B ratio={:.2})", endpoint, original_len, compressed_body.len(), compressed_body.len() as f64 / original_len as f64);
         
 
         // Retry logic with exponential backoff
@@ -579,14 +591,19 @@ impl NewRelicClient {
             info!("Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
 
             let license_key = crate::config::get_config().new_relic.license_key.as_deref().unwrap_or("");
-            let res = self.client
+            let mut req_builder = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
-                .header("User-Agent", "Ravi teja")
+                .header("Content-Encoding", "gzip")
+                .header("User-Agent", "newrelic-lambda-extension")
                 .header("X-License-Key", license_key)
-                .body(body.clone())
-                .send()
-                .await;
+                .body(compressed_body.clone());
+
+            // Add X-Event-Source: logs if this appears to be a logs endpoint
+            if endpoint.contains("log-api") || endpoint.ends_with("/log/v1") { 
+                req_builder = req_builder.header("X-Event-Source", "logs");
+            }
+            let res = req_builder.send().await;
 
             match res {
                 Ok(response) => {
@@ -618,7 +635,7 @@ impl NewRelicClient {
                             // Add to pending queue for retry during shutdown
                             let pending_request = PendingRequest::LogPayload {
                                 endpoint: endpoint.to_string(),
-                                payload: body.clone(),
+                                payload: json_body.clone(),
                                 attempts: 0,
                             };
                             self.add_pending_request(pending_request);
@@ -640,7 +657,7 @@ impl NewRelicClient {
                         // Add to pending queue for retry during shutdown
                         let pending_request = PendingRequest::LogPayload {
                             endpoint: endpoint.to_string(),
-                            payload: body.clone(),
+                            payload: json_body.clone(),
                             attempts: 0,
                         };
                         self.add_pending_request(pending_request);

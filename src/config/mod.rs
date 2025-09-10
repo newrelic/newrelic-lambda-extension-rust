@@ -148,44 +148,38 @@ impl ExtensionConfig {
     }
 }
 
-/// Global configuration instance
-static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
-static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
+use std::sync::OnceLock;
+
+/// Global configuration instance (thread-safe, single-init)
+static GLOBAL_CONFIG: OnceLock<ExtensionConfig> = OnceLock::new();
+static LOGGING_INIT: std::sync::Once = std::sync::Once::new();
 
 /// Initialize the global configuration and logging
 pub fn init_config() -> &'static ExtensionConfig {
-    unsafe {
-        CONFIG_INIT.call_once(|| {
-            let config = ExtensionConfig::from_env();
+    // Initialize logging once (independent of config storage)
+    LOGGING_INIT.call_once(|| {
+        let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
+            .or_else(|_| env::var("RUST_LOG"))
+            .unwrap_or_else(|_| "info".to_string());
+        let env_filter = EnvFilter::try_new(&log_level).unwrap();
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .with_level(true)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    });
 
-            let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
-                .or_else(|_| env::var("RUST_LOG"))
-                .unwrap_or_else(|_| "info".to_string());
-
-            let env_filter = EnvFilter::try_new(&log_level).unwrap();
-            let subscriber = tracing_subscriber::fmt::Subscriber::builder()
-                .with_env_filter(env_filter)
-                .with_level(true)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-            
-            info!("[Config] New Relic Lambda Extension configuration loaded");
-            info!("[Config] Extension enabled: {}", config.new_relic.extension_enabled);
-            info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "Set" } else { "Not set" });
-
-            GLOBAL_CONFIG = Some(config);
-        });
-        
-        GLOBAL_CONFIG.as_ref().unwrap()
-    }
+    GLOBAL_CONFIG.get_or_init(|| {
+        let config = ExtensionConfig::from_env();
+        info!("[Config] New Relic Lambda Extension configuration loaded");
+        info!("[Config] Extension enabled: {}", config.new_relic.extension_enabled);
+        info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "Set" } else { "Not set" });
+        config
+    })
 }
 
 /// Get the global configuration
 pub fn get_config() -> &'static ExtensionConfig {
-    unsafe {
-        GLOBAL_CONFIG.as_ref().unwrap_or_else(|| {
-            panic!("Configuration not initialized. Call init_config() first.");
-        })
-    }
+    GLOBAL_CONFIG.get().expect("Configuration not initialized. Call init_config() first.")
 }
 

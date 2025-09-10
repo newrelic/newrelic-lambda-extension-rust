@@ -1,11 +1,8 @@
 use crate::newrelic::client::NewRelicClient;
 use crate::config::ExtensionConfig;
+use crate::context::InvocationContext;
 use std::sync::Arc;
 use serde_json::json;
-use base64::{Engine as _, engine::general_purpose};
-use flate2::write::GzEncoder;
-use flate2::Compression;
-use std::io::Write;
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -16,11 +13,12 @@ const AGENT_PIPE_PATH: &str = "/tmp/newrelic-telemetry";
 pub struct AgentPayloadProcessor {
     client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
+    invocation_context: Arc<std::sync::Mutex<InvocationContext>>,
 }
 
 impl AgentPayloadProcessor {
-    pub fn new(client: Arc<NewRelicClient>, config: Arc<ExtensionConfig>) -> Self {
-        Self { client, config }
+    pub fn new(client: Arc<NewRelicClient>, config: Arc<ExtensionConfig>, invocation_context: Arc<std::sync::Mutex<InvocationContext>>) -> Self {
+        Self { client, config, invocation_context }
     }
 
     /// Start the agent payload pipeline: Listen -> Process -> Send
@@ -156,24 +154,58 @@ impl AgentPayloadProcessor {
     }
 
     /// Wrap the decompressed payload with Lambda context information
+    /// Expected final shape (entry is a STRING that itself is JSON of CloudWatch logs batch):
+    /// {
+    ///   "context": { ... },
+    ///   "entry": "{\"logEvents\":[{\"id\":\"<uuid>\",\"message\":\"[2, ...]\",\"timestamp\":<ms>}],\"logGroup\":\"/aws/lambda/...\", ...}"
     fn wrap_payload_with_context(&self, payload: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // Create context information from configuration
+        use uuid::Uuid;
+        use chrono::Utc;
+
+        // Context fields
         let function_name = &self.config.aws.function_name;
         let log_group_name = format!("/aws/lambda/{}", function_name);
-        
-        // For the invoked_function_arn, we need to construct it from available info
-        // In a real Lambda environment, this would come from AWS_LAMBDA_FUNCTION_NAME and other env vars
         let invoked_function_arn = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .map(|name| format!("arn:aws:lambda:{}:{}:function:{}", 
+            .map(|name| format!(
+                "arn:aws:lambda:{}:{}:function:{}",
                 std::env::var("AWS_REGION").unwrap_or_else(|_| "unknown".to_string()),
                 std::env::var("AWS_ACCOUNT_ID").unwrap_or_else(|_| "unknown".to_string()),
-                name))
+                name
+            ))
             .unwrap_or_else(|_| format!("arn:aws:lambda:unknown:unknown:function:{}", function_name));
-        
-        let log_stream_name = format!("newrelic-lambda-extension:{}", 
-            env!("CARGO_PKG_VERSION"));
+        let log_stream_name = format!("newrelic-lambda-extension:{}", env!("CARGO_PKG_VERSION"));
 
-        // Create the wrapped payload structure
+        // Build CloudWatch-like logEvents structure as a JSON string in `entry`.
+        // payload is assumed already a JSON fragment (agent array), so we escape it as message content.
+        // Use current invocation request id if available; fallback to uuid
+        let event_id = {
+            if let Ok(ctx) = self.invocation_context.lock() { ctx.request_id.clone() } else { String::new() }
+        };
+        let event_id = if event_id.is_empty() || event_id == "unknown" { Uuid::new_v4().to_string() } else { event_id };
+        let timestamp_ms = Utc::now().timestamp_millis();
+
+        // Escape existing backslashes and quotes in payload for embedding inside JSON string
+        let escaped_message = payload
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+
+        let entry_obj = json!({
+            "logEvents": [
+                {
+                    "id": event_id,
+                    "message": escaped_message,
+                    "timestamp": timestamp_ms
+                }
+            ],
+            "logGroup": log_group_name,
+            "logStream": "",
+            "messageType": "",
+            "owner": ""
+        });
+
+        // Serialize entry object then embed as string in outer wrapper
+        let entry_string = entry_obj.to_string();
+
         let wrapped_payload = json!({
             "context": {
                 "function_name": function_name,
@@ -181,7 +213,7 @@ impl AgentPayloadProcessor {
                 "log_group_name": log_group_name,
                 "log_stream_name": log_stream_name
             },
-            "entry": payload
+            "entry": entry_string
         });
 
         Ok(wrapped_payload.to_string())
