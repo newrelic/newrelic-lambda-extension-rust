@@ -1,11 +1,33 @@
 use crate::{config, config::ExtensionConfig, newrelic::payload};
 use reqwest::{header, Client, Error};
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use tokio::time::{timeout, Duration};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug)]
+// Global counter to tag agent payload send attempts uniquely for clearer CloudWatch correlation
+static AGENT_PAYLOAD_SEND_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+enum PendingRequest {
+    LogPayload {
+        endpoint: String,
+        payload: String,
+        attempts: usize,
+    },
+    AgentPayload {
+        endpoint: String,
+        payload: String,
+        attempts: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct NewRelicClient {
     client: Client,
+    pending_requests: Arc<Mutex<VecDeque<PendingRequest>>>,
 }
 
 impl NewRelicClient {
@@ -19,21 +41,260 @@ impl NewRelicClient {
                     .new_relic
                     .license_key
                     .as_deref()
-                    .unwrap_or_default(),
+                    .unwrap_or(""),
             )
-            .unwrap(),
-        );
-        headers.insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static("application/json"),
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
         );
 
-        let client = Client::builder()
-            .default_headers(headers)
-            .timeout(std::time::Duration::from_secs(10))  // Add 10 second timeout
-            .build().unwrap();
+        Self {
+            client: Client::builder()
+                .default_headers(headers)
+                .http1_only() // Avoid potential ALPN / h2 negotiation issues causing TLS EOF
+                .connect_timeout(Duration::from_millis(800)) // Fast fail on bad network / DNS
+                .pool_idle_timeout(Duration::from_secs(15))
+                .tcp_nodelay(true)
+                .timeout(Duration::from_millis(2500)) // Enforce a minimum timeout of 2.5 seconds
+                .build()
+                .unwrap_or_else(|_| Client::new()),
+            pending_requests: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
 
-        Self { client }
+    /// Add a pending request to the queue for retry during shutdown
+    fn add_pending_request(&self, request: PendingRequest) {
+        if let Ok(mut pending) = self.pending_requests.lock() {
+            info!("Adding pending request to queue. Current queue size: {}", pending.len());
+            pending.push_back(request);
+            info!("Pending request added. New queue size: {}", pending.len());
+        } else {
+            error!("Failed to acquire lock on pending requests queue");
+        }
+    }
+
+    /// Process all pending requests during shutdown
+    pub async fn process_pending_requests(&self, config: &ExtensionConfig, timeout_duration: Duration) -> Result<(), Error> {
+        info!("=== PROCESSING PENDING REQUESTS ===");
+        
+        let pending_count = {
+            if let Ok(pending) = self.pending_requests.lock() {
+                pending.len()
+            } else {
+                error!("Failed to acquire lock to check pending requests count");
+                return Ok(());
+            }
+        };
+
+        if pending_count == 0 {
+            info!("No pending requests to process");
+            return Ok(());
+        }
+
+        info!("Processing {} pending requests with timeout {:?}", pending_count, timeout_duration);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1400), // Leave 100ms buffer before 1.5s limit
+            async {
+                // Collect all pending requests at once for parallel processing
+                let all_requests = {
+                    if let Ok(mut pending) = self.pending_requests.lock() {
+                        let requests: Vec<_> = pending.drain(..).collect();
+                        requests
+                    } else {
+                        error!("Failed to acquire lock to get all pending requests");
+                        return Ok::<(), Error>(());
+                    }
+                };
+
+                if all_requests.is_empty() {
+                    info!("No pending requests to process");
+                    return Ok::<(), Error>(());
+                }
+
+                info!("Processing {} pending requests in parallel within 1.4 second timeout", all_requests.len());
+
+                // Extract config data we need for the tasks
+                let log_endpoint = config.new_relic.log_endpoint.clone();
+                let telemetry_endpoint = config.new_relic.telemetry_endpoint.clone();
+                let license_key = &config.new_relic.license_key.clone();
+
+                // Process requests in parallel with limited concurrency to avoid overwhelming
+                let max_concurrent = std::cmp::min(all_requests.len(), 10); // Max 10 concurrent requests
+                let mut tasks = Vec::new();
+
+                // Split requests into chunks for parallel processing
+                for (index, request) in all_requests.into_iter().enumerate() {
+                    let client = self.clone();
+                    let log_endpoint = log_endpoint.clone();
+                    let telemetry_endpoint = telemetry_endpoint.clone();
+                    let license_key = license_key.clone();
+                    
+                    let task = tokio::spawn(async move {
+                        info!("Starting parallel processing of pending request #{}", index + 1);
+                        
+                        // Create a temporary config-like structure for the request
+                        let temp_config = ExtensionConfig {
+                            new_relic: crate::config::NewRelicConfig {
+                                log_endpoint,
+                                telemetry_endpoint,
+                                license_key,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        
+                        match client.retry_pending_request(request, &temp_config).await {
+                            Ok(_) => {
+                                info!("Successfully processed pending request #{}", index + 1);
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!("Failed to process pending request #{}: {}", index + 1, e);
+                                Err(e)
+                            }
+                        }
+                    });
+                    
+                    tasks.push(task);
+                    
+                    // Limit concurrent tasks to avoid overwhelming the system
+                    if tasks.len() >= max_concurrent {
+                        // Wait for these tasks to complete before starting more
+                        let mut successful = 0;
+                        let mut failed = 0;
+                        
+                        for task in tasks {
+                            match task.await {
+                                Ok(Ok(())) => successful += 1,
+                                Ok(Err(_)) => failed += 1,
+                                Err(e) => {
+                                    failed += 1;
+                                    error!("Task panicked: {:?}", e);
+                                }
+                            }
+                        }
+                        
+                        info!("Completed chunk: {} successful, {} failed", successful, failed);
+                        tasks = Vec::new();
+                    }
+                }
+
+                // Process remaining tasks
+                if !tasks.is_empty() {
+                    info!("Processing final chunk of {} requests", tasks.len());
+                    let mut successful = 0;
+                    let mut failed = 0;
+                    
+                    for task in tasks {
+                        match task.await {
+                            Ok(Ok(())) => successful += 1,
+                            Ok(Err(_)) => failed += 1,
+                            Err(e) => {
+                                failed += 1;
+                                error!("Task panicked: {:?}", e);
+                            }
+                        }
+                    }
+                    
+                    info!("Final chunk completed: {} successful, {} failed", successful, failed);
+                }
+
+                info!("=== ALL PENDING REQUESTS PROCESSED IN PARALLEL ===");
+                Ok::<(), Error>(())
+            }
+        ).await;
+
+        match result {
+            Ok(_) => {
+                info!("=== PENDING REQUESTS PROCESSING COMPLETED ===");
+                Ok(())
+            }
+            Err(_) => {
+                error!("=== PENDING REQUESTS PROCESSING TIMED OUT ===");
+                let remaining = {
+                    if let Ok(pending) = self.pending_requests.lock() {
+                        pending.len()
+                    } else { 0 }
+                };
+                error!("Failed to process {} remaining pending requests due to timeout", remaining);
+                // Return Ok since timeout is expected and not really an error during shutdown
+                Ok(())
+            }
+        }
+    }
+
+    /// Retry a specific pending request
+    async fn retry_pending_request(&self, request: PendingRequest, config: &ExtensionConfig) -> Result<(), Error> {
+        const MAX_ATTEMPTS: usize = 2; // Reduced attempts during shutdown
+
+        match request {
+            PendingRequest::LogPayload { endpoint, payload, attempts } => {
+                if attempts >= MAX_ATTEMPTS {
+                    error!("Log payload request exceeded max attempts ({}), dropping", MAX_ATTEMPTS);
+                    return Ok(()); // Don't return error to continue processing other requests
+                }
+
+                info!("Retrying log payload request (attempt {} of {})", attempts + 1, MAX_ATTEMPTS);
+                
+                // Parse the payload back to the original log structure and use existing send_payload method
+                match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(parsed_payload) => {
+                        match self.send_payload(&endpoint, &parsed_payload).await {
+                            Ok(_) => {
+                                info!("Successfully sent pending log payload");
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!("Failed to send pending log payload: {}", e);
+                                
+                                // Re-queue with incremented attempt count if we haven't exceeded max attempts
+                                if attempts + 1 < MAX_ATTEMPTS {
+                                    let retry_request = PendingRequest::LogPayload {
+                                        endpoint,
+                                        payload,
+                                        attempts: attempts + 1,
+                                    };
+                                    self.add_pending_request(retry_request);
+                                }
+                                Err(e)
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to parse pending log payload: {}", e);
+                        // Return Ok to continue processing other requests instead of stopping
+                        Ok(())
+                    }
+                }
+            }
+            PendingRequest::AgentPayload { endpoint, payload, attempts } => {
+                if attempts >= MAX_ATTEMPTS {
+                    error!("Agent payload request exceeded max attempts ({}), dropping", MAX_ATTEMPTS);
+                    return Ok(()); // Don't return error to continue processing other requests
+                }
+
+                info!("Retrying agent payload request (attempt {} of {})", attempts + 1, MAX_ATTEMPTS);
+                match self.send_agent_payload(config, &payload).await {
+                    Ok(_) => {
+                        info!("Successfully sent pending agent payload");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        error!("Failed to send pending agent payload: {}", e);
+                        
+                        // Re-queue with incremented attempt count if we haven't exceeded max attempts
+                        if attempts + 1 < MAX_ATTEMPTS {
+                            let retry_request = PendingRequest::AgentPayload {
+                                endpoint,
+                                payload,
+                                attempts: attempts + 1,
+                            };
+                            self.add_pending_request(retry_request);
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        }
     }
 
     /// Sends a batch of logs to New Relic.
@@ -100,10 +361,86 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        info!("Sending agent payload to New Relic telemetry endpoint: {}", &config.new_relic.telemetry_endpoint);
-        
-        // Send the decompressed agent payload directly as JSON
-        self.send_raw_payload(&config.new_relic.telemetry_endpoint, payload_data).await
+    let send_id = AGENT_PAYLOAD_SEND_ID.fetch_add(1, Ordering::Relaxed);
+    info!("[AgentSend#{}] Sending agent payload to New Relic telemetry endpoint: {} ({} bytes)", send_id, &config.new_relic.telemetry_endpoint, payload_data.len());
+    // Send the decompressed (already JSON wrapped) agent payload directly
+        self.send_raw_payload(&config.new_relic.telemetry_endpoint, payload_data, send_id).await
+    }
+
+    /// Sends a JSON payload to a specified endpoint.
+    async fn send_raw_payload(&self, endpoint: &str, payload_data: &str, send_id: u64) -> Result<(), Error> {
+        // Strict per-attempt total timeout (includes DNS + TLS + body send + response headers)
+        const PER_ATTEMPT_TIMEOUT_MS: u64 = 2500; // matches minimum requirement
+        const MAX_RETRIES: usize = 3;
+        let license_key = crate::config::get_config().new_relic.license_key.as_deref().unwrap_or("");
+        let overall_start = std::time::Instant::now();
+        info!("[AgentSend#{}] Preparing raw payload to endpoint: {}", send_id, endpoint);
+        info!("[AgentSend#{}] Payload size={} bytes", send_id, payload_data.len());
+
+        for attempt in 0..=MAX_RETRIES {
+            let attempt_start = std::time::Instant::now();
+            info!("[AgentSend#{}] Attempt {} of {} (per-attempt timeout {}ms)", send_id, attempt + 1, MAX_RETRIES + 1, PER_ATTEMPT_TIMEOUT_MS);
+            // Build request (no misleading Content-Encoding header since we are not compressing)
+            let request = self.client
+                .post(endpoint)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "newrelic-lambda-extension")
+                .header("X-License-Key", license_key)
+                .body(payload_data.to_string());
+
+            // Apply manual timeout guard to ensure we never exceed PER_ATTEMPT_TIMEOUT_MS
+            let send_future = request.send();
+            let result = timeout(Duration::from_millis(PER_ATTEMPT_TIMEOUT_MS), send_future).await;
+
+            match result {
+                Err(_) => {
+                    error!("[AgentSend#{}] Attempt {} timed out after {}ms (overall_elapsed={}ms)", send_id, attempt + 1, PER_ATTEMPT_TIMEOUT_MS, overall_start.elapsed().as_millis());
+                    if attempt < MAX_RETRIES {
+                        let delay = std::time::Duration::from_millis(200 * (attempt as u64 + 1));
+                        warn!("[AgentSend#{}] Scheduling retry in {}ms", send_id, delay.as_millis());
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        error!("[AgentSend#{}] Exhausted retries due to timeouts, enqueueing for shutdown retry", send_id);
+                        let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Ok(());
+                    }
+                }
+                Ok(send_res) => match send_res {
+                    Err(e) => {
+                        error!("[AgentSend#{}] Network error on attempt {}: {} (elapsed={}ms overall_elapsed={}ms)", send_id, attempt + 1, e, attempt_start.elapsed().as_millis(), overall_start.elapsed().as_millis());
+                        if e.is_timeout() { error!("[AgentSend#{}] Underlying connector timeout", send_id); }
+                        if e.is_connect() { error!("[AgentSend#{}] Connect failure", send_id); }
+                        if e.is_request() { error!("[AgentSend#{}] Request build issue", send_id); }
+                        if attempt < MAX_RETRIES {
+                            let base = if e.is_connect() { 120 } else { 300 };
+                            let delay = std::time::Duration::from_millis(base * (attempt as u64 + 1));
+                            warn!("[AgentSend#{}] Retrying in {}ms", send_id, delay.as_millis());
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        } else {
+                            error!("[AgentSend#{}] Max retries exceeded (network), enqueueing for shutdown retry", send_id);
+                            let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Err(e);
+                        }
+                    }
+                    Ok(response) => {
+                        let status = response.status();
+                        info!("[AgentSend#{}] Received status={} (attempt_elapsed={}ms overall_elapsed={}ms)", send_id, status, attempt_start.elapsed().as_millis(), overall_start.elapsed().as_millis());
+                        if status.is_success() {
+                            info!("[AgentSend#{}] Successfully sent agent payload (status={}) total_elapsed={}ms", send_id, status, overall_start.elapsed().as_millis());
+                            return Ok(());
+                        }
+                        let body = response.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                        warn!("[AgentSend#{}] Non-success status={} body={} (attempt_elapsed={}ms)", send_id, status, body, attempt_start.elapsed().as_millis());
+                        if status.is_client_error() {
+                            warn!("[AgentSend#{}] Client error (won't retry)", send_id);
+                            return Ok(());
+                        }
+                        if attempt < MAX_RETRIES { let delay = std::time::Duration::from_millis(400 * (attempt as u64 + 1)); warn!("[AgentSend#{}] Retrying server error in {}ms", send_id, delay.as_millis()); tokio::time::sleep(delay).await; continue; } else { warn!("[AgentSend#{}] Server error retries exhausted, enqueueing", send_id); let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Ok(()); }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Sends a JSON payload to a specified endpoint.
@@ -117,14 +454,7 @@ impl NewRelicClient {
         };
 
         info!("Sending payload to endpoint: {}", endpoint);
-        //info!("Payload size: {} bytes", body.len());
         
-        // Log first 500 chars of payload for debugging (be careful with sensitive data)
-        // if body.len() > 500 {
-        //     info!("Payload preview: {}...", &body[..500]);
-        // } else {
-        //     info!("Full payload: {}", body);
-        // }
 
         // Retry logic with exponential backoff
         let mut retries = 0;
@@ -133,9 +463,12 @@ impl NewRelicClient {
         loop {
             info!("Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
 
+            let license_key = crate::config::get_config().new_relic.license_key.as_deref().unwrap_or("");
             let res = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
+                .header("User-Agent", "Ravi teja")
+                .header("X-License-Key", license_key)
                 .body(body.clone())
                 .send()
                 .await;
@@ -166,7 +499,14 @@ impl NewRelicClient {
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
-                            warn!("Max retries exceeded, giving up");
+                            warn!("Max retries exceeded for log payload, adding to pending queue");
+                            // Add to pending queue for retry during shutdown
+                            let pending_request = PendingRequest::LogPayload {
+                                endpoint: endpoint.to_string(),
+                                payload: body.clone(),
+                                attempts: 0,
+                            };
+                            self.add_pending_request(pending_request);
                             return Ok(());
                         }
                     }
@@ -181,7 +521,14 @@ impl NewRelicClient {
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
-                        warn!("Max network retries exceeded, giving up");
+                        warn!("Max network retries exceeded for log payload, adding to pending queue");
+                        // Add to pending queue for retry during shutdown
+                        let pending_request = PendingRequest::LogPayload {
+                            endpoint: endpoint.to_string(),
+                            payload: body.clone(),
+                            attempts: 0,
+                        };
+                        self.add_pending_request(pending_request);
                         return Err(e);
                     }
                 }
@@ -189,94 +536,6 @@ impl NewRelicClient {
         }
     }
 
-    /// Sends raw payload data (already serialized JSON) to a specified endpoint.
-    async fn send_raw_payload(&self, endpoint: &str, payload_data: &str) -> Result<(), Error> {
-        info!("Sending raw payload to endpoint: {}", endpoint);
-        info!("Payload size: {} bytes", payload_data.len());
-        
-        // Log first 200 chars of payload for debugging
-        let preview = if payload_data.len() > 200 {
-            format!("{}...", &payload_data[..200])
-        } else {
-            payload_data.to_string()
-        };
-        info!("Payload preview: {}", preview);
+    // NOTE: Legacy implementation of send_raw_payload removed to ensure the per-attempt timeout version above is always used.
 
-        // Retry logic with exponential backoff
-        let mut retries = 0;
-        const MAX_RETRIES: usize = 3;
-        
-        loop {
-            info!("Attempt {} of {} to send agent data to New Relic", retries + 1, MAX_RETRIES + 1);
-            info!("Making HTTP POST request to: {}", endpoint);
-
-            let res = self.client
-                .post(endpoint)
-                .header("Content-Type", "application/json")
-                .body(payload_data.to_string())
-                .send()
-                .await;
-
-            info!("HTTP request completed, processing response...");
-
-            match res {
-                Ok(response) => {
-                    let status = response.status();
-                    info!("Received response with status: {}", status);
-                    if status.is_success() {
-                        info!("Successfully sent agent payload to New Relic");
-                        return Ok(());
-                    } else {
-                        let response_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-                        warn!("Failed to send agent payload to New Relic. Status: {}, Response: {}", status, response_text);
-
-                        // Don't retry on client errors (4xx)
-                        if status.is_client_error() {
-                            warn!("Client error (4xx), not retrying");
-                            return Ok(());
-                        }
-                        
-                        // Retry on server errors (5xx) or other issues
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                            warn!("Retrying in {}ms...", delay.as_millis());
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        } else {
-                            warn!("Max retries exceeded, giving up");
-                            return Ok(());
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Network error sending agent payload to New Relic: {}", e);
-                    info!("Error details: {:?}", e);
-                    
-                    // Check if it's a timeout error
-                    if e.is_timeout() {
-                        warn!("Request timed out");
-                    } else if e.is_connect() {
-                        warn!("Connection failed");
-                    } else if e.is_request() {
-                        warn!("Request building failed");
-                    } else {
-                        warn!("Other network error: {}", e);
-                    }
-
-                    if retries < MAX_RETRIES {
-                        retries += 1;
-                        let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                        warn!("Network error, retrying in {}ms...", delay.as_millis());
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    } else {
-                        warn!("Max network retries exceeded, giving up");
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
 }
-

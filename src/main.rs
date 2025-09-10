@@ -147,11 +147,14 @@ async fn main() -> Result<()> {
             Arc::clone(&config),
         );
         
-        // Start the agent payload pipeline in background (fire-and-forget)
-        tokio::spawn(async move {
+        // Start the agent payload pipeline in background and keep handle for shutdown coordination
+        info!("Spawning agent payload processor background task...");
+        let agent_payload_handle = tokio::spawn(async move {
+            info!("Agent payload processor background task started");
             if let Err(e) = agent_processor.start_pipeline().await {
                 error!("Agent payload pipeline failed: {}", e);
             }
+            info!("Agent payload processor background task completed");
         });
         
         info!("Agent payload processor pipeline started successfully");
@@ -196,24 +199,50 @@ async fn main() -> Result<()> {
                     // No need to explicitly process here
                 }
                 NextEventResponse::Shutdown { shutdown_reason } => {
+                    info!("=== SHUTDOWN EVENT RECEIVED ===");
                     info!("Received SHUTDOWN event: {}", shutdown_reason);
+                    info!("Starting graceful shutdown process...");
 
-                    // Stop the harvester
+                    // Stop the harvester first
+                    info!("Stopping harvester...");
                     harvester_handle.abort();
+                    info!("Harvester stopped");
                     
-                    // Agent payload processing continues in background
-                    // No need to explicitly process pending data
-                    
-                    // Perform final flush of all data immediately
+                    // Perform final flush of logs and platform events
                     info!("Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
                         error!("Error during final log flush: {}", e);
-                    }
-                    if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                        error!("Error during final platform events flush: {}", e);
+                    } else {
+                        info!("Final log flush completed successfully");
                     }
                     
-                    info!("Extension shutdown complete.");
+                    if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
+                        error!("Error during final platform events flush: {}", e);
+                    } else {
+                        info!("Final platform events flush completed successfully");
+                    }
+                    
+                    // Give agent payload processor time to complete pending requests
+                    // AWS Lambda gives us ~2 seconds after function completion
+                    info!("Processing pending requests before shutdown...");
+                    
+                    // Process any pending requests that failed during normal operation
+                    let pending_result = newrelic_client.process_pending_requests(&config, Duration::from_millis(1500)).await;
+                    match pending_result {
+                        Ok(_) => {
+                            info!("All pending requests processed successfully");
+                        }
+                        Err(e) => {
+                            error!("Failed to process some pending requests: {}", e);
+                        }
+                    }
+                    
+                    // Now abort the agent payload processor
+                    info!("Aborting agent payload processor...");
+                    agent_payload_handle.abort();
+                    info!("Agent payload processor aborted");
+                    
+                    info!("=== EXTENSION SHUTDOWN COMPLETE ===");
                     break;
                 }
             }
