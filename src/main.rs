@@ -138,6 +138,12 @@ async fn main() -> Result<()> {
     } else {
         // --- ACTIVE MODE ---
         let newrelic_client = Arc::new(NewRelicClient::new());
+        
+        // Test connectivity to New Relic endpoints early
+        if let Err(e) = newrelic_client.test_connectivity(&config).await {
+            warn!("Connectivity test failed: {}. Extension will continue but may have delivery issues.", e);
+        }
+        
         let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
 
         // Initialize agent payload processor for APM agent data

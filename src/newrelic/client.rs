@@ -374,19 +374,52 @@ impl NewRelicClient {
         const MAX_RETRIES: usize = 3;
         let license_key = crate::config::get_config().new_relic.license_key.as_deref().unwrap_or("");
         let overall_start = std::time::Instant::now();
+        
+        // Enhanced logging for debugging
         info!("[AgentSend#{}] Preparing raw payload to endpoint: {}", send_id, endpoint);
-        info!("[AgentSend#{}] Payload size={} bytes", send_id, payload_data.len());
+        info!("[AgentSend#{}] Payload size={} bytes, license_key_present={}", send_id, payload_data.len(), !license_key.is_empty());
+        info!("[AgentSend#{}] License key prefix: {}***", send_id, license_key.get(..4).unwrap_or("NONE"));
+        
+        // Validate payload is valid JSON
+        if let Err(e) = serde_json::from_str::<serde_json::Value>(payload_data) {
+            error!("[AgentSend#{}] Invalid JSON payload: {}", send_id, e);
+            info!("[AgentSend#{}] Invalid payload content: {}", send_id, payload_data);
+            return Err(Error::from(e));
+        }
+        info!("[AgentSend#{}] Payload JSON validation passed", send_id);
+        
+        // Log payload preview for debugging
+        let preview = if payload_data.len() > 200 { 
+            format!("{}...", &payload_data[..200]) 
+        } else { 
+            payload_data.to_string() 
+        };
+        info!("[AgentSend#{}] Payload preview: {}", send_id, preview);
 
-        for attempt in 0..=MAX_RETRIES {
+        // Validate endpoint URL
+        match url::Url::parse(endpoint) {
+            Ok(parsed_url) => {
+                info!("[AgentSend#{}] Endpoint URL validation passed: scheme={}, host={:?}", send_id, parsed_url.scheme(), parsed_url.host_str());
+            },
+            Err(e) => {
+                error!("[AgentSend#{}] Invalid endpoint URL '{}': {}", send_id, endpoint, e);
+                return Err(reqwest::Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e)));
+            }
+        }
+        
+        for attempt in 0..MAX_RETRIES {
             let attempt_start = std::time::Instant::now();
-            info!("[AgentSend#{}] Attempt {} of {} (per-attempt timeout {}ms)", send_id, attempt + 1, MAX_RETRIES + 1, PER_ATTEMPT_TIMEOUT_MS);
+            info!("[AgentSend#{}] Attempt {} of {} (per-attempt timeout {}ms)", send_id, attempt + 1, MAX_RETRIES, PER_ATTEMPT_TIMEOUT_MS);
             // Build request (no misleading Content-Encoding header since we are not compressing)
+            info!("[AgentSend#{}] Building request with headers: Content-Type=application/json, User-Agent=newrelic-lambda-extension", send_id);
             let request = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "newrelic-lambda-extension")
                 .header("X-License-Key", license_key)
                 .body(payload_data.to_string());
+            
+            info!("[AgentSend#{}] Request built successfully, sending...", send_id);
 
             // Apply manual timeout guard to ensure we never exceed PER_ATTEMPT_TIMEOUT_MS
             let send_future = request.send();
@@ -394,52 +427,132 @@ impl NewRelicClient {
 
             match result {
                 Err(_) => {
-                    error!("[AgentSend#{}] Attempt {} timed out after {}ms (overall_elapsed={}ms)", send_id, attempt + 1, PER_ATTEMPT_TIMEOUT_MS, overall_start.elapsed().as_millis());
-                    if attempt < MAX_RETRIES {
-                        let delay = std::time::Duration::from_millis(200 * (attempt as u64 + 1));
-                        warn!("[AgentSend#{}] Scheduling retry in {}ms", send_id, delay.as_millis());
+                    error!("[AgentSend#{}] ⏱️ TIMEOUT: Attempt {} exceeded {}ms limit (overall_elapsed={}ms)", send_id, attempt + 1, PER_ATTEMPT_TIMEOUT_MS, overall_start.elapsed().as_millis());
+                    error!("[AgentSend#{}] Timeout details: endpoint={}, payload_size={} bytes", send_id, endpoint, payload_data.len());
+                    
+                    if attempt + 1 < MAX_RETRIES {
+                        let delay = std::time::Duration::from_millis(500 * (1 << attempt)); // 500ms, 1s, 2s
+                        warn!("[AgentSend#{}] Timeout retry {} in {}ms", send_id, attempt + 2, delay.as_millis());
                         tokio::time::sleep(delay).await;
                         continue;
-                    } else {
-                        error!("[AgentSend#{}] Exhausted retries due to timeouts, enqueueing for shutdown retry", send_id);
-                        let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Ok(());
                     }
+                    error!("[AgentSend#{}] ❌ All attempts timed out", send_id);
+                    let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; 
+                    self.add_pending_request(pending_request); 
+                    return Ok(());
                 }
                 Ok(send_res) => match send_res {
                     Err(e) => {
-                        error!("[AgentSend#{}] Network error on attempt {}: {} (elapsed={}ms overall_elapsed={}ms)", send_id, attempt + 1, e, attempt_start.elapsed().as_millis(), overall_start.elapsed().as_millis());
-                        if e.is_timeout() { error!("[AgentSend#{}] Underlying connector timeout", send_id); }
-                        if e.is_connect() { error!("[AgentSend#{}] Connect failure", send_id); }
-                        if e.is_request() { error!("[AgentSend#{}] Request build issue", send_id); }
-                        if attempt < MAX_RETRIES {
-                            let base = if e.is_connect() { 120 } else { 300 };
-                            let delay = std::time::Duration::from_millis(base * (attempt as u64 + 1));
-                            warn!("[AgentSend#{}] Retrying in {}ms", send_id, delay.as_millis());
+                        error!("[AgentSend#{}] 🌐 NETWORK ERROR on attempt {}: {} (elapsed={}ms overall_elapsed={}ms)", send_id, attempt + 1, e, attempt_start.elapsed().as_millis(), overall_start.elapsed().as_millis());
+                        
+                        // Detailed error classification
+                        if e.is_timeout() { 
+                            error!("[AgentSend#{}] ⏱️ Network timeout - slow connection or server overload", send_id); 
+                        }
+                        if e.is_connect() { 
+                            error!("[AgentSend#{}] 🔌 Connection failed - DNS resolution or network unreachable", send_id);
+                            error!("[AgentSend#{}] Check: 1) Internet connectivity 2) DNS resolution for {}", send_id, endpoint);
+                        }
+                        if e.is_request() { 
+                            error!("[AgentSend#{}] 📦 Request build failed - malformed request", send_id); 
+                        }
+                        if e.is_decode() {
+                            error!("[AgentSend#{}] 🔄 Response decode error - corrupted response", send_id);
+                        }
+                        
+                        // Log the raw error for debugging
+                        info!("[AgentSend#{}] Raw error details: {:?}", send_id, e);
+                        
+                        if attempt + 1 < MAX_RETRIES {
+                            let delay = std::time::Duration::from_millis(500 * (1 << attempt)); // Exponential: 500ms, 1s, 2s
+                            warn!("[AgentSend#{}] Network retry {} in {}ms", send_id, attempt + 2, delay.as_millis());
                             tokio::time::sleep(delay).await;
                             continue;
-                        } else {
-                            error!("[AgentSend#{}] Max retries exceeded (network), enqueueing for shutdown retry", send_id);
-                            let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Err(e);
                         }
+                        error!("[AgentSend#{}] ❌ All network retries failed", send_id);
+                        let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; 
+                        self.add_pending_request(pending_request); 
+                        return Err(e);
                     }
                     Ok(response) => {
                         let status = response.status();
+                        let headers = response.headers().clone();
                         info!("[AgentSend#{}] Received status={} (attempt_elapsed={}ms overall_elapsed={}ms)", send_id, status, attempt_start.elapsed().as_millis(), overall_start.elapsed().as_millis());
+                        
+                        // Log response headers for debugging
+                        info!("[AgentSend#{}] Response headers: {:?}", send_id, headers);
+                        
                         if status.is_success() {
-                            info!("[AgentSend#{}] Successfully sent agent payload (status={}) total_elapsed={}ms", send_id, status, overall_start.elapsed().as_millis());
+                            // Read response body to verify successful processing
+                            let body = response.text().await.unwrap_or_else(|_| "<unreadable>".into());
+                            info!("[AgentSend#{}] ✅ SUCCESS: Payload delivered (status={}) total_elapsed={}ms", send_id, status, overall_start.elapsed().as_millis());
+                            info!("[AgentSend#{}] Success response body: {}", send_id, body);
+                            
+                            // Verify New Relic accepted the data
+                            if body.contains("success") || body.is_empty() || status == 200 {
+                                info!("[AgentSend#{}] ✅ New Relic confirmed data acceptance", send_id);
+                            } else {
+                                warn!("[AgentSend#{}] ⚠️ Unexpected success response: {}", send_id, body);
+                            }
                             return Ok(());
                         }
+                        
                         let body = response.text().await.unwrap_or_else(|_| "<unreadable>".into());
-                        warn!("[AgentSend#{}] Non-success status={} body={} (attempt_elapsed={}ms)", send_id, status, body, attempt_start.elapsed().as_millis());
+                        error!("[AgentSend#{}] ❌ FAILED: status={} body='{}' (attempt_elapsed={}ms)", send_id, status, body, attempt_start.elapsed().as_millis());
+                        
+                        // Enhanced error analysis
+                        match status.as_u16() {
+                            400 => error!("[AgentSend#{}] Bad Request - Invalid payload format or missing required fields", send_id),
+                            401 => error!("[AgentSend#{}] Unauthorized - Invalid or missing license key", send_id),
+                            403 => error!("[AgentSend#{}] Forbidden - License key valid but lacks permissions", send_id),
+                            413 => error!("[AgentSend#{}] Payload Too Large - Reduce batch size", send_id),
+                            429 => error!("[AgentSend#{}] Rate Limited - Too many requests", send_id),
+                            500..=599 => error!("[AgentSend#{}] Server Error - New Relic service issue", send_id),
+                            _ => error!("[AgentSend#{}] Unexpected status code", send_id),
+                        }
+                        
                         if status.is_client_error() {
-                            warn!("[AgentSend#{}] Client error (won't retry)", send_id);
+                            error!("[AgentSend#{}] Client error - not retrying. Check payload format and credentials.", send_id);
                             return Ok(());
                         }
-                        if attempt < MAX_RETRIES { let delay = std::time::Duration::from_millis(400 * (attempt as u64 + 1)); warn!("[AgentSend#{}] Retrying server error in {}ms", send_id, delay.as_millis()); tokio::time::sleep(delay).await; continue; } else { warn!("[AgentSend#{}] Server error retries exhausted, enqueueing", send_id); let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; self.add_pending_request(pending_request); return Ok(()); }
+                        
+                        if attempt + 1 < MAX_RETRIES { 
+                            let delay = std::time::Duration::from_millis(500 * (1 << attempt)); // Exponential: 500ms, 1s, 2s
+                            warn!("[AgentSend#{}] Server error retry {} in {}ms", send_id, attempt + 2, delay.as_millis()); 
+                            tokio::time::sleep(delay).await; 
+                            continue; 
+                        }
+                        error!("[AgentSend#{}] Server error retries exhausted", send_id); 
+                        let pending_request = PendingRequest::AgentPayload { endpoint: endpoint.to_string(), payload: payload_data.to_string(), attempts: 0 }; 
+                        self.add_pending_request(pending_request); 
+                        return Ok(());
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Test connectivity to New Relic endpoints
+    pub async fn test_connectivity(&self, config: &ExtensionConfig) -> Result<(), Error> {
+        info!("[Diagnostics] Testing connectivity to New Relic endpoints...");
+        
+        // Test log endpoint
+        info!("[Diagnostics] Testing log endpoint: {}", config.new_relic.log_endpoint);
+        let log_test = self.client.head(&config.new_relic.log_endpoint).send().await;
+        match log_test {
+            Ok(resp) => info!("[Diagnostics] Log endpoint reachable: status={}", resp.status()),
+            Err(e) => error!("[Diagnostics] Log endpoint unreachable: {}", e),
+        }
+        
+        // Test telemetry endpoint  
+        info!("[Diagnostics] Testing telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
+        let telemetry_test = self.client.head(&config.new_relic.telemetry_endpoint).send().await;
+        match telemetry_test {
+            Ok(resp) => info!("[Diagnostics] Telemetry endpoint reachable: status={}", resp.status()),
+            Err(e) => error!("[Diagnostics] Telemetry endpoint unreachable: {}", e),
+        }
+        
         Ok(())
     }
 

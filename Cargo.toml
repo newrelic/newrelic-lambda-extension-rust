@@ -20,6 +20,7 @@ flate2 = "1.0"
 base64 = "0.22"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+url = "2.4"
 libc = "0.2"
 
 [profile.release]
