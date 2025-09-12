@@ -19,6 +19,8 @@ hyper = { version = "0.14", features = ["full"] }
 flate2 = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
+nix = { version = "0.28", features = ["fs"] }
+base64 = "0.22"
 
 [profile.release]
 lto = true

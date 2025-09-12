@@ -58,7 +58,6 @@ impl LogProcessor {
             // Send immediately if we have 3+ logs (simple batch condition)
             if batch_size >= 3 {
                 drop(batch); // Release the lock before async operation
-                tracing::info!("🚀 Batch size reached 3, sending logs immediately!");
                 let processor = self.clone();
                 tokio::spawn(async move {
                     if let Err(e) = processor.send_and_clear_batch_simple().await {
@@ -120,11 +119,11 @@ impl LogProcessor {
         // Send directly without spawning - simpler and more reliable
         match client.send_logs(&config, batch, &context.invoked_function_arn).await {
             Ok(()) => {
-                tracing::info!("[LogProcessor] ✅ Successfully sent logs to New Relic");
+                tracing::info!("[LogProcessor] Successfully sent logs to New Relic");
                 Ok(())
             },
             Err(e) => {
-                tracing::error!("[LogProcessor] ❌ Failed to send logs: {}", e);
+                tracing::error!("[LogProcessor] Failed to send logs: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }

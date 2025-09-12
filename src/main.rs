@@ -9,6 +9,7 @@ mod logs;
 mod platform;
 mod newrelic;
 mod context;
+mod agent;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -150,6 +151,28 @@ async fn main() -> Result<()> {
             Arc::clone(&config),
             Arc::clone(&invocation_context),
         ));
+
+         // 1. Initialize the telemetry pipe listener
+        let agent_telemetry_rx = match agent::ipc::init_telemetry_channel().await {
+            Ok(rx) => {
+                info!(
+                    "Agent telemetry channel initialized, listening on pipe: {}",
+                    agent::ipc::TELEMETRY_NAMED_PIPE_PATH
+                );
+                rx
+            }
+            Err(e) => {
+                tracing::error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
+                return Err(e);
+            }
+        };
+
+        // 2. Start the dedicated processor for agent payloads
+        agent::processor::start_agent_payload_processor(
+            agent_telemetry_rx,
+            Arc::clone(&newrelic_client),
+            Arc::clone(&invocation_context),
+        );
 
         let harvester = Harvester::new(
             vec![log_processor.clone(), platform_processor.clone()],

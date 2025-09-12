@@ -97,13 +97,6 @@ impl NewRelicClient {
         info!("🚀 Sending payload to endpoint: {}", endpoint);
         info!("📦 Payload size: {} bytes", body.len());
         
-        // Log first 500 chars of payload for debugging (be careful with sensitive data)
-        if body.len() > 500 {
-            info!("📄 Payload preview: {}...", &body[..500]);
-        } else {
-            info!("📄 Full payload: {}", body);
-        }
-
         // Retry logic with exponential backoff
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
@@ -124,15 +117,15 @@ impl NewRelicClient {
                     info!("📡 Received response with status: {}", status);
                     
                     if status.is_success() {
-                        info!("✅ Successfully sent data to New Relic! Status: {}", status);
+                        info!("Successfully sent data to New Relic! Status: {}", status);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        warn!("❌ Failed to send data to New Relic. Status: {}, Response: {}", status, response_text);
+                        warn!("Failed to send data to New Relic. Status: {}, Response: {}", status, response_text);
                         
                         // Don't retry on client errors (4xx)
                         if status.is_client_error() {
-                            warn!("🚫 Client error (4xx), not retrying");
+                            warn!("Client error (4xx), not retrying");
                             return Ok(());
                         }
                         
@@ -140,26 +133,26 @@ impl NewRelicClient {
                         if retries < MAX_RETRIES {
                             retries += 1;
                             let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                            warn!("⏳ Retrying in {}ms...", delay.as_millis());
+                            warn!("Retrying in {}ms...", delay.as_millis());
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
-                            warn!("🔥 Max retries exceeded, giving up");
+                            warn!("Max retries exceeded, giving up");
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("🌐 Network error sending data to New Relic: {}", e);
-                    
+                    warn!("Network error sending data to New Relic: {}", e);
+
                     if retries < MAX_RETRIES {
                         retries += 1;
                         let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                        warn!("⏳ Network error, retrying in {}ms...", delay.as_millis());
+                        warn!("Network error, retrying in {}ms...", delay.as_millis());
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
-                        warn!("🔥 Max network retries exceeded, giving up");
+                        warn!("Max network retries exceeded, giving up");
                         return Err(e);
                     }
                 }
