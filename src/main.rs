@@ -9,19 +9,20 @@ mod logs;
 mod platform;
 mod newrelic;
 mod context;
+mod agent;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
 
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     io::{Error, Result},
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::info;
+use tracing::{info, error};
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
@@ -29,6 +30,7 @@ use crate::{
     telemetry::listener::setup_telemetry_listener,
     newrelic::{client::NewRelicClient, harvester::Harvester},
 };
+use chrono::Utc;
 
 // --- Extension Constants ---
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
@@ -63,6 +65,42 @@ enum NextEventResponse {
     },
 }
 
+// --- Structs for building the wrapped payload ---
+#[derive(Serialize)]
+struct WrappedPayload<'a> {
+    context: Context<'a>,
+    entry: String,
+}
+
+#[derive(Serialize)]
+struct Context<'a> {
+    function_name: &'a str,
+    invoked_function_arn: &'a str,
+    log_group_name: String,
+    log_stream_name: &'a str,
+}
+
+#[derive(Serialize)]
+struct EntryPayload<'a> {
+    #[serde(rename = "logEvents")]
+    log_events: Vec<LogEvent<'a>>,
+    #[serde(rename = "logGroup")]
+    log_group: String,
+    #[serde(rename = "logStream")]
+    log_stream: &'a str,
+    #[serde(rename = "messageType")]
+    message_type: &'a str,
+    owner: &'a str,
+}
+
+#[derive(Serialize)]
+struct LogEvent<'a> {
+    id: &'a str,
+    message: &'a str,
+    timestamp: i64,
+}
+
+
 // --- Main Application Logic ---
 
 #[tokio::main]
@@ -76,52 +114,6 @@ async fn main() -> Result<()> {
         .build()
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?);
 
-    // Check for test mode
-    if std::env::var("NR_EXTENSION_TEST_MODE").unwrap_or_default() == "true" {
-        info!("Running in TEST MODE - will simulate telemetry events instead of connecting to Lambda Runtime API");
-        
-        let newrelic_client = Arc::new(NewRelicClient::new());
-        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
-
-        let log_processor = Arc::new(LogProcessor::new(
-            Arc::clone(&newrelic_client),
-            Arc::clone(&config),
-            Arc::clone(&invocation_context),
-        ));
-        let platform_processor = Arc::new(PlatformProcessor::new(
-            Arc::clone(&newrelic_client),
-            Arc::clone(&config),
-            Arc::clone(&invocation_context),
-        ));
-
-        // Set up a test function context
-        {
-            let mut context = invocation_context.lock().unwrap();
-            context.request_id = "test-request-12345".to_string();
-            context.invoked_function_arn = "arn:aws:lambda:us-east-1:123456789012:function:test-function".to_string();
-        }
-
-        #[cfg(debug_assertions)]
-        {
-            // Simulate some telemetry events
-            test_telemetry::simulate_telemetry_processing(&log_processor, &platform_processor).await;
-            
-            // Send the data immediately
-            info!("Sending test data to New Relic...");
-            if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                tracing::error!("Error sending test logs: {}", e);
-            }
-            if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                tracing::error!("Error sending test platform events: {}", e);
-            }
-            
-            info!("Test mode completed. Check the logs above for any issues.");
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        
-        return Ok(());
-    }
-
     if !config.new_relic.extension_enabled {
         // --- NO-OP MODE ---
         info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
@@ -130,15 +122,43 @@ async fn main() -> Result<()> {
         info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
         loop {
-            if let NextEventResponse::Shutdown { shutdown_reason } = next_event(&client, &ext_id).await? {
-                info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
-                break;
+            match next_event(&client, &ext_id).await {
+                Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
+                    info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
+                    break;
+                }
+                Ok(_) => { /* Ignore INVOKE events in no-op mode */ }
+                Err(_) => { /* Ignore errors and continue polling */ }
             }
         }
     } else {
         // --- ACTIVE MODE ---
         let newrelic_client = Arc::new(NewRelicClient::new());
         let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+
+        // Create a shared buffer for agent payloads
+        let agent_payload_buffer = Arc::new(Mutex::new(Vec::new()));
+
+        // Initialize the telemetry pipe listener
+        let agent_telemetry_rx = match agent::ipc::init_telemetry_channel().await {
+            Ok(rx) => {
+                info!(
+                    "Agent telemetry channel initialized, listening on pipe: {}",
+                    agent::ipc::TELEMETRY_NAMED_PIPE_PATH
+                );
+                rx
+            }
+            Err(e) => {
+                error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
+                return Err(e);
+            }
+        };
+
+        // Start the agent payload collector
+        agent::processor::start_agent_payload_collector(
+            agent_telemetry_rx,
+            Arc::clone(&agent_payload_buffer),
+        );
 
         let log_processor = Arc::new(LogProcessor::new(
             Arc::clone(&newrelic_client),
@@ -167,31 +187,68 @@ async fn main() -> Result<()> {
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
         info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
+        // State for tracking the previous invocation
+        let mut last_request_id: Option<String> = None;
+        let mut last_invoked_arn: Option<String> = None;
+
         loop {
-            match next_event(&client, &ext_id).await? {
-                NextEventResponse::Invoke { request_id, invoked_function_arn } => {
+            let event_result = next_event(&client, &ext_id).await;
+
+            // Process the previous invocation's agent payload now.
+            process_agent_payloads(
+                &agent_payload_buffer, 
+                &last_request_id, 
+                &last_invoked_arn, 
+                &newrelic_client, 
+                &config
+            ).await;
+
+            match event_result {
+                Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
                     info!("🔥 Received INVOKE event for request ID: {}", request_id);
+                    
+                    // Update the global context for other processors
+                    {
+                        let mut context = invocation_context.lock().unwrap();
+                        context.request_id = request_id.clone();
+                        context.invoked_function_arn = invoked_function_arn.clone();
+                    }
+
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
+                    
+                    // Save the context for the *next* loop iteration
+                    last_request_id = Some(request_id);
+                    last_invoked_arn = Some(invoked_function_arn);
                 }
-                NextEventResponse::Shutdown { shutdown_reason } => {
+                Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
                     info!("🛑 Received SHUTDOWN event: {}", shutdown_reason);
                     
-                    // Stop the harvester
                     harvester_handle.abort();
                     
-                    // Perform final flush of all data immediately
                     info!("🚀 Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                        tracing::error!("❌ Error during final log flush: {}", e);
+                        error!("❌ Error during final log flush: {}", e);
                     }
                     if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                        tracing::error!("❌ Error during final platform events flush: {}", e);
+                        error!("❌ Error during final platform events flush: {}", e);
                     }
+
+                    // FINAL AGENT FLUSH: Process the very last payload before exiting.
+                    process_agent_payloads(
+                        &agent_payload_buffer, 
+                        &last_request_id, 
+                        &last_invoked_arn, 
+                        &newrelic_client, 
+                        &config
+                    ).await;
                     
-                    // Give time for final requests to complete
-                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                     info!("✅ Extension shutdown complete.");
                     break;
+                }
+                Err(e) => {
+                    error!("Error receiving next event: {}. Continuing.", e);
+                    continue;
                 }
             }
         }
@@ -199,6 +256,73 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
+
+/// Drains the agent payload buffer and sends all pending payloads to New Relic.
+async fn process_agent_payloads(
+    buffer: &Arc<Mutex<Vec<Vec<u8>>>>,
+    request_id_opt: &Option<String>,
+    invoked_arn_opt: &Option<String>,
+    client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) {
+    let payloads = {
+        let mut buf = buffer.lock().unwrap();
+        std::mem::take(&mut *buf)
+    };
+
+    if payloads.is_empty() {
+        return;
+    }
+
+    let (Some(request_id), Some(invoked_arn)) = (request_id_opt, invoked_arn_opt) else {
+        error!("[agentsend] Payloads exist in buffer but no previous context is available. Discarding {} payloads.", payloads.len());
+        return;
+    };
+
+    info!("[agentsend] Processing {} buffered agent payloads for request_id: {}", payloads.len(), request_id);
+
+    let function_name = invoked_arn.split(':').last().unwrap_or("");
+    let log_group_name = format!("/aws/lambda/{}", function_name);
+
+    for payload_bytes in payloads {
+        let Ok(payload_str) = String::from_utf8(payload_bytes) else {
+            error!("[agentsend] Failed to decode payload as UTF-8 for request_id: {}", request_id);
+            continue;
+        };
+
+        let entry_payload = EntryPayload {
+            log_events: vec![LogEvent { id: request_id, message: &payload_str, timestamp: Utc::now().timestamp_millis() }],
+            log_group: log_group_name.clone(),
+            log_stream: "",
+            message_type: "",
+            owner: "",
+        };
+
+        let Ok(entry_string) = serde_json::to_string(&entry_payload) else {
+            error!("[agentsend] Failed to serialize entry payload for request_id: {}", request_id);
+            continue;
+        };
+
+        let wrapped_payload = WrappedPayload {
+            context: Context {
+                function_name,
+                invoked_function_arn: invoked_arn,
+                log_group_name: log_group_name.clone(),
+                log_stream_name: "newrelic-lambda-extension:2.3.19",
+            },
+            entry: entry_string,
+        };
+
+        if let Ok(final_json) = serde_json::to_string(&wrapped_payload) {
+            if let Err(e) = client.send_agent_payload(config, &final_json).await {
+                error!("[agentsend] Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
+            }
+        } else {
+            error!("[agentsend] Failed to serialize final wrapped payload for request_id: {}", request_id);
+        }
+    }
+}
+
 
 // --- Helper Functions ---
 
