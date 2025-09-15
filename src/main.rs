@@ -114,7 +114,9 @@ async fn main() -> Result<()> {
         .build()
         .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?);
 
-    if !config.new_relic.extension_enabled {
+    //add check of newrelic license key is not present go to no op mode
+
+    if !config.new_relic.extension_enabled || config.new_relic.license_key.is_none() {
         // --- NO-OP MODE ---
         info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
         let response = register(&client).await?;
@@ -205,7 +207,7 @@ async fn main() -> Result<()> {
 
             match event_result {
                 Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
-                    info!("🔥 Received INVOKE event for request ID: {}", request_id);
+                    info!("Received INVOKE event for request ID: {}", request_id);
                     
                     // Update the global context for other processors
                     {
@@ -221,16 +223,16 @@ async fn main() -> Result<()> {
                     last_invoked_arn = Some(invoked_function_arn);
                 }
                 Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    info!("🛑 Received SHUTDOWN event: {}", shutdown_reason);
+                    info!("Received SHUTDOWN event: {}", shutdown_reason);
                     
                     harvester_handle.abort();
                     
                     info!("🚀 Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                        error!("❌ Error during final log flush: {}", e);
+                        error!("Error during final log flush: {}", e);
                     }
                     if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                        error!("❌ Error during final platform events flush: {}", e);
+                        error!("Error during final platform events flush: {}", e);
                     }
 
                     // FINAL AGENT FLUSH: Process the very last payload before exiting.
@@ -243,7 +245,7 @@ async fn main() -> Result<()> {
                     ).await;
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    info!("✅ Extension shutdown complete.");
+                    info!("Extension shutdown complete.");
                     break;
                 }
                 Err(e) => {
@@ -413,9 +415,9 @@ async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> 
         .map_err(|e| {
             // Log more details about timeout errors
             if e.is_timeout() {
-                tracing::warn!("⏰ Timeout waiting for next Lambda event (this is normal during idle periods)");
+                tracing::warn!("Timeout waiting for next Lambda event (this is normal during idle periods)");
             } else {
-                tracing::error!("🌐 Network error getting next event: {}", e);
+                tracing::error!("Network error getting next event: {}", e);
             }
             Error::new(std::io::ErrorKind::Other, e)
         })?;

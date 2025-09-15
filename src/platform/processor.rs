@@ -67,7 +67,7 @@ impl PlatformProcessor {
             return Ok(());
         }
 
-        tracing::info!("[PlatformProcessor] 🚀 Sending {} platform events to New Relic NOW", batch.len());
+        tracing::info!("[PlatformProcessor] Sending {} platform events to New Relic NOW", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -87,11 +87,11 @@ impl PlatformProcessor {
         // Send directly without spawning
         match client.send_platform_events(&config, payload).await {
             Ok(()) => {
-                tracing::info!("[PlatformProcessor] ✅ Successfully sent platform events to New Relic");
+                tracing::info!("[PlatformProcessor] Successfully sent platform events to New Relic");
                 Ok(())
             },
             Err(e) => {
-                tracing::error!("[PlatformProcessor] ❌ Failed to send platform events: {}", e);
+                tracing::error!("[PlatformProcessor] Failed to send platform events: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }

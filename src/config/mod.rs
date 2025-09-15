@@ -1,6 +1,10 @@
 use std::{env, time::Duration};
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tracing::{info, Event, Subscriber};
+use tracing_subscriber::{
+    fmt::{self, FmtContext, FormatEvent, FormatFields},
+    registry::LookupSpan,
+    EnvFilter,
+};
 
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
@@ -32,7 +36,7 @@ pub struct NewRelicConfig {
 
     /// New Relic log endpoint URL
     pub log_endpoint: String,
-    
+
     /// The interval at which to send data to New Relic
     pub harvest_interval: Duration,
 }
@@ -121,28 +125,65 @@ impl ExtensionConfig {
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
 
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
-        
+
         if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
             config.new_relic.telemetry_endpoint = endpoint;
         } else if let Some("eu") = license_key_prefix {
-            config.new_relic.telemetry_endpoint = "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
+            config.new_relic.telemetry_endpoint =
+                "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
         }
 
         if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
             config.new_relic.log_endpoint = endpoint;
         } else if let Some("eu") = license_key_prefix {
-             config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
+            config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
         }
 
         // Load AWS Lambda configuration
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
         }
-        
-        config.aws.function_name = env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or(config.aws.function_name);
+
+        config.aws.function_name =
+            env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
 
         config
+    }
+}
+
+/// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
+struct CustomFormatter;
+
+impl<S, N> FormatEvent<S, N> for CustomFormatter
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        // Add the static prefix
+        write!(writer, "[NR_EXT]")?;
+
+        // Add the log level
+        let metadata = event.metadata();
+        write!(writer, ":{}:", metadata.level())?;
+
+        // Add the file and line number
+        if let Some(file) = metadata.file() {
+            write!(writer, "{}:", file)?;
+        }
+        if let Some(line) = metadata.line() {
+            write!(writer, "{} ", line)?;
+        }
+
+        // Add the message
+        ctx.format_fields(writer.by_ref(), event)?;
+
+        writeln!(writer)
     }
 }
 
@@ -155,21 +196,36 @@ pub fn init_config() -> &'static ExtensionConfig {
     unsafe {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
-            
-            let env_filter = EnvFilter::try_new(&env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())).unwrap();
-            let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+
+            let env_filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+            // Use the custom formatter
+            let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
-                .with_level(true)
+                .event_format(CustomFormatter)
                 .finish();
-            tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-            
+
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("setting default subscriber failed");
+
             info!("[Config] New Relic Lambda Extension configuration loaded");
-            info!("[Config] Extension enabled: {}", config.new_relic.extension_enabled);
-            info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "✅ Set" } else { "❌ Not set" });
+            info!(
+                "[Config] Extension enabled: {}",
+                config.new_relic.extension_enabled
+            );
+            info!(
+                "[Config] License key: {}",
+                if config.new_relic.license_key.is_some() {
+                    "Set"
+                } else {
+                    "Not set"
+                }
+            );
 
             GLOBAL_CONFIG = Some(config);
         });
-        
+
         GLOBAL_CONFIG.as_ref().unwrap()
     }
 }
@@ -177,9 +233,11 @@ pub fn init_config() -> &'static ExtensionConfig {
 /// Get the global configuration
 pub fn get_config() -> &'static ExtensionConfig {
     unsafe {
-        GLOBAL_CONFIG.as_ref().unwrap_or_else(|| {
-            panic!("Configuration not initialized. Call init_config() first.");
-        })
+        GLOBAL_CONFIG
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!("Configuration not initialized. Call init_config() first.");
+            })
     }
 }
 
