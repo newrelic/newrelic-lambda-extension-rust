@@ -173,7 +173,6 @@ where
         write!(writer, ":{}:", metadata.level())?;
 
         // OPTIMIZATION: Only include file and line numbers in debug builds.
-        // This is a major performance improvement for production release builds.
         #[cfg(debug_assertions)]
         {
             if let Some(file) = metadata.file() {
@@ -201,8 +200,10 @@ pub fn init_config() -> &'static ExtensionConfig {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
 
-            let env_filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            // Read log level from NEW_RELIC_EXTENSION_LOG_LEVEL, defaulting to "info"
+            let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
+                .unwrap_or_else(|_| "info".to_string());
+            let env_filter = EnvFilter::new(log_level);
 
             // Use the custom formatter
             let subscriber = fmt::Subscriber::builder()
