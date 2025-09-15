@@ -97,14 +97,14 @@ impl NewRelicClient {
             return Ok(());
         }
         
-        info!("[agentsend] 🚀 Sending agent payload to endpoint: {}", AGENT_TELEMETRY_ENDPOINT);
-        info!("[agentsend] 📦 Agent payload size: {} bytes", payload_json.len());
+        info!("[agentsend] Sending agent payload to endpoint: {}", AGENT_TELEMETRY_ENDPOINT);
+        info!("[agentsend] Agent payload size: {} bytes", payload_json.len());
 
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
 
         loop {
-            info!("[agentsend] 🔄 Attempt {} of {} to send agent payload to New Relic", retries + 1, MAX_RETRIES + 1);
+            info!("[agentsend] Attempt {} of {} to send agent payload to New Relic", retries + 1, MAX_RETRIES + 1);
             
             let res = self.client
                 .post(AGENT_TELEMETRY_ENDPOINT)
@@ -118,10 +118,10 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    info!("[agentsend] 📡 Received response with status: {}", status);
+                    info!("[agentsend] Received response with status: {}", status);
                     
                     if status.is_success() {
-                        info!("[agentsend] ✅ Successfully sent agent payload to New Relic! Status: {}", status);
+                        info!("[agentsend] Successfully sent agent payload to New Relic! Status: {}", status);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
@@ -170,15 +170,15 @@ impl NewRelicClient {
             }
         };
 
-        info!("🚀 Sending payload to endpoint: {}", endpoint);
-        info!("📦 Payload size: {} bytes", body.len());
+        info!("Sending payload to endpoint: {}", endpoint);
+        info!("Payload size: {} bytes", body.len());
         
         // Retry logic with exponential backoff
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
         
         loop {
-            info!("🔄 Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
+            info!("Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
             
             let res = self.client
                 .post(endpoint)
@@ -190,7 +190,7 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    info!("📡 Received response with status: {}", status);
+                    info!("Received response with status: {}", status);
                     
                     if status.is_success() {
                         info!("Successfully sent data to New Relic! Status: {}", status);

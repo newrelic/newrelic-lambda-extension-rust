@@ -17,7 +17,7 @@ pub fn start_agent_payload_collector(
     payload_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
 ) {
     tokio::spawn(async move {
-        info!("✅ Agent payload collector has started and is waiting for data.");
+        info!("Agent payload collector has started and is waiting for data.");
 
         while let Some(payload_bytes) = receiver.recv().await {
             info!("[agentsend] Collector received agent telemetry payload ({} bytes).", payload_bytes.len());

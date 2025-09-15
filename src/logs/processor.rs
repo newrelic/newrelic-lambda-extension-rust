@@ -110,7 +110,7 @@ impl LogProcessor {
             return Ok(());
         }
 
-        tracing::info!("[LogProcessor] 🚀 Sending {} logs to New Relic NOW", batch.len());
+        tracing::info!("[LogProcessor] Sending {} logs to New Relic NOW", batch.len());
         
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
