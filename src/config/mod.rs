@@ -172,12 +172,16 @@ where
         let metadata = event.metadata();
         write!(writer, ":{}:", metadata.level())?;
 
-        // Add the file and line number
-        if let Some(file) = metadata.file() {
-            write!(writer, "{}:", file)?;
-        }
-        if let Some(line) = metadata.line() {
-            write!(writer, "{} ", line)?;
+        // OPTIMIZATION: Only include file and line numbers in debug builds.
+        // This is a major performance improvement for production release builds.
+        #[cfg(debug_assertions)]
+        {
+            if let Some(file) = metadata.file() {
+                write!(writer, "{}:", file)?;
+            }
+            if let Some(line) = metadata.line() {
+                write!(writer, "{} ", line)?;
+            }
         }
 
         // Add the message
@@ -217,9 +221,9 @@ pub fn init_config() -> &'static ExtensionConfig {
             info!(
                 "[Config] License key: {}",
                 if config.new_relic.license_key.is_some() {
-                    "Set"
+                    "✅ Set"
                 } else {
-                    "Not set"
+                    "❌ Not set"
                 }
             );
 
