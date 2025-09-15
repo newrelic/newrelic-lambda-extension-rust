@@ -222,9 +222,9 @@ pub fn init_config() -> &'static ExtensionConfig {
             info!(
                 "[Config] License key: {}",
                 if config.new_relic.license_key.is_some() {
-                    "✅ Set"
+                    "Set"
                 } else {
-                    "❌ Not set"
+                    "Not set"
                 }
             );
 
