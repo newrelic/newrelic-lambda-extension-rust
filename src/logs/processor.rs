@@ -1,3 +1,4 @@
+use tracing::{debug, info, error, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
@@ -43,7 +44,7 @@ impl LogProcessor {
             return;
         }
 
-        tracing::debug!("Processing log record: type={}, time={}, message_preview={}...", 
+        debug!("Processing log record: type={}, time={}, message_preview={}...", 
             record.record_type, 
             record.time,
             if message_str.len() > 100 { &message_str[..100] } else { &message_str }
@@ -53,7 +54,7 @@ impl LogProcessor {
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
-            tracing::debug!("Added log to batch. Current batch size: {}", batch_size);
+            debug!("Added log to batch. Current batch size: {}", batch_size);
             
             // Send immediately if we have 3+ logs (simple batch condition)
             if batch_size >= 3 {
@@ -61,12 +62,12 @@ impl LogProcessor {
                 let processor = self.clone();
                 tokio::spawn(async move {
                     if let Err(e) = processor.send_and_clear_batch_simple().await {
-                        tracing::error!("Failed to send logs: {}", e);
+                        error!("Failed to send logs: {}", e);
                     }
                 });
             }
         } else {
-            tracing::warn!("Failed to convert telemetry record to log message");
+            warn!("Failed to convert telemetry record to log message");
         }
     }
 
@@ -75,9 +76,22 @@ impl LogProcessor {
         let timestamp = record.time.timestamp_millis();
         let message = record.record.to_string();
         let mut attributes = serde_json::Map::new();
-        if let Some(request_id) = record.record.get("requestId").and_then(|v| v.as_str()) {
-            attributes.insert("request_id".to_string(), request_id.into());
-        }
+        
+        // Get request_id from the context
+        let context = self.invocation_context.lock().unwrap();
+        let request_id = &context.request_id;
+        
+        // Add AWS Lambda request ID
+        attributes.insert("aws.lambda_request_id".to_string(), request_id.clone().into());
+        
+        // Add faas.execution (same as request_id)
+        attributes.insert("faas.execution".to_string(), request_id.clone().into());
+        
+        // Add newrelic.logPattern
+        attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
+        
+        // Add newrelic.source
+        attributes.insert("newrelic.source".to_string(), "api.logs".into());
 
         Some(payload::LogMessage {
             timestamp,
@@ -106,11 +120,11 @@ impl LogProcessor {
         };
         
         if batch.is_empty() {
-            tracing::debug!("[LogProcessor] No logs to send");
+            debug!("[LogProcessor] No logs to send");
             return Ok(());
         }
 
-        tracing::info!("[LogProcessor] Sending {} logs to New Relic NOW", batch.len());
+        info!("[LogProcessor] Sending {} logs to New Relic NOW", batch.len());
         
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);

@@ -56,7 +56,7 @@ impl NewRelicClient {
         }
 
         let mut common_attributes = serde_json::Map::new();
-        common_attributes.insert("plugin".to_string(), serde_json::json!({ "type": "newrelic-lambda-extension" }));
+        common_attributes.insert("plugin".to_string(), serde_json::json!("newrelic-lambda-extension:2.3.23"));
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
         
