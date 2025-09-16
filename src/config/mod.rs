@@ -1,7 +1,7 @@
 use std::{env, time::Duration};
 use tracing::{info, Event, Subscriber};
 use tracing_subscriber::{
-    fmt::{FmtContext, FormatEvent, FormatFields, format::Writer},
+    fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
     EnvFilter,
 };
@@ -137,70 +137,43 @@ impl Default for ExtensionSettings {
 }
 
 impl ExtensionConfig {
-    /// Load configuration from environment variables (simple and fast)
+    /// Load configuration from environment variables
     pub fn from_env() -> Self {
-        let start_time = std::time::Instant::now();
         let mut config = Self::default();
-        let default_time = start_time.elapsed();
 
-        // Simple, direct environment variable lookups (fastest approach)
-        let env_start = std::time::Instant::now();
+        // Load New Relic configuration
         config.new_relic.extension_enabled = env::var("NEW_RELIC_LAMBDA_EXTENSION_ENABLED")
             .unwrap_or_else(|_| "true".to_string())
             .parse()
             .unwrap_or(true);
 
         config.new_relic.license_key = env::var("NEW_RELIC_LICENSE_KEY").ok();
-        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID")
-            .unwrap_or_default();
-        config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME")
-            .unwrap_or_default();
+        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID").unwrap_or_default();
+        config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
-        let env_vars_time = env_start.elapsed();
 
-        // Endpoint configuration
-        let endpoint_start = std::time::Instant::now();
-        config.new_relic.telemetry_endpoint = env::var("NEW_RELIC_TELEMETRY_ENDPOINT")
-            .unwrap_or_else(|_| config.new_relic.telemetry_endpoint);
-        
-        config.new_relic.log_endpoint = env::var("NEW_RELIC_LOG_ENDPOINT")
-            .unwrap_or_else(|_| config.new_relic.log_endpoint);
-        let endpoint_time = endpoint_start.elapsed();
+        let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
 
-        // Parse harvest interval directly
-        let parse_start = std::time::Instant::now();
-        config.new_relic.harvest_interval = env::var("NEW_RELIC_HARVEST_INTERVAL")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(2000));
-
-        // Parse telemetry timeout directly  
-        if let Ok(timeout_str) = env::var("NEW_RELIC_TIMEOUT") {
-            if let Ok(timeout_ms) = timeout_str.parse::<u64>() {
-                config.extension.telemetry_timeout = timeout_ms;
-            }
+        if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
+            config.new_relic.telemetry_endpoint = endpoint;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.telemetry_endpoint =
+                "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
         }
-        let parse_time = parse_start.elapsed();
 
-        // AWS configuration (minimal)
-        let aws_start = std::time::Instant::now();
-        config.aws.runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-            .unwrap_or_else(|_| config.aws.runtime_api);
-        config.aws.function_name = env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or_else(|_| config.aws.function_name);
-        let aws_time = aws_start.elapsed();
+        if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
+            config.new_relic.log_endpoint = endpoint;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
+        }
 
-        let total_time = start_time.elapsed();
-        
-        // Performance profiling output (will be removed after optimization)
-        println!("[PERF] Config loading breakdown:");
-        println!("[PERF]   Default config: {:?}", default_time);
-        println!("[PERF]   Environment vars: {:?}", env_vars_time);
-        println!("[PERF]   Endpoints: {:?}", endpoint_time);
-        println!("[PERF]   Parsing: {:?}", parse_time);
-        println!("[PERF]   AWS config: {:?}", aws_time);
-        println!("[PERF]   TOTAL CONFIG TIME: {:?}", total_time);
+        // Load AWS Lambda configuration
+        if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
+            config.aws.runtime_api = runtime_api;
+        }
+
+        config.aws.function_name =
+            env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
 
         config
     }
@@ -217,7 +190,7 @@ where
     fn format_event(
         &self,
         ctx: &FmtContext<'_, S, N>,
-        mut writer: Writer<'_>,
+        mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
         // Add the static prefix
@@ -249,38 +222,41 @@ where
 static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
 static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
 
-/// Load configuration without logging setup (ultra-fast)
-pub fn load_config() -> Result<ExtensionConfig, String> {
-    Ok(ExtensionConfig::from_env())
-}
-
-/// Initialize the global configuration and logging (optimized)
+/// Initialize the global configuration and logging
 pub fn init_config() -> &'static ExtensionConfig {
     unsafe {
         CONFIG_INIT.call_once(|| {
-            // OPTIMIZATION: Load config first without any I/O
             let config = ExtensionConfig::from_env();
 
-            // OPTIMIZATION: Lightweight logging setup with minimal allocations
+            // Read log level from NEW_RELIC_EXTENSION_LOG_LEVEL, defaulting to "info"
             let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
                 .unwrap_or_else(|_| "info".to_string());
-            
-            // Use more efficient logging setup
             let env_filter = EnvFilter::new(log_level);
-            let subscriber = tracing_subscriber::fmt::Subscriber::builder()
+
+            // Use the custom formatter
+            let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
                 .event_format(CustomFormatter)
-                .with_max_level(tracing::Level::INFO) // Limit max level for performance
                 .finish();
 
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            // OPTIMIZATION: Defer detailed logging until after config is ready
-            // Only log critical information during initialization
             info!("[Config] New Relic Lambda Extension configuration loaded");
-            info!("[Config] Extension enabled: {}", config.new_relic.extension_enabled);
-            info!("[Config] License key: {}", if config.new_relic.license_key.is_some() { "Set" } else { "Not set" });
+            info!(
+                "[Config] Extension enabled: {}",
+                config.new_relic.extension_enabled
+            );
+            info!(
+                "[Config] License key: {}",
+                if config.new_relic.license_key.is_some() {
+                    "Set"
+                } else {
+                    "Not set"
+                }
+            );
+            info!("[Config] Telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
+            info!("[Config] Log endpoint: {}", config.new_relic.log_endpoint);
 
             GLOBAL_CONFIG = Some(config);
         });

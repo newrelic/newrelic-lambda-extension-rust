@@ -11,7 +11,6 @@ mod newrelic;
 mod context;
 mod agent;
 mod credentials;
-mod tracing_utils;  // Comprehensive tracing utilities
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -110,31 +109,18 @@ struct LogEvent<'a> {
 async fn main() -> Result<()> {
     let start_time = std::time::Instant::now();
     
-    // --- 1. Ultra-Fast Configuration Loading (No Logging Setup) ---
-    println!("[PERF] Starting extension initialization...");
-    let config_start = std::time::Instant::now();
-    let config = Arc::new(config::load_config().expect("Failed to load configuration"));
-    let config_time = config_start.elapsed();
-    
-    // --- 2. Initialize Logging After Config ---
-    let logging_start = std::time::Instant::now();
-    config::init_config(); // This sets up logging
-    let logging_time = logging_start.elapsed();
-    
-    println!("[PERF] Config loaded in {:?}, logging setup in {:?}", config_time, logging_time);
+    // --- 1. Initialize Configuration & Logging ---
+    let config = Arc::new(config::init_config().clone());
     info!("Starting extension: {} (config loaded in {:?})", &config.extension.name, start_time.elapsed());
 
     // --- 2. License Key Extraction Phase (First Priority) ---
     let init_start = std::time::Instant::now();
-    println!("[PERF] Starting license key extraction...");
     
     // Check configuration for credential sources
-    let creds_config_start = std::time::Instant::now();
     let credentials_config = config::Configuration::from(config.as_ref());
-    println!("[PERF] Credentials config created in {:?}", creds_config_start.elapsed());
     
     // OPTIMIZATION: Determine if we need AWS services at all
-    let aws_check_start = std::time::Instant::now();
+    // AWS is needed ONLY when NEW_RELIC_LICENSE_KEY is not set AND we have AWS credential sources
     let needs_aws = credentials_config.license_key.is_empty() && (
         // Explicit AWS credential sources via environment variables
         std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok() ||
@@ -145,12 +131,9 @@ async fn main() -> Result<()> {
         // Default: try AWS with default key name "NEW_RELIC_LICENSE_KEY" when no direct license key
         std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok()
     );
-    println!("[PERF] AWS necessity check completed in {:?}", aws_check_start.elapsed());
     
-    // OPTIMIZATION: Extract license key FIRST before any other initialization
-    let license_start = std::time::Instant::now();
+        // OPTIMIZATION: Extract license key FIRST before any other initialization
     let license_key = if !credentials_config.license_key.is_empty() {
-        println!("[PERF] License key found directly in {:?}", license_start.elapsed());
         info!("Using license key from environment variable NEW_RELIC_LICENSE_KEY (found in {:?}) - AWS services not needed", init_start.elapsed());
         Some(credentials_config.license_key.clone())
     } else if needs_aws {
@@ -178,33 +161,39 @@ async fn main() -> Result<()> {
         updated_config.new_relic.license_key = Some(key.clone());
     }
     let config = Arc::new(updated_config);
-    let license_time = license_start.elapsed();
-    println!("[PERF] License key resolution completed in {:?}", license_time);
 
-    // --- 3. MINIMAL REGISTRATION PHASE (Cold Start Optimization) ---
-    // Only register with Lambda Runtime - defer ALL heavy initialization until after registration
-    let registration_start = std::time::Instant::now();
-    println!("[PERF] Starting minimal registration...");
+    // --- 3. Parallel Initialization Phase (Now with license key ready) ---
+    let parallel_start = std::time::Instant::now();
     
-    let minimal_client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+    // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
+    let (client_result, registration_result) = if license_key.is_some() {
+        // License key available immediately - maximum parallelization
+        tokio::join!(
+            async {
+                Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+            },
+            async {
+                register(&Client::new()).await
+            }
+        )
+    } else {
+        // No license key - still need to register for no-op mode
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let registration = register(&client).await?;
+        (Ok(client), Ok(registration))
+    };
     
-    let registration = register(&minimal_client).await?;
-    let registration_time = registration_start.elapsed();
-    println!("[PERF] Extension registered in {:?}", registration_time);
-    
-    let init_time = start_time.elapsed();
-    println!("[PERF] COLD START COMPLETE: Total init time: {:?}", init_time);
-    info!("Extension registered with ID: {} (active mode setup took {:?})", registration.extension_id, registration_time);
+    let client = Arc::new(client_result?);
+    let registration = registration_result?;
 
-    // --- 4. LAZY INITIALIZATION PHASE (Post-Registration) ---
-    // Now that we're registered, do the heavy lifting in the background
-    let heavy_init_start = std::time::Instant::now();
-    println!("[PERF] Starting post-registration heavy initialization...");
-    
-    let client = Arc::new(minimal_client);
+    info!("Parallel initialization completed in {:?}", parallel_start.elapsed());
+    info!("Total initialization time: {:?}", start_time.elapsed());
 
     if !config.new_relic.extension_enabled || license_key.is_none() {
         // --- NO-OP MODE ---
@@ -212,11 +201,10 @@ async fn main() -> Result<()> {
         let ext_id = registration.extension_id.clone();
         info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
-        // Minimal no-op event loop (no heavy initialization needed)
         loop {
             match next_event(&client, &ext_id).await {
-                Ok(NextEventResponse::Shutdown { shutdown_reason: _ }) => {
-                    info!("[No-op] Received SHUTDOWN event");
+                Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
+                    info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
                     break;
                 }
                 Ok(_) => { /* Ignore INVOKE events in no-op mode */ }
@@ -224,21 +212,14 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        // --- ACTIVE MODE - LAZY HEAVY INITIALIZATION ---
-        println!("[PERF] Starting heavy component initialization...");
+        // --- ACTIVE MODE ---
+        let active_mode_start = std::time::Instant::now();
         
-        // Initialize all heavy components in parallel (post-registration)
+        // MAXIMUM PARALLEL OPTIMIZATION: Initialize ALL components at once since license key is ready
         let (invocation_context, agent_payload_buffer, agent_telemetry_rx, newrelic_client) = tokio::join!(
+            async { Arc::new(Mutex::new(InvocationContext::default())) },
+            async { Arc::new(Mutex::new(Vec::new())) },
             async {
-                println!("[PERF] Creating invocation context...");
-                Arc::new(Mutex::new(InvocationContext::default()))
-            },
-            async {
-                println!("[PERF] Creating agent payload buffer...");
-                Arc::new(Mutex::new(Vec::new()))
-            },
-            async {
-                println!("[PERF] Initializing agent telemetry channel...");
                 match agent::ipc::init_telemetry_channel().await {
                     Ok(rx) => {
                         info!(
@@ -254,7 +235,7 @@ async fn main() -> Result<()> {
                 }
             },
             async {
-                println!("[PERF] Creating NewRelic client...");
+                // Create NewRelic client in parallel since license key is now available
                 Arc::new(NewRelicClient::new(&config))
             }
         );
@@ -263,14 +244,12 @@ async fn main() -> Result<()> {
         let newrelic_client = newrelic_client;
 
         // Start the agent payload collector
-        println!("[PERF] Starting agent payload collector...");
         agent::processor::start_agent_payload_collector(
             agent_telemetry_rx,
             Arc::clone(&agent_payload_buffer),
         );
 
-        // Create processors in parallel
-        println!("[PERF] Creating processors...");
+        // PARALLEL OPTIMIZATION: Create processors in parallel, then setup telemetry listener
         let (log_processor, platform_processor) = tokio::join!(
             async {
                 Arc::new(LogProcessor::new(
@@ -288,10 +267,8 @@ async fn main() -> Result<()> {
             }
         );
         
-        println!("[PERF] Setting up telemetry listener...");
         let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone()).await?;
 
-        println!("[PERF] Creating harvester...");
         let harvester = Harvester::new(
             vec![log_processor.clone(), platform_processor.clone()],
             config.new_relic.harvest_interval,
@@ -300,11 +277,8 @@ async fn main() -> Result<()> {
             harvester.run().await;
         });
 
-        let heavy_init_time = heavy_init_start.elapsed();
-        println!("[PERF] Heavy initialization completed in {:?}", heavy_init_time);
-
         let ext_id = registration.extension_id.clone();
-        info!("Extension registered with ID: {} (post-registration setup took {:?})", ext_id, heavy_init_time);
+        info!("Extension registered with ID: {} (active mode setup took {:?})", ext_id, active_mode_start.elapsed());
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
         info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
