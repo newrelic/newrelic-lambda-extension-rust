@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
     if !config.new_relic.extension_enabled || config.new_relic.license_key.is_none() {
         // --- NO-OP MODE ---
-        info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false.");
+        info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false. Or NEW_RELIC_LICENSE_KEY is not set.");
         let response = register(&client).await?;
         let ext_id = response.extension_id.clone();
         info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
