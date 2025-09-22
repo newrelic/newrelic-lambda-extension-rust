@@ -370,6 +370,14 @@ async fn register(client: &Client) -> Result<RegisterResponse> {
 async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Result<()> {
     let config = config::get_config();
     let url = format!("http://{}/2022-07-01/telemetry", &config.aws.runtime_api);
+    // Always include platform; optionally include function/extension based on config flags.
+    let mut types = vec!["platform".to_string()];
+    if config.extension.send_function_logs {
+        types.push("function".to_string());
+    }
+    if config.extension.send_extension_logs {
+        types.push("extension".to_string());
+    }
 
     let body = serde_json::json!({
         "schemaVersion": "2022-07-01",
@@ -377,7 +385,7 @@ async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Res
             "protocol": "HTTP",
             "URI": format!("http://sandbox:{}", port),
         },
-        "types": ["platform", "function", "extension"],
+        "types": types,
         "buffering": {
             "maxItems": config.extension.max_batch_items,
             "maxBytes": config.extension.max_batch_size,
