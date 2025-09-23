@@ -71,6 +71,12 @@ pub struct ExtensionSettings {
 
     /// Telemetry timeout in milliseconds
     pub telemetry_timeout: u64,
+
+    /// Whether to subscribe to function telemetry/logs (Lambda 'function' type)
+    pub send_function_logs: bool,
+
+    /// Whether to subscribe to extension logs (Lambda 'extension' type)
+    pub send_extension_logs: bool,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -132,6 +138,8 @@ impl Default for ExtensionSettings {
             max_batch_size: 262_144, // 256KB
             max_batch_items: 1000,
             telemetry_timeout: 25, // 25ms for immediate delivery
+            send_function_logs: false,
+            send_extension_logs: false,
         }
     }
 }
@@ -139,6 +147,11 @@ impl Default for ExtensionSettings {
 impl ExtensionConfig {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
+        // Read (potential) log forwarding flags early so they can be used in later logic.
+        // These are currently not wired into config structs; added per user request.
+        let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
+        let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
+
         let mut config = Self::default();
 
         // Load New Relic configuration
@@ -174,6 +187,13 @@ impl ExtensionConfig {
 
         config.aws.function_name =
             env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
+
+        // Parse the optional boolean flags (accept true/false/1/0/yes/no case-insensitive)
+        fn parse_bool(s: &str) -> bool {
+            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        config.extension.send_function_logs = parse_bool(&send_function_logs_str);
+        config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
 
         config
     }
@@ -254,6 +274,11 @@ pub fn init_config() -> &'static ExtensionConfig {
                 } else {
                     "Not set"
                 }
+            );
+            info!(
+                "[Config] Send function logs: {} | Send extension logs: {}",
+                config.extension.send_function_logs,
+                config.extension.send_extension_logs
             );
             info!("[Config] Telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
             info!("[Config] Log endpoint: {}", config.new_relic.log_endpoint);
