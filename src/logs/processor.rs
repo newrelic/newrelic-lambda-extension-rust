@@ -120,7 +120,6 @@ impl LogProcessor {
         };
         
         if batch.is_empty() {
-            debug!("[LogProcessor] No logs to send");
             return Ok(());
         }
 

@@ -1,72 +1,231 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/package_layer.sh <target-triple>
-# Example (recommended): ./scripts/package_layer.sh x86_64-unknown-linux-musl
-
-TARGET=${1:-x86_64-unknown-linux-musl}
-if ! rustup target list --installed | grep -q "$TARGET"; then
-  echo "Target $TARGET not installed. Installing..." >&2
-  rustup target add "$TARGET"
-fi
-BIN_NAME=newrelic-lambda-extension
-
 # Ensure we run from repo root so paths resolve
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT_DIR="$(pwd)"
 cd "$ROOT_DIR"
 
-OUT_DIR="$ROOT_DIR/dist"
-LAYER_ROOT="$ROOT_DIR/.layer"
+# --- Configuration ---
+BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
+REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2"}
+REGIONS_ARM64=${REGIONS_ARM64:-"us-west-2"}
 
-mkdir -p "$OUT_DIR"
-rm -rf "$LAYER_ROOT"
+BIN_NAME="newrelic-lambda-extension"
+DIST_DIR="$ROOT_DIR/dist"
+LAYER_DIR="$ROOT_DIR/.layer"
+TMP_ENV_FILE_NAME="$DIST_DIR/nr_tmp_env.sh"
 
-echo "Packaging $BIN_NAME for target $TARGET" >&2
+# --- Build and Package Functions ---
 
-build_with_cross() {
-  echo "Building with cross for $TARGET" >&2
-  cross build --release --target "$TARGET"
-}
+# Builds the Rust extension for a given target
+build_extension() {
+  local target="$1"
+  echo "Building extension for target $target" >&2
 
-build_with_zig() {
-  echo "Building with cargo-zigbuild for $TARGET" >&2
-  cargo zigbuild --release --target "$TARGET"
-}
-
-build_with_cargo() {
-  echo "Building with cargo for $TARGET (native toolchain)" >&2
-  cargo build --release --target "$TARGET"
-}
-
-# Prefer cargo-zigbuild over cross for musl targets on macOS/ARM
-if command -v cargo-zigbuild >/dev/null 2>&1; then
-  build_with_zig
-elif command -v cross >/dev/null 2>&1; then
-  build_with_cross
-else
-  # If on macOS and targeting linux, using plain cargo will likely fail to link
-  if [[ "$(uname -s)" == "Darwin" && "$TARGET" == *"unknown-linux"* ]]; then
-    echo "Error: Cross-linking to $TARGET on macOS requires 'cross' or 'cargo-zigbuild'." >&2
-    echo "Install one of these and retry:" >&2
-    echo "  cargo install cross --git https://github.com/cross-rs/cross" >&2
-    echo "  # or" >&2
-    echo "  cargo install cargo-zigbuild && brew install zig" >&2
-    exit 1
+  if ! rustup target list --installed | grep -q "$target"; then
+    echo "Rust target $target not installed. Installing..." >&2
+    rustup target add "$target"
   fi
-  build_with_cargo
-fi
 
-# Assemble layer structure
-mkdir -p "$LAYER_ROOT/extensions"
-cp "$ROOT_DIR/target/$TARGET/release/$BIN_NAME" "$LAYER_ROOT/extensions/$BIN_NAME"
+  # Prefer cargo-zigbuild over cross for musl targets
+  if command -v cargo-zigbuild >/dev/null 2>&1; then
+    echo "Building with cargo-zigbuild for $target" >&2
+    cargo zigbuild --release --target "$target" --target-dir "$ROOT_DIR/target"
+  elif command -v cross >/dev/null 2>&1; then
+    echo "Building with cross for $target" >&2
+    cross build --release --target "$target" --target-dir "$ROOT_DIR/target"
+  else
+    if [[ "$(uname -s)" == "Darwin" && "$target" == *"unknown-linux"* ]]; then
+      echo "Error: Cross-compiling to Linux on macOS requires 'cross' or 'cargo-zigbuild'." >&2
+      exit 1
+    fi
+    echo "Building with cargo for $target (native toolchain)" >&2
+    cargo build --release --target "$target" --target-dir "$ROOT_DIR/target"
+  fi
+}
 
-# Zip
-ARCH="${TARGET%%-*}"
-ZIP_NAME="$OUT_DIR/$BIN_NAME-${ARCH}.zip"
-(cd "$LAYER_ROOT" && zip -r9 "../$(basename "$ZIP_NAME")" . >/dev/null)
+# Packages the built extension into a standalone layer zip
+package_extension_layer() {
+  local target="$1"
+  local arch="${target%%-*}"
+  local zip_name="$DIST_DIR/${BIN_NAME}-${arch}.zip"
 
-# Cleanup
-rm -rf "$LAYER_ROOT"
+  echo "Packaging standalone extension layer for $arch" >&2
 
-echo "Created $ZIP_NAME"
+  rm -rf "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR/extensions"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
+
+  (cd "$LAYER_DIR" && zip -r9 "$zip_name" . >/dev/null)
+  rm -rf "$LAYER_DIR"
+
+  echo "Created $zip_name"
+}
+
+# Builds a layer for a specific Python version
+build_python_layer() {
+  local py_version="$1"
+  local target="$2"
+  local arch="${target%%-*}"
+  local py_dot_version
+  py_dot_version=$(echo "$py_version" | sed 's/\(.\)/\1./')
+  local zip_name="$DIST_DIR/python${py_version}-${arch}.zip"
+
+  echo "Building New Relic layer for python$py_dot_version ($arch)" >&2
+
+  rm -rf "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
+  
+  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
+  cp "$SCRIPT_DIR/newrelic_lambda_wrapper.py" "$LAYER_DIR/python/newrelic_lambda_wrapper.py"
+  
+  mkdir -p "$LAYER_DIR/extensions"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
+
+  (cd "$LAYER_DIR" && zip -r9 "$zip_name" . >/dev/null)
+  rm -rf "$LAYER_DIR"
+
+  echo "Build complete: $zip_name"
+}
+
+# Builds a layer for a specific Node.js version
+build_nodejs_layer() {
+  local node_version="$1"
+  local target="$2"
+  local arch="${target%%-*}"
+  local zip_name="$DIST_DIR/nodejs${node_version}-${arch}.zip"
+
+  echo "Building New Relic layer for nodejs${node_version}.x ($arch)" >&2
+
+  rm -rf "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR/nodejs/node_modules"
+
+  npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
+  cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/index.js"
+
+  mkdir -p "$LAYER_DIR/extensions"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
+
+  (cd "$LAYER_DIR" && zip -r9 "$zip_name" . >/dev/null)
+  rm -rf "$LAYER_DIR"
+
+  echo "Build complete: $zip_name"
+}
+
+# --- AWS Publish Functions ---
+
+hash_file() {
+  if command -v md5sum &>/dev/null; then
+    md5sum "$1" | awk '{ print $1 }'
+  else
+    md5 -q "$1"
+  fi
+}
+
+publish_layer() {
+  local layer_archive="$1"
+  local region="$2"
+  local runtime_name="$3" # e.g., python3.11, nodejs20.x, extension
+  local arch="$4" # e.g., x86_64, arm64
+  local layer_name="$5"
+
+  local hash
+  hash=$(hash_file "$layer_archive")
+  local bucket_name="${BUCKET_PREFIX}-${region}"
+  local s3_key="${runtime_name}/${hash}.${arch}.zip"
+
+  echo "Uploading ${layer_archive} to s3://${bucket_name}/${s3_key}"
+  aws --region "$region" s3 cp "$layer_archive" "s3://${bucket_name}/${s3_key}"
+
+  echo "Publishing ${runtime_name} layer to ${region} as ${layer_name}"
+  local layer_output
+  layer_output=$(aws lambda publish-layer-version \
+    --layer-name "${layer_name}" \
+    --content "S3Bucket=${bucket_name},S3Key=${s3_key}" \
+    --description "New Relic Test Layer for ${runtime_name} (${arch})" \
+    --license-info "Apache-2.0" \
+    --compatible-architectures "$arch" \
+    --region "$region" \
+    --output json)
+
+  local layer_version
+  layer_version=$(echo "$layer_output" | jq -r '.Version')
+  local layer_arn
+  layer_arn=$(echo "$layer_output" | jq -r '.LayerArn')
+  local full_layer_arn="${layer_arn}:${layer_version}"
+
+  echo "Published ${runtime_name} layer version ${layer_version} to ${region}"
+  echo "Full Layer ARN: ${full_layer_arn}"
+
+  local arch_upper
+  arch_upper=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
+  local runtime_nodots
+  runtime_nodots=$(echo "${runtime_name//./}" | tr '[:lower:]' '[:upper:]')
+  local env_var_name="LAYER_ARN_${runtime_nodots}_${arch_upper}"
+  
+  echo "export $env_var_name='$full_layer_arn'" >> "$TMP_ENV_FILE_NAME"
+}
+
+# --- Main Execution Logic ---
+
+main() {
+  mkdir -p "$DIST_DIR"
+  rm -f "$TMP_ENV_FILE_NAME"
+  touch "$TMP_ENV_FILE_NAME"
+
+  # --- Build for x86_64 ---
+  local target_x86="x86_64-unknown-linux-musl"
+  build_extension "$target_x86"
+  
+  # Package and publish standalone extension
+  package_extension_layer "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRRustExtensionX86"
+  done
+
+  # Package and publish Python layers
+  build_python_layer "312" "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
+  done
+
+  # Package and publish Python layers
+  build_python_layer "313" "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRRustExtensionPython313X86"
+  done
+
+  # Package and publish Node.js layers
+  build_nodejs_layer "20" "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRRustExtensionNodejs20X86"
+  done
+
+  --- Build for arm64 ---
+  local target_arm="aarch64-unknown-linux-musl"
+  build_extension "$target_arm"
+
+  # Package and publish standalone extension
+  package_extension_layer "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
+  done
+
+  # Package and publish Python layers
+  build_python_layer "311" "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/python311-aarch64.zip" "$region" "python3.11" "arm64" "NRTestExtensionPython311ARM64"
+  done
+
+  # Package and publish Node.js layers
+  build_nodejs_layer "20" "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/nodejs20-aarch64.zip" "$region" "nodejs20.x" "arm64" "NRTestExtensionNodejs20ARM64"
+  done
+
+  echo "All layers published. Environment variables saved to $TMP_ENV_FILE_NAME"
+  cat "$TMP_ENV_FILE_NAME"
+}
+
+main "$@"

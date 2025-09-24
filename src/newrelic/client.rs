@@ -1,4 +1,4 @@
-use crate::{config, config::ExtensionConfig, newrelic::payload};
+use crate::{config::ExtensionConfig, newrelic::payload};
 use reqwest::{header, Client, Error};
 use serde::Serialize;
 use tracing::{info, warn};
@@ -11,19 +11,14 @@ pub struct NewRelicClient {
 }
 
 impl NewRelicClient {
-    /// Creates a new New Relic client.
-    pub fn new() -> Self {
+    /// Creates a new New Relic client with the provided configuration.
+    pub fn new(config: &ExtensionConfig) -> Self {
+        let license_key = config.new_relic.license_key.as_deref().unwrap_or_default();
+        
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "Api-Key",
-            header::HeaderValue::from_str(
-                config::get_config()
-                    .new_relic
-                    .license_key
-                    .as_deref()
-                    .unwrap_or_default(),
-            )
-            .unwrap(),
+            header::HeaderValue::from_str(license_key).unwrap(),
         );
         headers.insert(
             header::CONTENT_TYPE,

@@ -10,6 +10,7 @@ mod platform;
 mod newrelic;
 mod context;
 mod agent;
+mod credentials;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -22,13 +23,15 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tracing::{info, error};
+use tokio::sync::mpsc;
+use tracing::{info, error, warn};
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     telemetry::listener::setup_telemetry_listener,
     newrelic::{client::NewRelicClient, harvester::Harvester},
+    credentials::get_new_relic_license_key,
 };
 use chrono::Utc;
 
@@ -109,18 +112,87 @@ async fn main() -> Result<()> {
     let config = Arc::new(config::init_config().clone());
     info!("Starting extension: {}", &config.extension.name);
 
-    let client = Arc::new(Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?);
+    // --- 2. License Key Extraction Phase (First Priority) ---
+    // Check configuration for credential sources
+    let credentials_config = config::Configuration::from(config.as_ref());
+    
+    // OPTIMIZATION: Determine if we need AWS services at all
+    // AWS is needed ONLY when NEW_RELIC_LICENSE_KEY is not set AND we have AWS credential sources
+    let needs_aws = credentials_config.license_key.is_empty() && (
+        // Explicit AWS credential sources via environment variables
+        std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok() ||
+        std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok() ||
+        // Configured AWS credential sources in config
+        !credentials_config.license_key_secret_id.is_empty() ||
+        !credentials_config.license_key_ssm_parameter_name.is_empty() ||
+        // Default: try AWS with default key name "NEW_RELIC_LICENSE_KEY" when no direct license key
+        std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok()
+    );
+    
+        // OPTIMIZATION: Extract license key FIRST before any other initialization
+    let license_key = if !credentials_config.license_key.is_empty() {
+        info!("Using license key from environment variable NEW_RELIC_LICENSE_KEY - AWS services not needed");
+        Some(credentials_config.license_key.clone())
+    } else if needs_aws {
+        info!("No direct license key found, checking AWS credential sources...");
+        
+        match get_new_relic_license_key(&credentials_config).await {
+            Ok(key) => {
+                info!("Successfully obtained New Relic license key from AWS");
+                Some(key)
+            }
+            Err(e) => {
+                warn!("No license key found from AWS sources: {}. Extension will run in no-op mode.", e);
+                None
+            }
+        }
+    } else {
+        warn!("No license key available and not in AWS Lambda environment. Extension will run in no-op mode.");
+        None
+    };
 
-    //add check of newrelic license key is not present go to no op mode
+    // Update the config with the obtained license key IMMEDIATELY
+    let mut updated_config = config.as_ref().clone();
+    if let Some(ref key) = license_key {
+        updated_config.new_relic.license_key = Some(key.clone());
+    }
+    let config = Arc::new(updated_config);
 
-    if !config.new_relic.extension_enabled || config.new_relic.license_key.is_none() {
+    // --- 3. Parallel Initialization Phase (Now with license key ready) ---
+    // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
+    let (client_result, registration_result) = if license_key.is_some() {
+        // License key available immediately - maximum parallelization
+        tokio::join!(
+            async {
+                Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
+            },
+            async {
+                register(&Client::new()).await
+            }
+        )
+    } else {
+        // No license key - still need to register for no-op mode
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        let registration = register(&client).await?;
+        (Ok(client), Ok(registration))
+    };
+    
+    let client = Arc::new(client_result?);
+    let registration = registration_result?;
+
+    info!("Parallel initialization completed");
+    info!("Extension initialization complete");
+
+    if !config.new_relic.extension_enabled || license_key.is_none() {
         // --- NO-OP MODE ---
         info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false. Or NEW_RELIC_LICENSE_KEY is not set.");
-        let response = register(&client).await?;
-        let ext_id = response.extension_id.clone();
+        let ext_id = registration.extension_id.clone();
         info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
 
         loop {
@@ -135,26 +207,40 @@ async fn main() -> Result<()> {
         }
     } else {
         // --- ACTIVE MODE ---
-        let newrelic_client = Arc::new(NewRelicClient::new());
-        let invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
-
-        // Create a shared buffer for agent payloads
-        let agent_payload_buffer = Arc::new(Mutex::new(Vec::new()));
-
-        // Initialize the telemetry pipe listener
-        let agent_telemetry_rx = match agent::ipc::init_telemetry_channel().await {
-            Ok(rx) => {
-                info!(
-                    "Agent telemetry channel initialized, listening on pipe: {}",
-                    agent::ipc::TELEMETRY_NAMED_PIPE_PATH
-                );
-                rx
+        
+        // MAXIMUM PARALLEL OPTIMIZATION: Initialize ALL components at once since license key is ready
+        let (invocation_context, agent_payload_buffer, agent_telemetry_rx, newrelic_client, runtime_done_channels) = tokio::join!(
+            async { Arc::new(Mutex::new(InvocationContext::default())) },
+            async { Arc::new(Mutex::new(Vec::new())) },
+            async {
+                match agent::ipc::init_telemetry_channel().await {
+                    Ok(rx) => {
+                        info!(
+                            "Agent telemetry channel initialized, listening on pipe: {}",
+                            agent::ipc::TELEMETRY_NAMED_PIPE_PATH
+                        );
+                        Ok(rx)
+                    }
+                    Err(e) => {
+                        error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
+                        Err(e)
+                    }
+                }
+            },
+            async {
+                // Create NewRelic client in parallel since license key is now available
+                Arc::new(NewRelicClient::new(&config))
+            },
+            async {
+                // Create channel for runtime done notifications
+                let (tx, rx) = mpsc::unbounded_channel();
+                (tx, rx)
             }
-            Err(e) => {
-                error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
-                return Err(e);
-            }
-        };
+        );
+        
+        let agent_telemetry_rx = agent_telemetry_rx?;
+        let newrelic_client = newrelic_client;
+        let (runtime_done_tx, mut runtime_done_rx) = runtime_done_channels;
 
         // Start the agent payload collector
         agent::processor::start_agent_payload_collector(
@@ -162,16 +248,25 @@ async fn main() -> Result<()> {
             Arc::clone(&agent_payload_buffer),
         );
 
-        let log_processor = Arc::new(LogProcessor::new(
-            Arc::clone(&newrelic_client),
-            Arc::clone(&config),
-            Arc::clone(&invocation_context),
-        ));
-        let platform_processor = Arc::new(PlatformProcessor::new(
-            Arc::clone(&newrelic_client),
-            Arc::clone(&config),
-            Arc::clone(&invocation_context),
-        ));
+        // PARALLEL OPTIMIZATION: Create processors in parallel, then setup telemetry listener
+        let (log_processor, platform_processor) = tokio::join!(
+            async {
+                Arc::new(LogProcessor::new(
+                    Arc::clone(&newrelic_client),
+                    Arc::clone(&config),
+                    Arc::clone(&invocation_context),
+                ))
+            },
+            async {
+                Arc::new(PlatformProcessor::new(
+                    Arc::clone(&newrelic_client),
+                    Arc::clone(&config),
+                    Arc::clone(&invocation_context),
+                ))
+            }
+        );
+        
+        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone(), Some(runtime_done_tx)).await?;
 
         let harvester = Harvester::new(
             vec![log_processor.clone(), platform_processor.clone()],
@@ -181,11 +276,8 @@ async fn main() -> Result<()> {
             harvester.run().await;
         });
 
-        let response = register(&client).await?;
-        let ext_id = response.extension_id.clone();
+        let ext_id = registration.extension_id.clone();
         info!("Extension registered with ID: {}", ext_id);
-
-        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone()).await?;
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
         info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
@@ -218,7 +310,35 @@ async fn main() -> Result<()> {
 
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
-                    // Save the context for the *next* loop iteration
+                    // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
+                    info!("[agentsend] 🎯 Waiting for platform.runtimeDone signal...");
+                    
+                    // Wait indefinitely for platform.runtimeDone - it's guaranteed to come
+                    if let Some(_) = runtime_done_rx.recv().await {
+                        info!("[agentsend] Received platform.runtimeDone signal");
+                        // Wait additional 300-500ms buffer time for any final telemetry
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    } else {
+                        warn!("[agentsend] Runtime done channel closed unexpectedly");
+                    }
+                    
+                    // Check buffer size for debugging
+                    let buffer_size = {
+                        let buffer = agent_payload_buffer.lock().unwrap();
+                        buffer.len()
+                    };
+                    info!("[agentsend] Buffer contains {} payloads after runtime completion, processing now", buffer_size);
+                    
+                    // Process current invocation's agent payload after runtime is done
+                    process_agent_payloads(
+                        &agent_payload_buffer, 
+                        &Some(request_id.clone()), 
+                        &Some(invoked_function_arn.clone()), 
+                        &newrelic_client, 
+                        &config
+                    ).await;
+                    
+                    // Save the context for the *next* loop iteration (for any remaining payloads)
                     last_request_id = Some(request_id);
                     last_invoked_arn = Some(invoked_function_arn);
                 }
@@ -227,7 +347,7 @@ async fn main() -> Result<()> {
                     
                     harvester_handle.abort();
                     
-                    info!("🚀 Performing FINAL flush of all logs and platform events...");
+                    info!("Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
                         error!("Error during final log flush: {}", e);
                     }
@@ -316,8 +436,13 @@ async fn process_agent_payloads(
         };
 
         if let Ok(final_json) = serde_json::to_string(&wrapped_payload) {
-            if let Err(e) = client.send_agent_payload(config, &final_json).await {
-                error!("[agentsend] Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
+            match client.send_agent_payload(config, &final_json).await {
+                Ok(()) => {
+                    info!("[agentsend] Successfully sent agent payload to New Relic for request_id: {}", request_id);
+                }
+                Err(e) => {
+                    error!("[agentsend] Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
+                }
             }
         } else {
             error!("[agentsend] Failed to serialize final wrapped payload for request_id: {}", request_id);

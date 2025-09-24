@@ -28,6 +28,12 @@ pub struct NewRelicConfig {
     /// New Relic License Key for authentication
     pub license_key: Option<String>,
 
+    /// AWS Secrets Manager secret ID for license key
+    pub license_key_secret_id: String,
+
+    /// AWS SSM Parameter Store parameter name for license key
+    pub license_key_ssm_parameter_name: String,
+
     /// Original Lambda handler (before wrapping)
     pub lambda_handler: Option<String>,
 
@@ -73,6 +79,24 @@ pub struct ExtensionSettings {
     pub send_extension_logs: bool,
 }
 
+/// Configuration struct that matches the credentials module expectations
+#[derive(Debug, Clone)]
+pub struct Configuration {
+    pub license_key: String,
+    pub license_key_secret_id: String,
+    pub license_key_ssm_parameter_name: String,
+}
+
+impl From<&ExtensionConfig> for Configuration {
+    fn from(config: &ExtensionConfig) -> Self {
+        Self {
+            license_key: config.new_relic.license_key.clone().unwrap_or_default(),
+            license_key_secret_id: config.new_relic.license_key_secret_id.clone(),
+            license_key_ssm_parameter_name: config.new_relic.license_key_ssm_parameter_name.clone(),
+        }
+    }
+}
+
 impl Default for ExtensionConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +112,8 @@ impl Default for NewRelicConfig {
         Self {
             extension_enabled: true,
             license_key: None,
+            license_key_secret_id: String::new(),
+            license_key_ssm_parameter_name: String::new(),
             lambda_handler: None,
             telemetry_endpoint: "https://cloud-collector.newrelic.com/aws/lambda/v1".to_string(),
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
@@ -135,6 +161,8 @@ impl ExtensionConfig {
             .unwrap_or(true);
 
         config.new_relic.license_key = env::var("NEW_RELIC_LICENSE_KEY").ok();
+        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID").unwrap_or_default();
+        config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
 
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
@@ -252,6 +280,8 @@ pub fn init_config() -> &'static ExtensionConfig {
                 config.extension.send_function_logs,
                 config.extension.send_extension_logs
             );
+            info!("[Config] Telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
+            info!("[Config] Log endpoint: {}", config.new_relic.log_endpoint);
 
             GLOBAL_CONFIG = Some(config);
         });

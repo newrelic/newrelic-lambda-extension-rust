@@ -9,29 +9,53 @@ repository = "https://github.com/yourusername/newrelic-lambda-extension"
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.11", features = ["json", "rustls-tls"], default-features = false }
+# Tokio - only load what we actually use (massive startup time improvement)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+# Reqwest - use newer version to match AWS SDK and reduce duplicates
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-hyper = { version = "0.14", features = ["full"] }
+# Hyper - use v1 to match AWS SDK (eliminates duplicate hyper 0.14)
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "service"] }
+# Use http v1 to match AWS SDK
+http-body-util = "0.1"
 flate2 = "1.0"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 nix = { version = "0.28", features = ["fs"] }
-base64 = "0.22"
+base64 = "0.22"  # Use newer version to match AWS SDK
+anyhow = "1.0"
+
+# AWS dependencies - ALWAYS INCLUDED as default (as you requested)
+aws-config = { version = "1.8", features = ["behavior-version-latest"] }
+aws-sdk-secretsmanager = { version = "1.88", features = ["behavior-version-latest"] }
+aws-sdk-ssm = { version = "1.93", features = ["behavior-version-latest"] }
 
 [profile.release]
-lto = true
-codegen-units = 1
-opt-level = "z"  # Optimize for size (important for Lambda cold starts)
-strip = true
-panic = "abort"  # Reduce binary size and improve performance
+lto = "fat"          # Maximum link-time optimization
+codegen-units = 1    # Single codegen unit for better optimization
+opt-level = "z"      # Optimize for size (important for Lambda cold starts)
+strip = true         # Strip debug symbols
+panic = "abort"      # Reduce binary size and improve performance
+debug = false        # No debug info in release
 
-# Optimize dependencies for release builds
+# Optimize dependencies for release builds - aggressive settings
 [profile.release.package."*"]
 opt-level = 3
+debug = false
+
+# Optimize AWS dependencies specifically for size and speed
+[profile.release.package.aws-config]
+opt-level = "z"
+
+[profile.release.package.aws-sdk-secretsmanager]
+opt-level = "z"
+
+[profile.release.package.aws-sdk-ssm]
+opt-level = "z"
 
 # Dev profile optimizations for faster development
 [profile.dev]
