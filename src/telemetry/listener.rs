@@ -30,6 +30,7 @@ pub struct TelemetryRecord {
 pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
+    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
     let listener = TcpListener::bind(addr).await.map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
@@ -41,6 +42,7 @@ pub async fn setup_telemetry_listener(
                 Ok((stream, _)) => {
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
+                    let runtime_done_tx_clone = runtime_done_tx.clone();
                     
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -49,6 +51,7 @@ pub async fn setup_telemetry_listener(
                                 req,
                                 log_processor.clone(),
                                 platform_processor.clone(),
+                                runtime_done_tx_clone.clone(),
                             )
                         });
                         
@@ -76,6 +79,7 @@ async fn handle_telemetry_request(
     req: Request<Incoming>,
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
+    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -95,6 +99,7 @@ async fn handle_telemetry_request(
         Ok(records) => {
             tracing::info!("Successfully parsed {} telemetry records", records.len());
             let mut function_completed = false;
+            let mut runtime_done_received = false;
             
             for record in records {
                 tracing::debug!("Processing telemetry record: type={}", record.record_type);
@@ -107,14 +112,31 @@ async fn handle_telemetry_request(
                         tracing::debug!("Routing extension log to LogProcessor");
                         log_processor.process_record(record);
                     }
+                    "platform.runtimeDone" => {
+                        tracing::info!("🎯 Runtime completed (platform.runtimeDone), signaling agent telemetry processing");
+                        platform_processor.process_record(record);
+                        runtime_done_received = true;
+                        function_completed = true;
+                    }
                     "platform.report" | "platform.end" => {
-                        tracing::debug!("Function execution completed, will flush after processing");
+                        tracing::info!("📋 Function execution completed ({}), will flush after processing", record.record_type);
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
                     _ => {
                         tracing::debug!("Routing platform event ({}) to PlatformProcessor", record.record_type);
                         platform_processor.process_record(record);
+                    }
+                }
+            }
+            
+            // If runtime is done, signal the main loop to process agent telemetry
+            if runtime_done_received {
+                if let Some(ref tx) = runtime_done_tx {
+                    if let Err(e) = tx.send(()) {
+                        tracing::warn!("Failed to send runtime done signal: {}", e);
+                    } else {
+                        tracing::info!("🚀 Sent runtime done signal to main loop for agent telemetry processing");
                     }
                 }
             }

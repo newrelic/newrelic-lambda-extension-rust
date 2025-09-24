@@ -23,6 +23,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use tokio::sync::mpsc;
 use tracing::{info, error, warn};
 use crate::{
     context::InvocationContext,
@@ -107,15 +108,11 @@ struct LogEvent<'a> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let start_time = std::time::Instant::now();
-    
     // --- 1. Initialize Configuration & Logging ---
     let config = Arc::new(config::init_config().clone());
-    info!("Starting extension: {} (config loaded in {:?})", &config.extension.name, start_time.elapsed());
+    info!("Starting extension: {}", &config.extension.name);
 
     // --- 2. License Key Extraction Phase (First Priority) ---
-    let init_start = std::time::Instant::now();
-    
     // Check configuration for credential sources
     let credentials_config = config::Configuration::from(config.as_ref());
     
@@ -134,24 +131,23 @@ async fn main() -> Result<()> {
     
         // OPTIMIZATION: Extract license key FIRST before any other initialization
     let license_key = if !credentials_config.license_key.is_empty() {
-        info!("Using license key from environment variable NEW_RELIC_LICENSE_KEY (found in {:?}) - AWS services not needed", init_start.elapsed());
+        info!("Using license key from environment variable NEW_RELIC_LICENSE_KEY - AWS services not needed");
         Some(credentials_config.license_key.clone())
     } else if needs_aws {
         info!("No direct license key found, checking AWS credential sources...");
         
-        let cred_check_start = std::time::Instant::now();
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
-                info!("Successfully obtained New Relic license key from AWS (took {:?})", cred_check_start.elapsed());
+                info!("Successfully obtained New Relic license key from AWS");
                 Some(key)
             }
             Err(e) => {
-                warn!("No license key found from AWS sources: {}. Extension will run in no-op mode. (took {:?})", e, cred_check_start.elapsed());
+                warn!("No license key found from AWS sources: {}. Extension will run in no-op mode.", e);
                 None
             }
         }
     } else {
-        warn!("No license key available and not in AWS Lambda environment. Extension will run in no-op mode. (took {:?})", init_start.elapsed());
+        warn!("No license key available and not in AWS Lambda environment. Extension will run in no-op mode.");
         None
     };
 
@@ -163,8 +159,6 @@ async fn main() -> Result<()> {
     let config = Arc::new(updated_config);
 
     // --- 3. Parallel Initialization Phase (Now with license key ready) ---
-    let parallel_start = std::time::Instant::now();
-    
     // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
     let (client_result, registration_result) = if license_key.is_some() {
         // License key available immediately - maximum parallelization
@@ -192,8 +186,8 @@ async fn main() -> Result<()> {
     let client = Arc::new(client_result?);
     let registration = registration_result?;
 
-    info!("Parallel initialization completed in {:?}", parallel_start.elapsed());
-    info!("Total initialization time: {:?}", start_time.elapsed());
+    info!("Parallel initialization completed");
+    info!("Extension initialization complete");
 
     if !config.new_relic.extension_enabled || license_key.is_none() {
         // --- NO-OP MODE ---
@@ -213,10 +207,9 @@ async fn main() -> Result<()> {
         }
     } else {
         // --- ACTIVE MODE ---
-        let active_mode_start = std::time::Instant::now();
         
         // MAXIMUM PARALLEL OPTIMIZATION: Initialize ALL components at once since license key is ready
-        let (invocation_context, agent_payload_buffer, agent_telemetry_rx, newrelic_client) = tokio::join!(
+        let (invocation_context, agent_payload_buffer, agent_telemetry_rx, newrelic_client, runtime_done_channels) = tokio::join!(
             async { Arc::new(Mutex::new(InvocationContext::default())) },
             async { Arc::new(Mutex::new(Vec::new())) },
             async {
@@ -237,11 +230,17 @@ async fn main() -> Result<()> {
             async {
                 // Create NewRelic client in parallel since license key is now available
                 Arc::new(NewRelicClient::new(&config))
+            },
+            async {
+                // Create channel for runtime done notifications
+                let (tx, rx) = mpsc::unbounded_channel();
+                (tx, rx)
             }
         );
         
         let agent_telemetry_rx = agent_telemetry_rx?;
         let newrelic_client = newrelic_client;
+        let (runtime_done_tx, mut runtime_done_rx) = runtime_done_channels;
 
         // Start the agent payload collector
         agent::processor::start_agent_payload_collector(
@@ -267,7 +266,7 @@ async fn main() -> Result<()> {
             }
         );
         
-        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone()).await?;
+        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone(), Some(runtime_done_tx)).await?;
 
         let harvester = Harvester::new(
             vec![log_processor.clone(), platform_processor.clone()],
@@ -278,7 +277,7 @@ async fn main() -> Result<()> {
         });
 
         let ext_id = registration.extension_id.clone();
-        info!("Extension registered with ID: {} (active mode setup took {:?})", ext_id, active_mode_start.elapsed());
+        info!("Extension registered with ID: {}", ext_id);
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
         info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
@@ -311,17 +310,26 @@ async fn main() -> Result<()> {
 
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
-                    // Wait a bit for agent telemetry to arrive, then send it immediately
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
+                    info!("[agentsend] 🎯 Waiting for platform.runtimeDone signal...");
+                    
+                    // Wait indefinitely for platform.runtimeDone - it's guaranteed to come
+                    if let Some(_) = runtime_done_rx.recv().await {
+                        info!("[agentsend] Received platform.runtimeDone signal");
+                        // Wait additional 300-500ms buffer time for any final telemetry
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                    } else {
+                        warn!("[agentsend] Runtime done channel closed unexpectedly");
+                    }
                     
                     // Check buffer size for debugging
                     let buffer_size = {
                         let buffer = agent_payload_buffer.lock().unwrap();
                         buffer.len()
                     };
-                    info!("[agentsend] Buffer contains {} payloads after invoke, processing immediately", buffer_size);
+                    info!("[agentsend] Buffer contains {} payloads after runtime completion, processing now", buffer_size);
                     
-                    // Process current invocation's agent payload immediately
+                    // Process current invocation's agent payload after runtime is done
                     process_agent_payloads(
                         &agent_payload_buffer, 
                         &Some(request_id.clone()), 

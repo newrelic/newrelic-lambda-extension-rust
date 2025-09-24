@@ -75,8 +75,9 @@ build_python_layer() {
   echo "Building New Relic layer for python$py_dot_version ($arch)" >&2
 
   rm -rf "$LAYER_DIR"
-  mkdir -p "$LAYER_DIR/python/"
-  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/"
+  mkdir -p "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
+  
+  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
   cp "$SCRIPT_DIR/newrelic_lambda_wrapper.py" "$LAYER_DIR/python/newrelic_lambda_wrapper.py"
   
   mkdir -p "$LAYER_DIR/extensions"
@@ -189,15 +190,21 @@ main() {
     publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
   done
 
+  # Package and publish Python layers
+  build_python_layer "313" "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRRustExtensionPython313X86"
+  done
+
   # Package and publish Node.js layers
   build_nodejs_layer "20" "$target_x86"
   for region in $REGIONS_X86_64; do
     publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRRustExtensionNodejs20X86"
   done
 
-  # --- Build for arm64 ---
-  # local target_arm="aarch64-unknown-linux-musl"
-  # build_extension "$target_arm"
+  --- Build for arm64 ---
+  local target_arm="aarch64-unknown-linux-musl"
+  build_extension "$target_arm"
 
   # Package and publish standalone extension
   package_extension_layer "$target_arm"
