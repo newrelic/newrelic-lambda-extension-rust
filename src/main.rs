@@ -329,6 +329,9 @@ async fn main() -> Result<()> {
                     };
                     info!("[agentsend] Buffer contains {} payloads after runtime completion, processing now", buffer_size);
                     
+                    if buffer_size == 0 {
+                        warn!("[agentsend] No agent payloads found, agent may not be initialized or runtime handler not set");
+                    }
                     // Process current invocation's agent payload after runtime is done
                     process_agent_payloads(
                         &agent_payload_buffer, 
