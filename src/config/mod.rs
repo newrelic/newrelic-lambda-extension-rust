@@ -77,6 +77,9 @@ pub struct ExtensionSettings {
 
     /// Whether to subscribe to extension logs (Lambda 'extension' type)
     pub send_extension_logs: bool,
+
+    /// Log level for the extension (info, debug, trace, all, error, warn)
+    pub log_level: String,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -140,6 +143,7 @@ impl Default for ExtensionSettings {
             telemetry_timeout: 25, // 25ms for immediate delivery
             send_function_logs: false,
             send_extension_logs: false,
+            log_level: "info".to_string(),
         }
     }
 }
@@ -195,6 +199,9 @@ impl ExtensionConfig {
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
 
+        // Configure logging
+        config.extension.log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+
         config
     }
 }
@@ -248,9 +255,13 @@ pub fn init_config() -> &'static ExtensionConfig {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
 
-            // Read log level from NEW_RELIC_EXTENSION_LOG_LEVEL, defaulting to "info"
-            let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
-                .unwrap_or_else(|_| "info".to_string());
+            // Determine log level - support 'all' as alias for 'trace'
+            let log_level = if config.extension.log_level.to_lowercase() == "all" {
+                "trace".to_string()
+            } else {
+                config.extension.log_level.clone()
+            };
+
             let env_filter = EnvFilter::new(log_level);
 
             // Use the custom formatter
@@ -262,26 +273,8 @@ pub fn init_config() -> &'static ExtensionConfig {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            info!("[Config] New Relic Lambda Extension configuration loaded");
-            info!(
-                "[Config] Extension enabled: {}",
-                config.new_relic.extension_enabled
-            );
-            info!(
-                "[Config] License key: {}",
-                if config.new_relic.license_key.is_some() {
-                    "Set"
-                } else {
-                    "Not set"
-                }
-            );
-            info!(
-                "[Config] Send function logs: {} | Send extension logs: {}",
-                config.extension.send_function_logs,
-                config.extension.send_extension_logs
-            );
-            info!("[Config] Telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
-            info!("[Config] Log endpoint: {}", config.new_relic.log_endpoint);
+            // Clean startup - only essential log
+            info!("New Relic Lambda Extension started");
 
             GLOBAL_CONFIG = Some(config);
         });

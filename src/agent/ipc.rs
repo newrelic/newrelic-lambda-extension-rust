@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task;
-use tracing::{error, info, warn};
+use tracing::{debug, error, trace, warn};
 
 pub const TELEMETRY_NAMED_PIPE_PATH: &str = "/tmp/newrelic-telemetry";
 const TELEMETRY_NAMED_PIPE_RETRIES: u32 = 10;
@@ -23,7 +23,7 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
 
     // 1. Remove the pipe if it already exists, ignoring "Not Found" errors.
     match fs::remove_file(path) {
-        Ok(_) => info!("Removed existing telemetry pipe."),
+        Ok(_) => debug!("Removed existing telemetry pipe."),
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
@@ -32,7 +32,7 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
     let mode = stat::Mode::from_bits(0o666).unwrap(); // 0o666 is always valid
     unistd::mkfifo(path, mode)
         .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create FIFO: {}", e)))?;
-    info!("Created new telemetry pipe at {}", TELEMETRY_NAMED_PIPE_PATH);
+    debug!("Created new telemetry pipe at {}", TELEMETRY_NAMED_PIPE_PATH);
 
 
     // 3. Wait for the pipe to be visible in the filesystem to avoid race conditions.
@@ -50,7 +50,10 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
 
     // 5. Spawn a background task to poll the pipe.
     tokio::spawn(async move {
-        info!("Starting telemetry pipe listener loop.");
+        debug!("Starting telemetry pipe listener loop.");
+        let mut consecutive_errors = 0;
+        let mut bytes_received_count = 0;
+        
         loop {
             // Reading from the pipe is a blocking operation. We offload it to a
             // blocking-safe thread pool to avoid starving the async executor.
@@ -58,11 +61,20 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
 
             match bytes_result {
                 Ok(bytes) => {
+                    consecutive_errors = 0; // Reset error counter on success
+                    
                     if bytes.is_empty() {
                         // This can happen if the writer closes the pipe immediately.
                         // We just continue to the next read attempt.
                         continue;
                     }
+                    
+                    bytes_received_count += 1;
+                    // Only log every 10th successful read to reduce noise
+                    if bytes_received_count % 10 == 1 {
+                        trace!("Received {} bytes from telemetry pipe (count: {})", bytes.len(), bytes_received_count);
+                    }
+                    
                     // Send the received data through the channel. If it fails,
                     // it means the receiver has been dropped, so we can exit the loop.
                     if tx.send(bytes).await.is_err() {
@@ -71,7 +83,11 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
                     }
                 }
                 Err(e) => {
-                    error!("Error polling for telemetry: {}. Retrying in 1s.", e);
+                    consecutive_errors += 1;
+                    // Only log errors every 5th occurrence to reduce spam
+                    if consecutive_errors % 5 == 1 {
+                        error!("Error polling for telemetry: {} (count: {}). Retrying in 1s.", e, consecutive_errors);
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }

@@ -24,7 +24,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::mpsc;
-use tracing::{info, error, warn};
+use tracing::{debug, error, info, trace, warn};
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
@@ -110,7 +110,7 @@ struct LogEvent<'a> {
 async fn main() -> Result<()> {
     // --- 1. Initialize Configuration & Logging ---
     let config = Arc::new(config::init_config().clone());
-    info!("Starting extension: {}", &config.extension.name);
+    trace!("Starting extension: {}", &config.extension.name);
 
     // --- 2. License Key Extraction Phase (First Priority) ---
     // Check configuration for credential sources
@@ -131,14 +131,14 @@ async fn main() -> Result<()> {
     
         // OPTIMIZATION: Extract license key FIRST before any other initialization
     let license_key = if !credentials_config.license_key.is_empty() {
-        info!("Using license key from environment variable NEW_RELIC_LICENSE_KEY - AWS services not needed");
+        debug!("Using license key from environment variable");
         Some(credentials_config.license_key.clone())
     } else if needs_aws {
-        info!("No direct license key found, checking AWS credential sources...");
+        debug!("Checking AWS credential sources for license key");
         
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
-                info!("Successfully obtained New Relic license key from AWS");
+                debug!("Successfully obtained New Relic license key from AWS");
                 Some(key)
             }
             Err(e) => {
@@ -186,19 +186,19 @@ async fn main() -> Result<()> {
     let client = Arc::new(client_result?);
     let registration = registration_result?;
 
-    info!("Parallel initialization completed");
-    info!("Extension initialization complete");
+    debug!("Parallel initialization completed");
+    info!("Extension ready");
 
     if !config.new_relic.extension_enabled || license_key.is_none() {
         // --- NO-OP MODE ---
-        info!("Extension is in no-op mode because NEW_RELIC_LAMBDA_EXTENSION_ENABLED is set to false. Or NEW_RELIC_LICENSE_KEY is not set.");
+        info!("Extension running in no-op mode");
         let ext_id = registration.extension_id.clone();
-        info!("[No-op] Extension registered with ID: {}. Waiting for SHUTDOWN signal.", ext_id);
+        debug!("Extension registered with ID: {} (no-op mode)", ext_id);
 
         loop {
             match next_event(&client, &ext_id).await {
                 Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    info!("[No-op] Received SHUTDOWN event: {}. Exiting.", shutdown_reason);
+                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
                     break;
                 }
                 Ok(_) => { /* Ignore INVOKE events in no-op mode */ }
@@ -277,9 +277,9 @@ async fn main() -> Result<()> {
         });
 
         let ext_id = registration.extension_id.clone();
-        info!("Extension registered with ID: {}", ext_id);
+        debug!("Extension registered with ID: {}", ext_id);
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
-        info!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
+        debug!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
         // State for tracking the previous invocation
         let mut last_request_id: Option<String> = None;
@@ -299,7 +299,7 @@ async fn main() -> Result<()> {
 
             match event_result {
                 Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
-                    info!("Received INVOKE event for request ID: {}", request_id);
+                    trace!("Received INVOKE event for request ID: {}", request_id);
                     
                     // Update the global context for other processors
                     {
@@ -311,15 +311,15 @@ async fn main() -> Result<()> {
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
                     // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
-                    info!("[agentsend] 🎯 Waiting for platform.runtimeDone signal...");
+                    trace!("Waiting for platform.runtimeDone signal...");
                     
                     // Wait indefinitely for platform.runtimeDone - it's guaranteed to come
                     if let Some(_) = runtime_done_rx.recv().await {
-                        info!("[agentsend] Received platform.runtimeDone signal");
+                        trace!("Received platform.runtimeDone signal");
                         // Wait additional 300-500ms buffer time for any final telemetry
                         tokio::time::sleep(Duration::from_millis(400)).await;
                     } else {
-                        warn!("[agentsend] Runtime done channel closed unexpectedly");
+                        warn!("Runtime done channel closed unexpectedly");
                     }
                     
                     // Check buffer size for debugging
@@ -327,7 +327,7 @@ async fn main() -> Result<()> {
                         let buffer = agent_payload_buffer.lock().unwrap();
                         buffer.len()
                     };
-                    info!("[agentsend] Buffer contains {} payloads after runtime completion, processing now", buffer_size);
+                    trace!("Buffer contains {} payloads after runtime completion, processing now", buffer_size);
                     
                     if buffer_size == 0 {
                         warn!("[agentsend] No agent payloads found, agent may not be initialized or runtime handler not set");
@@ -346,11 +346,11 @@ async fn main() -> Result<()> {
                     last_invoked_arn = Some(invoked_function_arn);
                 }
                 Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    info!("Received SHUTDOWN event: {}", shutdown_reason);
+                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
                     
                     harvester_handle.abort();
                     
-                    info!("Performing FINAL flush of all logs and platform events...");
+                    debug!("Performing FINAL flush of all logs and platform events...");
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
                         error!("Error during final log flush: {}", e);
                     }
@@ -368,7 +368,7 @@ async fn main() -> Result<()> {
                     ).await;
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    info!("Extension shutdown complete.");
+                    debug!("Extension shutdown complete.");
                     break;
                 }
                 Err(e) => {
@@ -400,18 +400,22 @@ async fn process_agent_payloads(
     }
 
     let (Some(request_id), Some(invoked_arn)) = (request_id_opt, invoked_arn_opt) else {
-        error!("[agentsend] Payloads exist in buffer but no previous context is available. Discarding {} payloads.", payloads.len());
+        error!("Payloads exist in buffer but no previous context is available. Discarding {} payloads.", payloads.len());
         return;
     };
 
-    info!("[agentsend] Processing {} buffered agent payloads for request_id: {}", payloads.len(), request_id);
+    debug!("Processing {} buffered agent payloads for request_id: {}", payloads.len(), request_id);
 
     let function_name = invoked_arn.split(':').last().unwrap_or("");
     let log_group_name = format!("/aws/lambda/{}", function_name);
+    
+    let mut success_count = 0;
+    let mut error_count = 0;
 
     for payload_bytes in payloads {
         let Ok(payload_str) = String::from_utf8(payload_bytes) else {
-            error!("[agentsend] Failed to decode payload as UTF-8 for request_id: {}", request_id);
+            error!("Failed to decode payload as UTF-8 for request_id: {}", request_id);
+            error_count += 1;
             continue;
         };
 
@@ -424,7 +428,8 @@ async fn process_agent_payloads(
         };
 
         let Ok(entry_string) = serde_json::to_string(&entry_payload) else {
-            error!("[agentsend] Failed to serialize entry payload for request_id: {}", request_id);
+            error!("Failed to serialize entry payload for request_id: {}", request_id);
+            error_count += 1;
             continue;
         };
 
@@ -441,15 +446,25 @@ async fn process_agent_payloads(
         if let Ok(final_json) = serde_json::to_string(&wrapped_payload) {
             match client.send_agent_payload(config, &final_json).await {
                 Ok(()) => {
-                    info!("[agentsend] Successfully sent agent payload to New Relic for request_id: {}", request_id);
+                    success_count += 1;
                 }
                 Err(e) => {
-                    error!("[agentsend] Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
+                    error!("Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
+                    error_count += 1;
                 }
             }
         } else {
-            error!("[agentsend] Failed to serialize final wrapped payload for request_id: {}", request_id);
+            error!("Failed to serialize final wrapped payload for request_id: {}", request_id);
+            error_count += 1;
         }
+    }
+    
+    // Summary logging instead of per-payload logging
+    if success_count > 0 {
+        trace!("Successfully sent {} agent payloads to New Relic for request_id: {}", success_count, request_id);
+    }
+    if error_count > 0 {
+        error!("Failed to send {} agent payloads for request_id: {}", error_count, request_id);
     }
 }
 
