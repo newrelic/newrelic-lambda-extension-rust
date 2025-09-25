@@ -9,6 +9,7 @@ use std::{
     io::Result,
     sync::{Arc, Mutex},
 };
+use tracing::{debug, error, trace};
 
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
@@ -36,16 +37,19 @@ impl PlatformProcessor {
 
     /// Processes a single platform telemetry record.
     pub fn process_record(&self, record: TelemetryRecord) {
-        tracing::debug!("Processing platform record: type={}, time={}", record.record_type, record.time);
         
+        // Convert the record to JSON and add to our batch
+        let event = serde_json::to_value(&record).unwrap_or_else(|e| {
+            error!("Failed to serialize platform record: {}", e);
+            serde_json::Value::Null
+        });
         let mut batch = self.platform_events_batch.lock().unwrap();
-        batch.push(serde_json::json!({
-            "type": record.record_type,
-            "record": record.record,
-            "time": record.time,
-        }));
+        batch.push(event);
         
-        tracing::debug!("Added platform event to batch. Current batch size: {}", batch.len());
+        // Only log batch size every 10th addition to reduce noise
+        if batch.len() % 10 == 1 {
+            trace!("Added platform event to batch. Current batch size: {}", batch.len());
+        }
     }
 
     /// Updates the invocation context with the latest invoke event details.
@@ -63,11 +67,11 @@ impl PlatformProcessor {
         };
 
         if batch.is_empty() {
-            tracing::debug!("[PlatformProcessor] No platform events to send");
+            trace!("No platform events to send");
             return Ok(());
         }
 
-        tracing::info!("[PlatformProcessor] Sending {} platform events to New Relic NOW", batch.len());
+        debug!("Sending {} platform events to New Relic", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -87,11 +91,11 @@ impl PlatformProcessor {
         // Send directly without spawning
         match client.send_platform_events(&config, payload).await {
             Ok(()) => {
-                tracing::info!("[PlatformProcessor] Successfully sent platform events to New Relic");
+                trace!("Successfully sent platform events to New Relic");
                 Ok(())
             },
             Err(e) => {
-                tracing::error!("[PlatformProcessor] Failed to send platform events: {}", e);
+                error!("Failed to send platform events: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }

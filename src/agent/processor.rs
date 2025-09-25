@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::{info};
+use tracing::{debug, trace};
 
 /// Spawns a new asynchronous task that continuously receives telemetry payloads
 /// from the agent and stores them in a shared buffer.
@@ -17,16 +17,23 @@ pub fn start_agent_payload_collector(
     payload_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
 ) {
     tokio::spawn(async move {
-        info!("Agent payload collector has started and is waiting for data.");
+        debug!("Agent payload collector started and waiting for data.");
+        let mut payload_count = 0;
 
         while let Some(payload_bytes) = receiver.recv().await {
-            info!("[agentsend] Collector received agent telemetry payload ({} bytes).", payload_bytes.len());
+            payload_count += 1;
+            
+            // Only log every 10th payload to reduce noise, or log first few
+            if payload_count <= 3 || payload_count % 10 == 0 {
+                trace!("Collector received agent telemetry payload ({} bytes) - count: {}", payload_bytes.len(), payload_count);
+            }
+            
             // Lock the buffer and add the new payload
             let mut buffer = payload_buffer.lock().unwrap();
             buffer.push(payload_bytes);
         }
 
-        info!("Agent payload collector channel closed. Shutting down.");
+        debug!("Agent payload collector channel closed. Shutting down.");
     });
 }
 

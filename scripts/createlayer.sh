@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 
 # --- Configuration ---
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2"}
+REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2 us-west-1"}
 REGIONS_ARM64=${REGIONS_ARM64:-"us-west-2"}
 
 BIN_NAME="newrelic-lambda-extension"
@@ -102,7 +102,20 @@ build_nodejs_layer() {
   mkdir -p "$LAYER_DIR/nodejs/node_modules"
 
   npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
-  cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/index.js"
+  
+  # Create the newrelic-lambda-wrapper as a proper Node.js module
+  mkdir -p "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper"
+  cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/index.js"
+  
+  # Create a package.json for the newrelic-lambda-wrapper module
+  cat > "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/package.json" << 'EOF'
+{
+  "name": "newrelic-lambda-wrapper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs"
+}
+EOF
 
   mkdir -p "$LAYER_DIR/extensions"
   cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
@@ -177,20 +190,20 @@ main() {
   # --- Build for x86_64 ---
   local target_x86="x86_64-unknown-linux-musl"
   build_extension "$target_x86"
-  
+
   # Package and publish standalone extension
   package_extension_layer "$target_x86"
   for region in $REGIONS_X86_64; do
     publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRRustExtensionX86"
   done
 
-  # Package and publish Python layers
-  build_python_layer "312" "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
-  done
+  # # Package and publish Python layers
+  # build_python_layer "312" "$target_x86"
+  # for region in $REGIONS_X86_64; do
+  #   publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
+  # done
 
-  # Package and publish Python layers
+  # # Package and publish Python layers
   build_python_layer "313" "$target_x86"
   for region in $REGIONS_X86_64; do
     publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRRustExtensionPython313X86"
@@ -202,27 +215,27 @@ main() {
     publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRRustExtensionNodejs20X86"
   done
 
-  --- Build for arm64 ---
-  local target_arm="aarch64-unknown-linux-musl"
-  build_extension "$target_arm"
+  #--- Build for arm64 ---
+  # local target_arm="aarch64-unknown-linux-musl"
+  # build_extension "$target_arm"
 
-  # Package and publish standalone extension
-  package_extension_layer "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
-  done
+  # # Package and publish standalone extension
+  # package_extension_layer "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
+  # done
 
-  # Package and publish Python layers
-  build_python_layer "311" "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/python311-aarch64.zip" "$region" "python3.11" "arm64" "NRTestExtensionPython311ARM64"
-  done
+  # # Package and publish Python layers
+  # build_python_layer "311" "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/python311-aarch64.zip" "$region" "python3.11" "arm64" "NRTestExtensionPython311ARM64"
+  # done
 
-  # Package and publish Node.js layers
-  build_nodejs_layer "20" "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/nodejs20-aarch64.zip" "$region" "nodejs20.x" "arm64" "NRTestExtensionNodejs20ARM64"
-  done
+  # # Package and publish Node.js layers
+  # build_nodejs_layer "20" "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/nodejs20-aarch64.zip" "$region" "nodejs20.x" "arm64" "NRTestExtensionNodejs20ARM64"
+  # done
 
   echo "All layers published. Environment variables saved to $TMP_ENV_FILE_NAME"
   cat "$TMP_ENV_FILE_NAME"

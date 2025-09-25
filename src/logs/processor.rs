@@ -1,4 +1,4 @@
-use tracing::{debug, info, error, warn};
+use tracing::{debug, error, trace, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
@@ -44,17 +44,16 @@ impl LogProcessor {
             return;
         }
 
-        debug!("Processing log record: type={}, time={}, message_preview={}...", 
-            record.record_type, 
-            record.time,
-            if message_str.len() > 100 { &message_str[..100] } else { &message_str }
-        );
 
         if let Some(log_message) = self.to_log_message(record) {
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
-            debug!("Added log to batch. Current batch size: {}", batch_size);
+            
+            // Only log batch size every 10th addition to reduce noise
+            if batch_size % 10 == 1 {
+                trace!("Added log to batch. Current batch size: {}", batch_size);
+            }
             
             // Send immediately if we have 3+ logs (simple batch condition)
             if batch_size >= 3 {
@@ -123,7 +122,7 @@ impl LogProcessor {
             return Ok(());
         }
 
-        info!("[LogProcessor] Sending {} logs to New Relic NOW", batch.len());
+        debug!("Sending {} logs to New Relic", batch.len());
         
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -132,11 +131,11 @@ impl LogProcessor {
         // Send directly without spawning - simpler and more reliable
         match client.send_logs(&config, batch, &context.invoked_function_arn).await {
             Ok(()) => {
-                tracing::info!("[LogProcessor] Successfully sent logs to New Relic");
+                trace!("Successfully sent logs to New Relic");
                 Ok(())
             },
             Err(e) => {
-                tracing::error!("[LogProcessor] Failed to send logs: {}", e);
+                error!("Failed to send logs: {}", e);
                 Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }

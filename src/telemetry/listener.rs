@@ -3,14 +3,14 @@ use crate::{
     platform::processor::PlatformProcessor,
 };
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     io::{Error, Result},
     net::SocketAddr,
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{error, info};
+use tracing::{debug, error, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -18,7 +18,7 @@ use hyper_util::rt::TokioIo;
 use http_body_util::{BodyExt, Full};
 use tokio::net::TcpListener;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TelemetryRecord {
     pub time: DateTime<Utc>,
     #[serde(rename = "type")]
@@ -70,7 +70,7 @@ pub async fn setup_telemetry_listener(
         }
     });
 
-    info!("Telemetry listener started on {}", local_addr);
+    debug!("Telemetry listener started on {}", local_addr);
     Ok(local_addr)
 }
 
@@ -93,73 +93,86 @@ async fn handle_telemetry_request(
     
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
 
-    tracing::debug!("Received telemetry data: {} bytes", body_str.len());
+    trace!("Received telemetry data: {} bytes", body_str.len());
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
-            tracing::info!("Successfully parsed {} telemetry records", records.len());
+            if records.len() > 10 {
+                trace!("Processing {} telemetry records (batch)", records.len());
+            } else if records.len() > 0 {
+                trace!("Processing {} telemetry records", records.len());
+            }
+            
             let mut function_completed = false;
             let mut runtime_done_received = false;
+            let mut function_count = 0;
+            let mut extension_count = 0;
+            let mut platform_count = 0;
             
             for record in records {
-                tracing::debug!("Processing telemetry record: type={}", record.record_type);
                 match record.record_type.as_str() {
                     "function" => {
-                        tracing::debug!("Routing function log to LogProcessor");
+                        function_count += 1;
                         log_processor.process_record(record);
                     }
                     "extension" => {
-                        tracing::debug!("Routing extension log to LogProcessor");
+                        extension_count += 1;
                         log_processor.process_record(record);
                     }
                     "platform.runtimeDone" => {
-                        tracing::info!("🎯 Runtime completed (platform.runtimeDone), signaling agent telemetry processing");
+                        debug!("Runtime completed, signaling agent telemetry processing");
                         platform_processor.process_record(record);
                         runtime_done_received = true;
                         function_completed = true;
                     }
                     "platform.report" | "platform.end" => {
-                        tracing::info!("📋 Function execution completed ({}), will flush after processing", record.record_type);
+                        debug!("Function execution completed ({})", record.record_type);
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
                     _ => {
-                        tracing::debug!("Routing platform event ({}) to PlatformProcessor", record.record_type);
+                        platform_count += 1;
                         platform_processor.process_record(record);
                     }
                 }
+            }
+            
+            // Summary logging instead of per-record logging
+            if function_count > 0 || extension_count > 0 || platform_count > 0 {
+                trace!("Processed records - function: {}, extension: {}, platform: {}", 
+                       function_count, extension_count, platform_count);
             }
             
             // If runtime is done, signal the main loop to process agent telemetry
             if runtime_done_received {
                 if let Some(ref tx) = runtime_done_tx {
                     if let Err(e) = tx.send(()) {
-                        tracing::warn!("Failed to send runtime done signal: {}", e);
+                        warn!("Failed to send runtime done signal: {}", e);
                     } else {
-                        tracing::info!("🚀 Sent runtime done signal to main loop for agent telemetry processing");
+                        trace!("Sent runtime done signal to main loop for agent telemetry processing");
                     }
                 }
             }
             
             // If function execution completed, send all accumulated data immediately
             if function_completed {
-                tracing::info!("🚀 Function execution completed, flushing all data immediately!");
+                debug!("Function execution completed, flushing data");
                 let log_proc_clone = Arc::clone(&log_processor);
                 let platform_proc_clone = Arc::clone(&platform_processor);
                 
                 tokio::spawn(async move {
                     if let Err(e) = log_proc_clone.send_and_clear_batch_simple().await {
-                        tracing::error!("Failed to send logs after function completion: {}", e);
+                        error!("Failed to send logs after function completion: {}", e);
                     }
                     if let Err(e) = platform_proc_clone.send_and_clear_batch_simple().await {
-                        tracing::error!("Failed to send platform events after function completion: {}", e);
+                        error!("Failed to send platform events after function completion: {}", e);
                     }
                 });
             }
         }
         Err(e) => {
             error!("Failed to parse telemetry records: {}", e);
-            tracing::debug!("Raw telemetry data that failed to parse: {}", body_str);
+            trace!("Raw telemetry data that failed to parse: {}", body_str);
         }
     }
 
