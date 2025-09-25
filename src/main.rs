@@ -301,19 +301,24 @@ async fn main() -> Result<()> {
                 &last_invoked_arn, 
                 &newrelic_client, 
                 &config,
-                &invocation_context
+                &invocation_context,
+                &log_processor
             ).await;
 
             match event_result {
                 Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
                     trace!("Received INVOKE event for request ID: {}", request_id);
                     
-                    // Update the global context for other processors
+                    // Update the global context for other processors and reset trace ID state
                     {
                         let mut context = invocation_context.lock().unwrap();
                         context.request_id = request_id.clone();
                         context.invoked_function_arn = invoked_function_arn.clone();
+                        context.trace_id = None; // Reset trace ID for new invocation
                     }
+                    
+                    // Reset log processor trace ID state for new invocation
+                    log_processor.reset_trace_id_state();
 
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
@@ -346,8 +351,14 @@ async fn main() -> Result<()> {
                         &Some(invoked_function_arn.clone()), 
                         &newrelic_client, 
                         &config,
-                        &invocation_context
+                        &invocation_context,
+                        &log_processor
                     ).await;
+                    
+                    // Flush any remaining buffered logs (in case trace ID was never extracted)
+                    if let Err(e) = log_processor.flush_buffered_logs_at_invocation_end().await {
+                        error!("Error flushing buffered logs at invocation end: {}", e);
+                    }
                     
                     // Save the context for the *next* loop iteration (for any remaining payloads)
                     last_request_id = Some(request_id);
@@ -373,7 +384,8 @@ async fn main() -> Result<()> {
                         &last_invoked_arn, 
                         &newrelic_client, 
                         &config,
-                        &invocation_context
+                        &invocation_context,
+                        &log_processor
                     ).await;
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -399,6 +411,7 @@ async fn process_agent_payloads(
     client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
     invocation_context: &Arc<Mutex<InvocationContext>>,
+    log_processor: &Arc<logs::processor::LogProcessor>,
 ) {
     let payloads = {
         let mut buf = buffer.lock().unwrap();
@@ -406,6 +419,14 @@ async fn process_agent_payloads(
     };
 
     if payloads.is_empty() {
+        // No agent payloads means no opportunity to extract trace ID
+        // If trace ID collection is enabled, we should flush any buffered logs
+        if config.new_relic.collect_trace_id {
+            debug!("No agent payloads received - flushing buffered logs without trace ID");
+            if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
+                error!("Failed to handle no-payloads trace ID extraction failure: {}", e);
+            }
+        }
         return;
     }
 
@@ -421,27 +442,49 @@ async fn process_agent_payloads(
     
     let mut success_count = 0;
     let mut error_count = 0;
+    let mut trace_id_found = false;
+    let mut trace_extraction_attempted = false;
 
     for payload_bytes in payloads {
         // Extract trace ID from agent payload if collection is enabled
-        if config.new_relic.collect_trace_id {
+        if config.new_relic.collect_trace_id && !trace_extraction_attempted {
             debug!("NEW_RELIC_COLLECT_TRACE_ID is enabled, attempting to extract trace ID from {} byte payload", payload_bytes.len());
+            trace_extraction_attempted = true;
+            
             match trace::extract_trace_id_from_payload(&payload_bytes) {
                 Ok(Some(trace_id)) => {
                     info!("Successfully extracted trace ID from agent payload: {}", trace_id);
+                    trace_id_found = true;
+                    
                     // Store trace ID in invocation context
                     if let Ok(mut context) = invocation_context.lock() {
-                        context.trace_id = Some(trace_id);
+                        context.trace_id = Some(trace_id.clone());
                         debug!("Updated invocation context with extracted trace ID");
+                    }
+                    
+                    // Notify log processor that trace ID has been extracted
+                    // This will update all buffered logs with the trace ID and send them
+                    if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
+                        error!("Failed to update buffered logs with trace ID: {}", e);
                     }
                 },
                 Ok(None) => {
                     debug!("No trace ID found in agent payload");
+                    // Notify log processor that extraction failed (no trace ID found)
+                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
+                        error!("Failed to handle trace ID extraction failure: {}", e);
+                    }
                 },
                 Err(e) => {
                     warn!("Failed to extract trace ID from agent payload: {}", e);
+                    // Notify log processor that extraction failed (error occurred)
+                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
+                        error!("Failed to handle trace ID extraction failure: {}", e);
+                    }
                 }
             }
+        } else if config.new_relic.collect_trace_id && trace_id_found {
+            trace!("Trace ID already found, skipping extraction for remaining payloads");
         } else {
             trace!("NEW_RELIC_COLLECT_TRACE_ID is disabled, skipping trace extraction");
         }
