@@ -11,6 +11,7 @@ mod newrelic;
 mod context;
 mod agent;
 mod credentials;
+mod trace;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -41,13 +42,14 @@ const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
 // --- Structs for API Responses ---
 
-#[derive(Clone, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 struct RegisterResponse {
-    #[serde(skip_deserializing)]
     extension_id: String,
+    #[allow(dead_code)]
     function_name: String,
+    #[allow(dead_code)]
     function_version: String,
+    #[allow(dead_code)]
     handler: String,
 }
 
@@ -157,6 +159,10 @@ async fn main() -> Result<()> {
         updated_config.new_relic.license_key = Some(key.clone());
     }
     let config = Arc::new(updated_config);
+
+    // Log important configuration settings
+    info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
+    debug!("Extension configuration loaded successfully");
 
     // --- 3. Parallel Initialization Phase (Now with license key ready) ---
     // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
@@ -294,7 +300,8 @@ async fn main() -> Result<()> {
                 &last_request_id, 
                 &last_invoked_arn, 
                 &newrelic_client, 
-                &config
+                &config,
+                &invocation_context
             ).await;
 
             match event_result {
@@ -338,7 +345,8 @@ async fn main() -> Result<()> {
                         &Some(request_id.clone()), 
                         &Some(invoked_function_arn.clone()), 
                         &newrelic_client, 
-                        &config
+                        &config,
+                        &invocation_context
                     ).await;
                     
                     // Save the context for the *next* loop iteration (for any remaining payloads)
@@ -364,7 +372,8 @@ async fn main() -> Result<()> {
                         &last_request_id, 
                         &last_invoked_arn, 
                         &newrelic_client, 
-                        &config
+                        &config,
+                        &invocation_context
                     ).await;
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -389,6 +398,7 @@ async fn process_agent_payloads(
     invoked_arn_opt: &Option<String>,
     client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
+    invocation_context: &Arc<Mutex<InvocationContext>>,
 ) {
     let payloads = {
         let mut buf = buffer.lock().unwrap();
@@ -413,6 +423,29 @@ async fn process_agent_payloads(
     let mut error_count = 0;
 
     for payload_bytes in payloads {
+        // Extract trace ID from agent payload if collection is enabled
+        if config.new_relic.collect_trace_id {
+            debug!("NEW_RELIC_COLLECT_TRACE_ID is enabled, attempting to extract trace ID from {} byte payload", payload_bytes.len());
+            match trace::extract_trace_id_from_payload(&payload_bytes) {
+                Ok(Some(trace_id)) => {
+                    info!("Successfully extracted trace ID from agent payload: {}", trace_id);
+                    // Store trace ID in invocation context
+                    if let Ok(mut context) = invocation_context.lock() {
+                        context.trace_id = Some(trace_id);
+                        debug!("Updated invocation context with extracted trace ID");
+                    }
+                },
+                Ok(None) => {
+                    debug!("No trace ID found in agent payload");
+                },
+                Err(e) => {
+                    warn!("Failed to extract trace ID from agent payload: {}", e);
+                }
+            }
+        } else {
+            trace!("NEW_RELIC_COLLECT_TRACE_ID is disabled, skipping trace extraction");
+        }
+
         let Ok(payload_str) = String::from_utf8(payload_bytes) else {
             error!("Failed to decode payload as UTF-8 for request_id: {}", request_id);
             error_count += 1;
@@ -500,12 +533,28 @@ async fn register(client: &Client) -> Result<RegisterResponse> {
         .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?
         .to_string();
 
-    let mut register_response: RegisterResponse = resp
+    // Parse the response JSON to get the other fields (function_name, etc.)
+    let response_json: serde_json::Value = resp
         .json()
         .await
         .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    register_response.extension_id = extension_id;
+    let register_response = RegisterResponse {
+        extension_id,
+        function_name: response_json.get("functionName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        function_version: response_json.get("functionVersion")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        handler: response_json.get("handler")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+    };
+
     Ok(register_response)
 }
 

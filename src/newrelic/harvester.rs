@@ -50,6 +50,7 @@ impl Harvester {
     }
 
     /// Performs a final flush of all processors.
+    #[allow(dead_code)]
     pub async fn final_flush(&self) -> Result<()> {
         debug!("Performing final flush of all processors");
         let mut error_count = 0;

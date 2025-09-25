@@ -76,15 +76,21 @@ impl LogProcessor {
         let message = record.record.to_string();
         let mut attributes = serde_json::Map::new();
         
-        // Get request_id from the context
+        // Get request_id and trace_id from the context
         let context = self.invocation_context.lock().unwrap();
         let request_id = &context.request_id;
+        let trace_id = &context.trace_id;
         
         // Add AWS Lambda request ID
         attributes.insert("aws.lambda_request_id".to_string(), request_id.clone().into());
         
         // Add faas.execution (same as request_id)
         attributes.insert("faas.execution".to_string(), request_id.clone().into());
+        
+        // Only add trace ID if it's present (not None)
+        if let Some(ref trace_id_value) = trace_id {
+            attributes.insert("trace.id".to_string(), trace_id_value.clone().into());
+        }
         
         // Add newrelic.logPattern
         attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
@@ -99,17 +105,7 @@ impl LogProcessor {
         })
     }
 
-    /// Check if we should send logs immediately (simple batching)
-    pub fn should_send_immediately(&self) -> bool {
-        let batch = self.log_batch.lock().unwrap();
-        batch.len() >= 5 // Send every 5 logs
-    }
 
-    /// Get current batch size
-    pub fn get_batch_size(&self) -> usize {
-        let batch = self.log_batch.lock().unwrap();
-        batch.len()
-    }
 
     /// Simple synchronous send method - just send the data without complex async handling
     pub async fn send_and_clear_batch_simple(&self) -> Result<()> {

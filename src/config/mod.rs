@@ -45,6 +45,9 @@ pub struct NewRelicConfig {
 
     /// The interval at which to send data to New Relic
     pub harvest_interval: Duration,
+
+    /// Enable/disable trace ID collection from agent payloads
+    pub collect_trace_id: bool,
 }
 
 /// AWS Lambda specific configuration
@@ -121,6 +124,7 @@ impl Default for NewRelicConfig {
             telemetry_endpoint: "https://cloud-collector.newrelic.com/aws/lambda/v1".to_string(),
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
             harvest_interval: Duration::from_secs(2), // More frequent flushing
+            collect_trace_id: false, // Disabled by default
         }
     }
 }
@@ -168,6 +172,13 @@ impl ExtensionConfig {
         config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID").unwrap_or_default();
         config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
+        
+        // Parse the trace ID collection flag (accept true/false/1/0/yes/no case-insensitive)
+        fn parse_bool(s: &str) -> bool {
+            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+        let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
+        config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
 
@@ -193,9 +204,6 @@ impl ExtensionConfig {
             env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
 
         // Parse the optional boolean flags (accept true/false/1/0/yes/no case-insensitive)
-        fn parse_bool(s: &str) -> bool {
-            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        }
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
 
@@ -279,18 +287,24 @@ pub fn init_config() -> &'static ExtensionConfig {
             GLOBAL_CONFIG = Some(config);
         });
 
-        GLOBAL_CONFIG.as_ref().unwrap()
+        #[allow(static_mut_refs)]
+        {
+            GLOBAL_CONFIG.as_ref().unwrap()
+        }
     }
 }
 
 /// Get the global configuration
 pub fn get_config() -> &'static ExtensionConfig {
     unsafe {
-        GLOBAL_CONFIG
-            .as_ref()
-            .unwrap_or_else(|| {
+        #[allow(static_mut_refs)]
+        {
+            GLOBAL_CONFIG
+                .as_ref()
+                .unwrap_or_else(|| {
                 panic!("Configuration not initialized. Call init_config() first.");
             })
+        }
     }
 }
 

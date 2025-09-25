@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde_json::json;
 
 /// Creates sample function log events for testing
+#[allow(dead_code)]
 pub fn create_sample_function_logs() -> Vec<TelemetryRecord> {
     vec![
         TelemetryRecord {
@@ -28,6 +29,7 @@ pub fn create_sample_function_logs() -> Vec<TelemetryRecord> {
 }
 
 /// Creates sample extension log events for testing
+#[allow(dead_code)]
 pub fn create_sample_extension_logs() -> Vec<TelemetryRecord> {
     vec![
         TelemetryRecord {
@@ -43,6 +45,7 @@ pub fn create_sample_extension_logs() -> Vec<TelemetryRecord> {
 }
 
 /// Creates sample platform events for testing
+#[allow(dead_code)]
 pub fn create_sample_platform_events() -> Vec<TelemetryRecord> {
     vec![
         TelemetryRecord {
@@ -66,6 +69,7 @@ pub fn create_sample_platform_events() -> Vec<TelemetryRecord> {
 }
 
 /// Simulates processing telemetry records for testing
+#[allow(dead_code)]
 pub async fn simulate_telemetry_processing(
     log_processor: &crate::logs::processor::LogProcessor,
     platform_processor: &crate::platform::processor::PlatformProcessor,
