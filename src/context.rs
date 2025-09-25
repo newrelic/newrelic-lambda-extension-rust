@@ -5,6 +5,7 @@
 pub struct InvocationContext {
     pub invoked_function_arn: String,
     pub request_id: String,
+    pub trace_id: Option<String>,
 }
 
 impl Default for InvocationContext {
@@ -12,6 +13,7 @@ impl Default for InvocationContext {
         Self {
             invoked_function_arn: "arn:aws:lambda:unknown:unknown:function:unknown".to_string(),
             request_id: "unknown".to_string(),
+            trace_id: None,
         }
     }
 }
