@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
         tokio::join!(
             async {
                 Client::builder()
-                    .timeout(Duration::from_secs(30))
+                    .timeout(Duration::from_secs(10)) // Faster timeout for Lambda Runtime API
                     .build()
                     .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
             },
@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
     } else {
         // No license key - still need to register for no-op mode
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(10)) // Faster timeout for Lambda Runtime API
             .build()
             .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
         let registration = register(&client).await?;

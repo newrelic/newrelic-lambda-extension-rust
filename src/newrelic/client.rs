@@ -36,7 +36,12 @@ impl NewRelicClient {
             header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
         );
 
-        let client = Client::builder().default_headers(headers).build().unwrap();
+        let client = Client::builder()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_millis(2400)) // 2.4 second timeout for Lambda environment
+            .pool_idle_timeout(std::time::Duration::from_secs(10)) // Reset stale connections faster
+            .pool_max_idle_per_host(2) // Limit connection reuse
+            .build().unwrap();
 
         Self { client }
     }
@@ -114,6 +119,7 @@ impl NewRelicClient {
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload_json.to_string())
+                .timeout(std::time::Duration::from_millis(2400)) // 2.4s per-request timeout
                 .send()
                 .await;
 
@@ -148,7 +154,15 @@ impl NewRelicClient {
                 }
                 Err(e) => {
                     if retries == 0 {
-                        warn!("[agentsend] Network error: {}", e);
+                        // Classify common network errors for better debugging
+                        let error_msg = e.to_string();
+                        if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
+                            warn!("[agentsend] Connection issue (will retry): {}", e);
+                        } else if e.is_timeout() {
+                            warn!("[agentsend] Request timeout after 2.4s (will retry): {}", e);
+                        } else {
+                            warn!("[agentsend] Network error: {}", e);
+                        }
                     }
 
                     if retries < MAX_RETRIES {
@@ -188,6 +202,7 @@ impl NewRelicClient {
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
+                .timeout(std::time::Duration::from_millis(2400)) // 2.4s per-request timeout
                 .send()
                 .await;
 
@@ -225,7 +240,15 @@ impl NewRelicClient {
                 }
                 Err(e) => {
                     if retries == 0 {
-                        warn!("Network error: {}", e);
+                        // Classify common network errors for better debugging
+                        let error_msg = e.to_string();
+                        if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
+                            warn!("Connection issue (will retry): {}", e);
+                        } else if e.is_timeout() {
+                            warn!("Request timeout after 2.4s (will retry): {}", e);
+                        } else {
+                            warn!("Network error: {}", e);
+                        }
                     }
 
                     if retries < MAX_RETRIES {
