@@ -1,4 +1,4 @@
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
@@ -7,8 +7,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::{
-    io::Result,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 /// State of trace ID extraction for the current invocation
@@ -34,6 +34,11 @@ pub struct LogProcessor {
     /// Current state of trace ID extraction (only allocated if collection is enabled)
     trace_extraction_state: Option<Arc<Mutex<TraceIdExtractionState>>>,
 }
+
+/// Configuration constants for batching and retry logic
+const MAX_BATCH_SIZE: usize = 100; // Maximum logs per batch to avoid 413 errors
+const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
+const RETRY_DELAY_MS: u64 = 200; // Base retry delay in milliseconds
 
 impl LogProcessor {
     /// Creates a new LogProcessor.
@@ -87,7 +92,6 @@ impl LogProcessor {
                     drop(state); // Release lock before modifying buffer
                     let mut buffered = buffered_logs.lock().unwrap();
                     buffered.push(log_message);
-                    debug!("Buffering log while waiting for trace ID extraction. Buffered count: {}", buffered.len());
                     return;
                 }
             }
@@ -96,11 +100,6 @@ impl LogProcessor {
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
-            
-            // Only log batch size every 10th addition to reduce noise
-            if batch_size % 10 == 1 {
-                trace!("Added log to batch. Current batch size: {}", batch_size);
-            }
             
             // Send immediately if we have 3+ logs (simple batch condition)
             if batch_size >= 3 {
@@ -153,7 +152,7 @@ impl LogProcessor {
     }
 
     /// Called when a trace ID is extracted - updates all buffered logs and sends them
-    pub async fn on_trace_id_extracted(&self, trace_id: &str) -> Result<()> {
+    pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
             (&self.trace_extraction_state, &self.buffered_logs) else {
             return Ok(()); // Nothing to do if trace ID collection is disabled
@@ -169,29 +168,22 @@ impl LogProcessor {
         };
         
         if buffered_logs.is_empty() {
-            debug!("No buffered logs to update with trace ID: {}", trace_id);
             return Ok(());
         }
         
-        debug!("Updating {} buffered logs with trace ID: {}", buffered_logs.len(), trace_id);
+        debug!("Applied trace ID to {} buffered logs", buffered_logs.len());
         
         // Update all buffered logs with the trace ID
         for log in &mut buffered_logs {
             log.attributes.insert("trace.id".to_string(), trace_id.into());
         }
         
-        // Add buffered logs to the current batch
-        {
-            let mut batch = self.log_batch.lock().unwrap();
-            batch.extend(buffered_logs);
-        }
-        
-        // Send the batch immediately
-        self.send_and_clear_batch_simple().await
+        // Send buffered logs immediately with chunking and retry logic
+        self.send_buffered_logs_with_retry(buffered_logs).await
     }
 
     /// Called when trace ID extraction fails - sends all buffered logs without trace ID
-    pub async fn on_trace_id_extraction_failed(&self) -> Result<()> {
+    pub async fn on_trace_id_extraction_failed(&self) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
             (&self.trace_extraction_state, &self.buffered_logs) else {
             return Ok(()); // Nothing to do if trace ID collection is disabled
@@ -207,20 +199,13 @@ impl LogProcessor {
         };
         
         if buffered_logs.is_empty() {
-            debug!("No buffered logs to send after failed trace ID extraction");
             return Ok(());
         }
         
-        warn!("Sending {} buffered logs without trace ID due to extraction failure", buffered_logs.len());
+        warn!("Trace ID extraction failed - sending {} buffered logs without trace ID", buffered_logs.len());
         
-        // Add buffered logs to the current batch (without trace ID)
-        {
-            let mut batch = self.log_batch.lock().unwrap();
-            batch.extend(buffered_logs);
-        }
-        
-        // Send the batch immediately
-        self.send_and_clear_batch_simple().await
+        // Send buffered logs immediately with chunking and retry logic (without trace ID)
+        self.send_buffered_logs_with_retry(buffered_logs).await
     }
 
     /// Reset the trace ID collection state for a new invocation
@@ -234,7 +219,7 @@ impl LogProcessor {
 
     /// Called at the end of an invocation to flush any remaining buffered logs
     /// This ensures logs are not lost if trace ID was never extracted
-    pub async fn flush_buffered_logs_at_invocation_end(&self) -> Result<()> {
+    pub async fn flush_buffered_logs_at_invocation_end(&self) -> std::io::Result<()> {
         let Some(ref buffered_logs_arc) = self.buffered_logs else {
             return Ok(()); // Nothing to do if trace ID collection is disabled
         };
@@ -248,20 +233,61 @@ impl LogProcessor {
             return Ok(());
         }
         
-        warn!("Flushing {} buffered logs without trace ID - invocation ending without trace extraction", buffered_logs.len());
+        warn!("Invocation ended without trace ID extraction - flushing {} buffered logs", buffered_logs.len());
         
-        // Add buffered logs to the current batch without trace ID
-        {
-            let mut batch = self.log_batch.lock().unwrap();
-            batch.extend(buffered_logs);
-        }
-        
-        // Send the batch
-        self.send_and_clear_batch_simple().await
+        // Send buffered logs immediately with chunking and retry logic
+        self.send_buffered_logs_with_retry(buffered_logs).await
     }
 
-    /// Simple synchronous send method - just send the data without complex async handling
-    pub async fn send_and_clear_batch_simple(&self) -> Result<()> {
+    /// Send buffered logs directly with chunking and retry logic
+    /// This bypasses the regular batch to ensure immediate sending with proper context
+    async fn send_buffered_logs_with_retry(&self, logs: Vec<payload::LogMessage>) -> std::io::Result<()> {
+        if logs.is_empty() {
+            return Ok(());
+        }
+        
+        let client = Arc::clone(&self.newrelic_client);
+        let config = Arc::clone(&self.config);
+        let context = self.invocation_context.lock().unwrap().clone();
+        
+        // Split large batches into smaller chunks to avoid 413 errors
+        let chunks: Vec<Vec<payload::LogMessage>> = logs
+            .chunks(MAX_BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        
+        if chunks.len() > 1 {
+            debug!("Chunking {} buffered logs into {} batches", logs.len(), chunks.len());
+        }
+        
+        let mut failed_count = 0;
+        let mut successful_chunks = 0;
+        
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &context.invoked_function_arn, chunk_idx).await {
+                Ok(()) => {
+                    successful_chunks += 1;
+                },
+                Err(e) => {
+                    error!("Buffered logs send failed: {}", e);
+                    failed_count += chunk.len();
+                    // Don't accumulate failed logs - they will be dropped to prevent cross-invocation issues
+                }
+            }
+        }
+        
+        if successful_chunks > 0 {
+            info!("Successfully sent {} buffered log chunks", successful_chunks);
+        }
+        if failed_count > 0 {
+            warn!("Dropped {} buffered logs due to send failures", failed_count);
+        }
+        
+        Ok(())
+    }
+
+    /// Robust send method with chunking, retry logic, and proper error handling
+    pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
         let batch = {
             let mut batch_guard = self.log_batch.lock().unwrap();
             std::mem::take(&mut *batch_guard)
@@ -271,21 +297,89 @@ impl LogProcessor {
             return Ok(());
         }
 
-        debug!("Sending {} logs to New Relic", batch.len());
-        
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
         
-        // Send directly without spawning - simpler and more reliable
-        match client.send_logs(&config, batch, &context.invoked_function_arn).await {
-            Ok(()) => {
-                trace!("Successfully sent logs to New Relic");
-                Ok(())
-            },
-            Err(e) => {
-                error!("Failed to send logs: {}", e);
-                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+        // Split large batches into smaller chunks to avoid 413 errors
+        let chunks: Vec<Vec<payload::LogMessage>> = batch
+            .chunks(MAX_BATCH_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        
+        if chunks.len() > 1 {
+            debug!("Chunking {} logs into {} batches", batch.len(), chunks.len());
+        }
+        
+        let mut failed_logs = Vec::new();
+        let mut successful_chunks = 0;
+        
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &context.invoked_function_arn, chunk_idx).await {
+                Ok(()) => {
+                    successful_chunks += 1;
+                },
+                Err(e) => {
+                    error!("Log batch send failed: {}", e);
+                    // Store failed logs for potential retry in current invocation only
+                    // DO NOT carry over to next invocation to avoid request_id/trace_id pollution
+                    failed_logs.extend(chunk);
+                }
+            }
+        }
+        
+        if successful_chunks > 0 {
+            info!("Successfully sent {} log chunks", successful_chunks);
+        }
+        if !failed_logs.is_empty() {
+            warn!("Dropped {} logs to prevent cross-invocation pollution", failed_logs.len());
+            // Explicitly drop failed logs rather than risk sending them with wrong metadata
+            // in the next invocation
+        }
+        
+        Ok(())
+    }
+    
+    /// Send a single chunk with retry logic
+    async fn send_chunk_with_retry(
+        &self,
+        client: &NewRelicClient,
+        config: &ExtensionConfig,
+        chunk: Vec<payload::LogMessage>,
+        function_arn: &str,
+        _chunk_idx: usize,
+    ) -> std::io::Result<()> {
+        let mut retries = 0;
+        
+        loop {
+            match client.send_logs(config, chunk.clone(), function_arn).await {
+                Ok(()) => {
+                    return Ok(());
+                },
+                Err(e) => {
+                    if retries == 0 {
+                        warn!("Log send failed: {}", e);
+                    }
+                    
+                    // Check if this is a 413 (Payload Too Large) error
+                    if e.to_string().contains("413") || e.to_string().contains("Payload Too Large") {
+                        error!("Payload too large even after chunking - dropping {} logs", chunk.len());
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData, 
+                            "Payload too large even after chunking"
+                        ));
+                    }
+                    
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        let delay = Duration::from_millis(RETRY_DELAY_MS * (2_u64.pow(retries as u32 - 1)));
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    } else {
+                        error!("Max retries exceeded - dropping {} logs", chunk.len());
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                    }
+                }
             }
         }
     }
@@ -293,11 +387,11 @@ impl LogProcessor {
 
 #[async_trait]
 impl Flush for LogProcessor {
-    async fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> std::io::Result<()> {
         self.send_and_clear_batch_simple().await
     }
 
-    async fn final_flush(&self) -> Result<()> {
+    async fn final_flush(&self) -> std::io::Result<()> {
         self.send_and_clear_batch_simple().await
     }
 }

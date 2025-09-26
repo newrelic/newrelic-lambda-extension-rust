@@ -26,6 +26,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
+
+// Extension name and version from Cargo.toml
+const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
+const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
@@ -133,11 +137,8 @@ async fn main() -> Result<()> {
     
         // OPTIMIZATION: Extract license key FIRST before any other initialization
     let license_key = if !credentials_config.license_key.is_empty() {
-        debug!("Using license key from environment variable");
         Some(credentials_config.license_key.clone())
     } else if needs_aws {
-        debug!("Checking AWS credential sources for license key");
-        
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
                 debug!("Successfully obtained New Relic license key from AWS");
@@ -162,7 +163,6 @@ async fn main() -> Result<()> {
 
     // Log important configuration settings
     info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
-    debug!("Extension configuration loaded successfully");
 
     // --- 3. Parallel Initialization Phase (Now with license key ready) ---
     // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
@@ -192,19 +192,17 @@ async fn main() -> Result<()> {
     let client = Arc::new(client_result?);
     let registration = registration_result?;
 
-    debug!("Parallel initialization completed");
     info!("Extension ready");
 
     if !config.new_relic.extension_enabled || license_key.is_none() {
         // --- NO-OP MODE ---
         info!("Extension running in no-op mode");
         let ext_id = registration.extension_id.clone();
-        debug!("Extension registered with ID: {} (no-op mode)", ext_id);
+
 
         loop {
             match next_event(&client, &ext_id).await {
                 Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
                     break;
                 }
                 Ok(_) => { /* Ignore INVOKE events in no-op mode */ }
@@ -283,9 +281,7 @@ async fn main() -> Result<()> {
         });
 
         let ext_id = registration.extension_id.clone();
-        debug!("Extension registered with ID: {}", ext_id);
         subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
-        debug!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
 
         // State for tracking the previous invocation
         let mut last_request_id: Option<String> = None;
@@ -307,8 +303,6 @@ async fn main() -> Result<()> {
 
             match event_result {
                 Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
-                    trace!("Received INVOKE event for request ID: {}", request_id);
-                    
                     // Update the global context for other processors and reset trace ID state
                     {
                         let mut context = invocation_context.lock().unwrap();
@@ -323,23 +317,19 @@ async fn main() -> Result<()> {
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
                     // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
-                    trace!("Waiting for platform.runtimeDone signal...");
-                    
                     // Wait indefinitely for platform.runtimeDone - it's guaranteed to come
                     if let Some(_) = runtime_done_rx.recv().await {
-                        trace!("Received platform.runtimeDone signal");
                         // Wait additional 300-500ms buffer time for any final telemetry
                         tokio::time::sleep(Duration::from_millis(400)).await;
                     } else {
                         warn!("Runtime done channel closed unexpectedly");
                     }
                     
-                    // Check buffer size for debugging
+                    // Check if agent payloads are available
                     let buffer_size = {
                         let buffer = agent_payload_buffer.lock().unwrap();
                         buffer.len()
                     };
-                    trace!("Buffer contains {} payloads after runtime completion, processing now", buffer_size);
                     
                     if buffer_size == 0 {
                         warn!("[agentsend] No agent payloads found, agent may not be initialized or runtime handler not set");
@@ -365,11 +355,11 @@ async fn main() -> Result<()> {
                     last_invoked_arn = Some(invoked_function_arn);
                 }
                 Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
+                    info!("Extension shutting down: {}", shutdown_reason);
                     
                     harvester_handle.abort();
                     
-                    debug!("Performing FINAL flush of all logs and platform events...");
+                    // Perform final flush of all logs and platform events
                     if let Err(e) = log_processor.send_and_clear_batch_simple().await {
                         error!("Error during final log flush: {}", e);
                     }
@@ -389,7 +379,7 @@ async fn main() -> Result<()> {
                     ).await;
                     
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    debug!("Extension shutdown complete.");
+                    info!("Extension shutdown complete");
                     break;
                 }
                 Err(e) => {
@@ -422,7 +412,6 @@ async fn process_agent_payloads(
         // No agent payloads means no opportunity to extract trace ID
         // If trace ID collection is enabled, we should flush any buffered logs
         if config.new_relic.collect_trace_id {
-            debug!("No agent payloads received - flushing buffered logs without trace ID");
             if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
                 error!("Failed to handle no-payloads trace ID extraction failure: {}", e);
             }
@@ -435,7 +424,7 @@ async fn process_agent_payloads(
         return;
     };
 
-    debug!("Processing {} buffered agent payloads for request_id: {}", payloads.len(), request_id);
+    info!("Processing {} agent payloads", payloads.len());
 
     let function_name = invoked_arn.split(':').last().unwrap_or("");
     let log_group_name = format!("/aws/lambda/{}", function_name);
@@ -443,13 +432,11 @@ async fn process_agent_payloads(
     let mut success_count = 0;
     let mut error_count = 0;
     let mut trace_id_found = false;
-    let mut trace_extraction_attempted = false;
 
     for payload_bytes in payloads {
         // Extract trace ID from agent payload if collection is enabled
-        if config.new_relic.collect_trace_id && !trace_extraction_attempted {
-            debug!("NEW_RELIC_COLLECT_TRACE_ID is enabled, attempting to extract trace ID from {} byte payload", payload_bytes.len());
-            trace_extraction_attempted = true;
+        // Continue trying until we find one, then stop
+        if config.new_relic.collect_trace_id && !trace_id_found {
             
             match trace::extract_trace_id_from_payload(&payload_bytes) {
                 Ok(Some(trace_id)) => {
@@ -459,7 +446,6 @@ async fn process_agent_payloads(
                     // Store trace ID in invocation context
                     if let Ok(mut context) = invocation_context.lock() {
                         context.trace_id = Some(trace_id.clone());
-                        debug!("Updated invocation context with extracted trace ID");
                     }
                     
                     // Notify log processor that trace ID has been extracted
@@ -469,24 +455,13 @@ async fn process_agent_payloads(
                     }
                 },
                 Ok(None) => {
-                    debug!("No trace ID found in agent payload");
-                    // Notify log processor that extraction failed (no trace ID found)
-                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
-                        error!("Failed to handle trace ID extraction failure: {}", e);
-                    }
+                    // Continue to next payload to try extraction
                 },
                 Err(e) => {
                     warn!("Failed to extract trace ID from agent payload: {}", e);
-                    // Notify log processor that extraction failed (error occurred)
-                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
-                        error!("Failed to handle trace ID extraction failure: {}", e);
-                    }
+                    // Continue to next payload to try extraction
                 }
             }
-        } else if config.new_relic.collect_trace_id && trace_id_found {
-            trace!("Trace ID already found, skipping extraction for remaining payloads");
-        } else {
-            trace!("NEW_RELIC_COLLECT_TRACE_ID is disabled, skipping trace extraction");
         }
 
         let Ok(payload_str) = String::from_utf8(payload_bytes) else {
@@ -514,7 +489,7 @@ async fn process_agent_payloads(
                 function_name,
                 invoked_function_arn: invoked_arn,
                 log_group_name: log_group_name.clone(),
-                log_stream_name: "newrelic-lambda-extension:2.3.19",
+                log_stream_name: &format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION),
             },
             entry: entry_string,
         };
@@ -535,12 +510,19 @@ async fn process_agent_payloads(
         }
     }
     
-    // Summary logging instead of per-payload logging
+    // If trace ID collection was enabled but we didn't find one, handle failure
+    if config.new_relic.collect_trace_id && !trace_id_found {
+        if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
+            error!("Failed to handle trace ID extraction failure (no trace ID found in any payload): {}", e);
+        }
+    }
+    
+    // Summary logging
     if success_count > 0 {
-        trace!("Successfully sent {} agent payloads to New Relic for request_id: {}", success_count, request_id);
+        info!("Successfully sent {} agent payloads", success_count);
     }
     if error_count > 0 {
-        error!("Failed to send {} agent payloads for request_id: {}", error_count, request_id);
+        error!("Failed to send {} agent payloads", error_count);
     }
 }
 
@@ -656,11 +638,10 @@ async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> 
         .send()
         .await
         .map_err(|e| {
-            // Log more details about timeout errors
             if e.is_timeout() {
-                tracing::warn!("Timeout waiting for next Lambda event (this is normal during idle periods)");
+                warn!("Timeout waiting for next Lambda event (normal during idle periods)");
             } else {
-                tracing::error!("Network error getting next event: {}", e);
+                error!("Network error getting next event: {}", e);
             }
             Error::new(std::io::ErrorKind::Other, e)
         })?;

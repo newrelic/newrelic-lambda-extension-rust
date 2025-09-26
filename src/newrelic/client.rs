@@ -3,7 +3,14 @@ use reqwest::{header, Client, Error};
 use serde::Serialize;
 use tracing::{info, warn};
 
-const AGENT_TELEMETRY_ENDPOINT: &str = "https://staging-cloud-collector.newrelic.com/aws/lambda/v1";
+// Extension name and version from Cargo.toml
+const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
+const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Helper function to get extension name with version
+fn get_extension_name_with_version() -> String {
+    format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+}
 
 #[derive(Debug)]
 pub struct NewRelicClient {
@@ -24,6 +31,10 @@ impl NewRelicClient {
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
         );
+        headers.insert(
+            "User-Agent",
+            header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
+        );
 
         let client = Client::builder().default_headers(headers).build().unwrap();
 
@@ -42,16 +53,16 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        info!("Sending {} log entries to New Relic", batch.len());
-        
         // Validate license key
         if config.new_relic.license_key.is_none() {
             warn!("New Relic license key is not set, skipping log send");
             return Ok(());
         }
 
+        info!("Sending {} log messages to NR", batch.len());
+
         let mut common_attributes = serde_json::Map::new();
-        common_attributes.insert("plugin".to_string(), serde_json::json!("newrelic-lambda-extension:2.3.23"));
+        common_attributes.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
         
@@ -59,8 +70,6 @@ impl NewRelicClient {
             common: payload::Common { attributes: common_attributes },
             logs: batch,
         }];
-
-        info!("Log payload created, sending to endpoint: {}", &config.new_relic.log_endpoint);
         self.send_payload(&config.new_relic.log_endpoint, &log_data).await
     }
 
@@ -76,8 +85,7 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        info!("Sending platform events to New Relic");
-        info!("Platform payload created, sending to endpoint: {}", &config.new_relic.telemetry_endpoint);
+        info!("Sending platform events to NR");
         self.send_payload(&config.new_relic.telemetry_endpoint, &payload).await
     }
 
@@ -92,19 +100,18 @@ impl NewRelicClient {
             return Ok(());
         }
         
-        info!("[agentsend] Sending agent payload to endpoint: {}", AGENT_TELEMETRY_ENDPOINT);
-        info!("[agentsend] Agent payload size: {} bytes", payload_json.len());
-
+        let start_time = std::time::Instant::now();
+        let payload_size = payload_json.len();
+        info!("[agentsend] Sending agent payload to NR: {} bytes", payload_size);
+        
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
 
         loop {
-            info!("[agentsend] Attempt {} of {} to send agent payload to New Relic", retries + 1, MAX_RETRIES + 1);
             
             let res = self.client
-                .post(AGENT_TELEMETRY_ENDPOINT)
+                .post(&config.new_relic.telemetry_endpoint)
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
-                .header("User-Agent", "newrelic-lambda-extension")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload_json.to_string())
                 .send()
@@ -113,41 +120,43 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    info!("[agentsend] Received response with status: {}", status);
                     
                     if status.is_success() {
-                        info!("[agentsend] Successfully sent agent payload to New Relic! Status: {}", status);
+                        let duration = start_time.elapsed();
+                        info!("[agentsend] Successfully sent agent payload - size: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
+                        if retries == 0 {
+                            warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
+                        }
                         
                         if status.is_client_error() {
-                            warn!("[agentsend] Client error (4xx), not retrying agent payload");
+                            warn!("[agentsend] Client error (4xx), not retrying");
                             return Ok(());
                         }
                         
                         if retries < MAX_RETRIES {
                             retries += 1;
-                            let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                            warn!("[agentsend] Retrying agent payload in {}ms...", delay.as_millis());
+                            let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
                             tokio::time::sleep(delay).await;
                         } else {
-                            warn!("[agentsend] Max retries for agent payload exceeded, giving up");
+                            warn!("[agentsend] Max retries exceeded");
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("[agentsend] Network error sending agent payload: {}", e);
+                    if retries == 0 {
+                        warn!("[agentsend] Network error: {}", e);
+                    }
 
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                        warn!("[agentsend] Network error, retrying agent payload in {}ms...", delay.as_millis());
+                        let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
                         tokio::time::sleep(delay).await;
                     } else {
-                        warn!("[agentsend] Max network retries for agent payload exceeded, giving up");
+                        warn!("[agentsend] Max network retries exceeded");
                         return Err(e);
                     }
                 }
@@ -157,6 +166,7 @@ impl NewRelicClient {
 
     /// Sends a JSON payload to a specified endpoint.
     async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<(), Error> {
+        let start_time = std::time::Instant::now();
         let body = match serde_json::to_string(payload) {
             Ok(json) => json,
             Err(e) => {
@@ -165,15 +175,14 @@ impl NewRelicClient {
             }
         };
 
-        info!("Sending payload to endpoint: {}", endpoint);
-        info!("Payload size: {} bytes", body.len());
-        
+        let payload_size = body.len();
+        info!("Sending payload to NR endpoint: {} bytes", payload_size);
+
         // Retry logic with exponential backoff
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
         
         loop {
-            info!("Attempt {} of {} to send data to New Relic", retries + 1, MAX_RETRIES + 1);
             
             let res = self.client
                 .post(endpoint)
@@ -185,14 +194,16 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    info!("Received response with status: {}", status);
                     
                     if status.is_success() {
-                        info!("Successfully sent data to New Relic! Status: {}", status);
+                        let duration = start_time.elapsed();
+                        info!("Successfully sent payload to NR - size: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        warn!("Failed to send data to New Relic. Status: {}, Response: {}", status, response_text);
+                        if retries == 0 {
+                            warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
+                        }
                         
                         // Don't retry on client errors (4xx)
                         if status.is_client_error() {
@@ -203,27 +214,27 @@ impl NewRelicClient {
                         // Retry on server errors (5xx) or other issues
                         if retries < MAX_RETRIES {
                             retries += 1;
-                            let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                            warn!("Retrying in {}ms...", delay.as_millis());
+                            let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
-                            warn!("Max retries exceeded, giving up");
+                            warn!("Max retries exceeded");
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
-                    warn!("Network error sending data to New Relic: {}", e);
+                    if retries == 0 {
+                        warn!("Network error: {}", e);
+                    }
 
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = std::time::Duration::from_millis(1000 * retries as u64);
-                        warn!("Network error, retrying in {}ms...", delay.as_millis());
+                        let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
-                        warn!("Max network retries exceeded, giving up");
+                        warn!("Max network retries exceeded");
                         return Err(e);
                     }
                 }

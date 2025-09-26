@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -70,7 +70,7 @@ pub async fn setup_telemetry_listener(
         }
     });
 
-    debug!("Telemetry listener started on {}", local_addr);
+    info!("Telemetry listener started on {}", local_addr);
     Ok(local_addr)
 }
 
@@ -93,15 +93,11 @@ async fn handle_telemetry_request(
     
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
 
-    trace!("Received telemetry data: {} bytes", body_str.len());
+
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
-            if records.len() > 10 {
-                trace!("Processing {} telemetry records (batch)", records.len());
-            } else if records.len() > 0 {
-                trace!("Processing {} telemetry records", records.len());
-            }
+
             
             let mut function_completed = false;
             let mut runtime_done_received = false;
@@ -120,13 +116,13 @@ async fn handle_telemetry_request(
                         log_processor.process_record(record);
                     }
                     "platform.runtimeDone" => {
-                        debug!("Runtime completed, signaling agent telemetry processing");
+
                         platform_processor.process_record(record);
                         runtime_done_received = true;
                         function_completed = true;
                     }
                     "platform.report" | "platform.end" => {
-                        debug!("Function execution completed ({})", record.record_type);
+
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
@@ -149,14 +145,14 @@ async fn handle_telemetry_request(
                     if let Err(e) = tx.send(()) {
                         warn!("Failed to send runtime done signal: {}", e);
                     } else {
-                        trace!("Sent runtime done signal to main loop for agent telemetry processing");
+
                     }
                 }
             }
             
             // If function execution completed, send all accumulated data immediately
             if function_completed {
-                debug!("Function execution completed, flushing data");
+
                 let log_proc_clone = Arc::clone(&log_processor);
                 let platform_proc_clone = Arc::clone(&platform_processor);
                 
@@ -172,7 +168,7 @@ async fn handle_telemetry_request(
         }
         Err(e) => {
             error!("Failed to parse telemetry records: {}", e);
-            trace!("Raw telemetry data that failed to parse: {}", body_str);
+
         }
     }
 
