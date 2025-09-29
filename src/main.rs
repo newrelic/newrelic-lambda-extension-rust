@@ -300,9 +300,23 @@ async fn main() -> Result<()> {
                 &invocation_context,
                 &log_processor
             ).await;
+            
+            // After processing previous invocation's payloads, ensure ALL buffers are flushed 
+            // before clearing the request_id for the new invocation
+            if last_request_id.is_some() {
+                // Flush all remaining logs/buffers to ensure nothing is lost
+                if let Err(e) = log_processor.flush_all_buffers_before_clear().await {
+                    error!("Error flushing all buffers before clearing request_id: {}", e);
+                }
+                
+                // Now safe to clear request_id - logs will be buffered for new invocation
+                log_processor.clear_request_id();
+            }
 
             match event_result {
                 Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
+                    let invocation_start_time = chrono::Utc::now();
+                    
                     // Update the global context for other processors and reset trace ID state
                     {
                         let mut context = invocation_context.lock().unwrap();
@@ -311,8 +325,23 @@ async fn main() -> Result<()> {
                         context.trace_id = None; // Reset trace ID for new invocation
                     }
                     
-                    // Reset log processor trace ID state for new invocation
+                    // Set invocation start time for timestamp filtering
+                    log_processor.set_invocation_start_time(invocation_start_time);
+                    
+                    // Reset log processor trace ID state for new invocation  
                     log_processor.reset_trace_id_state();
+                    
+                    // Retry any failed logs from previous invocations before starting new one
+                    if let Err(e) = log_processor.retry_failed_logs_before_invocation().await {
+                        error!("Error retrying failed logs: {}", e);
+                    }
+                    
+                    // Process any logs that were buffered waiting for this request_id
+                    if let Err(e) = log_processor.on_request_id_available(&request_id).await {
+                        error!("Error processing buffered logs with request_id: {}", e);
+                    }
+                    
+                    info!("New invocation started - request_id: {}, timestamp: {}", request_id, invocation_start_time);
 
                     platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                     
