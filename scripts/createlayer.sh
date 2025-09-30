@@ -101,8 +101,10 @@ build_nodejs_layer() {
   rm -rf "$LAYER_DIR"
   mkdir -p "$LAYER_DIR/nodejs/node_modules"
 
-  npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
-  
+  # npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
+  npm install --install-strategy=nested --prefix $LAYER_DIR/nodejs newrelic@latest
+  rm -rf $LAYER_DIR/nodejs/node_modules/newrelic/node_modules/@opentelemetry
+
   # Create the newrelic-lambda-wrapper as a proper Node.js module
   mkdir -p "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper"
   cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/index.js"

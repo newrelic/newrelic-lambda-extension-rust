@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{ error, info, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -92,8 +92,6 @@ async fn handle_telemetry_request(
     };
     
     let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
-
-
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
@@ -177,4 +175,3 @@ async fn handle_telemetry_request(
         .body(Full::new(Bytes::from("OK")))
         .unwrap())
 }
-

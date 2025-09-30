@@ -38,7 +38,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::{debug, warn};
+use tracing::warn;
 use crate::config::Configuration;
 
 /// License key secret structure for JSON parsing
@@ -215,7 +215,7 @@ fn decode_license_key(raw_json: &str) -> Result<String> {
     let secret: LicenseKeySecret = serde_json::from_str(raw_json)?;
     
     if secret.license_key.is_empty() {
-        return Err(anyhow!("malformed license key secret; missing \"LicenseKey\" attribute"));
+        return Err(anyhow!("malformed license key secret; missing LicenseKey attribute"));
     }
     
     Ok(secret.license_key)

@@ -1,4 +1,5 @@
-use tracing::{debug, error, info, trace, warn};
+
+use tracing::{debug, error, info, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
@@ -47,6 +48,7 @@ const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
 const RETRY_DELAY_MS: u64 = 200; // Base retry delay in milliseconds
 
 impl LogProcessor {
+    
     /// Creates a new LogProcessor.
     pub fn new(
         newrelic_client: Arc<NewRelicClient>,
@@ -75,7 +77,9 @@ impl LogProcessor {
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
-
+    pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
+        Arc::clone(&self.invocation_context)
+    }
     /// Updates the invocation start time (called when new invocation begins)
     pub fn set_invocation_start_time(&self, start_time: chrono::DateTime<chrono::Utc>) {
         *self.invocation_start_time.lock().unwrap() = start_time;
@@ -164,24 +168,8 @@ impl LogProcessor {
             return;
         }
 
-        // Filter out telemetry that's older than current invocation start time
-        // This prevents late telemetry from previous invocations getting wrong request_id
-        let is_current_invocation = {
-            let context = self.invocation_context.lock().unwrap();
-            let invocation_start = *self.invocation_start_time.lock().unwrap();
-            if context.request_id == "unknown" {
-                true // No active invocation yet, accept all logs for buffering
-            } else {
-                // Only accept logs that are from current invocation timeframe (no tolerance)
-                record.time >= invocation_start
-            }
-        };
-
-        if !is_current_invocation {
-            debug!("Filtering out late telemetry from previous invocation: timestamp={}, message='{}'", 
-                   record.time, message_str);
-            return;
-        }
+        // Remove the timestamp filtering logic - we should flush old logs properly instead
+        // The main.rs should handle flushing previous invocation logs before processing new ones
 
         if let Some(mut log_message) = self.to_log_message(record) {
             // First check: Do we have a valid request_id?
@@ -444,6 +432,70 @@ impl LogProcessor {
         Ok(())
     }
 
+    /// Flush all buffers with the previous invocation's context before starting new invocation
+    /// This ensures logs from previous invocation get the correct request_id and trace_id
+    pub async fn flush_with_previous_context(
+        &self, 
+        previous_request_id: &str, 
+        previous_trace_id: Option<&str>
+    ) -> std::io::Result<()> {
+        // Flush request_id buffer with previous context
+        let mut request_buffered_logs = {
+            let mut buffered = self.request_id_buffer.lock().unwrap();
+            std::mem::take(&mut *buffered)
+        };
+
+        // Update request_id buffered logs with previous context
+        for log_message in &mut request_buffered_logs {
+            log_message.attributes.insert("aws.lambda_request_id".to_string(), 
+                            serde_json::Value::String(previous_request_id.to_string()));
+            log_message.attributes.insert("faas.execution".to_string(), 
+                            serde_json::Value::String(previous_request_id.to_string()));
+            if let Some(trace_id) = previous_trace_id {
+                log_message.attributes.insert("trace.id".to_string(), 
+                                serde_json::Value::String(trace_id.to_string()));
+            }
+        }
+
+        // Flush trace_id buffer with previous context if enabled
+        let mut trace_buffered_logs = if let Some(ref buffered_logs_arc) = self.buffered_logs {
+            let mut buffered = buffered_logs_arc.lock().unwrap();
+            std::mem::take(&mut *buffered)
+        } else {
+            Vec::new()
+        };
+
+        // Update trace_id buffered logs with previous context
+        for log_message in &mut trace_buffered_logs {
+            if let Some(trace_id) = previous_trace_id {
+                log_message.attributes.insert("trace.id".to_string(), 
+                                serde_json::Value::String(trace_id.to_string()));
+            }
+        }
+
+        // Combine all logs and send them
+        let mut all_logs = request_buffered_logs;
+        all_logs.extend(trace_buffered_logs);
+
+        // Also flush current batch
+        let current_batch = {
+            let mut batch_guard = self.log_batch.lock().unwrap();
+            std::mem::take(&mut *batch_guard)
+        };
+        all_logs.extend(current_batch);
+
+        if !all_logs.is_empty() {
+            info!("Flushing {} logs with previous invocation context (request_id: {})", 
+                  all_logs.len(), previous_request_id);
+            self.send_buffered_logs_with_retry(all_logs).await?;
+        }
+
+        // Reset trace ID state for new invocation
+        self.reset_trace_id_state();
+
+        Ok(())
+    }
+
     /// Clear the request_id when the invocation is complete
     /// This ensures logs are buffered again for the next invocation until new request_id arrives
     pub fn clear_request_id(&self) {
@@ -653,8 +705,6 @@ impl LogProcessor {
             }
         }
     }
-
-
 }
 
 #[async_trait]
@@ -667,4 +717,3 @@ impl Flush for LogProcessor {
         self.send_and_clear_batch_simple().await
     }
 }
-
