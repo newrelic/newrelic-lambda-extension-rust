@@ -877,8 +877,8 @@ fn create_wrapped_agent_payload_json(
     create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id)
 }
 
-/// Create New Relic log format with agent data in message field and Lambda context
-/// Returns stringified JSON with both log events and Lambda context information
+/// Create New Relic format with Lambda context and stringified log events in entry field
+/// Returns JSON with context and entry fields matching New Relic expected format
 fn create_newrelic_log_format(
     agent_data: &[u8],
     function_name: &str,
@@ -896,14 +896,8 @@ fn create_newrelic_log_format(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Create New Relic payload with both Lambda context and log events
-    let payload = serde_json::json!({
-        "context": {
-            "function_name": function_name,
-            "invoked_function_arn": invoked_function_arn,
-            "log_group_name": log_group_name,
-            "log_stream_name": request_id
-        },
+    // Create the log events structure first
+    let log_events_payload = serde_json::json!({
         "logEvents": [{
             "id": request_id,
             "message": agent_data_str,
@@ -915,8 +909,22 @@ fn create_newrelic_log_format(
         "owner": ""
     });
 
-    // Convert to string and return the stringified JSON (this is what New Relic expects)
-    payload.to_string()
+    // Stringify the log events payload to put in entry field
+    let log_events_string = log_events_payload.to_string();
+
+    // Create final payload with context and stringified entry
+    let final_payload = serde_json::json!({
+        "context": {
+            "function_name": function_name,
+            "invoked_function_arn": invoked_function_arn,
+            "log_group_name": log_group_name,
+            "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+        },
+        "entry": log_events_string
+    });
+
+    // Convert to string and return
+    final_payload.to_string()
 }
 
 /// Registers the extension with the Lambda Runtime API.
