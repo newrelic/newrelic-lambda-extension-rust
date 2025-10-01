@@ -35,6 +35,23 @@ impl PlatformProcessor {
         }
     }
 
+    /// Creates a no-op PlatformProcessor for disabled mode.
+    pub fn new_noop() -> Self {
+        use crate::config::ExtensionConfig;
+        use crate::context::InvocationContext;
+        
+        let noop_config = Arc::new(ExtensionConfig::default());
+        let noop_invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+        let noop_client = Arc::new(NewRelicClient::new_noop());
+        
+        Self {
+            platform_events_batch: Mutex::new(Vec::new()),
+            newrelic_client: noop_client,
+            config: noop_config,
+            invocation_context: noop_invocation_context,
+        }
+    }
+
     /// Processes a single platform telemetry record.
     pub fn process_record(&self, record: TelemetryRecord) {
         

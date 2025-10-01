@@ -46,6 +46,15 @@ impl NewRelicClient {
         Self { client }
     }
 
+    /// Creates a no-op New Relic client for disabled mode.
+    pub fn new_noop() -> Self {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_millis(100)) // Very short timeout for no-op
+            .build().unwrap();
+
+        Self { client }
+    }
+
     /// Sends a batch of logs to New Relic.
     pub async fn send_logs(
         &self,

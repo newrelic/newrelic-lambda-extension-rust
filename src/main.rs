@@ -18,7 +18,7 @@ mod test_telemetry;
 
 use std::{
     env,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -28,7 +28,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 use reqwest::Client;
-use base64::{Engine as _, engine::general_purpose};
+// Removed base64 import - no longer needed for agent payload handling
 
 use crate::{
     context::InvocationContext,
@@ -51,15 +51,34 @@ const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
-// --- Global state for warm starts (like Go's global vars) ---
-static mut INVOKED_FUNCTION_ARN: Option<String> = None;
-static mut LAST_REQUEST_ID: Option<String> = None;
+// --- Global state for warm starts (safer approach) ---
+static INVOKED_FUNCTION_ARN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static LAST_REQUEST_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+// --- Cold start initialization state ---
+static IS_COLD_START: OnceLock<Mutex<bool>> = OnceLock::new();
 
 // --- Lazy-initialized global components (initialized once during cold start) ---
 static INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = 
     Lazy::new(|| Arc::new(Mutex::new(InvocationContext::default())));
 static AGENT_PAYLOAD_BUFFER: Lazy<Arc<Mutex<Vec<Vec<u8>>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+// --- Cold start components (initialized once, reused across invocations) ---
+static EXTENSION_COMPONENTS: OnceLock<Mutex<Option<ExtensionComponents>>> = OnceLock::new();
+
+// Structure to hold all initialized components for warm starts
+#[derive(Debug)]
+struct ExtensionComponents {
+    client: Arc<Client>,
+    extension_id: String,
+    log_processor: Arc<LogProcessor>,
+    platform_processor: Arc<PlatformProcessor>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<config::ExtensionConfig>,
+    runtime_done_rx: mpsc::UnboundedReceiver<()>,
+    harvester_handle: tokio::task::JoinHandle<()>,
+}
 
 // --- Structs for API Responses ---
 
@@ -139,12 +158,44 @@ async fn main() -> std::io::Result<()> {
 async fn run_extension_safely() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let extension_startup_time = std::time::Instant::now();
     
+    // Check if this is a cold start or warm start
+    let is_cold_start = {
+        let cold_start_mutex = IS_COLD_START.get_or_init(|| Mutex::new(true));
+        let cold_start = cold_start_mutex.lock().unwrap();
+        *cold_start
+    };
+    
+    if is_cold_start {
+        info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
+        
+        // Perform cold start initialization
+        perform_cold_start_initialization(extension_startup_time).await?;
+        
+        // Mark as no longer cold start for subsequent invocations
+        {
+            let cold_start_mutex = IS_COLD_START.get().unwrap();
+            let mut cold_start = cold_start_mutex.lock().unwrap();
+            *cold_start = false;
+        }
+    } else {
+        info!("=== WARM START: Reusing initialized extension components ===");
+    }
+    
+    // Enter main event loop for both cold and warm starts
+    let total_events_processed = execute_main_event_loop().await;
+    
+    // Cleanup on shutdown (only happens once per container lifecycle)
+    perform_extension_shutdown_cleanup(total_events_processed, extension_startup_time).await;
+    
+    Ok(())
+}
+
+/// Perform all cold start initialization - called only once per container
+async fn perform_cold_start_initialization(extension_startup_time: std::time::Instant) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize config first (this sets up logging)
     let config = config::init_config().clone();
     let config = Arc::new(config);
     
-    info!("Initializing version {} of the New Relic Lambda Extension...", EXTENSION_VERSION);
-
     // --- COLD START PHASE: Maximum parallel initialization ---
     
     // 1. PARALLEL: License key resolution
@@ -153,9 +204,24 @@ async fn run_extension_safely() -> Result<(), Box<dyn std::error::Error + Send +
 
     // 2. Early exit for disabled extension (no-op mode)
     if !config.new_relic.extension_enabled {
-        info!("Extension telemetry processing disabled");
+        info!("Extension telemetry processing disabled - entering no-op mode");
         let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
-        execute_noop_event_loop(&client, &extension_id).await;
+        
+        // Store no-op components for warm starts
+        {
+            let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
+            let mut components = components_mutex.lock().unwrap();
+            *components = Some(ExtensionComponents {
+                client,
+                extension_id,
+                log_processor: Arc::new(LogProcessor::new_noop()),
+                platform_processor: Arc::new(PlatformProcessor::new_noop()),
+                newrelic_client: Arc::new(NewRelicClient::new_noop()),
+                config: config.clone(),
+                runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+                harvester_handle: tokio::spawn(async {}),
+            });
+        }
         return Ok(());
     }
 
@@ -163,7 +229,22 @@ async fn run_extension_safely() -> Result<(), Box<dyn std::error::Error + Send +
     let Some(license_key) = license_key_option else {
         warn!("No license key available. Running in no-op mode.");
         let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
-        execute_noop_event_loop(&client, &extension_id).await;
+        
+        // Store no-op components for warm starts
+        {
+            let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
+            let mut components = components_mutex.lock().unwrap();
+            *components = Some(ExtensionComponents {
+                client,
+                extension_id,
+                log_processor: Arc::new(LogProcessor::new_noop()),
+                platform_processor: Arc::new(PlatformProcessor::new_noop()),
+                newrelic_client: Arc::new(NewRelicClient::new_noop()),
+                config: config.clone(),
+                runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+                harvester_handle: tokio::spawn(async {}),
+            });
+        }
         return Ok(());
     };
 
@@ -244,22 +325,24 @@ async fn run_extension_safely() -> Result<(), Box<dyn std::error::Error + Send +
         config.new_relic.harvest_interval,
     );
 
-    info!("Extension ready (cold start duration: {:?})", extension_startup_time.elapsed());
+    // 11. Store all initialized components for warm starts
+    {
+        let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
+        let mut components = components_mutex.lock().unwrap();
+        *components = Some(ExtensionComponents {
+            client,
+            extension_id,
+            log_processor,
+            platform_processor,
+            newrelic_client,
+            config,
+            runtime_done_rx,
+            harvester_handle,
+        });
+    }
 
-    // 11. Enter main event loop - THIS IS WHERE WARM STARTS LIVE
-    let total_events_processed = execute_main_telemetry_processing_loop(
-        &client,
-        &extension_id,
-        runtime_done_rx,
-        log_processor,
-        platform_processor,
-        newrelic_client,
-        config,
-    ).await;
-
-    // 12. Cleanup on shutdown
-    perform_extension_shutdown_cleanup(harvester_handle, total_events_processed, extension_startup_time).await;
-
+    info!("Cold start initialization complete (duration: {:?})", extension_startup_time.elapsed());
+    
     Ok(())
 }
 
@@ -340,17 +423,29 @@ fn start_harvester_background_task(
     })
 }
 
+/// Main event loop - handles both cold start (first call) and warm starts (subsequent calls)
+async fn execute_main_event_loop() -> u32 {
+    // Get components (either from cold start initialization or reuse from previous invocations)
+    let components_mutex = EXTENSION_COMPONENTS.get()
+        .expect("Extension components should be initialized during cold start");
+    let mut components_guard = components_mutex.lock().unwrap();
+    let components = components_guard.as_mut()
+        .expect("Extension components should be initialized during cold start");
+
+    // Check if this is a no-op mode
+    if !components.config.new_relic.extension_enabled || components.config.new_relic.license_key.is_none() {
+        info!("Running in no-op mode");
+        execute_noop_event_loop(&components.client, &components.extension_id).await;
+        return 0;
+    }
+
+    // Execute main telemetry processing loop
+    execute_main_telemetry_processing_loop(components).await
+}
+
 /// Main telemetry processing event loop - where warm starts spend their time
-/// Equivalent to Go's mainLoop function
-async fn execute_main_telemetry_processing_loop(
-    client: &Arc<Client>,
-    extension_id: &str,
-    mut runtime_done_rx: mpsc::UnboundedReceiver<()>,
-    log_processor: Arc<LogProcessor>,
-    platform_processor: Arc<PlatformProcessor>,
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<config::ExtensionConfig>,
-) -> u32 {
+/// Equivalent to Go's mainLoop function  
+async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut previous_invocation_context: Option<(String, String)> = None;
 
@@ -362,19 +457,19 @@ async fn execute_main_telemetry_processing_loop(
         // Process any remaining agent payloads from previous invocation
         process_previous_invocation_agent_payloads(
             &previous_invocation_context,
-            &newrelic_client,
-            &config,
-            &log_processor
+            &components.newrelic_client,
+            &components.config,
+            &components.log_processor
         ).await;
         
         // Clear request_id after processing previous invocation's payloads
         if previous_invocation_context.is_some() {
-            flush_all_buffers_before_request_id_reset(&log_processor).await;
-            log_processor.clear_request_id();
+            flush_all_buffers_before_request_id_reset(&components.log_processor).await;
+            components.log_processor.clear_request_id();
         }
 
         // Fetch next Lambda runtime event (WARM START: Only real network call)
-        let runtime_event = match fetch_next_lambda_runtime_event(client, extension_id).await {
+        let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
             Ok(event) => event,
             Err(e) => {
                 error!("Error receiving next event: {:?}. Continuing.", e);
@@ -392,11 +487,11 @@ async fn execute_main_telemetry_processing_loop(
                 process_lambda_invocation_event(
                     &request_id,
                     &invoked_function_arn,
-                    &log_processor,
-                    &platform_processor,
-                    &mut runtime_done_rx,
-                    &newrelic_client,
-                    &config,
+                    &components.log_processor,
+                    &components.platform_processor,
+                    &mut components.runtime_done_rx,
+                    &components.newrelic_client,
+                    &components.config,
                 ).await;
                 
                 // Save context for next iteration
@@ -406,8 +501,8 @@ async fn execute_main_telemetry_processing_loop(
                 info!("Extension shutting down: {}", shutdown_reason);
                 
                 // Final cleanup
-                perform_final_telemetry_flush(&log_processor, &platform_processor).await;
-                process_final_agent_payloads(&previous_invocation_context, &newrelic_client, &config, &log_processor).await;
+                perform_final_telemetry_flush(&components.log_processor, &components.platform_processor).await;
+                process_final_agent_payloads(&previous_invocation_context, &components.newrelic_client, &components.config, &components.log_processor).await;
                 
                 break;
             }
@@ -456,10 +551,15 @@ async fn process_lambda_invocation_event(
 
 /// Update global invocation context
 fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str, invocation_start_time: chrono::DateTime<chrono::Utc>) {
-    // Update global state (like Go's global vars)
-    unsafe {
-        INVOKED_FUNCTION_ARN = Some(invoked_function_arn.to_string());
-        LAST_REQUEST_ID = Some(request_id.to_string());
+    // Update global state (safe approach)
+    {
+        let arn_mutex = INVOKED_FUNCTION_ARN.get_or_init(|| Mutex::new(None));
+        let mut arn = arn_mutex.lock().unwrap();
+        *arn = Some(invoked_function_arn.to_string());
+        
+        let request_id_mutex = LAST_REQUEST_ID.get_or_init(|| Mutex::new(None));
+        let mut last_request_id = request_id_mutex.lock().unwrap();
+        *last_request_id = Some(request_id.to_string());
     }
 
     // Update shared context
@@ -637,12 +737,18 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
 
 /// Perform extension shutdown cleanup
 async fn perform_extension_shutdown_cleanup(
-    harvester_handle: tokio::task::JoinHandle<()>,
     total_events_processed: u32,
     extension_startup_time: std::time::Instant,
 ) {
     info!("New Relic Extension shutting down after {} events", total_events_processed);
-    harvester_handle.abort();
+    
+    // Get harvester handle from global components if available
+    if let Some(components_mutex) = EXTENSION_COMPONENTS.get() {
+        let components_guard = components_mutex.lock().unwrap();
+        if let Some(components) = components_guard.as_ref() {
+            components.harvester_handle.abort();
+        }
+    }
     
     let shutdown_at = std::time::Instant::now();
     let total_runtime = shutdown_at.duration_since(extension_startup_time);
@@ -714,7 +820,8 @@ async fn process_agent_payloads_with_context(
             }
         }
 
-        let wrapped_payload_json = create_wrapped_agent_payload_json(
+        // Wrap whatever the agent sent (payload, message, etc.) and send it
+        let wrapped_agent_data_json = create_wrapped_agent_payload_json(
             &payload_bytes,
             function_name,
             invoked_arn,
@@ -722,7 +829,7 @@ async fn process_agent_payloads_with_context(
             request_id,
         );
 
-        match client.send_agent_payload(config, &wrapped_payload_json).await {
+        match client.send_agent_payload(config, &wrapped_agent_data_json).await {
             Ok(_) => {
                 success_count += 1;
                 debug!("Successfully sent agent payload {} for request_id: {}", success_count, request_id);
@@ -744,7 +851,9 @@ async fn process_agent_payloads_with_context(
     info!("Agent payload processing complete: {} success, {} errors", success_count, error_count);
 }
 
-/// Create wrapped payload for agent telemetry as JSON string
+/// Create wrapped agent payload JSON string
+/// Create New Relic log format with agent data in message field
+/// Only extract trace ID if enabled via environment variable
 fn create_wrapped_agent_payload_json(
     payload_bytes: &[u8],
     function_name: &str,
@@ -752,19 +861,62 @@ fn create_wrapped_agent_payload_json(
     log_group_name: &str,
     request_id: &str,
 ) -> String {
-    let context = serde_json::json!({
-        "function_name": function_name,
-        "invoked_function_arn": invoked_function_arn,
-        "log_group_name": log_group_name,
-        "log_stream_name": request_id
+    debug!("Processing agent data of {} bytes for function: {}", payload_bytes.len(), function_name);
+    
+    // Check if trace ID extraction is enabled via environment variable
+    let extract_trace_id = std::env::var("NR_EXTRACT_TRACE_ID")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    
+    if extract_trace_id {
+        // TODO: Implement trace ID extraction logic here
+        debug!("Trace ID extraction enabled, but not yet implemented");
+    }
+    
+    // Create New Relic log event format with agent data as message
+    create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id)
+}
+
+/// Create New Relic log format with agent data in message field and Lambda context
+/// Returns stringified JSON with both log events and Lambda context information
+fn create_newrelic_log_format(
+    agent_data: &[u8],
+    function_name: &str,
+    invoked_function_arn: &str,
+    log_group_name: &str,
+    request_id: &str,
+) -> String {
+    // Convert agent data to string (should be JSON array like [1,"NR_LAMBDA_MONITORING","compressed_data"])
+    let agent_data_str = String::from_utf8_lossy(agent_data);
+    debug!("Agent data to wrap in log format: {}", agent_data_str);
+
+    // Generate timestamp in milliseconds
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Create New Relic payload with both Lambda context and log events
+    let payload = serde_json::json!({
+        "context": {
+            "function_name": function_name,
+            "invoked_function_arn": invoked_function_arn,
+            "log_group_name": log_group_name,
+            "log_stream_name": request_id
+        },
+        "logEvents": [{
+            "id": request_id,
+            "message": agent_data_str,
+            "timestamp": timestamp
+        }],
+        "logGroup": log_group_name,
+        "logStream": "",
+        "messageType": "",
+        "owner": ""
     });
 
-    let wrapped_payload = serde_json::json!({
-        "context": context,
-        "entry": general_purpose::STANDARD.encode(payload_bytes)
-    });
-
-    wrapped_payload.to_string()
+    // Convert to string and return the stringified JSON (this is what New Relic expects)
+    payload.to_string()
 }
 
 /// Registers the extension with the Lambda Runtime API.

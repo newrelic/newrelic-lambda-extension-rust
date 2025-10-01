@@ -77,6 +77,28 @@ impl LogProcessor {
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
         }
     }
+
+    /// Creates a no-op LogProcessor for disabled mode.
+    pub fn new_noop() -> Self {
+        use crate::config::ExtensionConfig;
+        use crate::context::InvocationContext;
+        
+        let noop_config = Arc::new(ExtensionConfig::default());
+        let noop_invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
+        let noop_client = Arc::new(NewRelicClient::new_noop());
+        
+        Self {
+            log_batch: Arc::new(Mutex::new(Vec::new())),
+            newrelic_client: noop_client,
+            config: noop_config,
+            invocation_context: noop_invocation_context,
+            buffered_logs: None,
+            trace_extraction_state: None,
+            request_id_buffer: Arc::new(Mutex::new(Vec::new())),
+            invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
+            failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
     pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
         Arc::clone(&self.invocation_context)
     }
