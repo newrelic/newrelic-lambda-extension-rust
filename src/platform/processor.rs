@@ -84,7 +84,6 @@ impl PlatformProcessor {
         };
 
         if batch.is_empty() {
-            trace!("No platform events to send");
             return Ok(());
         }
 

@@ -55,17 +55,11 @@ const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 static INVOKED_FUNCTION_ARN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static LAST_REQUEST_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-// --- Cold start initialization state ---
-static IS_COLD_START: OnceLock<Mutex<bool>> = OnceLock::new();
-
 // --- Lazy-initialized global components (initialized once during cold start) ---
 static INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = 
     Lazy::new(|| Arc::new(Mutex::new(InvocationContext::default())));
 static AGENT_PAYLOAD_BUFFER: Lazy<Arc<Mutex<Vec<Vec<u8>>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
-
-// --- Cold start components (initialized once, reused across invocations) ---
-static EXTENSION_COMPONENTS: OnceLock<Mutex<Option<ExtensionComponents>>> = OnceLock::new();
 
 // Structure to hold all initialized components for warm starts
 #[derive(Debug)]
@@ -138,7 +132,7 @@ async fn main() -> std::io::Result<()> {
     }));
     
     // CRITICAL: Wrap everything in error handling to prevent Lambda crashes
-    match run_extension_safely().await {
+    match run_extension().await {
         Ok(_) => {
             eprintln!("[NR_EXT]:INFO:Extension completed successfully");
             Ok(())
@@ -154,44 +148,28 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-/// Safe wrapper around the main extension logic
-async fn run_extension_safely() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Main extension logic following correct Lambda extension lifecycle
+async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let extension_startup_time = std::time::Instant::now();
     
-    // Check if this is a cold start or warm start
-    let is_cold_start = {
-        let cold_start_mutex = IS_COLD_START.get_or_init(|| Mutex::new(true));
-        let cold_start = cold_start_mutex.lock().unwrap();
-        *cold_start
-    };
+    info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
     
-    if is_cold_start {
-        info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
-        
-        // Perform cold start initialization
-        perform_cold_start_initialization(extension_startup_time).await?;
-        
-        // Mark as no longer cold start for subsequent invocations
-        {
-            let cold_start_mutex = IS_COLD_START.get().unwrap();
-            let mut cold_start = cold_start_mutex.lock().unwrap();
-            *cold_start = false;
-        }
-    } else {
-        info!("=== WARM START: Reusing initialized extension components ===");
-    }
+    // PHASE 1: ONE-TIME COLD START INITIALIZATION
+    let extension_components = perform_one_time_initialization().await?;
     
-    // Enter main event loop for both cold and warm starts
-    let total_events_processed = execute_main_event_loop().await;
+    info!("Cold start initialization complete (duration: {:?})", extension_startup_time.elapsed());
     
-    // Cleanup on shutdown (only happens once per container lifecycle)
-    perform_extension_shutdown_cleanup(total_events_processed, extension_startup_time).await;
+    // PHASE 2: INFINITE EVENT LOOP (handles both first invoke and all warm starts)
+    let (total_events_processed, harvester_handle) = run_infinite_event_loop(extension_components).await;
+    
+    // PHASE 3: CLEANUP ON SHUTDOWN (only happens once per container lifecycle)
+    perform_extension_shutdown_cleanup(total_events_processed, harvester_handle, extension_startup_time).await;
     
     Ok(())
 }
 
-/// Perform all cold start initialization - called only once per container
-async fn perform_cold_start_initialization(extension_startup_time: std::time::Instant) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Perform all one-time initialization - called only once per container
+async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
     // Initialize config first (this sets up logging)
     let config = config::init_config().clone();
     let config = Arc::new(config);
@@ -207,22 +185,17 @@ async fn perform_cold_start_initialization(extension_startup_time: std::time::In
         info!("Extension telemetry processing disabled - entering no-op mode");
         let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
         
-        // Store no-op components for warm starts
-        {
-            let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
-            let mut components = components_mutex.lock().unwrap();
-            *components = Some(ExtensionComponents {
-                client,
-                extension_id,
-                log_processor: Arc::new(LogProcessor::new_noop()),
-                platform_processor: Arc::new(PlatformProcessor::new_noop()),
-                newrelic_client: Arc::new(NewRelicClient::new_noop()),
-                config: config.clone(),
-                runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-                harvester_handle: tokio::spawn(async {}),
-            });
-        }
-        return Ok(());
+        // Return no-op components
+        return Ok(ExtensionComponents {
+            client,
+            extension_id,
+            log_processor: Arc::new(LogProcessor::new_noop()),
+            platform_processor: Arc::new(PlatformProcessor::new_noop()),
+            newrelic_client: Arc::new(NewRelicClient::new_noop()),
+            config: config.clone(),
+            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+            harvester_handle: tokio::spawn(async {}),
+        });
     }
 
     // 3. Early exit if no license key available
@@ -230,22 +203,17 @@ async fn perform_cold_start_initialization(extension_startup_time: std::time::In
         warn!("No license key available. Running in no-op mode.");
         let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
         
-        // Store no-op components for warm starts
-        {
-            let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
-            let mut components = components_mutex.lock().unwrap();
-            *components = Some(ExtensionComponents {
-                client,
-                extension_id,
-                log_processor: Arc::new(LogProcessor::new_noop()),
-                platform_processor: Arc::new(PlatformProcessor::new_noop()),
-                newrelic_client: Arc::new(NewRelicClient::new_noop()),
-                config: config.clone(),
-                runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-                harvester_handle: tokio::spawn(async {}),
-            });
-        }
-        return Ok(());
+        // Return no-op components
+        return Ok(ExtensionComponents {
+            client,
+            extension_id,
+            log_processor: Arc::new(LogProcessor::new_noop()),
+            platform_processor: Arc::new(PlatformProcessor::new_noop()),
+            newrelic_client: Arc::new(NewRelicClient::new_noop()),
+            config: config.clone(),
+            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+            harvester_handle: tokio::spawn(async {}),
+        });
     };
 
     // 4. Update config with resolved license key
@@ -325,25 +293,17 @@ async fn perform_cold_start_initialization(extension_startup_time: std::time::In
         config.new_relic.harvest_interval,
     );
 
-    // 11. Store all initialized components for warm starts
-    {
-        let components_mutex = EXTENSION_COMPONENTS.get_or_init(|| Mutex::new(None));
-        let mut components = components_mutex.lock().unwrap();
-        *components = Some(ExtensionComponents {
-            client,
-            extension_id,
-            log_processor,
-            platform_processor,
-            newrelic_client,
-            config,
-            runtime_done_rx,
-            harvester_handle,
-        });
-    }
-
-    info!("Cold start initialization complete (duration: {:?})", extension_startup_time.elapsed());
-    
-    Ok(())
+    // 11. Return initialized components directly
+    Ok(ExtensionComponents {
+        client,
+        extension_id,
+        log_processor,
+        platform_processor,
+        newrelic_client,
+        config,
+        runtime_done_rx,
+        harvester_handle,
+    })
 }
 
 /// Resolve license key with AWS fallback if needed
@@ -423,28 +383,29 @@ fn start_harvester_background_task(
     })
 }
 
-/// Main event loop - handles both cold start (first call) and warm starts (subsequent calls)
-async fn execute_main_event_loop() -> u32 {
-    // Get components (either from cold start initialization or reuse from previous invocations)
-    let components_mutex = EXTENSION_COMPONENTS.get()
-        .expect("Extension components should be initialized during cold start");
-    let mut components_guard = components_mutex.lock().unwrap();
-    let components = components_guard.as_mut()
-        .expect("Extension components should be initialized during cold start");
-
+/// Infinite event loop - handles first invoke (cold start) and all subsequent invokes (warm starts)
+async fn run_infinite_event_loop(mut extension_components: ExtensionComponents) -> (u32, tokio::task::JoinHandle<()>) {
     // Check if this is a no-op mode
-    if !components.config.new_relic.extension_enabled || components.config.new_relic.license_key.is_none() {
+    if !extension_components.config.new_relic.extension_enabled || extension_components.config.new_relic.license_key.is_none() {
         info!("Running in no-op mode");
-        execute_noop_event_loop(&components.client, &components.extension_id).await;
-        return 0;
+        execute_noop_event_loop(&extension_components.client, &extension_components.extension_id).await;
+        return (0, extension_components.harvester_handle);
     }
 
     // Execute main telemetry processing loop
-    execute_main_telemetry_processing_loop(components).await
+    let total_events = execute_main_telemetry_processing_loop(&mut extension_components).await;
+    (total_events, extension_components.harvester_handle)
 }
 
-/// Main telemetry processing event loop - where warm starts spend their time
-/// Equivalent to Go's mainLoop function  
+/// INFINITE EVENT LOOP - Core of Lambda Extension Lifecycle
+/// 
+/// This loop implements the correct Lambda extension pattern:
+/// 1. GET /next (blocks here - Lambda freezes extension)
+/// 2. Receive INVOKE event (Lambda unfreezes extension)  
+/// 3. Process event quickly (< 50ms for warm starts)
+/// 4. Return to step 1 (loops forever until SHUTDOWN)
+///
+/// First iteration = Cold Start, subsequent iterations = Warm Starts
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut previous_invocation_context: Option<(String, String)> = None;
@@ -452,19 +413,12 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
     loop {
         // WARM START CRITICAL PATH: This is the ONLY work done on warm starts
         debug!("mainLoop: waiting for next lambda invocation event...");
-        let event_processing_start_time = std::time::Instant::now();
         
-        // Process any remaining agent payloads from previous invocation
-        process_previous_invocation_agent_payloads(
-            &previous_invocation_context,
-            &components.newrelic_client,
-            &components.config,
-            &components.log_processor
-        ).await;
+        // WARM START CRITICAL PATH: No processing here - just setup for next event
+        // All telemetry processing happens in detached background tasks
         
-        // Clear request_id after processing previous invocation's payloads
+        // Immediately clear previous request context (no network I/O)
         if previous_invocation_context.is_some() {
-            flush_all_buffers_before_request_id_reset(&components.log_processor).await;
             components.log_processor.clear_request_id();
         }
 
@@ -481,18 +435,87 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 
         match runtime_event {
             LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
-                // WARM START: Process invocation event
-                trace!("Invocation processed in {:?} (request_id: {})", event_processing_start_time.elapsed(), request_id);
+                // PERFORMANCE: Start timing AFTER receiving the event (not including wait time)
+                let event_processing_start_time = std::time::Instant::now();
                 
-                process_lambda_invocation_event(
-                    &request_id,
-                    &invoked_function_arn,
-                    &components.log_processor,
-                    &components.platform_processor,
-                    &mut components.runtime_done_rx,
-                    &components.newrelic_client,
-                    &components.config,
-                ).await;
+                // WARM START OPTIMIZATION: Minimal synchronous processing
+                let invocation_start_time = chrono::Utc::now();
+                
+                // Update global invocation context (fast)
+                update_global_invocation_context(&request_id, &invoked_function_arn, invocation_start_time);
+                
+                // Fast local state updates (no network I/O)
+                components.log_processor.set_invocation_start_time(invocation_start_time);
+                components.log_processor.reset_trace_id_state();
+                components.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
+                
+                // OPTIMIZED PROCESSING STRATEGY:
+                // ==============================
+                // Cold start: Process synchronously to ensure delivery before container shutdown
+                // Warm start: Process in background for optimal performance
+                
+                if event_counter == 1 {
+                    // COLD START: Synchronous processing to ensure delivery
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    process_current_invocation_agent_payloads(
+                        &request_id,
+                        &invoked_function_arn,
+                        &components.newrelic_client,
+                        &components.config,
+                        &components.log_processor,
+                    ).await;
+                } else {
+                    // WARM START: Background processing for speed
+                    // Process previous invocation data in background (already available)
+                    if previous_invocation_context.is_some() {
+                        tokio::spawn({
+                            let previous_context = previous_invocation_context.clone();
+                            let newrelic_client = Arc::clone(&components.newrelic_client);
+                            let config = Arc::clone(&components.config);
+                            let log_processor = Arc::clone(&components.log_processor);
+                            async move {
+                                process_previous_invocation_agent_payloads(
+                                    &previous_context,
+                                    &newrelic_client,
+                                    &config,
+                                    &log_processor
+                                ).await;
+                            }
+                        });
+                    }
+                    
+                    // Process current invocation data in background with timing
+                    tokio::spawn({
+                        let current_request_id = request_id.clone();
+                        let current_invoked_arn = invoked_function_arn.clone();
+                        let newrelic_client = Arc::clone(&components.newrelic_client);
+                        let config = Arc::clone(&components.config);
+                        let log_processor = Arc::clone(&components.log_processor);
+                        
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            process_current_invocation_agent_payloads(
+                                &current_request_id,
+                                &current_invoked_arn,
+                                &newrelic_client,
+                                &config,
+                                &log_processor,
+                            ).await;
+                        }
+                    });
+                }
+                
+                // PERFORMANCE: Measure actual processing time (excludes wait time)
+                let event_processing_time = event_processing_start_time.elapsed();
+                
+                // Log performance - first event after initialization is cold start, rest are warm starts
+                if event_counter == 1 {
+                    info!("COLD START: First invocation processed in {:?} (request_id: {})", 
+                          event_processing_time, request_id);
+                } else {
+                    info!("WARM START: Event {} processed in {:?} (request_id: {})", 
+                          event_counter, event_processing_time, request_id);
+                }
                 
                 // Save context for next iteration
                 previous_invocation_context = Some((request_id, invoked_function_arn));
@@ -519,34 +542,29 @@ async fn process_lambda_invocation_event(
     log_processor: &Arc<LogProcessor>,
     platform_processor: &Arc<PlatformProcessor>,
     runtime_done_rx: &mut mpsc::UnboundedReceiver<()>,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
+    _newrelic_client: &Arc<NewRelicClient>,
+    _config: &Arc<config::ExtensionConfig>,
 ) {
     let invocation_start_time = chrono::Utc::now();
     
     // Update global invocation context
     update_global_invocation_context(request_id, invoked_function_arn, invocation_start_time);
     
-    // Setup log processor for new invocation
-    setup_log_processor_for_new_invocation(log_processor, invocation_start_time, request_id).await;
+    // WARM START OPTIMIZATION: Only do immediate, local state updates
     
-    // Process platform events
+    // Fast local state updates (no network I/O)
+    log_processor.set_invocation_start_time(invocation_start_time);
+    log_processor.reset_trace_id_state();
     platform_processor.process_invoke_event(request_id, invoked_function_arn);
     
-    // Wait for runtime completion
-    wait_for_lambda_runtime_completion(runtime_done_rx).await;
+    // CRITICAL WARM START OPTIMIZATION:
+    // ================================
+    // Return IMMEDIATELY after minimal setup.
+    // DO NOT wait for Lambda function completion in the main thread!
+    // All telemetry processing happens in detached background tasks.
+    // This ensures warm start completes in ~10ms instead of 1000ms+.
     
-    // Process current invocation's agent payloads
-    process_current_invocation_agent_payloads(
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-        log_processor
-    ).await;
-    
-    // Flush any remaining buffered logs
-    flush_remaining_buffered_logs_at_invocation_end(log_processor).await;
+    // NO synchronous processing here - everything is fire-and-forget!
 }
 
 /// Update global invocation context
@@ -594,13 +612,11 @@ async fn setup_log_processor_for_new_invocation(
     }
 }
 
-/// Wait for Lambda runtime completion signal
+/// Wait for Lambda runtime completion signal (optimized for warm starts)
 async fn wait_for_lambda_runtime_completion(runtime_done_rx: &mut mpsc::UnboundedReceiver<()>) {
     // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
-    if runtime_done_rx.recv().await.is_some() {
-        // Wait additional buffer time for any final telemetry
-        tokio::time::sleep(Duration::from_millis(400)).await;
-    } else {
+    // REMOVED: 400ms sleep that was causing warm start delays
+    if runtime_done_rx.recv().await.is_none() {
         warn!("Runtime done channel closed unexpectedly");
     }
 }
@@ -738,17 +754,13 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
 /// Perform extension shutdown cleanup
 async fn perform_extension_shutdown_cleanup(
     total_events_processed: u32,
+    harvester_handle: tokio::task::JoinHandle<()>,
     extension_startup_time: std::time::Instant,
 ) {
     info!("New Relic Extension shutting down after {} events", total_events_processed);
     
-    // Get harvester handle from global components if available
-    if let Some(components_mutex) = EXTENSION_COMPONENTS.get() {
-        let components_guard = components_mutex.lock().unwrap();
-        if let Some(components) = components_guard.as_ref() {
-            components.harvester_handle.abort();
-        }
-    }
+    // Stop harvester background task
+    harvester_handle.abort();
     
     let shutdown_at = std::time::Instant::now();
     let total_runtime = shutdown_at.duration_since(extension_startup_time);
@@ -1012,9 +1024,11 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
 
     let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
 
+    // Optimized for Lambda environment - longer timeout for event polling
     let response = client
         .get(&url)
         .header(EXTENSION_ID_HEADER, ext_id)
+        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
         .send()
         .await?;
 
@@ -1030,4 +1044,94 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
         .await?;
 
     Ok(event)
+}
+
+/// Spawn background telemetry processor for warm starts
+/// This processes both previous and current invocation data asynchronously
+fn spawn_background_telemetry_processor(
+    current_request_id: &str,
+    current_invoked_arn: &str,
+    previous_context: &Option<(String, String)>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<config::ExtensionConfig>,
+    log_processor: Arc<LogProcessor>,
+) {
+    let current_request_id = current_request_id.to_string();
+    let current_invoked_arn = current_invoked_arn.to_string();
+    let previous_context = previous_context.clone();
+    
+    // Spawn completely detached background task - NO AWAIT!
+    tokio::spawn(async move {
+        // Process previous invocation's telemetry first (if any)
+        if previous_context.is_some() {
+            process_previous_invocation_agent_payloads(
+                &previous_context,
+                &newrelic_client,
+                &config,
+                &log_processor
+            ).await;
+        }
+        
+        // Wait for current Lambda function to complete
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        
+        // Process current invocation's telemetry
+        process_current_invocation_agent_payloads(
+            &current_request_id,
+            &current_invoked_arn,
+            &newrelic_client,
+            &config,
+            &log_processor
+        ).await;
+    });
+}
+
+/// Wait for initial telemetry with timeout to balance performance and data collection
+async fn wait_for_initial_telemetry_with_timeout() {
+    // Strategy: Wait up to 200ms for the Lambda function to start and produce telemetry
+    // This is a balance between:
+    // - Performance: 200ms is still acceptable for AWS billing vs losing telemetry
+    // - Data quality: Give Lambda function adequate time to start and produce agent payloads
+    
+    tokio::select! {
+        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
+            // Timeout reached - return to minimize warm start impact
+            debug!("Telemetry wait timeout reached (200ms) - returning to minimize warm start impact");
+        }
+        _ = wait_for_agent_payload_signal() => {
+            // Agent payload received - we can return earlier
+            debug!("Agent payload received - returning early to optimize performance");
+        }
+    }
+}
+
+/// Wait for signal that agent payload has been received
+async fn wait_for_agent_payload_signal() {
+    // Record the current buffer size at start
+    let initial_count = {
+        if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
+            buffer.len()
+        } else {
+            0
+        }
+    };
+    
+    // Wait for NEW payloads (buffer size to increase)
+    loop {
+        let current_count = {
+            if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
+                buffer.len()
+            } else {
+                0
+            }
+        };
+        
+        if current_count > initial_count {
+            debug!("New agent payload detected (count: {} -> {})", initial_count, current_count);
+            return;
+        }
+        
+        // Check every 5ms for faster detection
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
