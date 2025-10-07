@@ -38,7 +38,7 @@ impl NewRelicClient {
 
         let client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_millis(2400)) // 100ms aggressive timeout for Lambda environment
+            .timeout(std::time::Duration::from_millis(2400)) // 2.4s timeout for New Relic requests
             .pool_idle_timeout(std::time::Duration::from_secs(10)) // Reset stale connections faster
             .pool_max_idle_per_host(2) // Limit connection reuse
             .build().unwrap();

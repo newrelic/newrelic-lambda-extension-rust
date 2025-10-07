@@ -342,7 +342,11 @@ async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionCon
 /// Initialize HTTP client with appropriate timeout
 async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Client::builder()
-        .timeout(Duration::from_secs(10))
+        // Remove global timeout - let individual requests set their own timeouts
+        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
+        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer for Lambda runtime API
+        .pool_max_idle_per_host(2) // Limit idle connections
+        .tcp_keepalive(Duration::from_secs(60)) // Enable TCP keepalive
         .build()?)
 }
 
@@ -640,7 +644,16 @@ async fn process_current_invocation_agent_payloads(
     };
     
     if buffer_size == 0 {
-        warn!("[agentsend] No agent payloads found, agent may not be initialized or runtime handler not set");
+        // Only warn about missing agent payloads after the first few invocations
+        // During cold start, the agent might not be ready yet
+        static INVOCATION_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let current_count = INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        
+        if current_count > 2 { // Only warn after 3rd invocation
+            warn!("[agentsend] No agent payloads found after {} invocations, agent may not be initialized or runtime handler not set", current_count + 1);
+        } else {
+            debug!("[agentsend] No agent payloads found (invocation {}), agent may still be initializing", current_count + 1);
+        }
     }
 
     process_agent_payloads_with_context(
@@ -954,6 +967,7 @@ async fn register_extension_with_lambda_runtime(client: &Client) -> Result<(Exte
         .post(&url)
         .header(EXTENSION_NAME_HEADER, EXTENSION_NAME)
         .json(&payload)
+        .timeout(Duration::from_secs(30)) // 30 second timeout for registration
         .send()
         .await?;
 
@@ -1004,6 +1018,7 @@ async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: 
         .put(&url)
         .header(EXTENSION_ID_HEADER, ext_id)
         .json(&payload)
+        .timeout(Duration::from_secs(30)) // 30 second timeout for telemetry subscription
         .send()
         .await?;
 
@@ -1024,26 +1039,55 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
 
     let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
 
-    // Optimized for Lambda environment - longer timeout for event polling
-    let response = client
-        .get(&url)
-        .header(EXTENSION_ID_HEADER, ext_id)
-        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
-        .send()
-        .await?;
+    // Retry logic for extension event polling - this is critical for reliability
+    const MAX_RETRIES: u32 = 3;
+    let mut retry_count = 0;
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Next event request failed with status: {}, body: {}", status, body);
-        return Err(format!("Next event request failed with status: {}", status).into());
+    loop {
+        let response = client
+            .get(&url)
+            .header(EXTENSION_ID_HEADER, ext_id)
+            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                // Success case - process the response
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+                    error!("Next event request failed with status: {}, body: {}", status, body);
+                    return Err(format!("Next event request failed with status: {}", status).into());
+                }
+
+                let event: LambdaRuntimeEvent = resp.json().await?;
+                return Ok(event);
+            },
+            Err(e) => {
+                // Handle timeout and connection errors with retry
+                retry_count += 1;
+                
+                if e.is_timeout() {
+                    warn!("Extension event polling timeout (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                } else if e.is_connect() {
+                    warn!("Extension event polling connection error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                } else {
+                    warn!("Extension event polling error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                }
+
+                if retry_count >= MAX_RETRIES {
+                    error!("Extension event polling failed after {} retries, giving up", MAX_RETRIES);
+                    return Err(e.into());
+                }
+
+                // Exponential backoff: 1s, 2s, 4s
+                let delay = Duration::from_secs(2_u64.pow(retry_count - 1));
+                warn!("Retrying extension event polling in {:?}...", delay);
+                tokio::time::sleep(delay).await;
+            }
+        }
     }
-
-    let event: LambdaRuntimeEvent = response
-        .json()
-        .await?;
-
-    Ok(event)
 }
 
 /// Spawn background telemetry processor for warm starts
