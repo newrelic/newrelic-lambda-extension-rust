@@ -184,6 +184,55 @@ impl PlatformProcessor {
     fn extract_request_id_from_record(&self, record: &TelemetryRecord) -> Option<String> {
         record.record.get("requestId")?.as_str().map(String::from)
     }
+    
+    /// Extract RequestId from REPORT message content
+    /// Example: "REPORT RequestId: ace7dff2-1e6d-4dd4-85b4-09c0b94dd0d1\t..."
+    fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
+        if message.starts_with("REPORT RequestId: ") {
+            // Find the RequestId value between "REPORT RequestId: " and the first tab
+            if let Some(start) = message.find("REPORT RequestId: ") {
+                let after_prefix = &message[start + "REPORT RequestId: ".len()..];
+                if let Some(tab_pos) = after_prefix.find('\t') {
+                    return Some(after_prefix[..tab_pos].to_string());
+                } else {
+                    // No tab found, take until space or end of string
+                    let request_id = after_prefix.split_whitespace().next()?;
+                    return Some(request_id.to_string());
+                }
+            }
+        }
+        None
+    }
+    
+    /// Extract log level from message content for platform events
+    /// Returns appropriate log level based on message content
+    fn extract_log_level_from_message(&self, message: &str) -> &'static str {
+        let message_upper = message.to_uppercase();
+        
+        // Check for error patterns
+        if message_upper.contains("ERROR") || 
+           message_upper.contains("FAIL") ||
+           message_upper.contains("EXCEPTION") {
+            "ERROR"
+        } 
+        // Check for warning patterns
+        else if message_upper.contains("WARN") || 
+                message_upper.contains("WARNING") {
+            "WARNING"
+        }
+        // Check for debug patterns
+        else if message_upper.contains("DEBUG") {
+            "DEBUG"
+        }
+        // Check for trace patterns
+        else if message_upper.contains("TRACE") {
+            "TRACE"
+        }
+        // Default to INFO for platform events (REPORT, INIT, etc.)
+        else {
+            "INFO"
+        }
+    }
 
     /// Updates the invocation context with the latest invoke event details.
     pub fn process_invoke_event(&self, request_id: &str, invoked_function_arn: &str) {
@@ -247,15 +296,38 @@ impl PlatformProcessor {
                 
                 // Get the invocation context for standard attributes
                 let context = self.invocation_context.lock().unwrap();
-                attributes.insert("aws.lambda_request_id".to_string(), 
-                                serde_json::Value::String(context.request_id.clone()));
-                attributes.insert("faas.execution".to_string(), 
-                                serde_json::Value::String(context.request_id.clone()));
                 
-                // Add log level
-                if let Some(level) = event.get("level").and_then(|l| l.as_str()) {
-                    attributes.insert("log.level".to_string(), serde_json::Value::String(level.to_string()));
+                // Extract RequestId from the message itself (for REPORT logs) or use context
+                let request_id = if message.starts_with("REPORT RequestId: ") {
+                    // Extract RequestId directly from REPORT message
+                    self.extract_request_id_from_message(&message)
+                        .unwrap_or_else(|| context.request_id.clone())
+                } else {
+                    context.request_id.clone()
+                };
+                
+                // Only add AWS Lambda attributes if we have a valid request_id
+                if !request_id.is_empty() {
+                    attributes.insert("aws.lambda_request_id".to_string(), 
+                                    serde_json::Value::String(request_id.clone()));
+                    attributes.insert("faas.execution".to_string(), 
+                                    serde_json::Value::String(request_id.clone()));
                 }
+                
+                // Only add faas.arn if we have a valid invoked_function_arn
+                if !context.invoked_function_arn.is_empty() {
+                    attributes.insert("faas.arn".to_string(), 
+                                    serde_json::Value::String(context.invoked_function_arn.clone()));
+                }
+                
+                // Add log level (use event level or extract from message)
+                let log_level = if let Some(level) = event.get("level").and_then(|l| l.as_str()) {
+                    level.to_string()
+                } else {
+                    // Extract log level from message content
+                    self.extract_log_level_from_message(&message).to_string()
+                };
+                attributes.insert("level".to_string(), serde_json::Value::String(log_level));
                 
                 // Add platform event type
                 if let Some(event_type) = event.get("type").and_then(|t| t.as_str()) {

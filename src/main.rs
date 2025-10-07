@@ -160,24 +160,85 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
+/// Safely spawn a background task with error protection
+/// This prevents errors in background tasks from propagating up and provides logging
+fn spawn_safe_task<F>(task_name: &str, future: F) -> tokio::task::JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let task_name = task_name.to_string();
+    tokio::spawn(async move {
+        // The panic hook will catch any panics in this task
+        // We just need to ensure proper error logging
+        future.await;
+        debug!("Background task '{}' completed", task_name);
+    })
+}
+
+/// Run the extension in true no-op mode - follows Extension API lifecycle but does nothing
+/// Registers with Extension API and waits for INVOKE/SHUTDOWN events but processes nothing
+async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("Extension running in NO-OP mode - no telemetry will be collected");
+    eprintln!("[NR_EXT] INFO Extension running in NO-OP mode - Lambda function will continue normally");
+    
+    // Even in no-op mode, we need to properly register with the Lambda Extensions API
+    // and wait for INVOKE/SHUTDOWN events to follow the correct lifecycle
+    let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
+    
+    info!("Extension registered in no-op mode with ID: {}", extension_id);
+    
+    // Follow proper Extension API lifecycle - wait for events but do nothing with them
+    loop {
+        match fetch_next_lambda_runtime_event(&client, &extension_id).await {
+            Ok(LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
+                debug!("No-op mode: Received INVOKE event for request {}, doing nothing", request_id);
+                // Do absolutely nothing - no telemetry, no processing, no network calls
+            }
+            Ok(LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
+                info!("No-op mode: Extension shutting down: {}", shutdown_reason);
+                break;
+            }
+            Err(e) => {
+                error!("Error receiving next event in no-op mode: {:?}. Continuing.", e);
+                continue;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
 /// Main extension logic following correct Lambda extension lifecycle
 async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let extension_startup_time = std::time::Instant::now();
     
     info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
     
-    // PHASE 1: ONE-TIME COLD START INITIALIZATION
-    let extension_components = perform_one_time_initialization().await?;
-    
+    // PHASE 1: ONE-TIME COLD START INITIALIZATION (with true no-op fallback)
+    let extension_components = match perform_one_time_initialization().await {
+        Ok(components) => {
+            info!("Extension initialization successful");
+            Some(components)
+        }
+        Err(e) => {
+            error!("Extension initialization failed, entering true no-op mode: {}", e);
+            eprintln!("[NR_EXT] ERROR Initialization failed, entering true no-op mode (Lambda function will continue normally): {}", e);
+            
+            // Enter true no-op mode - do absolutely nothing
+            run_noop_extension().await?;
+            return Ok(()); // This return will never be reached since noop runs forever
+        }
+    };
+
+    let extension_components = extension_components.unwrap(); // Safe because we handled the None case above
+
     info!("Cold start initialization complete (duration: {:?})", extension_startup_time.elapsed());
     
     // PHASE 2: INFINITE EVENT LOOP (handles both first invoke and all warm starts)
     let (total_events_processed, harvester_handle) = run_infinite_event_loop(extension_components).await;
     
     // PHASE 3: CLEANUP ON SHUTDOWN (only happens once per container lifecycle)
-    perform_extension_shutdown_cleanup(total_events_processed, harvester_handle, extension_startup_time).await;
-    
-    Ok(())
+    perform_extension_shutdown_cleanup(total_events_processed, harvester_handle, extension_startup_time).await;    Ok(())
 }
 
 /// Perform all one-time initialization - called only once per container
@@ -588,6 +649,14 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 components.log_processor.reset_trace_id_state();
                 components.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                 
+                // Retry failed logs from previous invocation in background (non-blocking)
+                let log_processor_clone = components.log_processor.clone();
+                spawn_safe_task("failed_log_retry", async move {
+                    if let Err(e) = log_processor_clone.retry_failed_logs_before_invocation().await {
+                        error!("Error retrying failed logs: {}", e);
+                    }
+                });
+                
                 // OPTIMIZED PROCESSING STRATEGY WITH PROPER AGENT PAYLOAD TIMING:
                 // ===============================================================
                 // Wait for Lambda function completion (runtimeDone event) before processing agent payloads
@@ -672,37 +741,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
     event_counter
 }
 
-/// Process Lambda invocation event
-async fn process_lambda_invocation_event(
-    request_id: &str,
-    invoked_function_arn: &str,
-    log_processor: &Arc<LogProcessor>,
-    platform_processor: &Arc<PlatformProcessor>,
-    _runtime_done_rx: &mut mpsc::UnboundedReceiver<()>,
-    _newrelic_client: &Arc<NewRelicClient>,
-    _config: &Arc<config::ExtensionConfig>,
-) {
-    let invocation_start_time = chrono::Utc::now();
-    
-    // Update global invocation context
-    update_global_invocation_context(request_id, invoked_function_arn, invocation_start_time);
-    
-    // WARM START OPTIMIZATION: Only do immediate, local state updates
-    
-    // Fast local state updates (no network I/O)
-    log_processor.set_invocation_start_time(invocation_start_time);
-    log_processor.reset_trace_id_state();
-    platform_processor.process_invoke_event(request_id, invoked_function_arn);
-    
-    // CRITICAL WARM START OPTIMIZATION:
-    // ================================
-    // Return IMMEDIATELY after minimal setup.
-    // DO NOT wait for Lambda function completion in the main thread!
-    // All telemetry processing happens in detached background tasks.
-    // This ensures warm start completes in ~10ms instead of 1000ms+.
-    
-    // NO synchronous processing here - everything is fire-and-forget!
-}
+
 
 /// Create per-request context for concurrent request handling
 fn create_request_context(request_id: &str, invoked_function_arn: &str) -> Arc<Mutex<InvocationContext>> {
@@ -913,25 +952,7 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
     info!("New invocation started - request_id: {}, timestamp: {}", request_id, invocation_start_time);
 }
 
-/// Setup log processor for new invocation
-async fn setup_log_processor_for_new_invocation(
-    log_processor: &Arc<LogProcessor>,
-    invocation_start_time: chrono::DateTime<chrono::Utc>,
-    request_id: &str,
-) {
-    log_processor.set_invocation_start_time(invocation_start_time);
-    log_processor.reset_trace_id_state();
-    
-    // Retry any failed logs from previous invocations
-    if let Err(e) = log_processor.retry_failed_logs_before_invocation().await {
-        error!("Error retrying failed logs: {}", e);
-    }
-    
-    // Process any logs that were buffered waiting for this request_id
-    if let Err(e) = log_processor.on_request_id_available(request_id).await {
-        error!("Error processing buffered logs with request_id: {}", e);
-    }
-}
+
 
 /// Wait for function completion and then process agent payloads
 /// This ensures we wait for the Lambda function to complete before checking for agent payloads
@@ -1213,12 +1234,7 @@ async fn process_current_invocation_agent_payloads_impl(
     }
 }
 
-/// Flush remaining buffered logs at invocation end
-async fn flush_remaining_buffered_logs_at_invocation_end(log_processor: &Arc<LogProcessor>) {
-    if let Err(e) = log_processor.flush_buffered_logs_at_invocation_end().await {
-        error!("Error flushing buffered logs at invocation end: {}", e);
-    }
-}
+
 
 
 async fn process_previous_invocation_agent_payloads(
@@ -1253,12 +1269,7 @@ async fn process_previous_invocation_agent_payloads(
     }
 }
 
-/// Flush all buffers before clearing request_id
-async fn flush_all_buffers_before_request_id_reset(log_processor: &Arc<LogProcessor>) {
-    if let Err(e) = log_processor.flush_all_buffers_before_clear().await {
-        error!("Error flushing all buffers before clearing request_id: {}", e);
-    }
-}
+
 
 /// Perform final telemetry flush during shutdown
 async fn perform_final_telemetry_flush(
@@ -1697,92 +1708,5 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
     }
 }
 
-/// Spawn background telemetry processor for warm starts
-/// This processes both previous and current invocation data asynchronously
-fn spawn_background_telemetry_processor(
-    current_request_id: &str,
-    current_invoked_arn: &str,
-    previous_context: &Option<(String, String)>,
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<config::ExtensionConfig>,
-    log_processor: Arc<LogProcessor>,
-) {
-    let current_request_id = current_request_id.to_string();
-    let current_invoked_arn = current_invoked_arn.to_string();
-    let previous_context = previous_context.clone();
-    
-    // Spawn completely detached background task - NO AWAIT!
-    tokio::spawn(async move {
-        // Process previous invocation's telemetry first (if any)
-        if previous_context.is_some() {
-            process_previous_invocation_agent_payloads(
-                &previous_context,
-                &newrelic_client,
-                &config,
-                &log_processor
-            ).await;
-        }
-        
-        // Wait for current Lambda function to complete
-        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
-        
-        // Process current invocation's telemetry with coordination
-        process_agent_payloads_with_coordination(
-            &current_request_id,
-            &current_invoked_arn,
-            &newrelic_client,
-            &config,
-            &log_processor
-        ).await;
-    });
-}
 
-/// Wait for initial telemetry with timeout to balance performance and data collection
-async fn wait_for_initial_telemetry_with_timeout() {
-    // Strategy: Wait up to 200ms for the Lambda function to start and produce telemetry
-    // This is a balance between:
-    // - Performance: 200ms is still acceptable for AWS billing vs losing telemetry
-    // - Data quality: Give Lambda function adequate time to start and produce agent payloads
-    
-    tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {
-            // Timeout reached - return to minimize warm start impact
-            debug!("Telemetry wait timeout reached (200ms) - returning to minimize warm start impact");
-        }
-        _ = wait_for_agent_payload_signal() => {
-            // Agent payload received - we can return earlier
-            debug!("Agent payload received - returning early to optimize performance");
-        }
-    }
-}
 
-/// Wait for signal that agent payload has been received
-async fn wait_for_agent_payload_signal() {
-    // Record the current buffer size at start
-    let initial_count = {
-        if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
-            buffer.len()
-        } else {
-            0
-        }
-    };
-    
-    // Wait for NEW payloads (buffer size to increase)
-    loop {
-        let current_count = {
-            if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
-                buffer.len()
-            } else {
-                0
-            }
-        };
-        
-        if current_count > initial_count {
-            debug!("New agent payload detected (count: {} -> {})", initial_count, current_count);
-            return;
-        }
-        
-        // Check every 5ms for faster detection
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-}

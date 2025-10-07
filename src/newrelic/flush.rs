@@ -11,26 +11,4 @@ pub trait Flush: Send + Sync {
     async fn final_flush(&self) -> IoResult<()>;
 }
 
-use std::sync::Arc;
-use crate::logs::processor::LogProcessor;
-use crate::platform::processor::PlatformProcessor;
 
-pub enum ProcessorType {
-    LogProcessor(Arc<LogProcessor>),
-    PlatformProcessor(Arc<PlatformProcessor>),
-}
-
-impl ProcessorType {
-    pub async fn flush(&self) -> IoResult<()> {
-        match self {
-            ProcessorType::LogProcessor(p) => p.flush().await,
-            ProcessorType::PlatformProcessor(p) => p.flush().await,
-        }
-    }
-    pub async fn final_flush(&self) -> IoResult<()> {
-        match self {
-            ProcessorType::LogProcessor(p) => p.final_flush().await,
-            ProcessorType::PlatformProcessor(p) => p.final_flush().await,
-        }
-    }
-}

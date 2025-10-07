@@ -63,18 +63,6 @@ pub struct AwsConfig {
 /// Extension specific settings
 #[derive(Debug, Clone)]
 pub struct ExtensionSettings {
-    /// Extension name
-    pub name: String,
-
-    /// Maximum telemetry items per batch
-    pub max_batch_items: usize,
-
-    /// Maximum telemetry batch size in bytes
-    pub max_batch_size: usize,
-
-    /// Telemetry timeout in milliseconds
-    pub telemetry_timeout: u64,
-
     /// Whether to subscribe to function telemetry/logs (Lambda 'function' type)
     pub send_function_logs: bool,
 
@@ -141,10 +129,6 @@ impl Default for AwsConfig {
 impl Default for ExtensionSettings {
     fn default() -> Self {
         Self {
-            name: "newrelic-lambda-extension".to_string(),
-            max_batch_size: 262_144, // 256KB
-            max_batch_items: 1000,
-            telemetry_timeout: 25, // 25ms for immediate delivery
             send_function_logs: false,
             send_extension_logs: false,
             log_level: "info".to_string(),
@@ -212,6 +196,8 @@ impl ExtensionConfig {
 
         config
     }
+
+
 }
 
 /// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
@@ -294,17 +280,5 @@ pub fn init_config() -> &'static ExtensionConfig {
     }
 }
 
-/// Get the global configuration
-pub fn get_config() -> &'static ExtensionConfig {
-    unsafe {
-        #[allow(static_mut_refs)]
-        {
-            GLOBAL_CONFIG
-                .as_ref()
-                .unwrap_or_else(|| {
-                panic!("Configuration not initialized. Call init_config() first.");
-            })
-        }
-    }
-}
+
 

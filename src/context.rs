@@ -8,22 +8,13 @@ pub struct InvocationContext {
     pub trace_id: Option<String>,
 }
 
-impl InvocationContext {
-    /// Creates a new context for a specific invocation
-    pub fn new(request_id: String, invoked_function_arn: String) -> Self {
-        Self {
-            invoked_function_arn,
-            request_id,
-            trace_id: None,
-        }
-    }
-}
+
 
 impl Default for InvocationContext {
     fn default() -> Self {
         Self {
-            invoked_function_arn: "arn:aws:lambda:unknown:unknown:function:unknown".to_string(),
-            request_id: "unknown".to_string(),
+            invoked_function_arn: String::new(), // Empty string instead of "unknown"
+            request_id: String::new(), // Empty string instead of "unknown"
             trace_id: None,
         }
     }

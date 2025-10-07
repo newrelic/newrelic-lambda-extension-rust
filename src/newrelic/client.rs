@@ -87,22 +87,6 @@ impl NewRelicClient {
         self.send_payload(&config.new_relic.log_endpoint, &log_data).await
     }
 
-    /// Sends a batch of platform events to New Relic.
-    pub async fn send_platform_events(
-        &self,
-        config: &ExtensionConfig,
-        payload: serde_json::Value,
-    ) -> Result<(), Error> {
-        // Validate license key
-        if config.new_relic.license_key.is_none() {
-            warn!("New Relic license key is not set, skipping platform events send");
-            return Ok(());
-        }
-
-        info!("Sending platform events to NR");
-        self.send_payload(&config.new_relic.telemetry_endpoint, &payload).await
-    }
-
     /// Sends the wrapped agent payload to the New Relic collector.
     pub async fn send_agent_payload(
         &self,
