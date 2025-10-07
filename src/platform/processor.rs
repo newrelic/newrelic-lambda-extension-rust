@@ -318,6 +318,14 @@ impl PlatformProcessor {
                 if !context.invoked_function_arn.is_empty() {
                     attributes.insert("faas.arn".to_string(), 
                                     serde_json::Value::String(context.invoked_function_arn.clone()));
+                } else if let Some(constructed_arn) = config.aws.construct_function_arn() {
+                    // Use complete ARN constructed from registration details
+                    attributes.insert("faas.arn".to_string(), 
+                                    serde_json::Value::String(constructed_arn.clone()));
+                    debug!("Used constructed faas.arn from registration details: {}", constructed_arn);
+                } else {
+                    debug!("Cannot construct faas.arn - missing registration details for platform event: {}", 
+                          message.chars().take(100).collect::<String>());
                 }
                 
                 // Add log level (use event level or extract from message)

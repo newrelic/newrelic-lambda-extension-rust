@@ -183,7 +183,7 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
     
     // Even in no-op mode, we need to properly register with the Lambda Extensions API
     // and wait for INVOKE/SHUTDOWN events to follow the correct lifecycle
-    let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
+    let (client, extension_id, _registration) = initialize_lambda_runtime_client_and_register().await?;
     
     info!("Extension registered in no-op mode with ID: {}", extension_id);
     
@@ -247,16 +247,12 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     let config = config::init_config().clone();
     let config = Arc::new(config);
     
-    // --- COLD START PHASE: Maximum parallel initialization ---
+    // --- PHASE 1: PARALLEL CRITICAL OPERATIONS (maximum performance) ---
     
-    // 1. PARALLEL: License key resolution
-    let license_key_result = resolve_license_key_with_aws_fallback(&config).await;
-    let license_key_option = license_key_result?;
-
-    // 2. Early exit for disabled extension (no-op mode)
+    // 1. Early exit for disabled extension (no-op mode)
     if !config.new_relic.extension_enabled {
         info!("Extension telemetry processing disabled - entering no-op mode");
-        let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
+        let (client, extension_id, _registration) = initialize_lambda_runtime_client_and_register().await?;
         
         // Return no-op components
         return Ok(ExtensionComponents {
@@ -271,12 +267,30 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         });
     }
 
-    // 3. Early exit if no license key available
+    // 2. PARALLEL CRITICAL OPERATIONS: License key validation + Extension registration
+    //    Both are required regardless of no-op mode (extension needs SHUTDOWN events)
+    info!("Starting parallel license key validation and extension registration...");
+    let (license_key_result, registration_result) = tokio::join!(
+        resolve_license_key_with_aws_fallback(&config),
+        initialize_lambda_runtime_client_and_register()
+    );
+
+    let license_key_option = license_key_result?;
+    let (client, extension_id, registration) = registration_result?;
+    
     let Some(license_key) = license_key_option else {
-        warn!("No license key available. Running in no-op mode.");
-        let (client, extension_id) = initialize_lambda_runtime_client_and_register().await?;
+        warn!("No license key available after checking all sources. Running in no-op mode.");
         
-        // Return no-op components
+        // Update config with registration details even in no-op mode
+        let mut updated_config = (*config).clone();
+        updated_config.aws.update_from_registration(
+            registration.function_name,
+            registration.function_version,
+            registration.account_id,
+        );
+        let config = Arc::new(updated_config);
+        
+        // Return no-op components (extension already registered for SHUTDOWN events)
         return Ok(ExtensionComponents {
             client,
             extension_id,
@@ -289,42 +303,46 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         });
     };
 
-    // 4. Update config with resolved license key
+    // 3. Update config with validated license key
     let mut updated_config = (*config).clone();
     updated_config.new_relic.license_key = Some(license_key);
     let config = Arc::new(updated_config);
+    
+    info!("License key validated and extension registered - proceeding with full initialization");
 
     info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
 
-    // 5. PARALLEL: Initialize ALL core components simultaneously for maximum cold start performance
+    // --- PHASE 2: PARALLEL INITIALIZATION (using already registered extension) ---
+    
+    // Update config with registration details first (needed for NewRelic client)
+    let mut updated_config = (*config).clone();
+    updated_config.aws.update_from_registration(
+        registration.function_name,
+        registration.function_version,
+        registration.account_id,
+    );
+    let config = Arc::new(updated_config);
+    
+    // 4. MAXIMALLY PARALLEL: Initialize remaining core components simultaneously 
     let (
-        client_result,
-        registration_result,
         agent_telemetry_rx_result,
         newrelic_client,
         runtime_done_channels
     ) = tokio::join!(
-        initialize_http_client_with_timeout(),
-        async {
-            let client = initialize_http_client_with_timeout().await?;
-            register_extension_with_lambda_runtime(&client).await
-        },
         initialize_agent_telemetry_ipc_channel(),
         async { Arc::new(NewRelicClient::new(&config)) },
         async { mpsc::unbounded_channel::<()>() }
     );
 
-    let client = Arc::new(client_result?);
-    let (_registration, extension_id) = registration_result?;
     let agent_telemetry_rx = agent_telemetry_rx_result?;
     let (runtime_done_tx, runtime_done_rx) = runtime_done_channels;
 
-    info!("Extension registered with ID: {}", extension_id);
+    info!("Extension components initialized - ID: {} (license key pre-validated)", extension_id);
 
-    // 6. Start agent payload collector (background task)
+    // Start agent payload collector (background task)
     start_agent_payload_collector_background_task(agent_telemetry_rx);
 
-    // 7. PARALLEL: Initialize telemetry processors
+    // Initialize processors with updated config
     let (log_processor, platform_processor) = tokio::join!(
         async {
             Arc::new(LogProcessor::new(
@@ -341,18 +359,13 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             ))
         }
     );
-
-    // 8. PARALLEL: Setup telemetry listener and subscribe to Lambda Telemetry API
-    let (telemetry_listener_result, _) = tokio::join!(
-        setup_telemetry_listener(
-            log_processor.clone(), 
-            platform_processor.clone(), 
-            Some(runtime_done_tx)
-        ),
-        async { () } // Placeholder for potential future parallel initialization
-    );
-
-    let telemetry_listener_address = telemetry_listener_result?;
+    
+    // Setup telemetry listener with the processors
+    let telemetry_listener_address = setup_telemetry_listener(
+        log_processor.clone(),
+        platform_processor.clone(),
+        Some(runtime_done_tx)
+    ).await?;
     
     // 9. Subscribe to Lambda Telemetry API
     subscribe_to_lambda_telemetry_api(&client, &extension_id, telemetry_listener_address.port()).await?;
@@ -424,10 +437,10 @@ async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::er
 }
 
 /// Initialize Lambda runtime client and register extension
-async fn initialize_lambda_runtime_client_and_register() -> Result<(Arc<Client>, String), Box<dyn std::error::Error + Send + Sync>> {
+async fn initialize_lambda_runtime_client_and_register() -> Result<(Arc<Client>, String, ExtensionRegistrationResponse), Box<dyn std::error::Error + Send + Sync>> {
     let client = Arc::new(initialize_http_client_with_timeout().await?);
-    let (_registration, extension_id) = register_extension_with_lambda_runtime(&client).await?;
-    Ok((client, extension_id))
+    let (registration, extension_id) = register_extension_with_lambda_runtime(&client).await?;
+    Ok((client, extension_id, registration))
 }
 
 /// Initialize agent telemetry IPC channel

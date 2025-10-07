@@ -58,6 +58,15 @@ pub struct AwsConfig {
 
     /// Lambda function name
     pub function_name: String,
+
+    /// Lambda function version (from registration response)
+    pub function_version: Option<String>,
+
+    /// AWS account ID (from registration response)  
+    pub account_id: Option<String>,
+
+    /// AWS region (extracted from runtime API endpoint or environment)
+    pub region: Option<String>,
 }
 
 /// Extension specific settings
@@ -122,6 +131,49 @@ impl Default for AwsConfig {
         Self {
             runtime_api: "127.0.0.1:9001".to_string(),
             function_name: "unknown".to_string(),
+            function_version: None,
+            account_id: None,
+            region: None,
+        }
+    }
+}
+
+impl AwsConfig {
+    /// Construct the complete Lambda function ARN using registration details
+    /// Format: arn:aws:lambda:region:account-id:function:function-name  
+    /// This matches the Go implementation: getLambdaARN()
+    pub fn construct_function_arn(&self) -> Option<String> {
+        // Get account ID from registration response
+        let account_id = self.account_id.as_ref()?.as_str();
+        if account_id.is_empty() {
+            return None;
+        }
+
+        // Get function name from registration response  
+        if self.function_name.is_empty() {
+            return None;
+        }
+
+        // Get region from environment variables (AWS_REGION or AWS_DEFAULT_REGION)
+        let region = env::var("AWS_REGION")
+            .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+            .ok()?;
+        
+        Some(format!(
+            "arn:aws:lambda:{}:{}:function:{}",
+            region, account_id, self.function_name
+        ))
+    }
+
+    /// Update configuration with Lambda registration response details  
+    pub fn update_from_registration(&mut self, function_name: String, function_version: String, account_id: Option<String>) {
+        self.function_name = function_name;
+        self.function_version = Some(function_version);
+        self.account_id = account_id;
+        
+        // Try to extract region from environment if not already set
+        if self.region.is_none() {
+            self.region = env::var("AWS_REGION").ok();
         }
     }
 }
