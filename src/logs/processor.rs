@@ -256,7 +256,13 @@ impl LogProcessor {
     /// Converts a TelemetryRecord into a LogMessage, if applicable.
     fn to_log_message(&self, record: TelemetryRecord) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
-        let message = record.record.to_string();
+        let message = match &record.record {
+            // If it's already a string, use it directly to avoid double stringification
+            // This prevents JSON logs from being escaped as strings within strings
+            serde_json::Value::String(s) => s.clone(),
+            // For other JSON values (objects, arrays, etc.), serialize to string
+            other => other.to_string()
+        };
         let mut attributes = serde_json::Map::new();
         
         // Get request_id and trace_id from the context

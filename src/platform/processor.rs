@@ -54,39 +54,103 @@ impl PlatformProcessor {
 
     /// Processes a single platform telemetry record.
     pub fn process_record(&self, record: TelemetryRecord) {
-        // Check if this is a platform.report event that needs conversion to REPORT log format
-        if record.record_type == "platform.report" {
-            if let Some(log_line) = self.convert_platform_report_to_log_line(&record) {
-                // Log the formatted REPORT line for debugging
-                debug!("Formatted platform.report as: {}", log_line);
-                
-                // Convert to New Relic log format and add to batch
-                let log_event = serde_json::json!({
-                    "timestamp": record.time,
-                    "message": log_line,
-                    "level": "INFO",
-                    "requestId": self.extract_request_id_from_record(&record)
-                });
-                
-                let mut batch = self.platform_events_batch.lock().unwrap();
-                batch.push(log_event);
-                
-                trace!("Added platform report log to batch. Current batch size: {}", batch.len());
-                return;
-            }
-        }
+        // Convert platform event to a proper log message format
+        let (message, level) = self.create_platform_log_message(&record);
         
-        // For other platform events, convert to JSON (fallback)
-        let event = serde_json::to_value(&record).unwrap_or_else(|e| {
-            error!("Failed to serialize platform record: {}", e);
-            serde_json::Value::Null
+        // Create structured log event
+        let log_event = serde_json::json!({
+            "timestamp": record.time,
+            "message": message,
+            "level": level,
+            "type": record.record_type,
+            "requestId": self.extract_request_id_from_record(&record)
         });
+        
         let mut batch = self.platform_events_batch.lock().unwrap();
-        batch.push(event);
+        batch.push(log_event);
         
         // Only log batch size every 10th addition to reduce noise
         if batch.len() % 10 == 1 {
             trace!("Added platform event to batch. Current batch size: {}", batch.len());
+        }
+    }
+
+    /// Create a proper log message for platform events with readable format
+    fn create_platform_log_message(&self, record: &TelemetryRecord) -> (String, String) {
+        match record.record_type.as_str() {
+            "platform.report" => {
+                // Format as clean AWS CloudWatch REPORT log line (no [NR_EXT] prefix)
+                // This creates the exact same format as CloudWatch logs for consistency
+                if let Some(report_line) = self.convert_platform_report_to_log_line(record) {
+                    (report_line, "INFO".to_string())
+                } else {
+                    ("REPORT formatting failed - missing required fields".to_string(), "WARN".to_string())
+                }
+            }
+            "platform.initStart" => {
+                let init_type = record.record.get("initializationType")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let runtime_version = record.record.get("runtimeVersion")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let phase = record.record.get("phase")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                    
+                (format!("INIT START RequestId: {} Type: {} Runtime: {} Phase: {}", 
+                    self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string()),
+                    init_type, runtime_version, phase), "INFO".to_string())
+            }
+            "platform.initRuntimeDone" => {
+                let init_type = record.record.get("initializationType")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let phase = record.record.get("phase")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let status = record.record.get("status")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                    
+                (format!("INIT RUNTIME DONE RequestId: {} Type: {} Phase: {} Status: {}", 
+                    self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string()),
+                    init_type, phase, status), "INFO".to_string())
+            }
+            "platform.initReport" => {
+                let init_type = record.record.get("initializationType")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let phase = record.record.get("phase")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                let metrics = record.record.get("metrics");
+                
+                let duration_info = if let Some(metrics) = metrics {
+                    let duration = metrics.get("durationMs").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    format!(" Duration: {:.2} ms", duration)
+                } else {
+                    "".to_string()
+                };
+                
+                (format!("INIT REPORT RequestId: {} Type: {} Phase: {}{}", 
+                    self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string()),
+                    init_type, phase, duration_info), "INFO".to_string())
+            }
+            "platform.start" => {
+                let request_id = self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string());
+                (format!("START RequestId: {}", request_id), "INFO".to_string())
+            }
+            "platform.end" => {
+                let request_id = self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string());
+                (format!("END RequestId: {}", request_id), "INFO".to_string())
+            }
+            "platform.runtimeDone" => {
+                let request_id = self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string());
+                let status = record.record.get("status")
+                    .and_then(|v| v.as_str()).unwrap_or("unknown");
+                    
+                (format!("RUNTIME DONE RequestId: {} Status: {}", request_id, status), "INFO".to_string())
+            }
+            _ => {
+                // For unknown platform events, create a readable summary
+                let request_id = self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string());
+                (format!("PLATFORM EVENT {} RequestId: {} Data: {}", 
+                    record.record_type.to_uppercase(), request_id, 
+                    serde_json::to_string(&record.record).unwrap_or_else(|_| "{}".to_string())), "INFO".to_string())
+            }
         }
     }
 
@@ -108,7 +172,8 @@ impl PlatformProcessor {
             String::new()
         };
         
-        // Format as AWS CloudWatch REPORT log line
+        // Format as clean AWS CloudWatch REPORT log line (no extension prefix, no extra escaping)
+        // This will be sent to New Relic exactly as-is with literal tabs, matching CloudWatch format
         Some(format!(
             "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\tMax Memory Used: {} MB{}",
             request_id, duration_ms, billed_duration_ms, memory_size_mb, max_memory_used_mb, init_duration_part
@@ -148,13 +213,19 @@ impl PlatformProcessor {
         let log_messages: Vec<crate::newrelic::payload::LogMessage> = batch
             .into_iter()
             .filter_map(|event| {
-                // Extract message and timestamp from the event
+                // Extract the formatted message from the event
                 let message = event.get("message")
                     .and_then(|m| m.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| {
-                        // Fallback: stringify the entire event if no message field
-                        serde_json::to_string(&event).unwrap_or_default()
+                        // Fallback: create a basic platform event message
+                        let event_type = event.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("platform.unknown");
+                        let request_id = event.get("requestId")
+                            .and_then(|r| r.as_str())
+                            .unwrap_or("unknown");
+                        format!("PLATFORM EVENT {} RequestId: {}", event_type.to_uppercase(), request_id)
                     });
 
                 // Convert timestamp string to i64 (milliseconds since epoch)
@@ -171,16 +242,29 @@ impl PlatformProcessor {
                     .unwrap_or_else(|_| chrono::Utc::now().into())
                     .timestamp_millis();
 
-                // Create attributes map with level and request_id
+                // Create attributes map with structured platform event info
                 let mut attributes = serde_json::Map::new();
                 
+                // Get the invocation context for standard attributes
+                let context = self.invocation_context.lock().unwrap();
+                attributes.insert("aws.lambda_request_id".to_string(), 
+                                serde_json::Value::String(context.request_id.clone()));
+                attributes.insert("faas.execution".to_string(), 
+                                serde_json::Value::String(context.request_id.clone()));
+                
+                // Add log level
                 if let Some(level) = event.get("level").and_then(|l| l.as_str()) {
-                    attributes.insert("level".to_string(), serde_json::Value::String(level.to_string()));
+                    attributes.insert("log.level".to_string(), serde_json::Value::String(level.to_string()));
                 }
                 
-                if let Some(request_id) = event.get("requestId").and_then(|r| r.as_str()) {
-                    attributes.insert("requestId".to_string(), serde_json::Value::String(request_id.to_string()));
+                // Add platform event type
+                if let Some(event_type) = event.get("type").and_then(|t| t.as_str()) {
+                    attributes.insert("platform.type".to_string(), serde_json::Value::String(event_type.to_string()));
                 }
+                
+                // Add standard New Relic attributes for platform logs
+                attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
+                attributes.insert("newrelic.source".to_string(), "api.platform".into());
 
                 Some(crate::newrelic::payload::LogMessage {
                     timestamp,

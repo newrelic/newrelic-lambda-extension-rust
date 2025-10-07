@@ -228,12 +228,12 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
-        // Add the static prefix
-        write!(writer, "[NR_EXT]")?;
+        // Add the static prefix with proper spacing
+        write!(writer, "[NR_EXT] ")?;
 
-        // Add the log level
+        // Add the log level without colons
         let metadata = event.metadata();
-        write!(writer, ":{}:", metadata.level())?;
+        write!(writer, "{} ", metadata.level())?;
 
         // OPTIMIZATION: Only include file and line numbers in debug builds.
         #[cfg(debug_assertions)]
