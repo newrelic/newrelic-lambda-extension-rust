@@ -568,10 +568,12 @@ impl LogProcessor {
 
     /// Clear the request_id when the invocation is complete
     /// This ensures logs are buffered again for the next invocation until new request_id arrives
+    /// Note: We keep invoked_function_arn since it doesn't change between invocations
     pub fn clear_request_id(&self) {
         let mut context = self.invocation_context.lock().unwrap();
         context.request_id = String::new(); // Use empty string instead of "unknown"
-        context.invoked_function_arn = String::new(); // Use empty string instead of "unknown" ARN
+        // Keep invoked_function_arn - it's the same for all invocations of this function
+        // context.invoked_function_arn = String::new(); // DON'T clear this
         context.trace_id = None;
         // Clear all buffers to prevent cross-invocation pollution
         self.request_id_buffer.lock().unwrap().clear();

@@ -29,7 +29,6 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 use reqwest::Client;
-// Removed base64 import - no longer needed for agent payload handling
 
 use crate::{
     context::InvocationContext,
@@ -44,7 +43,6 @@ use crate::{
     credentials::get_new_relic_license_key,
 };
 
-// Extension name and version from Cargo.toml
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -63,9 +61,7 @@ static REQUEST_CONTEXTS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<InvocationCont
 static REQUEST_AGENT_BUFFERS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-// Track requests that have completed agent payload processing to avoid redundant processing
-static PROCESSED_REQUESTS: Lazy<Arc<Mutex<std::collections::HashSet<String>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
+
 
 // --- Fallback global components for backward compatibility ---
 static INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = 
@@ -494,11 +490,8 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                        String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
             }
             
-            // Store in buffer for safety/fallback
-            route_payload_to_request_buffer(payload_bytes.clone()).await;
-            
-            // Process immediately and notify completion via channel
-            process_received_agent_payload_with_notification(payload_bytes).await;
+            // Route payload (will try immediate processing first, store if it fails)
+            route_payload_to_request_buffer(payload_bytes).await;
         }
 
         warn!("Agent payload collector channel closed. No more agent payloads will be received");
@@ -507,7 +500,7 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
 
 /// Route agent payload to the correct per-request buffer or global buffer
 async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    // Strategy: Use the most recently started request that hasn't been cleaned up yet
+    // Strategy: Process immediately if possible, otherwise store for later processing
     let current_request_id = {
         if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
             // Get the most recent request (assumes HashMap iteration order reflects insertion order in recent Rust)
@@ -518,19 +511,24 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     };
     
     if let Some(request_id) = current_request_id {
-        // Try to route to per-request buffer
-        let request_buffer = get_request_agent_buffer(&request_id);
-        let buffer_result = request_buffer.lock();
+        // Try immediate processing first
+        let processed_immediately = process_received_agent_payload_with_notification(payload_bytes.clone()).await;
         
-        match buffer_result {
-            Ok(mut buffer) => {
-                buffer.push(payload_bytes);
-                info!("Routed agent payload to request buffer for {} (buffer size now {})", 
-                     request_id, buffer.len());
-            }
-            Err(e) => {
-                error!("Failed to lock request buffer for {}: {}, using global buffer", request_id, e);
-                route_to_global_buffer(payload_bytes);
+        if !processed_immediately {
+            // Only store if immediate processing failed
+            let request_buffer = get_request_agent_buffer(&request_id);
+            let buffer_result = request_buffer.lock();
+            
+            match buffer_result {
+                Ok(mut buffer) => {
+                    buffer.push(payload_bytes);
+                    info!("Stored agent payload in request buffer for {} (buffer size now {})", 
+                         request_id, buffer.len());
+                }
+                Err(e) => {
+                    error!("Failed to lock request buffer for {}: {}, using global buffer", request_id, e);
+                    route_to_global_buffer(payload_bytes);
+                }
             }
         }
     } else {
@@ -573,15 +571,7 @@ fn initialize_global_components(
     let _ = GLOBAL_LOG_PROCESSOR.set(log_processor);
 }
 
-fn get_current_active_request_id() -> Option<String> {
-    // Get the most recent request ID from the global LAST_REQUEST_ID
-    if let Some(request_id_mutex) = LAST_REQUEST_ID.get() {
-        if let Ok(last_request_id) = request_id_mutex.lock() {
-            return last_request_id.clone();
-        }
-    }
-    None
-}
+
 
 fn get_current_invoked_function_arn() -> Option<String> {
     if let Some(arn_mutex) = INVOKED_FUNCTION_ARN.get() {
@@ -618,7 +608,7 @@ fn cleanup_payload_coordination_channel(request_id: &str) {
 }
 
 /// Process agent payload immediately when received from channel and notify completion
-async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>) {
+async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>) -> bool {
     // Use the same strategy as route_payload_to_request_buffer for consistency
     let current_request_id = {
         if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
@@ -632,7 +622,7 @@ async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>
     if current_request_id.is_none() {
         info!("No active request context, payload will be processed later");
         store_payload_for_later(payload_bytes);
-        return;
+        return false;
     }
     
     let request_id = current_request_id.unwrap();
@@ -641,7 +631,7 @@ async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>
     if invoked_function_arn.is_none() {
         warn!("No function ARN available, storing payload for later processing");
         store_payload_for_later(payload_bytes);
-        return;
+        return false;
     }
     
     let arn = invoked_function_arn.unwrap();
@@ -652,7 +642,7 @@ async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>
     if config.is_none() || newrelic_client.is_none() || log_processor.is_none() {
         info!("Extension components not ready, storing payload for later processing");
         store_payload_for_later(payload_bytes);
-        return;
+        return false;
     }
     
     let config = config.unwrap();
@@ -678,6 +668,8 @@ async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>
             info!("Notified runtime done handler that payload is complete for request {}", request_id);
         }
     }
+    
+    true // Successfully processed immediately
 }
 
 /// Process and send agent payload following our simple flow
@@ -839,6 +831,10 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 
         match runtime_event {
             LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
+                // CRITICAL: Update context IMMEDIATELY to prevent race conditions with agent payload processing
+                let invocation_start_time = chrono::Utc::now();
+                update_global_invocation_context(&request_id, &invoked_function_arn, invocation_start_time);
+                
                 // PERFORMANCE: Start timing AFTER receiving the event (not including wait time)
                 let event_processing_start_time = std::time::Instant::now();
                 
@@ -869,15 +865,10 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     }
                 }
                 
-                // WARM START OPTIMIZATION: Minimal synchronous processing
-                let invocation_start_time = chrono::Utc::now();
-                
-                // Update global invocation context (fast)
-                update_global_invocation_context(&request_id, &invoked_function_arn, invocation_start_time);
-                
                 // Fast local state updates (no network I/O)
                 components.log_processor.set_invocation_start_time(invocation_start_time);
                 components.log_processor.reset_trace_id_state();
+                // Request context isolation is handled automatically via shared invocation_context
                 components.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
                 
                 // Retry failed logs from previous invocation in background (non-blocking)
@@ -898,10 +889,6 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     wait_for_function_completion_and_process_payloads(
                         &mut components.runtime_done_rx,
                         &request_id,
-                        &invoked_function_arn,
-                        &components.newrelic_client,
-                        &components.config,
-                        &components.log_processor,
                     ).await;
                 } else {
                     // WARM START: Optimized background processing
@@ -1058,14 +1045,7 @@ fn cleanup_request_resources(request_id: &str) {
     cleanup_payload_coordination_channel(request_id);
 }
 
-/// Clean up processed request tracking (called after a delay to allow final safety checks)
-fn cleanup_processed_request_tracking(request_id: &str) {
-    if let Ok(mut processed) = PROCESSED_REQUESTS.lock() {
-        if processed.remove(request_id) {
-            debug!("Cleaned up processed request tracking for {}", request_id);
-        }
-    }
-}
+
 
 /// Check pending agent payloads for a given request context
 /// Returns (request_buffer_size, global_buffer_size)
@@ -1162,10 +1142,6 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
 async fn wait_for_function_completion_and_process_payloads(
     runtime_done_rx: &mut mpsc::UnboundedReceiver<()>,
     request_id: &str,
-    invoked_function_arn: &str,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    log_processor: &Arc<LogProcessor>,
 ) {
     // Step 1: Wait for runtime done signal (function completion)
     info!("Waiting for Lambda function completion (runtimeDone event)...");
@@ -1243,10 +1219,10 @@ fn get_and_clear_agent_payloads(request_id: &str) -> Vec<Vec<u8>> {
 /// Simplified warm start version - wait for channel coordination or timeout
 async fn wait_for_function_execution_and_agent_payloads(
     request_id: &str,
-    invoked_function_arn: &str,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    log_processor: &Arc<LogProcessor>,
+    _invoked_function_arn: &str,
+    _newrelic_client: &Arc<NewRelicClient>,
+    _config: &Arc<config::ExtensionConfig>,
+    _log_processor: &Arc<LogProcessor>,
 ) {
     info!("Waiting for agent payloads for request {}", request_id);
     
@@ -1510,19 +1486,12 @@ async fn process_agent_payloads_with_context(
     // Clean up per-request resources after processing
     if let Some(request_id) = request_id_opt {
         cleanup_request_resources(request_id);
-        
-        // Clean up processed request tracking after a delay to allow safety checks
-        let request_id_copy = request_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            cleanup_processed_request_tracking(&request_id_copy);
-        });
     }
 }
 
 /// Create wrapped agent payload JSON string
 /// Create New Relic log format with agent data in message field
-/// Only extract trace ID if enabled via environment variable
+/// NOTE: Trace ID extraction is handled separately in process_and_send_agent_payload
 fn create_wrapped_agent_payload_json(
     payload_bytes: &[u8],
     function_name: &str,
@@ -1531,16 +1500,6 @@ fn create_wrapped_agent_payload_json(
     request_id: &str,
 ) -> String {
     debug!("Processing agent data of {} bytes for function: {}", payload_bytes.len(), function_name);
-    
-    // Check if trace ID extraction is enabled via environment variable
-    let extract_trace_id = std::env::var("NR_EXTRACT_TRACE_ID")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
-    
-    if extract_trace_id {
-        // TODO: Implement trace ID extraction logic here
-        debug!("Trace ID extraction enabled, but not yet implemented");
-    }
     
     // Create New Relic log event format with agent data as message
     create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id)
