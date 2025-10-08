@@ -24,6 +24,7 @@ use std::{
 
 use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
@@ -57,7 +58,6 @@ static LAST_REQUEST_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 // --- CONCURRENT REQUEST HANDLING ---
 // Per-request contexts to handle concurrent Lambda invocations safely
-use std::collections::HashMap;
 static REQUEST_CONTEXTS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<InvocationContext>>>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 static REQUEST_AGENT_BUFFERS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> = 
@@ -72,6 +72,15 @@ static INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> =
     Lazy::new(|| Arc::new(Mutex::new(InvocationContext::default())));
 static AGENT_PAYLOAD_BUFFER: Lazy<Arc<Mutex<Vec<Vec<u8>>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+// --- Global components for immediate agent payload processing ---
+static GLOBAL_CONFIG: OnceLock<Arc<config::ExtensionConfig>> = OnceLock::new();
+static GLOBAL_NEWRELIC_CLIENT: OnceLock<Arc<NewRelicClient>> = OnceLock::new();
+static GLOBAL_LOG_PROCESSOR: OnceLock<Arc<LogProcessor>> = OnceLock::new();
+
+// Global coordination channels per request for agent payload processing
+static PAYLOAD_COORDINATION: Lazy<Arc<Mutex<HashMap<String, mpsc::UnboundedSender<()>>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 // Structure to hold all initialized components for warm starts
 #[derive(Debug)]
@@ -379,6 +388,13 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         config.new_relic.harvest_interval,
     );
 
+    // Initialize global components for immediate agent payload processing
+    initialize_global_components(
+        config.clone(),
+        newrelic_client.clone(),
+        log_processor.clone(),
+    );
+
     // 11. Return initialized components directly
     Ok(ExtensionComponents {
         client,
@@ -462,25 +478,27 @@ fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Recei
     start_concurrent_agent_payload_collector(agent_telemetry_rx);
 }
 
-/// Enhanced agent payload collector that handles concurrent requests
+/// Channel-based agent payload collector with immediate processing and notification
 fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
     tokio::spawn(async move {
-        info!("Agent payload collector started and waiting for data from agent IPC pipe");
+        info!("Agent payload collector started - continuously listening for agent payloads");
         let mut payload_count = 0;
 
         while let Some(payload_bytes) = receiver.recv().await {
             payload_count += 1;
             
-            // Log every agent payload reception with more detail
-            info!("Received agent payload #{} ({} bytes)", payload_count, payload_bytes.len());
+            info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
             
             if payload_count <= 5 {
-                debug!("Payload #{} preview: {:?}", payload_count, 
+                debug!("Agent Payload preview: {:?}", 
                        String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
             }
             
-            // Route payload to appropriate buffer based on current active request
-            route_payload_to_request_buffer(payload_bytes).await;
+            // Store in buffer for safety/fallback
+            route_payload_to_request_buffer(payload_bytes.clone()).await;
+            
+            // Process immediately and notify completion via channel
+            process_received_agent_payload_with_notification(payload_bytes).await;
         }
 
         warn!("Agent payload collector channel closed. No more agent payloads will be received");
@@ -529,6 +547,206 @@ fn route_to_global_buffer(payload_bytes: Vec<u8>) {
         info!("Routed payload to global buffer (buffer size now {})", buffer.len());
     } else {
         error!("Failed to lock global agent payload buffer - payload lost!");
+    }
+}
+
+// --- Helper functions for global component access ---
+fn get_global_config() -> Option<Arc<config::ExtensionConfig>> {
+    GLOBAL_CONFIG.get().cloned()
+}
+
+fn get_global_newrelic_client() -> Option<Arc<NewRelicClient>> {
+    GLOBAL_NEWRELIC_CLIENT.get().cloned()
+}
+
+fn get_global_log_processor() -> Option<Arc<LogProcessor>> {
+    GLOBAL_LOG_PROCESSOR.get().cloned()
+}
+
+fn initialize_global_components(
+    config: Arc<config::ExtensionConfig>,
+    newrelic_client: Arc<NewRelicClient>,
+    log_processor: Arc<LogProcessor>,
+) {
+    let _ = GLOBAL_CONFIG.set(config);
+    let _ = GLOBAL_NEWRELIC_CLIENT.set(newrelic_client);
+    let _ = GLOBAL_LOG_PROCESSOR.set(log_processor);
+}
+
+fn get_current_active_request_id() -> Option<String> {
+    // Get the most recent request ID from the global LAST_REQUEST_ID
+    if let Some(request_id_mutex) = LAST_REQUEST_ID.get() {
+        if let Ok(last_request_id) = request_id_mutex.lock() {
+            return last_request_id.clone();
+        }
+    }
+    None
+}
+
+fn get_current_invoked_function_arn() -> Option<String> {
+    if let Some(arn_mutex) = INVOKED_FUNCTION_ARN.get() {
+        if let Ok(arn_guard) = arn_mutex.lock() {
+            return arn_guard.clone();
+        }
+    }
+    None
+}
+
+fn store_payload_for_later(payload_bytes: Vec<u8>) {
+    if let Ok(mut buffer) = AGENT_PAYLOAD_BUFFER.lock() {
+        buffer.push(payload_bytes);
+    }
+}
+
+// Channel coordination helper functions
+fn create_payload_coordination_channel(request_id: &str) -> mpsc::UnboundedReceiver<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+        channels.insert(request_id.to_string(), tx);
+    }
+    
+    rx
+}
+
+fn cleanup_payload_coordination_channel(request_id: &str) {
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+        if channels.remove(request_id).is_some() {
+            debug!("Cleaned up coordination channel for request {}", request_id);
+        }
+    }
+}
+
+/// Process agent payload immediately when received from channel and notify completion
+async fn process_received_agent_payload_with_notification(payload_bytes: Vec<u8>) {
+    // Use the same strategy as route_payload_to_request_buffer for consistency
+    let current_request_id = {
+        if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
+            // Get the most recent request (assumes HashMap iteration order reflects insertion order in recent Rust)
+            contexts.keys().last().cloned()
+        } else {
+            None
+        }
+    };
+    
+    if current_request_id.is_none() {
+        info!("No active request context, payload will be processed later");
+        store_payload_for_later(payload_bytes);
+        return;
+    }
+    
+    let request_id = current_request_id.unwrap();
+    let invoked_function_arn = get_current_invoked_function_arn();
+    
+    if invoked_function_arn.is_none() {
+        warn!("No function ARN available, storing payload for later processing");
+        store_payload_for_later(payload_bytes);
+        return;
+    }
+    
+    let arn = invoked_function_arn.unwrap();
+    let config = get_global_config();
+    let newrelic_client = get_global_newrelic_client();
+    let log_processor = get_global_log_processor();
+    
+    if config.is_none() || newrelic_client.is_none() || log_processor.is_none() {
+        info!("Extension components not ready, storing payload for later processing");
+        store_payload_for_later(payload_bytes);
+        return;
+    }
+    
+    let config = config.unwrap();
+    let newrelic_client = newrelic_client.unwrap();
+    let log_processor = log_processor.unwrap();
+    
+    info!("Processing agent payload immediately for request {}", request_id);
+    
+    // Process and send immediately
+    process_and_send_agent_payload(
+        &payload_bytes,
+        &request_id,
+        &arn,
+        &newrelic_client,
+        &config,
+        &log_processor,
+    ).await;
+    
+    // Notify completion via channel
+    if let Ok(channels) = PAYLOAD_COORDINATION.lock() {
+        if let Some(tx) = channels.get(&request_id) {
+            let _ = tx.send(()); // Notify that payload processing is complete
+            info!("Notified runtime done handler that payload is complete for request {}", request_id);
+        }
+    }
+}
+
+/// Process and send agent payload following our simple flow
+async fn process_and_send_agent_payload(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+    log_processor: &Arc<LogProcessor>,
+) {
+    // 1. Check if trace ID is enabled via config
+    if config.new_relic.collect_trace_id {
+        // Extract trace ID if enabled
+        if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
+            info!("Extracted trace ID: {}, coordinating with logs", trace_id);
+            
+            update_trace_id_in_context(request_id, &trace_id);
+            
+            if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
+                error!("Failed to coordinate logs with trace ID: {}", e);
+            }
+        }
+    }
+    
+    // 2. Send agent payload to New Relic immediately
+    send_agent_payload_to_newrelic(
+        payload_bytes,
+        request_id,
+        invoked_function_arn,
+        newrelic_client,
+        config,
+    ).await;
+    
+    info!("Agent payload processed and sent for request {}", request_id);
+}
+
+fn update_trace_id_in_context(request_id: &str, trace_id: &str) {
+    let context = get_request_context(request_id);
+    if let Ok(mut ctx) = context.lock() {
+        ctx.trace_id = Some(trace_id.to_string());
+    };
+}
+
+async fn send_agent_payload_to_newrelic(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) {
+    let function_name = invoked_function_arn.split(':').last().unwrap_or("");
+    let log_group_name = format!("/aws/lambda/{}", function_name);
+    
+    let wrapped_payload = create_wrapped_agent_payload_json(
+        payload_bytes,
+        function_name,
+        invoked_function_arn,
+        &log_group_name,
+        request_id,
+    );
+    
+    match newrelic_client.send_agent_payload(config, &wrapped_payload).await {
+        Ok(_) => {
+            info!("Successfully sent agent payload for request {}", request_id);
+        }
+        Err(e) => {
+            error!("Failed to send agent payload for request {}: {}", request_id, e);
+        }
     }
 }
 
@@ -835,6 +1053,9 @@ fn cleanup_request_resources(request_id: &str) {
             debug!("No agent buffer found to clean up for request {}", request_id);
         }
     }
+    
+    // Clean up payload coordination channel
+    cleanup_payload_coordination_channel(request_id);
 }
 
 /// Clean up processed request tracking (called after a delay to allow final safety checks)
@@ -869,8 +1090,7 @@ fn check_pending_agent_payloads(context: &Option<(String, String)>) -> (usize, u
     }
 }
 
-/// Check for pending agent payloads before freeze and process them if found
-/// This is called at the end of each invocation, right before waiting for the next event
+/// Simple check before freeze mode with continuous listening
 async fn check_and_process_pending_agent_payloads_before_freeze(
     request_id: &str,
     invoked_function_arn: &str,
@@ -878,59 +1098,30 @@ async fn check_and_process_pending_agent_payloads_before_freeze(
     config: &Arc<config::ExtensionConfig>,
     log_processor: &Arc<LogProcessor>,
 ) {
-    // Check if this request has already been processed
-    let already_processed = {
-        if let Ok(processed) = PROCESSED_REQUESTS.lock() {
-            processed.contains(request_id)
-        } else {
-            false
+    info!("Checking for pending agent payloads before freeze for request {}", request_id);
+    
+    // Create a receiver for this request to wait for agent payload completion
+    let mut payload_completion_rx = create_payload_coordination_channel(request_id);
+    
+    // Wait for agent payload completion with timeout before freeze
+    info!("Waiting for agent payload completion before freeze for request {} (timeout)...", request_id);
+    
+    tokio::select! {
+        _ = payload_completion_rx.recv() => {
+            info!("Agent payload processing completed before freeze for request {}", request_id);
         }
-    };
-    
-    if already_processed {
-        return;
-    }
-    
-    // Quick check for pending payloads in both per-request and global buffers
-    let (request_buffer_size, global_buffer_size) = {
-        let request_buffer = get_request_agent_buffer(request_id);
-        let request_size = if let Ok(buffer) = request_buffer.lock() {
-            buffer.len()
-        } else {
-            0
-        };
-        
-        let global_size = if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
-            buffer.len()
-        } else {
-            0
-        };
-        
-        (request_size, global_size)
-    };
-    
-    let total_pending = request_buffer_size + global_buffer_size;
-    
-    if total_pending > 0 {
-        warn!("Found {} pending agent payloads (request: {}, global: {}), processing before extension freeze for request {}", 
-              total_pending, request_buffer_size, global_buffer_size, request_id);
-        
-        // Give a small additional wait for any final payloads that might be arriving
-        const FINAL_PAYLOAD_WAIT_MS: u64 = 100;
-        tokio::time::sleep(std::time::Duration::from_millis(FINAL_PAYLOAD_WAIT_MS)).await;
-        
-        // Process the pending payloads
-        process_agent_payloads_with_coordination(
-            request_id,
-            invoked_function_arn,
-            newrelic_client,
-            config,
-            log_processor,
-        ).await;
-        
-        info!("Completed processing pending agent payloads for request {}", request_id);
-    } else {
-        info!("No pending agent payloads found for request {} (safety check passed)", request_id);
+        _ = tokio::time::sleep(std::time::Duration::from_millis(150)) => {
+            info!("Timeout (150ms) waiting for agent payload before freeze for request {}", request_id);
+            
+            // Process any stored payloads as fallback
+            process_any_stored_payloads_for_request(
+                request_id,
+                invoked_function_arn,
+                newrelic_client,
+                config,
+                log_processor,
+            ).await;
+        }
     }
 }
 
@@ -967,8 +1158,7 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
 
 
 
-/// Wait for function completion and then process agent payloads
-/// This ensures we wait for the Lambda function to complete before checking for agent payloads
+/// Simplified: Wait for function completion and then check agent payload status
 async fn wait_for_function_completion_and_process_payloads(
     runtime_done_rx: &mut mpsc::UnboundedReceiver<()>,
     request_id: &str,
@@ -983,108 +1173,74 @@ async fn wait_for_function_completion_and_process_payloads(
         warn!("Runtime done channel closed unexpectedly");
     }
     
-    info!("Function completed, now waiting for agent payloads...");
+    info!("Function completed, checking for agent payload completion...");
     
-    // Step 2: Wait for agent payloads with timeout after function completion
-    // Agent payloads are typically generated 100-300ms after function completion
-    wait_for_agent_payloads_with_timeout_and_process(
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-        log_processor,
-    ).await;
+    // Step 2: Create a receiver for this request to check for immediate agent payload completion
+    let mut payload_completion_rx = create_payload_coordination_channel(request_id);
+    
+    // Check for immediate agent payload completion (no timeout)
+    info!("Checking for immediate agent payload completion for request {}...", request_id);
+    
+    // Check if payload was already processed immediately (no wait needed)
+    tokio::select! {
+        _ = payload_completion_rx.recv() => {
+            info!("Agent payload processing completed for request {}", request_id);
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_millis(0)) => {
+            // No wait - if payload arrives later, it will be caught by before-freeze check
+            info!("No immediate agent payload for request {} - will check before freeze", request_id);
+        }
+    }
 }
 
-/// Wait for agent payloads with a reasonable timeout and then process them
-/// This function waits for agent payloads to be generated after function completion
-async fn wait_for_agent_payloads_with_timeout_and_process(
+async fn process_any_stored_payloads_for_request(
     request_id: &str,
     invoked_function_arn: &str,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
     log_processor: &Arc<LogProcessor>,
 ) {
-    const AGENT_PAYLOAD_TIMEOUT_MS: u64 = 800; // Increased timeout for agent payloads
-    const CHECK_INTERVAL_MS: u64 = 50; // Check every 50ms
+    // Check for any stored payloads and process them
+    let payloads = get_and_clear_agent_payloads(request_id);
+    let payload_count = payloads.len();
     
-    let start_time = std::time::Instant::now();
-    let timeout_duration = std::time::Duration::from_millis(AGENT_PAYLOAD_TIMEOUT_MS);
-    
-    // Record initial buffer sizes to detect new payloads (check both per-request and global)
-    let (initial_request_buffer_size, initial_global_buffer_size) = {
-        let request_buffer = get_request_agent_buffer(request_id);
-        let request_size = if let Ok(buffer) = request_buffer.lock() {
-            buffer.len()
-        } else {
-            0
-        };
-        
-        let global_size = if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
-            buffer.len()
-        } else {
-            0
-        };
-        
-        (request_size, global_size)
-    };
-    
-    debug!("Waiting for agent payloads for request {} (initial: request={}, global={})...", 
-           request_id, initial_request_buffer_size, initial_global_buffer_size);
-    
-    // Wait for agent payloads or timeout
-    loop {
-        let (current_request_size, current_global_size) = {
-            let request_buffer = get_request_agent_buffer(request_id);
-            let request_size = if let Ok(buffer) = request_buffer.lock() {
-                buffer.len()
-            } else {
-                0
-            };
-            
-            let global_size = if let Ok(buffer) = AGENT_PAYLOAD_BUFFER.lock() {
-                buffer.len()
-            } else {
-                0
-            };
-            
-            (request_size, global_size)
-        };
-        
-        // Check if new payloads have arrived in either buffer
-        let new_request_payloads = current_request_size > initial_request_buffer_size;
-        let new_global_payloads = current_global_size > initial_global_buffer_size;
-        
-        if new_request_payloads || new_global_payloads {
-            let new_count = (current_request_size - initial_request_buffer_size) + 
-                           (current_global_size - initial_global_buffer_size);
-            info!("Agent payloads detected ({} new payloads) after {:?}, processing now...", 
-                  new_count, start_time.elapsed());
-            break;
-        }
-        
-        // Check for timeout
-        if start_time.elapsed() >= timeout_duration {
-            debug!("Agent payload timeout reached ({}ms), processing what we have...", AGENT_PAYLOAD_TIMEOUT_MS);
-            break;
-        }
-        
-        // Small delay before next check
-        tokio::time::sleep(std::time::Duration::from_millis(CHECK_INTERVAL_MS)).await;
+    if payload_count > 0 {
+        info!("Processing {} stored agent payloads for request {}", payload_count, request_id);
     }
     
-    // Process agent payloads with proper coordination
-    process_agent_payloads_with_coordination(
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-        log_processor,
-    ).await;
+    for payload_bytes in payloads {
+        process_and_send_agent_payload(
+            &payload_bytes,
+            request_id,
+            invoked_function_arn,
+            newrelic_client,
+            config,
+            log_processor,
+        ).await;
+    }
 }
 
-/// Wait for function execution and agent payloads (for warm starts without runtime_done_rx access)
-/// This function estimates function completion time and then waits for agent payloads
+fn get_and_clear_agent_payloads(request_id: &str) -> Vec<Vec<u8>> {
+    // Try per-request buffer first
+    if let Ok(buffers) = REQUEST_AGENT_BUFFERS.lock() {
+        if let Some(buffer) = buffers.get(request_id) {
+            if let Ok(mut buf) = buffer.lock() {
+                if !buf.is_empty() {
+                    return std::mem::take(&mut *buf);
+                }
+            }
+        }
+    }
+    
+    // Fallback to global buffer
+    if let Ok(mut global_buf) = AGENT_PAYLOAD_BUFFER.lock() {
+        std::mem::take(&mut *global_buf)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Simplified warm start version - wait for channel coordination or timeout
 async fn wait_for_function_execution_and_agent_payloads(
     request_id: &str,
     invoked_function_arn: &str,
@@ -1092,163 +1248,21 @@ async fn wait_for_function_execution_and_agent_payloads(
     config: &Arc<config::ExtensionConfig>,
     log_processor: &Arc<LogProcessor>,
 ) {
-    // Step 1: Wait for typical Lambda function execution time
-    // For warm starts, we need to wait longer since we can't detect function completion
-    // Based on logs, functions can take 4+ seconds, so we need a more intelligent approach
-    const INITIAL_WAIT_MS: u64 = 1000;  // Start with 1 second
-    const MAX_TOTAL_WAIT_MS: u64 = 8000; // Maximum 8 seconds total wait
-    const CHECK_INTERVAL_MS: u64 = 500;  // Check every 500ms
+    info!("Waiting for agent payloads for request {}", request_id);
     
-    info!("Starting agent payload processing for request {} - waiting for function execution and agent payloads", request_id);
+    // Create a receiver for this request to check for immediate agent payload completion
+    let mut payload_completion_rx = create_payload_coordination_channel(request_id);
     
-    let start_time = std::time::Instant::now();
+    // Check for immediate agent payload completion (no timeout)
+    info!("Checking for immediate agent payload completion for request {}...", request_id);
     
-    // Initial wait period
-    debug!("Initial wait of {}ms for function execution", INITIAL_WAIT_MS);
-    tokio::time::sleep(std::time::Duration::from_millis(INITIAL_WAIT_MS)).await;
-    
-        // Check for agent payloads periodically until we find them or timeout
-        let mut found_payloads = false;
-        let mut check_count = 0;
-        
-        while start_time.elapsed().as_millis() < MAX_TOTAL_WAIT_MS as u128 {
-            check_count += 1;
-            // Check if payloads have arrived
-            let current_buffer_size = {
-                // Check per-request buffer first
-                let request_buffer_size = match REQUEST_AGENT_BUFFERS.lock() {
-                    Ok(buffers) => {
-                        if let Some(buffer) = buffers.get(request_id) {
-                            match buffer.lock() {
-                                Ok(b) => b.len(),
-                                Err(_) => 0,
-                            }
-                        } else {
-                            0
-                        }
-                    }
-                    Err(_) => 0,
-                };
-                
-                if request_buffer_size > 0 {
-                    request_buffer_size
-                } else {
-                    // Check global buffer as fallback
-                    match AGENT_PAYLOAD_BUFFER.lock() {
-                        Ok(global_buffer) => global_buffer.len(),
-                        Err(_) => 0,
-                    }
-                }
-            };
-            
-            debug!("Agent payload check #{} - Buffer size: {}, Elapsed: {:?}", 
-                   check_count, current_buffer_size, start_time.elapsed());
-            
-            if current_buffer_size > 0 {
-                found_payloads = true;
-                info!("Found {} agent payloads after {:?} and {} checks", 
-                      current_buffer_size, start_time.elapsed(), check_count);
-                break;
-            }
-        
-        // Wait before next check
-        tokio::time::sleep(std::time::Duration::from_millis(CHECK_INTERVAL_MS)).await;
-    }
-    
-    if !found_payloads {
-        warn!("No agent payloads found after {:?} timeout ({} checks) for request {}", 
-              start_time.elapsed(), check_count, request_id);
-    }
-    
-    // Step 2: Process agent payloads with coordination
-    info!("Starting payload processing with coordination for request {}", request_id);
-    process_agent_payloads_with_coordination(
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-        log_processor,
-    ).await;
-}
-
-/// Process agent payloads with proper trace ID coordination
-/// This function handles both immediate sending (trace ID disabled) and coordinated sending (trace ID enabled)
-async fn process_agent_payloads_with_coordination(
-    request_id: &str,
-    invoked_function_arn: &str,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    log_processor: &Arc<LogProcessor>,
-) {
-    info!("Starting agent payload processing for request {}", request_id);
-    
-    if config.new_relic.collect_trace_id {
-        info!("Processing agent payloads with trace ID coordination enabled for request {}", request_id);
-    } else {
-        info!("Processing agent payloads immediately (trace ID collection disabled) for request {}", request_id);
-    }
-
-    process_current_invocation_agent_payloads_impl(
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-        log_processor,
-    ).await;
-    
-    info!("Completed agent payload processing for request {}", request_id);
-}
-
-/// Internal implementation for processing current invocation's agent payloads
-async fn process_current_invocation_agent_payloads_impl(
-    request_id: &str,
-    invoked_function_arn: &str,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    log_processor: &Arc<LogProcessor>,
-) {
-    // Check per-request buffer first, then global buffer as fallback
-    let request_buffer = get_request_agent_buffer(request_id);
-    let buffer_size = {
-        if let Ok(buffer) = request_buffer.lock() {
-            buffer.len()
-        } else {
-            error!("Failed to lock per-request agent buffer for {}", request_id);
-            return;
+    // Check if payload was already processed immediately (no wait needed)
+    tokio::select! {
+        _ = payload_completion_rx.recv() => {
+            info!("Agent payload processing completed for request {}", request_id);
         }
-    };
-    
-    if buffer_size == 0 {
-        // Each Lambda invocation produces exactly one agent payload
-        // If we don't have it yet, the agent may not be properly configured
-        static INVOCATION_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let current_count = INVOCATION_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        
-        if current_count > 1 { // Warn after 2nd invocation (agent should be ready by then)
-            warn!("[agentsend] No agent payloads found for request {} (invocation {}). Each Lambda invocation should produce exactly one agent payload. Agent may not be initialized or New Relic handler not wrapped around function.", request_id, current_count + 1);
-        } else {
-            debug!("[agentsend] No agent payloads found for request {} (invocation {}). This is normal during cold start if agent is still initializing.", request_id, current_count + 1);
-        }
-    } else {
-        info!("Processing {} agent payloads", buffer_size);
-    }
-
-    process_agent_payloads_with_context(
-        &Some(request_id.to_string()), 
-        &Some(invoked_function_arn.to_string()), 
-        newrelic_client, 
-        config,
-        log_processor
-    ).await;
-    
-    // Mark this request as processed for agent payloads
-    if let Ok(mut processed) = PROCESSED_REQUESTS.lock() {
-        processed.insert(request_id.to_string());
     }
 }
-
-
-
 
 async fn process_previous_invocation_agent_payloads(
     previous_context: &Option<(String, String)>,
