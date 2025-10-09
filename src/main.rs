@@ -81,6 +81,10 @@ static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = Lazy::n
     }))
 });
 
+// Global flag to track if this is a warm start (for performance optimization)
+static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> = 
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
 // --- PROCESSOR FACTORY FOR REQUEST-SCOPED PROCESSORS ---
 #[derive(Debug, Clone)]
 struct ProcessorFactory {
@@ -852,6 +856,8 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     info!("COLD START: First invocation processed in {:?} (request_id: {})", 
                           event_processing_time, request_id);
                 } else {
+                    // Set warm start flag for performance optimization
+                    IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
                     info!("WARM START: Event {} processed in {:?} (request_id: {})", 
                           event_counter, event_processing_time, request_id);
                 }
@@ -905,9 +911,9 @@ async fn process_request_concurrently(
         _ = state.coordination_rx.as_mut().unwrap().recv() => {
             info!("Function completed for request: {}", request_id);
         }
-        _ = tokio::time::sleep(Duration::from_secs(300)) => {
-            warn!("Timeout waiting for function completion for request: {}", request_id);
-        }
+        // _ = tokio::time::sleep(Duration::from_secs(300)) => {
+        //     warn!("Timeout waiting for function completion for request: {}", request_id);
+        // }
     }
     
     // Process agent payloads for this specific request

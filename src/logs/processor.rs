@@ -290,26 +290,21 @@ impl LogProcessor {
 
     /// Processes a single log telemetry record, adding it to the batch if valid.
     pub fn process_record(&self, record: TelemetryRecord) {
-        debug!("Processing log record: type={}", record.record_type);
 
         // Check if this log type should be sent based on configuration
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
-                    debug!("Skipping function log (send_function_logs={})", self.config.extension.send_function_logs);
                     return;
                 }
-                debug!("Processing function log (send_function_logs={})", self.config.extension.send_function_logs);
             }
             "extension" => {
                 if !self.config.extension.send_extension_logs {
-                    debug!("Skipping extension log (send_extension_logs={})", self.config.extension.send_extension_logs);
                     return;
                 }
-                debug!("Processing extension log (send_extension_logs={})", self.config.extension.send_extension_logs);
             }
             _ => {
-                debug!("Processing unknown log type: {}", record.record_type);
+                // Unknown log type - process it
             }
         }
         
@@ -317,8 +312,14 @@ impl LogProcessor {
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown log message");
         
-        // Avoid recursive logging from our own processors
-        if message_str.contains("[LogProcessor]") || message_str.contains("[PlatformProcessor]") {
+        // Avoid recursive logging from our own processors - CRITICAL to prevent infinite loops
+        if message_str.contains("[LogProcessor]") || 
+           message_str.contains("[PlatformProcessor]") ||
+           message_str.contains("[NR_EXT]") ||  // Block ALL extension logs to prevent feedback loop
+           message_str.contains("DEBUG") ||     // Block debug logs that cause recursion
+           message_str.contains("Processing log record") ||
+           message_str.contains("Added log to batch") ||
+           message_str.contains("Batching log for") {
             return;
         }
 
@@ -366,31 +367,43 @@ impl LogProcessor {
                 }
             }
             
-            // If trace ID collection is disabled, add to batch and flush periodically
-            // This provides better performance than individual sends while still being responsive
+            // If trace ID collection is disabled, use performance-optimized batching
             if self.trace_extraction_state.is_none() {
                 let mut batch = self.log_batch.lock().unwrap();
                 batch.push(log_message);
                 let batch_size = batch.len();
                 
-                debug!("Added log to immediate batch (trace ID disabled), current size: {}", batch_size);
+                // Check if this is a warm start for performance optimization
+                let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
                 
-                // Flush batch when it reaches a reasonable size for performance
-                if batch_size >= 10 {
+                // Performance optimization: Use different strategies for cold vs warm starts
+                // For cold starts: Send immediately to ensure logs are visible quickly  
+                // For warm starts: Hold all logs until final flush to avoid impacting function duration
+                if is_warm_start {
+                    // For warm starts: Don't send during function execution, let harvester/final flush handle it
+                    return;
+                }
+                
+                // Cold start: send immediately when we hit threshold
+                let flush_threshold = 15;
+                let should_flush = batch_size >= flush_threshold;
+                
+                if should_flush {
                     let logs_to_send = std::mem::take(&mut *batch);
                     drop(batch); // Release lock
                     
-                    debug!("Flushing batch of {} logs immediately", logs_to_send.len());
+                    debug!("Flushing batch of {} logs (warm_start={})", logs_to_send.len(), is_warm_start);
                     
                     let client = Arc::clone(&self.newrelic_client);
                     let config = Arc::clone(&self.config);
                     let context = self.invocation_context.lock().unwrap().clone();
                     
+                    // Cold start: send immediately but async to not block other processing
                     tokio::spawn(async move {
                         if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
-                            error!("Failed to send log batch immediately: {}", e);
+                            error!("Failed to send log batch (cold start): {}", e);
                         } else {
-                            debug!("Successfully sent log batch immediately");
+                            debug!("Successfully sent log batch (cold start)");
                         }
                     });
                 }

@@ -39,8 +39,9 @@ impl NewRelicClient {
         let client = Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_millis(2400)) // 2.4s timeout for New Relic requests
-            .pool_idle_timeout(std::time::Duration::from_secs(10)) // Reset stale connections faster
-            .pool_max_idle_per_host(2) // Limit connection reuse
+            .pool_idle_timeout(std::time::Duration::from_secs(90)) // Keep connections alive longer for Lambda warm starts
+            .pool_max_idle_per_host(10) // Allow more connections for concurrent batching
+            .tcp_keepalive(std::time::Duration::from_secs(30)) // TCP keepalive for better connection reuse
             .build().unwrap();
 
         Self { client }
