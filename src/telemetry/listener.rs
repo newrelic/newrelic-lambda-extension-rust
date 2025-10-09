@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{ error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -133,7 +133,7 @@ async fn handle_telemetry_request(
             
             // Summary logging instead of per-record logging
             if function_count > 0 || extension_count > 0 || platform_count > 0 {
-                trace!("Processed records - function: {}, extension: {}, platform: {}", 
+                info!("Processed telemetry records - function: {}, extension: {}, platform: {}", 
                        function_count, extension_count, platform_count);
             }
             
@@ -148,20 +148,11 @@ async fn handle_telemetry_request(
                 }
             }
             
-            // If function execution completed, send all accumulated data immediately
+            // Function completed - logs are accumulated, main loop will handle the final flush
             if function_completed {
-
-                let log_proc_clone = Arc::clone(&log_processor);
-                let platform_proc_clone = Arc::clone(&platform_processor);
-                
-                tokio::spawn(async move {
-                    if let Err(e) = log_proc_clone.send_and_clear_batch_simple().await {
-                        error!("Failed to send logs after function completion: {}", e);
-                    }
-                    if let Err(e) = platform_proc_clone.send_and_clear_batch_simple().await {
-                        error!("Failed to send platform events after function completion: {}", e);
-                    }
-                });
+                trace!("Function execution completed - telemetry accumulated for main loop flush");
+                // NOTE: Don't flush here! Let the main loop handle coordinated flush before freeze
+                // This prevents race conditions and ensures proper timing
             }
         }
         Err(e) => {

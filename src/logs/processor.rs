@@ -1,5 +1,5 @@
 
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
@@ -290,6 +290,29 @@ impl LogProcessor {
 
     /// Processes a single log telemetry record, adding it to the batch if valid.
     pub fn process_record(&self, record: TelemetryRecord) {
+        debug!("Processing log record: type={}", record.record_type);
+
+        // Check if this log type should be sent based on configuration
+        match record.record_type.as_str() {
+            "function" => {
+                if !self.config.extension.send_function_logs {
+                    debug!("Skipping function log (send_function_logs={})", self.config.extension.send_function_logs);
+                    return;
+                }
+                debug!("Processing function log (send_function_logs={})", self.config.extension.send_function_logs);
+            }
+            "extension" => {
+                if !self.config.extension.send_extension_logs {
+                    debug!("Skipping extension log (send_extension_logs={})", self.config.extension.send_extension_logs);
+                    return;
+                }
+                debug!("Processing extension log (send_extension_logs={})", self.config.extension.send_extension_logs);
+            }
+            _ => {
+                debug!("Processing unknown log type: {}", record.record_type);
+            }
+        }
+        
         let message_str = record.record.get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("Unknown log message");
@@ -338,25 +361,48 @@ impl LogProcessor {
                     drop(state); // Release lock before modifying buffer
                     let mut buffered = buffered_logs.lock().unwrap();
                     buffered.push(log_message);
+                    debug!("Buffered log for trace ID extraction, buffer size: {}", buffered.len());
                     return;
                 }
             }
             
-            // Normal processing - add to batch and potentially send
+            // If trace ID collection is disabled, add to batch and flush periodically
+            // This provides better performance than individual sends while still being responsive
+            if self.trace_extraction_state.is_none() {
+                let mut batch = self.log_batch.lock().unwrap();
+                batch.push(log_message);
+                let batch_size = batch.len();
+                
+                debug!("Added log to immediate batch (trace ID disabled), current size: {}", batch_size);
+                
+                // Flush batch when it reaches a reasonable size for performance
+                if batch_size >= 10 {
+                    let logs_to_send = std::mem::take(&mut *batch);
+                    drop(batch); // Release lock
+                    
+                    debug!("Flushing batch of {} logs immediately", logs_to_send.len());
+                    
+                    let client = Arc::clone(&self.newrelic_client);
+                    let config = Arc::clone(&self.config);
+                    let context = self.invocation_context.lock().unwrap().clone();
+                    
+                    tokio::spawn(async move {
+                        if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
+                            error!("Failed to send log batch immediately: {}", e);
+                        } else {
+                            debug!("Successfully sent log batch immediately");
+                        }
+                    });
+                }
+                return;
+            }
+            
+            // Trace ID collection enabled but already extracted - add to batch for coordinated flush
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
             
-            // Send immediately if we have 3+ logs (simple batch condition)
-            if batch_size >= 3 {
-                drop(batch); // Release the lock before async operation
-                let processor = self.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = processor.send_and_clear_batch_simple().await {
-                        error!("Failed to send logs: {}", e);
-                    }
-                });
-            }
+            debug!("Added log to batch for coordinated flush, current size: {}", batch_size);
         } else {
             warn!("Failed to convert telemetry record to log message");
         }
@@ -642,8 +688,11 @@ impl LogProcessor {
         };
         
         if batch.is_empty() {
+            debug!("No logs in batch to send");
             return Ok(());
         }
+
+        info!("Sending {} logs to New Relic", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -780,10 +829,12 @@ impl LogProcessor {
 #[async_trait]
 impl Flush for LogProcessor {
     async fn flush(&self) -> std::io::Result<()> {
+        // Send logs when explicitly flushed (called by main loop or harvester)
         self.send_and_clear_batch_simple().await
     }
 
     async fn final_flush(&self) -> std::io::Result<()> {
+        // Final flush during shutdown
         self.send_and_clear_batch_simple().await
     }
 }

@@ -375,10 +375,24 @@ impl PlatformProcessor {
 #[async_trait]
 impl Flush for PlatformProcessor {
     async fn flush(&self) -> Result<()> {
-        self.send_and_clear_batch_simple().await
+        // During normal operation, just accumulate events - don't send
+        // The main loop handles coordinated flush before freeze for better timing
+        // Only log batch size periodically to track accumulation
+        let batch_size = {
+            if let Ok(batch) = self.platform_events_batch.lock() {
+                batch.len()
+            } else { 0 }
+        };
+        
+        if batch_size > 0 {
+            trace!("Harvester flush: {} platform events accumulated (will be sent by coordinated flush)", batch_size);
+        }
+        
+        Ok(())
     }
     
     async fn final_flush(&self) -> Result<()> {
+        // Only send during final flush (shutdown)
         self.send_and_clear_batch_simple().await
     }
 }
