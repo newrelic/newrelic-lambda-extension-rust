@@ -135,6 +135,9 @@ async fn handle_telemetry_request(
             if function_count > 0 || extension_count > 0 || platform_count > 0 {
                 info!("Processed telemetry records - function: {}, extension: {}, platform: {}", 
                        function_count, extension_count, platform_count);
+            } else {
+                // Log when no records were processed to help debug
+                debug!("No telemetry records processed in this batch");
             }
             
             // If runtime is done, signal the main loop to process agent telemetry

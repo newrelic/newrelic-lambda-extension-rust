@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 
 # --- Configuration ---
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2 us-west-1"}
+REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2"}
 REGIONS_ARM64=${REGIONS_ARM64:-"us-west-2"}
 
 BIN_NAME="newrelic-lambda-extension"
@@ -195,27 +195,27 @@ main() {
 
   # Package and publish standalone extension
   package_extension_layer "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRRustExtensionX86"
-  done
+  # for region in $REGIONS_X86_64; do
+  #   publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRTestRustExtensionX86"
+  # done
 
   # # Package and publish Python layers
   # build_python_layer "312" "$target_x86"
   # for region in $REGIONS_X86_64; do
-  #   publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
+  #   publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRTestRustExtensionPython312X86"
   # done
 
   # # Package and publish Python layers
   build_python_layer "313" "$target_x86"
   for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRRustExtensionPython313X86"
+    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRTestRustExtensionPython313X86"
   done
 
   # Package and publish Node.js layers
-  build_nodejs_layer "20" "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRRustExtensionNodejs20X86"
-  done
+  # build_nodejs_layer "20" "$target_x86"
+  # for region in $REGIONS_X86_64; do
+  #   publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRTestRustExtensionNodejs20X86"
+  # done
 
   #--- Build for arm64 ---
   # local target_arm="aarch64-unknown-linux-musl"

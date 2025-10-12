@@ -290,21 +290,25 @@ impl LogProcessor {
 
     /// Processes a single log telemetry record, adding it to the batch if valid.
     pub fn process_record(&self, record: TelemetryRecord) {
+        trace!("LogProcessor received record type: {}", record.record_type);
 
         // Check if this log type should be sent based on configuration
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
+                    trace!("Skipping function log - send_function_logs is disabled");
                     return;
                 }
             }
             "extension" => {
                 if !self.config.extension.send_extension_logs {
+                    trace!("Skipping extension log - send_extension_logs is disabled");
                     return;
                 }
             }
             _ => {
                 // Unknown log type - process it
+                trace!("Processing unknown log type: {}", record.record_type);
             }
         }
         
@@ -313,15 +317,24 @@ impl LogProcessor {
             .unwrap_or("Unknown log message");
         
         // Avoid recursive logging from our own processors - CRITICAL to prevent infinite loops
+        // Only block very specific log processing messages that would create infinite feedback loops
         if message_str.contains("[LogProcessor]") || 
            message_str.contains("[PlatformProcessor]") ||
-           message_str.contains("[NR_EXT]") ||  // Block ALL extension logs to prevent feedback loop
-           message_str.contains("DEBUG") ||     // Block debug logs that cause recursion
            message_str.contains("Processing log record") ||
            message_str.contains("Added log to batch") ||
-           message_str.contains("Batching log for") {
+           message_str.contains("Batching log for") ||
+           message_str.contains("No logs in batch to send") ||
+           message_str.contains("Buffered log for trace ID extraction") ||
+           message_str.contains("Applied trace ID to") && message_str.contains("buffered logs") ||
+           message_str.contains("Flushing batch of") && message_str.contains("logs") ||
+           message_str.contains("Chunking") && message_str.contains("logs into") && message_str.contains("batches") ||
+           (message_str.contains("Successfully sent") || message_str.contains("Failed to send")) && 
+           (message_str.contains("log batch") || message_str.contains("previously failed logs")) {
+            trace!("Filtering out recursive log message: {}", message_str.chars().take(100).collect::<String>());
             return;
         }
+        
+        trace!("Processing log message: {}", message_str.chars().take(100).collect::<String>());
 
         // Remove the timestamp filtering logic - we should flush old logs properly instead
         // The main.rs should handle flushing previous invocation logs before processing new ones
@@ -493,7 +506,37 @@ impl LogProcessor {
         }
     }
 
-    /// Called when a trace ID is extracted - updates all buffered logs and sends them
+    /// Called when a trace ID is extracted - updates all buffered logs and moves them to main batch for coordinated sending
+    pub fn on_trace_id_extracted_to_batch(&self, trace_id: &str) {
+        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
+            (&self.trace_extraction_state, &self.buffered_logs) else {
+            return; // Nothing to do if trace ID collection is disabled
+        };
+
+        // Mark that we've successfully extracted the trace ID
+        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
+        
+        // Get all buffered logs
+        let mut buffered_logs = {
+            let mut buffered = buffered_logs_arc.lock().unwrap();
+            std::mem::take(&mut *buffered)
+        };
+        
+        if buffered_logs.is_empty() {
+            return;
+        }
+        
+        debug!("Moving {} trace-buffered logs to main batch with trace ID: {}", buffered_logs.len(), trace_id);
+        
+        // Update all buffered logs with the trace ID and move to main batch
+        let mut batch = self.log_batch.lock().unwrap();
+        for mut log in buffered_logs {
+            log.attributes.insert("trace.id".to_string(), trace_id.into());
+            batch.push(log);
+        }
+    }
+
+    /// Called when a trace ID is extracted - updates all buffered logs and sends them immediately
     pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
             (&self.trace_extraction_state, &self.buffered_logs) else {
@@ -623,6 +666,51 @@ impl LogProcessor {
         self.reset_trace_id_state();
 
         Ok(())
+    }
+
+    /// Process buffered logs when request_id becomes available
+    /// This moves logs from request_id_buffer to the main processing flow
+    pub fn process_buffered_logs_with_request_id(&self, request_id: &str) {
+        let buffered_logs = {
+            let mut buffer = self.request_id_buffer.lock().unwrap();
+            std::mem::take(&mut *buffer)
+        };
+        
+        if !buffered_logs.is_empty() {
+            info!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
+            
+            for mut log_message in buffered_logs {
+                // Add the request_id to the log message
+                log_message.attributes.insert("aws.lambda_request_id".to_string(), 
+                                serde_json::Value::String(request_id.to_string()));
+                log_message.attributes.insert("faas.execution".to_string(), 
+                                serde_json::Value::String(request_id.to_string()));
+                
+                // Now process the log through the normal flow (check trace ID, etc.)
+                // Add to appropriate buffer based on trace ID collection state
+                if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
+                    (&self.trace_extraction_state, &self.buffered_logs) {
+                    
+                    let state = extraction_state.lock().unwrap();
+                    let has_trace_id = {
+                        let context = self.invocation_context.lock().unwrap();
+                        context.trace_id.is_some()
+                    };
+                    
+                    // Buffer logs only if we're still waiting for trace ID extraction attempt
+                    if *state == TraceIdExtractionState::Waiting && !has_trace_id {
+                        drop(state);
+                        let mut buffered = buffered_logs_arc.lock().unwrap();
+                        buffered.push(log_message);
+                        continue;
+                    }
+                }
+                
+                // Add to main batch for sending
+                let mut batch = self.log_batch.lock().unwrap();
+                batch.push(log_message);
+            }
+        }
     }
 
     /// Clear the request_id when the invocation is complete

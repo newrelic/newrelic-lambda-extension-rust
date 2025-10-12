@@ -146,6 +146,7 @@ struct ExtensionComponents {
     runtime_done_rx: mpsc::UnboundedReceiver<()>,
     harvester: Arc<Harvester>,
     harvester_handle: tokio::task::JoinHandle<()>,
+    global_log_processor: Arc<LogProcessor>,
 }
 
 // --- Structs for API Responses ---
@@ -326,8 +327,9 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
             runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor, noop_platform_processor)),
+            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
+            global_log_processor: noop_log_processor,
         });
     }
 
@@ -377,8 +379,9 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
             runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor, noop_platform_processor)),
+            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
+            global_log_processor: noop_log_processor,
         });
     };
 
@@ -439,7 +442,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     let temp_platform_processor = processor_factory.create_platform_processor(global_context);
     
     let telemetry_listener_address = setup_telemetry_listener(
-        temp_log_processor,
+        temp_log_processor.clone(),
         temp_platform_processor,
         Some(runtime_done_tx)
     ).await?;
@@ -464,6 +467,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         runtime_done_rx,
         harvester,
         harvester_handle,
+        global_log_processor: temp_log_processor,
     })
 }
 
@@ -814,6 +818,9 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     global_context.invoked_function_arn = invoked_function_arn.clone();
                     global_context.trace_id = None; // Reset trace ID for new request
                 }
+                
+                // Process any logs that were buffered waiting for request_id
+                components.global_log_processor.process_buffered_logs_with_request_id(&request_id);
                 
                 // Create request-scoped processing state
                 let request_state = create_request_processing_state(
