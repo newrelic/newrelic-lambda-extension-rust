@@ -302,11 +302,6 @@ impl LogProcessor {
 
     /// Processes a single log telemetry record, adding it to the batch if valid.
     pub fn process_record(&self, record: TelemetryRecord) {
-        trace!("LogProcessor received record type: {}", record.record_type);
-
-        // Add diagnostic logging to see the actual record structure
-        trace!("Full telemetry record: {}", serde_json::to_string_pretty(&record).unwrap_or_else(|_| "Failed to serialize".to_string()));
-
         // Check if this log type should be sent based on configuration
         match record.record_type.as_str() {
             "function" => {
@@ -327,27 +322,26 @@ impl LogProcessor {
             }
         }
         
-        // Add more detailed message extraction debugging
-        let message_str = if let Some(message_value) = record.record.get("message") {
-            trace!("Found message field, type: {:?}, value: {:?}", message_value, message_value);
-            message_value.as_str().unwrap_or("Message field exists but not a string")
-        } else {
-            // Fix: Check if record is an object before trying to get keys
-            let available_fields = if let serde_json::Value::Object(ref map) = record.record {
-                map.keys().map(|k| k.as_str()).collect::<Vec<_>>()
-            } else {
-                vec!["<not an object>"]
-            };
-            trace!("No 'message' field found in record. Available fields: {:?}", available_fields);
-            "No message field found"
+        // Extract message for recursive filtering - handle both string and object records
+        let message_str = match &record.record {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Object(obj) => {
+                if let Some(message_value) = obj.get("message") {
+                    message_value.as_str().unwrap_or("")
+                } else {
+                    // If no message field, convert the entire object to string for filtering
+                    &serde_json::to_string(&record.record).unwrap_or_default()
+                }
+            }
+            _ => {
+                // For other types, convert to string for filtering
+                &serde_json::to_string(&record.record).unwrap_or_default()
+            }
         };
         
-        trace!("Extracted message: {}", message_str.chars().take(200).collect::<String>());
-        
-        // Avoid recursive logging from our own processors - CRITICAL to prevent infinite loops
-        // Only block very specific log processing messages that would create infinite feedback loops
-        if message_str.contains("[LogProcessor]") || 
-           message_str.contains("[PlatformProcessor]") ||
+        // CRITICAL: Prevent infinite recursion by filtering ALL extension-related log messages
+        // This must be comprehensive to prevent feedback loops
+        if 
            message_str.contains("Processing log record") ||
            message_str.contains("Added log to batch") ||
            message_str.contains("Batching log for") ||
@@ -356,38 +350,54 @@ impl LogProcessor {
            message_str.contains("Applied trace ID to") && message_str.contains("buffered logs") ||
            message_str.contains("Flushing batch of") && message_str.contains("logs") ||
            message_str.contains("Chunking") && message_str.contains("logs into") && message_str.contains("batches") ||
-           (message_str.contains("Successfully sent") || message_str.contains("Failed to send")) && 
-           (message_str.contains("log batch") || message_str.contains("previously failed logs")) {
-            trace!("Filtering out recursive log message: {}", message_str.chars().take(100).collect::<String>());
+           message_str.contains("Successfully sent") && (message_str.contains("log batch") || message_str.contains("previously failed logs")) ||
+           message_str.contains("Failed to send") && (message_str.contains("log batch") || message_str.contains("previously failed logs")) ||
+           message_str.contains("Full telemetry record") ||
+           message_str.contains("Extracted message") ||
+           message_str.contains("Processing log message") ||
+           message_str.contains("No 'message' field found in record") ||
+           message_str.contains("Available fields") ||
+           message_str.contains("checkout") ||
+           message_str.contains("Http::connect") ||
+           message_str.contains("http1 handshake") ||
+           message_str.contains("waiting for connection") ||
+           message_str.contains("connection is ready") ||
+           message_str.contains("connecting to") ||
+           message_str.contains("connected to") ||
+           message_str.contains("put; add idle connection") ||
+           message_str.contains("put; found waiter") ||
+           message_str.contains("Sending") && message_str.contains("log messages to NR") ||
+           message_str.contains("Sending payload to NR endpoint") ||
+           message_str.contains("Successfully sent payload to NR") ||
+           message_str.contains("Request timeout") ||
+           message_str.contains("LogProcessor received record type") ||
+           message_str.contains("Processing unknown log type") ||
+           message_str.contains("Added log to batch for coordinated flush") {
+            // Silently drop these messages to prevent infinite recursion
             return;
         }
-        
-        trace!("Processing log message: {}", message_str.chars().take(100).collect::<String>());
-
-        // Remove the timestamp filtering logic - we should flush old logs properly instead
-        // The main.rs should handle flushing previous invocation logs before processing new ones
-
+    
         if let Some(mut log_message) = self.to_log_message(record) {
             // First check: Do we have a valid request_id?
             let has_request_id = {
                 let context = self.invocation_context.lock().unwrap();
                 !context.request_id.is_empty()
             };
-
+    
             // If we don't have a request_id yet, buffer the log
             if !has_request_id {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
                 request_buffer.push(log_message);
                 return;
             }
-
+    
             // We have a request_id - update the log message attributes with it
             {
                 let context = self.invocation_context.lock().unwrap();
                 log_message.attributes.insert("aws.lambda_request_id".to_string(), 
                                 serde_json::Value::String(context.request_id.clone()));
             }
-
+    
             // Check if trace ID collection is enabled and we should buffer for trace ID
             if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
                 (&self.trace_extraction_state, &self.buffered_logs) {
@@ -408,55 +418,40 @@ impl LogProcessor {
                 }
             }
             
-            // If trace ID collection is disabled, use performance-optimized batching
-            if self.trace_extraction_state.is_none() {
-                let mut batch = self.log_batch.lock().unwrap();
-                batch.push(log_message);
-                let batch_size = batch.len();
-                
-                // Check if this is a warm start for performance optimization
-                let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
-                
-                // Performance optimization: Use different strategies for cold vs warm starts
-                // For cold starts: Send immediately to ensure logs are visible quickly  
-                // For warm starts: Hold all logs until final flush to avoid impacting function duration
-                if is_warm_start {
-                    // For warm starts: Don't send during function execution, let harvester/final flush handle it
-                    return;
-                }
-                
-                // Cold start: send immediately when we hit threshold
-                let flush_threshold = 15;
-                let should_flush = batch_size >= flush_threshold;
-                
-                if should_flush {
-                    let logs_to_send = std::mem::take(&mut *batch);
-                    drop(batch); // Release lock
-                    
-                    debug!("Flushing batch of {} logs (warm_start={})", logs_to_send.len(), is_warm_start);
-                    
-                    let client = Arc::clone(&self.newrelic_client);
-                    let config = Arc::clone(&self.config);
-                    let context = self.invocation_context.lock().unwrap().clone();
-                    
-                    // Cold start: send immediately but async to not block other processing
-                    tokio::spawn(async move {
-                        if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
-                            error!("Failed to send log batch (cold start): {}", e);
-                        } else {
-                            debug!("Successfully sent log batch (cold start)");
-                        }
-                    });
-                }
-                return;
-            }
-            
-            // Trace ID collection enabled but already extracted - add to batch for coordinated flush
+            // Add to main batch for sending
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
             
-            debug!("Added log to batch for coordinated flush, current size: {}", batch_size);
+            // Check if this is a warm start for performance optimization
+            let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+            
+            // Improved batching strategy:
+            // - Cold starts: Send smaller batches immediately for visibility
+            // - Warm starts: Use larger batches but still send during execution to avoid loss
+            let flush_threshold = if is_warm_start { 25 } else { 10 };
+            let should_flush = batch_size >= flush_threshold;
+            
+            if should_flush {
+                let logs_to_send = std::mem::take(&mut *batch);
+                drop(batch); // Release lock
+                
+                debug!("Flushing batch of {} logs (warm_start={}, threshold={})", 
+                       logs_to_send.len(), is_warm_start, flush_threshold);
+                
+                let client = Arc::clone(&self.newrelic_client);
+                let config = Arc::clone(&self.config);
+                let context = self.invocation_context.lock().unwrap().clone();
+                
+                // Send async to not block other processing
+                tokio::spawn(async move {
+                    if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
+                        error!("Failed to send log batch: {}", e);
+                    } else {
+                        debug!("Successfully sent log batch");
+                    }
+                });
+            }
         } else {
             warn!("Failed to convert telemetry record to log message");
         }
