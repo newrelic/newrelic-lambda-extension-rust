@@ -133,6 +133,18 @@ impl LogProcessor {
     pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
         Arc::clone(&self.invocation_context)
     }
+
+    /// Update the invocation context for a new request (used by global log processor)
+    pub fn update_invocation_context(&self, new_context: Arc<Mutex<InvocationContext>>) {
+        // Copy the new context data to the existing context to maintain the same Arc reference
+        if let (Some(mut current), Some(new)) = (self.invocation_context.safe_lock(), new_context.safe_lock()) {
+            current.request_id = new.request_id.clone();
+            current.invoked_function_arn = new.invoked_function_arn.clone();
+            current.trace_id = new.trace_id.clone();
+        } else {
+            warn!("Failed to update invocation context - mutex poisoned, extension continuing in degraded mode");
+        }
+    }
     /// Updates the invocation start time (called when new invocation begins)
     pub fn set_invocation_start_time(&self, start_time: chrono::DateTime<chrono::Utc>) {
         if let Some(mut guard) = self.invocation_start_time.safe_lock() {
@@ -292,6 +304,9 @@ impl LogProcessor {
     pub fn process_record(&self, record: TelemetryRecord) {
         trace!("LogProcessor received record type: {}", record.record_type);
 
+        // Add diagnostic logging to see the actual record structure
+        trace!("Full telemetry record: {}", serde_json::to_string_pretty(&record).unwrap_or_else(|_| "Failed to serialize".to_string()));
+
         // Check if this log type should be sent based on configuration
         match record.record_type.as_str() {
             "function" => {
@@ -312,9 +327,22 @@ impl LogProcessor {
             }
         }
         
-        let message_str = record.record.get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("Unknown log message");
+        // Add more detailed message extraction debugging
+        let message_str = if let Some(message_value) = record.record.get("message") {
+            trace!("Found message field, type: {:?}, value: {:?}", message_value, message_value);
+            message_value.as_str().unwrap_or("Message field exists but not a string")
+        } else {
+            // Fix: Check if record is an object before trying to get keys
+            let available_fields = if let serde_json::Value::Object(ref map) = record.record {
+                map.keys().map(|k| k.as_str()).collect::<Vec<_>>()
+            } else {
+                vec!["<not an object>"]
+            };
+            trace!("No 'message' field found in record. Available fields: {:?}", available_fields);
+            "No message field found"
+        };
+        
+        trace!("Extracted message: {}", message_str.chars().take(200).collect::<String>());
         
         // Avoid recursive logging from our own processors - CRITICAL to prevent infinite loops
         // Only block very specific log processing messages that would create infinite feedback loops
@@ -437,13 +465,22 @@ impl LogProcessor {
     /// Converts a TelemetryRecord into a LogMessage, if applicable.
     fn to_log_message(&self, record: TelemetryRecord) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
-        let message = match &record.record {
-            // If it's already a string, use it directly to avoid double stringification
-            // This prevents JSON logs from being escaped as strings within strings
-            serde_json::Value::String(s) => s.clone(),
-            // For other JSON values (objects, arrays, etc.), serialize to string
-            other => other.to_string()
+        
+        // Try multiple ways to extract the message from the telemetry record
+        let message = if let Some(message_value) = record.record.get("message") {
+            // Standard case: message field exists
+            match message_value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string()
+            }
+        } else {
+            // Fallback: use the entire record as the message
+            match &record.record {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string()
+            }
         };
+        
         let mut attributes = serde_json::Map::new();
         
         // Get request_id, invoked_function_arn and trace_id from the context
@@ -517,7 +554,7 @@ impl LogProcessor {
         *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
         
         // Get all buffered logs
-        let mut buffered_logs = {
+        let buffered_logs = {
             let mut buffered = buffered_logs_arc.lock().unwrap();
             std::mem::take(&mut *buffered)
         };

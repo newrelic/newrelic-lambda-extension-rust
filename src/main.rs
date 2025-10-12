@@ -119,7 +119,6 @@ impl ProcessorFactory {
 struct RequestProcessingState {
     request_id: String,
     context: Arc<Mutex<InvocationContext>>,
-    log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
@@ -828,7 +827,10 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     &invoked_function_arn,
                     &components.processor_factory
                 );
-                
+
+                // Update global log processor context for this request
+                components.global_log_processor.update_invocation_context(request_state.context.clone());
+
                 // Store request processing state
                 if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
                     processors.insert(request_id.clone(), request_state);
@@ -840,7 +842,8 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 let processor_factory_clone = components.processor_factory.clone();
                 let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
-                
+                let global_log_processor_clone = components.global_log_processor.clone();
+
                 let processing_handle = tokio::spawn(async move {
                     process_request_concurrently(
                         request_id_clone,
@@ -848,6 +851,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                         processor_factory_clone,
                         newrelic_client_clone,
                         config_clone,
+                        global_log_processor_clone,
                     ).await;
                 });
                 
@@ -889,6 +893,7 @@ async fn process_request_concurrently(
     _processor_factory: Arc<ProcessorFactory>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<config::ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
 ) {
     info!("Starting concurrent processing for request: {}", request_id);
     
@@ -907,10 +912,10 @@ async fn process_request_concurrently(
         return;
     };
     
-    // Set invocation start time
+    // Set invocation start time using global log processor
     let invocation_start_time = chrono::Utc::now();
-    state.log_processor.set_invocation_start_time(invocation_start_time);
-    state.log_processor.reset_trace_id_state();
+    global_log_processor.set_invocation_start_time(invocation_start_time);
+    global_log_processor.reset_trace_id_state();
     state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
     
     // Wait for function completion and process payloads
@@ -930,6 +935,7 @@ async fn process_request_concurrently(
         &state,
         &newrelic_client,
         &config,
+        &global_log_processor,
     ).await;
     
     // Final flush: Retry any failed agent payloads before function freeze
@@ -937,8 +943,8 @@ async fn process_request_concurrently(
     
     // Final flush: Flush any remaining logs (should be minimal if trace ID disabled)
     // When trace ID collection is disabled, logs are sent immediately, so this is just cleanup
-    if let Err(e) = state.log_processor.flush().await {
-        error!("Failed to flush log processor for request {}: {}", request_id, e);
+    if let Err(e) = global_log_processor.flush().await {
+        error!("Failed to flush global log processor for request {}: {}", request_id, e);
     }
     
     if let Err(e) = state.platform_processor.flush().await {
@@ -958,6 +964,7 @@ async fn process_request_agent_payloads(
     state: &RequestProcessingState,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
 ) {
     // Get payloads from request-specific buffer
     let payloads = {
@@ -976,13 +983,13 @@ async fn process_request_agent_payloads(
     
     info!("Processing {} agent payloads for request: {}", payloads.len(), request_id);
     
-    // Process each payload using the request-scoped log processor
+    // Process each payload using the global log processor
     for payload_bytes in payloads {
         if let Err(e) = process_and_send_agent_payload(
             &payload_bytes,
             request_id,
             invoked_function_arn,
-            &state.log_processor,
+            global_log_processor,
             newrelic_client,
             config,
         ).await {
@@ -1018,7 +1025,7 @@ async fn wait_for_all_requests_completion() {
 /// Create per-request context for concurrent request handling
 /// Create per-request processing state for concurrent request handling
 fn create_request_processing_state(
-    request_id: &str, 
+    request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>
 ) -> RequestProcessingState {
@@ -1028,31 +1035,29 @@ fn create_request_processing_state(
         invoked_function_arn: invoked_function_arn.to_string(),
         trace_id: None,
     }));
-    
-    // Create request-scoped processors
-    let log_processor = processor_factory.create_log_processor(context.clone());
+
+    // Create only platform processor - log processor will be global
     let platform_processor = processor_factory.create_platform_processor(context.clone());
-    
+
     // Create agent buffer
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
-    
+
     // Create coordination channel
     let (tx, rx) = mpsc::unbounded_channel();
-    
+
     // Store coordination sender
     if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
         channels.insert(request_id.to_string(), tx);
     }
-    
+
     let state = RequestProcessingState {
         request_id: request_id.to_string(),
         context: context.clone(),
-        log_processor,
         platform_processor,
         agent_buffer: agent_buffer.clone(),
         coordination_rx: Some(rx),
     };
-    
+
     // Store in global maps for backward compatibility
     if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
         contexts.insert(request_id.to_string(), context);
@@ -1060,8 +1065,8 @@ fn create_request_processing_state(
     if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
         buffers.insert(request_id.to_string(), agent_buffer);
     }
-    
-    info!("Created per-request processing state for {}", request_id);
+
+    info!("Created per-request processing state for {} (using global log processor)", request_id);
     state
 }
 
