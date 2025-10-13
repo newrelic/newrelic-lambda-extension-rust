@@ -12,7 +12,7 @@ pub struct Common {
     pub attributes: Map<String, serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LogMessage {
     pub timestamp: i64,
     pub message: String,

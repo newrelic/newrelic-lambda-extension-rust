@@ -16,46 +16,155 @@ mod trace;
 #[cfg(debug_assertions)]
 mod test_telemetry;
 
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    io::{Error, Result},
+    env,
     sync::{Arc, Mutex},
     time::Duration,
 };
+
 use tokio::sync::mpsc;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
+use reqwest::Client;
+
 use crate::{
     context::InvocationContext,
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     telemetry::listener::setup_telemetry_listener,
-    newrelic::{client::NewRelicClient, harvester::Harvester},
+    newrelic::{
+        client::NewRelicClient, 
+        harvester::Harvester,
+        flush::Flush,
+    },
     credentials::get_new_relic_license_key,
 };
-use chrono::Utc;
+
+const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
+const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // --- Extension Constants ---
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
+
+
+// --- CONCURRENT REQUEST HANDLING ---
+// --- CONCURRENT REQUEST HANDLING ---
+// Per-request contexts to handle concurrent Lambda invocations safely
+static REQUEST_CONTEXTS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<InvocationContext>>>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static REQUEST_AGENT_BUFFERS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Global coordination channels per request for agent payload processing
+static PAYLOAD_COORDINATION: Lazy<Arc<Mutex<HashMap<String, mpsc::UnboundedSender<()>>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Per-request processing state management
+static REQUEST_PROCESSORS: Lazy<Arc<Mutex<HashMap<String, RequestProcessingState>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+// Failed agent payloads buffer for retry across invocations
+static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+// Global current invocation context for telemetry processors
+static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = Lazy::new(|| {
+    Arc::new(Mutex::new(InvocationContext {
+        request_id: "temp".to_string(),
+        invoked_function_arn: "temp".to_string(),
+        trace_id: None,
+    }))
+});
+
+// Global flag to track if this is a warm start (for performance optimization)
+static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> = 
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+// --- PROCESSOR FACTORY FOR REQUEST-SCOPED PROCESSORS ---
+#[derive(Debug, Clone)]
+struct ProcessorFactory {
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<config::ExtensionConfig>,
+}
+
+impl ProcessorFactory {
+    fn new(newrelic_client: Arc<NewRelicClient>, config: Arc<config::ExtensionConfig>) -> Self {
+        Self { newrelic_client, config }
+    }
+    
+    fn create_log_processor(&self, request_context: Arc<Mutex<InvocationContext>>) -> Arc<LogProcessor> {
+        Arc::new(LogProcessor::new(
+            Arc::clone(&self.newrelic_client),
+            Arc::clone(&self.config),
+            request_context,
+        ))
+    }
+    
+    fn create_platform_processor(&self, request_context: Arc<Mutex<InvocationContext>>) -> Arc<PlatformProcessor> {
+        Arc::new(PlatformProcessor::new(
+            Arc::clone(&self.newrelic_client),
+            Arc::clone(&self.config),
+            request_context,
+        ))
+    }
+}
+
+// --- PER-REQUEST PROCESSING STATE ---
+#[derive(Debug)]
+struct RequestProcessingState {
+    request_id: String,
+    context: Arc<Mutex<InvocationContext>>,
+    platform_processor: Arc<PlatformProcessor>,
+    agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
+    coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
+}
+
+// --- FAILED AGENT PAYLOAD FOR RETRY ---
+#[derive(Debug, Clone)]
+struct FailedAgentPayload {
+    payload_bytes: Vec<u8>,
+    request_id: String,
+    invoked_function_arn: String,
+    retry_count: usize,
+    failed_at: chrono::DateTime<chrono::Utc>,
+}
+
+// Structure to hold all initialized components for warm starts
+#[derive(Debug)]
+struct ExtensionComponents {
+    client: Arc<Client>,
+    extension_id: String,
+    processor_factory: Arc<ProcessorFactory>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<config::ExtensionConfig>,
+    runtime_done_rx: mpsc::UnboundedReceiver<()>,
+    harvester: Arc<Harvester>,
+    harvester_handle: tokio::task::JoinHandle<()>,
+    global_log_processor: Arc<LogProcessor>,
+}
+
 // --- Structs for API Responses ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct RegisterResponse {
-    extension_id: String,
-    #[allow(dead_code)]
+struct ExtensionRegistrationResponse {
+    #[serde(rename = "functionName")]
     function_name: String,
-    #[allow(dead_code)]
+    #[serde(rename = "functionVersion")]
     function_version: String,
-    #[allow(dead_code)]
+    #[serde(rename = "handler")]
     handler: String,
+    #[serde(rename = "accountId", default)]
+    account_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "eventType")]
-enum NextEventResponse {
+enum LambdaRuntimeEvent {
     #[serde(rename(deserialize = "INVOKE"))]
     Invoke {
         #[serde(rename(deserialize = "requestId"))]
@@ -70,611 +179,1330 @@ enum NextEventResponse {
     },
 }
 
-// --- Structs for building the wrapped payload ---
-#[derive(Serialize)]
-struct WrappedPayload<'a> {
-    context: Context<'a>,
-    entry: String,
-}
-
-#[derive(Serialize)]
-struct Context<'a> {
-    function_name: &'a str,
-    invoked_function_arn: &'a str,
-    log_group_name: String,
-    log_stream_name: &'a str,
-}
-
-#[derive(Serialize)]
-struct EntryPayload<'a> {
-    #[serde(rename = "logEvents")]
-    log_events: Vec<LogEvent<'a>>,
-    #[serde(rename = "logGroup")]
-    log_group: String,
-    #[serde(rename = "logStream")]
-    log_stream: &'a str,
-    #[serde(rename = "messageType")]
-    message_type: &'a str,
-    owner: &'a str,
-}
-
-#[derive(Serialize)]
-struct LogEvent<'a> {
-    id: &'a str,
-    message: &'a str,
-    timestamp: i64,
-}
-
-
-// --- Main Application Logic ---
-
+/// Main entry point with CRITICAL panic safety to prevent Lambda crashes
 #[tokio::main]
-async fn main() -> Result<()> {
-    // --- 1. Initialize Configuration & Logging ---
-    let config = Arc::new(config::init_config().clone());
-    trace!("Starting extension: {}", &config.extension.name);
+async fn main() -> std::io::Result<()> {
+    // CRITICAL: Set up global panic hook to prevent ANY panic from crashing Lambda
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = if let Some(location) = panic_info.location() {
+            format!("{}:{}", location.file(), location.line())
+        } else {
+            "unknown location".to_string()
+        };
+        
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            *s
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.as_str()
+        } else {
+            "unknown panic message"
+        };
+        
+        // Use eprintln! since logging might not be available during panic
+        eprintln!("[NR_EXT] ERROR Extension panic caught (Lambda will continue): {}", message);
+        eprintln!("[NR_EXT] ERROR Panic location: {}", location);
+        
+        // Don't re-panic - just log and continue
+    }));
+    
+    // CRITICAL: Wrap everything in error handling to prevent Lambda crashes
+    match run_extension().await {
+        Ok(_) => {
+            eprintln!("[NR_EXT] INFO Extension completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            // Log error but don't propagate - this prevents Lambda from crashing
+            eprintln!("[NR_EXT] ERROR Extension failed but continuing gracefully: {}", e);
+            eprintln!("[NR_EXT] WARN Lambda function will continue without New Relic monitoring");
+            
+            // Return Ok to prevent Lambda crash - this is critical!
+            Ok(())
+        }
+    }
+}
 
-    // --- 2. License Key Extraction Phase (First Priority) ---
-    // Check configuration for credential sources
+
+
+/// Run the extension in true no-op mode - follows Extension API lifecycle but does nothing
+/// Registers with Extension API and waits for INVOKE/SHUTDOWN events but processes nothing
+async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("Extension running in NO-OP mode - no telemetry will be collected");
+    eprintln!("[NR_EXT] INFO Extension running in NO-OP mode - Lambda function will continue normally");
+    
+    // Even in no-op mode, we need to properly register with the Lambda Extensions API
+    // and wait for INVOKE/SHUTDOWN events to follow the correct lifecycle
+    let (client, extension_id, _registration) = initialize_lambda_runtime_client_and_register().await?;
+    
+    info!("Extension registered in no-op mode with ID: {}", extension_id);
+    
+    // Follow proper Extension API lifecycle - wait for events but do nothing with them
+    loop {
+        match fetch_next_lambda_runtime_event(&client, &extension_id).await {
+            Ok(LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
+                debug!("No-op mode: Received INVOKE event for request {}, doing nothing", request_id);
+                // Do absolutely nothing - no telemetry, no processing, no network calls
+            }
+            Ok(LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
+                info!("No-op mode: Extension shutting down: {}", shutdown_reason);
+                break;
+            }
+            Err(e) => {
+                error!("Error receiving next event in no-op mode: {:?}. Continuing.", e);
+                continue;
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+/// Main extension logic following correct Lambda extension lifecycle
+async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let extension_startup_time = std::time::Instant::now();
+    
+    info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
+    
+    // PHASE 1: ONE-TIME COLD START INITIALIZATION (with true no-op fallback)
+    let extension_components = match perform_one_time_initialization().await {
+        Ok(components) => {
+            info!("Extension initialization successful");
+            Some(components)
+        }
+        Err(e) => {
+            error!("Extension initialization failed, entering true no-op mode: {}", e);
+            eprintln!("[NR_EXT] ERROR Initialization failed, entering true no-op mode (Lambda function will continue normally): {}", e);
+            
+            // Enter true no-op mode - do absolutely nothing
+            run_noop_extension().await?;
+            return Ok(()); // This return will never be reached since noop runs forever
+        }
+    };
+
+    let extension_components = extension_components.unwrap(); // Safe because we handled the None case above
+
+    info!("Cold start initialization complete (duration: {:?})", extension_startup_time.elapsed());
+    
+    // PHASE 2: INFINITE EVENT LOOP (handles both first invoke and all warm starts)
+    let (total_events_processed, harvester_handle) = run_infinite_event_loop(extension_components).await;
+    
+    // PHASE 3: CLEANUP ON SHUTDOWN (only happens once per container lifecycle)
+    perform_extension_shutdown_cleanup(total_events_processed, harvester_handle, extension_startup_time).await;    Ok(())
+}
+
+/// Perform all one-time initialization - called only once per container
+async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
+    // Initialize config first (this sets up logging)
+    let config = config::init_config().clone();
+    let config = Arc::new(config);
+    
+    // --- PHASE 1: PARALLEL CRITICAL OPERATIONS (maximum performance) ---
+    
+    // 1. Early exit for disabled extension (no-op mode)
+    if !config.new_relic.extension_enabled {
+        info!("Extension telemetry processing disabled - entering no-op mode");
+        let (client, extension_id, _registration) = initialize_lambda_runtime_client_and_register().await?;
+        
+        // Create noop processor factory
+        let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
+        let noop_processor_factory = Arc::new(ProcessorFactory::new(
+            noop_newrelic_client.clone(),
+            config.clone()
+        ));
+        
+        // Create dummy processors for harvester
+        let dummy_context = Arc::new(Mutex::new(InvocationContext {
+            request_id: "noop".to_string(),
+            invoked_function_arn: "noop".to_string(),
+            trace_id: None,
+        }));
+        let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
+        let noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
+        
+        return Ok(ExtensionComponents {
+            client,
+            extension_id,
+            processor_factory: noop_processor_factory,
+            newrelic_client: noop_newrelic_client,
+            config: config.clone(),
+            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: noop_log_processor,
+        });
+    }
+
+    // 2. PARALLEL CRITICAL OPERATIONS: License key validation + Extension registration
+    //    Both are required regardless of no-op mode (extension needs SHUTDOWN events)
+    info!("Starting parallel license key validation and extension registration...");
+    let (license_key_result, registration_result) = tokio::join!(
+        resolve_license_key_with_aws_fallback(&config),
+        initialize_lambda_runtime_client_and_register()
+    );
+
+    let license_key_option = license_key_result?;
+    let (client, extension_id, registration) = registration_result?;
+    
+    let Some(license_key) = license_key_option else {
+        warn!("No license key available after checking all sources. Running in no-op mode.");
+        
+        // Update config with registration details even in no-op mode
+        let mut updated_config = (*config).clone();
+        updated_config.aws.update_from_registration(
+            registration.function_name,
+            registration.function_version,
+            registration.account_id,
+        );
+        let config = Arc::new(updated_config);
+        
+        // Return no-op components (extension already registered for SHUTDOWN events)
+        let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
+        let noop_processor_factory = Arc::new(ProcessorFactory::new(
+            noop_newrelic_client.clone(),
+            config.clone()
+        ));
+        
+        // Create dummy processors for harvester
+        let dummy_context = Arc::new(Mutex::new(InvocationContext {
+            request_id: "noop".to_string(),
+            invoked_function_arn: "noop".to_string(),
+            trace_id: None,
+        }));
+        let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
+        let noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
+        
+        return Ok(ExtensionComponents {
+            client,
+            extension_id,
+            processor_factory: noop_processor_factory,
+            newrelic_client: noop_newrelic_client,
+            config: config.clone(),
+            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
+            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: noop_log_processor,
+        });
+    };
+
+    // 3. Update config with validated license key
+    let mut updated_config = (*config).clone();
+    updated_config.new_relic.license_key = Some(license_key);
+    let config = Arc::new(updated_config);
+    
+    info!("License key validated and extension registered - proceeding with full initialization");
+
+    info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
+    info!("Log forwarding settings: send_function_logs={}, send_extension_logs={}", 
+          config.extension.send_function_logs, 
+          config.extension.send_extension_logs);
+
+    // --- PHASE 2: PARALLEL INITIALIZATION (using already registered extension) ---
+    
+    // Update config with registration details first (needed for NewRelic client)
+    let mut updated_config = (*config).clone();
+    updated_config.aws.update_from_registration(
+        registration.function_name,
+        registration.function_version,
+        registration.account_id,
+    );
+    let config = Arc::new(updated_config);
+    
+    // 4. MAXIMALLY PARALLEL: Initialize remaining core components simultaneously 
+    let (
+        agent_telemetry_rx_result,
+        newrelic_client,
+        runtime_done_channels
+    ) = tokio::join!(
+        initialize_agent_telemetry_ipc_channel(),
+        async { Arc::new(NewRelicClient::new(&config)) },
+        async { mpsc::unbounded_channel::<()>() }
+    );
+
+    let agent_telemetry_rx = agent_telemetry_rx_result?;
+    let (runtime_done_tx, runtime_done_rx) = runtime_done_channels;
+
+    info!("Extension components initialized - ID: {} (license key pre-validated)", extension_id);
+
+    // Start agent payload collector (background task)
+    start_agent_payload_collector_background_task(agent_telemetry_rx);
+    
+    // Clean up very old failed payloads (older than 24 hours)
+    cleanup_old_failed_payloads();
+
+    // Create processor factory for request-scoped processors
+    let processor_factory = Arc::new(ProcessorFactory::new(
+        Arc::clone(&newrelic_client),
+        Arc::clone(&config)
+    ));
+    
+    // Setup telemetry listener (use global current context that gets updated per request)
+    let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
+    let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
+    let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+    
+    let telemetry_listener_address = setup_telemetry_listener(
+        temp_log_processor.clone(),
+        temp_platform_processor,
+        Some(runtime_done_tx)
+    ).await?;
+    
+    // 9. Subscribe to Lambda Telemetry API
+    subscribe_to_lambda_telemetry_api(&client, &extension_id, telemetry_listener_address.port()).await?;
+
+    // 10. Start harvester background task (will be populated with per-request processors)
+    let (harvester, harvester_handle) = start_harvester_background_task(
+        vec![], // Empty processors vector - will be populated per request
+        config.new_relic.harvest_interval,
+        &processor_factory,
+    );
+
+    // 11. Return initialized components directly
+    Ok(ExtensionComponents {
+        client,
+        extension_id,
+        processor_factory,
+        newrelic_client,
+        config,
+        runtime_done_rx,
+        harvester,
+        harvester_handle,
+        global_log_processor: temp_log_processor,
+    })
+}
+
+/// Resolve license key with AWS fallback if needed
+async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionConfig>) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Fix: Dereference the Arc to get &ExtensionConfig
     let credentials_config = config::Configuration::from(config.as_ref());
     
-    // OPTIMIZATION: Determine if we need AWS services at all
-    // AWS is needed ONLY when NEW_RELIC_LICENSE_KEY is not set AND we have AWS credential sources
-    let needs_aws = credentials_config.license_key.is_empty() && (
-        // Explicit AWS credential sources via environment variables
+    // Check if AWS services are needed for license key resolution
+    let aws_services_required = credentials_config.license_key.is_empty() && (
         std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok() ||
         std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok() ||
-        // Configured AWS credential sources in config
         !credentials_config.license_key_secret_id.is_empty() ||
         !credentials_config.license_key_ssm_parameter_name.is_empty() ||
-        // Default: try AWS with default key name "NEW_RELIC_LICENSE_KEY" when no direct license key
         std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok()
     );
-    
-        // OPTIMIZATION: Extract license key FIRST before any other initialization
-    let license_key = if !credentials_config.license_key.is_empty() {
-        debug!("Using license key from environment variable");
-        Some(credentials_config.license_key.clone())
-    } else if needs_aws {
-        debug!("Checking AWS credential sources for license key");
-        
+
+    if !credentials_config.license_key.is_empty() {
+        Ok(Some(credentials_config.license_key.clone()))
+    } else if aws_services_required {
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
                 debug!("Successfully obtained New Relic license key from AWS");
-                Some(key)
+                Ok(Some(key))
             }
             Err(e) => {
                 warn!("No license key found from AWS sources: {}. Extension will run in no-op mode.", e);
-                None
+                Ok(None)
             }
         }
     } else {
         warn!("No license key available and not in AWS Lambda environment. Extension will run in no-op mode.");
-        None
-    };
-
-    // Update the config with the obtained license key IMMEDIATELY
-    let mut updated_config = config.as_ref().clone();
-    if let Some(ref key) = license_key {
-        updated_config.new_relic.license_key = Some(key.clone());
+        Ok(None)
     }
-    let config = Arc::new(updated_config);
+}
 
-    // Log important configuration settings
-    info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
-    debug!("Extension configuration loaded successfully");
+/// Initialize HTTP client with appropriate timeout
+async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(Client::builder()
+        // Remove global timeout - let individual requests set their own timeouts
+        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
+        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer for Lambda runtime API
+        .pool_max_idle_per_host(2) // Limit idle connections
+        .tcp_keepalive(Duration::from_secs(60)) // Enable TCP keepalive
+        .build()?)
+}
 
-    // --- 3. Parallel Initialization Phase (Now with license key ready) ---
-    // OPTIMIZATION: If license key is available immediately, start EVERYTHING in parallel
-    let (client_result, registration_result) = if license_key.is_some() {
-        // License key available immediately - maximum parallelization
-        tokio::join!(
-            async {
-                Client::builder()
-                    .timeout(Duration::from_secs(30))
-                    .build()
-                    .map_err(|e| Error::new(std::io::ErrorKind::Other, e))
-            },
-            async {
-                register(&Client::new()).await
+/// Initialize Lambda runtime client and register extension
+async fn initialize_lambda_runtime_client_and_register() -> Result<(Arc<Client>, String, ExtensionRegistrationResponse), Box<dyn std::error::Error + Send + Sync>> {
+    let client = Arc::new(initialize_http_client_with_timeout().await?);
+    let (registration, extension_id) = register_extension_with_lambda_runtime(&client).await?;
+    Ok((client, extension_id, registration))
+}
+
+/// Initialize agent telemetry IPC channel
+async fn initialize_agent_telemetry_ipc_channel() -> Result<mpsc::Receiver<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
+    match agent::ipc::init_telemetry_channel().await {
+        Ok(rx) => {
+            info!("Agent telemetry channel initialized, listening on pipe: {}", agent::ipc::TELEMETRY_NAMED_PIPE_PATH);
+            Ok(rx)
+        }
+        Err(e) => {
+            error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
+            Err(Box::new(e))
+        }
+    }
+}
+
+/// Start agent payload collector as background task with concurrent request handling
+fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Receiver<Vec<u8>>) {
+    start_concurrent_agent_payload_collector(agent_telemetry_rx);
+}
+
+/// Channel-based agent payload collector with immediate processing and notification
+fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
+    tokio::spawn(async move {
+        info!("Agent payload collector started - continuously listening for agent payloads");
+        let mut payload_count = 0;
+
+        while let Some(payload_bytes) = receiver.recv().await {
+            payload_count += 1;
+            
+            info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
+            
+            if payload_count <= 5 {
+                debug!("Agent Payload preview: {:?}", 
+                       String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
             }
-        )
-    } else {
-        // No license key - still need to register for no-op mode
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-        let registration = register(&client).await?;
-        (Ok(client), Ok(registration))
+            
+            // Route payload (will try immediate processing first, store if it fails)
+            route_payload_to_request_buffer(payload_bytes).await;
+        }
+
+        warn!("Agent payload collector channel closed. No more agent payloads will be received");
+    });
+}
+
+/// Route agent payload to the correct per-request buffer
+async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
+    // Find the most recent active request
+    let current_request_id = {
+        if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
+            // Get the most recent request (assumes HashMap iteration order reflects insertion order)
+            contexts.keys().last().cloned()
+        } else {
+            None
+        }
     };
     
-    let client = Arc::new(client_result?);
-    let registration = registration_result?;
-
-    debug!("Parallel initialization completed");
-    info!("Extension ready");
-
-    if !config.new_relic.extension_enabled || license_key.is_none() {
-        // --- NO-OP MODE ---
-        info!("Extension running in no-op mode");
-        let ext_id = registration.extension_id.clone();
-        debug!("Extension registered with ID: {} (no-op mode)", ext_id);
-
-        loop {
-            match next_event(&client, &ext_id).await {
-                Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
-                    break;
-                }
-                Ok(_) => { /* Ignore INVOKE events in no-op mode */ }
-                Err(_) => { /* Ignore errors and continue polling */ }
-            }
-        }
-    } else {
-        // --- ACTIVE MODE ---
-        
-        // MAXIMUM PARALLEL OPTIMIZATION: Initialize ALL components at once since license key is ready
-        let (invocation_context, agent_payload_buffer, agent_telemetry_rx, newrelic_client, runtime_done_channels) = tokio::join!(
-            async { Arc::new(Mutex::new(InvocationContext::default())) },
-            async { Arc::new(Mutex::new(Vec::new())) },
-            async {
-                match agent::ipc::init_telemetry_channel().await {
-                    Ok(rx) => {
-                        info!(
-                            "Agent telemetry channel initialized, listening on pipe: {}",
-                            agent::ipc::TELEMETRY_NAMED_PIPE_PATH
-                        );
-                        Ok(rx)
+    if let Some(request_id) = current_request_id {
+        // Store in request-specific buffer
+        if let Some(request_buffer) = get_request_agent_buffer(&request_id) {
+            match request_buffer.lock() {
+                Ok(mut buffer) => {
+                    buffer.push(payload_bytes);
+                    info!("Stored agent payload in request buffer for {} (buffer size now {})", 
+                         request_id, buffer.len());
+                    
+                    // Notify the request's coordination channel if available
+                    if let Ok(channels) = PAYLOAD_COORDINATION.lock() {
+                        if let Some(tx) = channels.get(&request_id) {
+                            let _ = tx.send(());
+                        }
                     }
-                    Err(e) => {
-                        error!("FATAL: Failed to initialize agent telemetry pipe: {}. Exiting.", e);
-                        Err(e)
-                    }
-                }
-            },
-            async {
-                // Create NewRelic client in parallel since license key is now available
-                Arc::new(NewRelicClient::new(&config))
-            },
-            async {
-                // Create channel for runtime done notifications
-                let (tx, rx) = mpsc::unbounded_channel();
-                (tx, rx)
-            }
-        );
-        
-        let agent_telemetry_rx = agent_telemetry_rx?;
-        let newrelic_client = newrelic_client;
-        let (runtime_done_tx, mut runtime_done_rx) = runtime_done_channels;
-
-        // Start the agent payload collector
-        agent::processor::start_agent_payload_collector(
-            agent_telemetry_rx,
-            Arc::clone(&agent_payload_buffer),
-        );
-
-        // PARALLEL OPTIMIZATION: Create processors in parallel, then setup telemetry listener
-        let (log_processor, platform_processor) = tokio::join!(
-            async {
-                Arc::new(LogProcessor::new(
-                    Arc::clone(&newrelic_client),
-                    Arc::clone(&config),
-                    Arc::clone(&invocation_context),
-                ))
-            },
-            async {
-                Arc::new(PlatformProcessor::new(
-                    Arc::clone(&newrelic_client),
-                    Arc::clone(&config),
-                    Arc::clone(&invocation_context),
-                ))
-            }
-        );
-        
-        let telemetry_addr = setup_telemetry_listener(log_processor.clone(), platform_processor.clone(), Some(runtime_done_tx)).await?;
-
-        let harvester = Harvester::new(
-            vec![log_processor.clone(), platform_processor.clone()],
-            config.new_relic.harvest_interval,
-        );
-        let harvester_handle = tokio::spawn(async move {
-            harvester.run().await;
-        });
-
-        let ext_id = registration.extension_id.clone();
-        debug!("Extension registered with ID: {}", ext_id);
-        subscribe_to_telemetry(&client, &ext_id, telemetry_addr.port()).await?;
-        debug!("Successfully subscribed to telemetry on port {}", telemetry_addr.port());
-
-        // State for tracking the previous invocation
-        let mut last_request_id: Option<String> = None;
-        let mut last_invoked_arn: Option<String> = None;
-
-        loop {
-            let event_result = next_event(&client, &ext_id).await;
-
-            // Process the previous invocation's agent payload now.
-            process_agent_payloads(
-                &agent_payload_buffer, 
-                &last_request_id, 
-                &last_invoked_arn, 
-                &newrelic_client, 
-                &config,
-                &invocation_context,
-                &log_processor
-            ).await;
-
-            match event_result {
-                Ok(NextEventResponse::Invoke { request_id, invoked_function_arn }) => {
-                    trace!("Received INVOKE event for request ID: {}", request_id);
-                    
-                    // Update the global context for other processors and reset trace ID state
-                    {
-                        let mut context = invocation_context.lock().unwrap();
-                        context.request_id = request_id.clone();
-                        context.invoked_function_arn = invoked_function_arn.clone();
-                        context.trace_id = None; // Reset trace ID for new invocation
-                    }
-                    
-                    // Reset log processor trace ID state for new invocation
-                    log_processor.reset_trace_id_state();
-
-                    platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
-                    
-                    // Wait for runtime done signal (no timeout - guaranteed by Telemetry API)
-                    trace!("Waiting for platform.runtimeDone signal...");
-                    
-                    // Wait indefinitely for platform.runtimeDone - it's guaranteed to come
-                    if let Some(_) = runtime_done_rx.recv().await {
-                        trace!("Received platform.runtimeDone signal");
-                        // Wait additional 300-500ms buffer time for any final telemetry
-                        tokio::time::sleep(Duration::from_millis(400)).await;
-                    } else {
-                        warn!("Runtime done channel closed unexpectedly");
-                    }
-                    
-                    // Check buffer size for debugging
-                    let buffer_size = {
-                        let buffer = agent_payload_buffer.lock().unwrap();
-                        buffer.len()
-                    };
-                    trace!("Buffer contains {} payloads after runtime completion, processing now", buffer_size);
-                    
-                    if buffer_size == 0 {
-                        warn!("[agentsend] No agent payloads found, agent may not be initialized or runtime handler not set");
-                    }
-                    // Process current invocation's agent payload after runtime is done
-                    process_agent_payloads(
-                        &agent_payload_buffer, 
-                        &Some(request_id.clone()), 
-                        &Some(invoked_function_arn.clone()), 
-                        &newrelic_client, 
-                        &config,
-                        &invocation_context,
-                        &log_processor
-                    ).await;
-                    
-                    // Flush any remaining buffered logs (in case trace ID was never extracted)
-                    if let Err(e) = log_processor.flush_buffered_logs_at_invocation_end().await {
-                        error!("Error flushing buffered logs at invocation end: {}", e);
-                    }
-                    
-                    // Save the context for the *next* loop iteration (for any remaining payloads)
-                    last_request_id = Some(request_id);
-                    last_invoked_arn = Some(invoked_function_arn);
-                }
-                Ok(NextEventResponse::Shutdown { shutdown_reason }) => {
-                    debug!("Received SHUTDOWN event: {}", shutdown_reason);
-                    
-                    harvester_handle.abort();
-                    
-                    debug!("Performing FINAL flush of all logs and platform events...");
-                    if let Err(e) = log_processor.send_and_clear_batch_simple().await {
-                        error!("Error during final log flush: {}", e);
-                    }
-                    if let Err(e) = platform_processor.send_and_clear_batch_simple().await {
-                        error!("Error during final platform events flush: {}", e);
-                    }
-
-                    // FINAL AGENT FLUSH: Process the very last payload before exiting.
-                    process_agent_payloads(
-                        &agent_payload_buffer, 
-                        &last_request_id, 
-                        &last_invoked_arn, 
-                        &newrelic_client, 
-                        &config,
-                        &invocation_context,
-                        &log_processor
-                    ).await;
-                    
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    debug!("Extension shutdown complete.");
-                    break;
                 }
                 Err(e) => {
-                    error!("Error receiving next event: {}. Continuing.", e);
-                    continue;
+                    error!("Failed to lock request buffer for {}: {} - payload lost!", request_id, e);
                 }
             }
+        } else {
+            warn!("No buffer found for request: {} - payload lost!", request_id);
+        }
+    } else {
+        warn!("No active requests found - agent payload lost!");
+    }
+}
+
+
+
+// Channel coordination helper functions
+fn create_payload_coordination_channel(request_id: &str) -> mpsc::UnboundedReceiver<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+        channels.insert(request_id.to_string(), tx);
+    }
+    
+    rx
+}
+
+fn cleanup_payload_coordination_channel(request_id: &str) {
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+        if channels.remove(request_id).is_some() {
+            debug!("Cleaned up coordination channel for request {}", request_id);
         }
     }
+}
 
+/// Buffer failed agent payload for retry across invocations
+fn buffer_failed_agent_payload(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+) {
+    let failed_payload = FailedAgentPayload {
+        payload_bytes: payload_bytes.to_vec(),
+        request_id: request_id.to_string(),
+        invoked_function_arn: invoked_function_arn.to_string(),
+        retry_count: 0,
+        failed_at: chrono::Utc::now(),
+    };
+    
+    if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+        failed_payloads.push(failed_payload);
+        info!("Buffered failed agent payload for request {} (total failed: {})", 
+             request_id, failed_payloads.len());
+    } else {
+        error!("Failed to lock FAILED_AGENT_PAYLOADS buffer - payload lost!");
+    }
+}
+
+/// Process agent payload immediately when received from channel and notify completion
+/// Process and send agent payload following our simple flow
+async fn process_and_send_agent_payload(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+    log_processor: &Arc<LogProcessor>,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract trace ID only if enabled via config
+    if config.new_relic.collect_trace_id {
+        if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
+            info!("Extracted trace ID: {}, coordinating with logs", trace_id);
+            
+            if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
+                error!("Failed to coordinate logs with trace ID: {}", e);
+            }
+        } else {
+            debug!("No trace ID found in agent payload or extraction failed");
+        }
+    } else {
+        debug!("Trace ID collection disabled, skipping extraction");
+    }
+    
+    // Actually send the agent payload to New Relic
+    match send_agent_payload_to_newrelic(
+        payload_bytes,
+        request_id,
+        invoked_function_arn,
+        newrelic_client,
+        config,
+    ).await {
+        Ok(_) => {
+            info!("Agent payload processed and sent (size: {} bytes)", payload_bytes.len());
+        }
+        Err(e) => {
+            error!("Failed to send agent payload for request {}: {}", request_id, e);
+            
+            // Buffer the failed payload for retry
+            buffer_failed_agent_payload(
+                payload_bytes,
+                request_id,
+                invoked_function_arn,
+            );
+            
+            warn!("Agent payload buffered for retry (size: {} bytes)", payload_bytes.len());
+        }
+    }
+    
     Ok(())
 }
 
-/// Drains the agent payload buffer and sends all pending payloads to New Relic.
-async fn process_agent_payloads(
-    buffer: &Arc<Mutex<Vec<Vec<u8>>>>,
-    request_id_opt: &Option<String>,
-    invoked_arn_opt: &Option<String>,
-    client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    invocation_context: &Arc<Mutex<InvocationContext>>,
-    log_processor: &Arc<logs::processor::LogProcessor>,
-) {
-    let payloads = {
-        let mut buf = buffer.lock().unwrap();
-        std::mem::take(&mut *buf)
-    };
-
-    if payloads.is_empty() {
-        // No agent payloads means no opportunity to extract trace ID
-        // If trace ID collection is enabled, we should flush any buffered logs
-        if config.new_relic.collect_trace_id {
-            debug!("No agent payloads received - flushing buffered logs without trace ID");
-            if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
-                error!("Failed to handle no-payloads trace ID extraction failure: {}", e);
-            }
-        }
-        return;
-    }
-
-    let (Some(request_id), Some(invoked_arn)) = (request_id_opt, invoked_arn_opt) else {
-        error!("Payloads exist in buffer but no previous context is available. Discarding {} payloads.", payloads.len());
-        return;
-    };
-
-    debug!("Processing {} buffered agent payloads for request_id: {}", payloads.len(), request_id);
-
-    let function_name = invoked_arn.split(':').last().unwrap_or("");
-    let log_group_name = format!("/aws/lambda/{}", function_name);
-    
-    let mut success_count = 0;
-    let mut error_count = 0;
-    let mut trace_id_found = false;
-    let mut trace_extraction_attempted = false;
-
-    for payload_bytes in payloads {
-        // Extract trace ID from agent payload if collection is enabled
-        if config.new_relic.collect_trace_id && !trace_extraction_attempted {
-            debug!("NEW_RELIC_COLLECT_TRACE_ID is enabled, attempting to extract trace ID from {} byte payload", payload_bytes.len());
-            trace_extraction_attempted = true;
-            
-            match trace::extract_trace_id_from_payload(&payload_bytes) {
-                Ok(Some(trace_id)) => {
-                    info!("Successfully extracted trace ID from agent payload: {}", trace_id);
-                    trace_id_found = true;
-                    
-                    // Store trace ID in invocation context
-                    if let Ok(mut context) = invocation_context.lock() {
-                        context.trace_id = Some(trace_id.clone());
-                        debug!("Updated invocation context with extracted trace ID");
-                    }
-                    
-                    // Notify log processor that trace ID has been extracted
-                    // This will update all buffered logs with the trace ID and send them
-                    if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
-                        error!("Failed to update buffered logs with trace ID: {}", e);
-                    }
-                },
-                Ok(None) => {
-                    debug!("No trace ID found in agent payload");
-                    // Notify log processor that extraction failed (no trace ID found)
-                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
-                        error!("Failed to handle trace ID extraction failure: {}", e);
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to extract trace ID from agent payload: {}", e);
-                    // Notify log processor that extraction failed (error occurred)
-                    if let Err(e) = log_processor.on_trace_id_extraction_failed().await {
-                        error!("Failed to handle trace ID extraction failure: {}", e);
-                    }
-                }
-            }
-        } else if config.new_relic.collect_trace_id && trace_id_found {
-            trace!("Trace ID already found, skipping extraction for remaining payloads");
+fn update_trace_id_in_context(request_id: &str, trace_id: &str) {
+    if let Some(context) = get_request_context(request_id) {
+        if let Ok(mut ctx) = context.lock() {
+            ctx.trace_id = Some(trace_id.to_string());
+            info!("Updated trace ID {} for request {}", trace_id, request_id);
         } else {
-            trace!("NEW_RELIC_COLLECT_TRACE_ID is disabled, skipping trace extraction");
+            error!("Failed to lock context for trace ID update for request {}", request_id);
         }
-
-        let Ok(payload_str) = String::from_utf8(payload_bytes) else {
-            error!("Failed to decode payload as UTF-8 for request_id: {}", request_id);
-            error_count += 1;
-            continue;
-        };
-
-        let entry_payload = EntryPayload {
-            log_events: vec![LogEvent { id: request_id, message: &payload_str, timestamp: Utc::now().timestamp_millis() }],
-            log_group: log_group_name.clone(),
-            log_stream: "",
-            message_type: "",
-            owner: "",
-        };
-
-        let Ok(entry_string) = serde_json::to_string(&entry_payload) else {
-            error!("Failed to serialize entry payload for request_id: {}", request_id);
-            error_count += 1;
-            continue;
-        };
-
-        let wrapped_payload = WrappedPayload {
-            context: Context {
-                function_name,
-                invoked_function_arn: invoked_arn,
-                log_group_name: log_group_name.clone(),
-                log_stream_name: "newrelic-lambda-extension:2.3.19",
-            },
-            entry: entry_string,
-        };
-
-        if let Ok(final_json) = serde_json::to_string(&wrapped_payload) {
-            match client.send_agent_payload(config, &final_json).await {
-                Ok(()) => {
-                    success_count += 1;
-                }
-                Err(e) => {
-                    error!("Error sending agent payload to New Relic for request_id {}: {}", request_id, e);
-                    error_count += 1;
-                }
-            }
-        } else {
-            error!("Failed to serialize final wrapped payload for request_id: {}", request_id);
-            error_count += 1;
-        }
-    }
-    
-    // Summary logging instead of per-payload logging
-    if success_count > 0 {
-        trace!("Successfully sent {} agent payloads to New Relic for request_id: {}", success_count, request_id);
-    }
-    if error_count > 0 {
-        error!("Failed to send {} agent payloads for request_id: {}", error_count, request_id);
+    } else {
+        error!("No context found for request {} during trace ID update", request_id);
     }
 }
 
+async fn send_agent_payload_to_newrelic(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let function_name = invoked_function_arn.split(':').last().unwrap_or("");
+    let log_group_name = format!("/aws/lambda/{}", function_name);
+    
+    let wrapped_payload = create_wrapped_agent_payload_json(
+        payload_bytes,
+        function_name,
+        invoked_function_arn,
+        &log_group_name,
+        request_id,
+    );
+    
+    match newrelic_client.send_agent_payload(config, &wrapped_payload).await {
+        Ok(_) => {
+            info!("Successfully sent agent payload for request {}", request_id);
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to send agent payload for request {}: {}", request_id, e);
+            Err(Box::new(e))
+        }
+    }
+}
 
-// --- Helper Functions ---
+/// Start harvester as background task
+fn start_harvester_background_task(
+    processors: Vec<Arc<dyn Flush>>,
+    harvest_interval: Duration,
+    processor_factory: &Arc<ProcessorFactory>,
+) -> (Arc<Harvester>, tokio::task::JoinHandle<()>) {
+    // Create dummy processors for harvester (will be replaced by per-request processors)
+    let dummy_context = Arc::new(Mutex::new(InvocationContext {
+        request_id: "harvester".to_string(),
+        invoked_function_arn: "harvester".to_string(),
+        trace_id: None,
+    }));
+    let dummy_log_processor = processor_factory.create_log_processor(dummy_context.clone());
+    let dummy_platform_processor = processor_factory.create_platform_processor(dummy_context);
+    
+    let harvester = Arc::new(Harvester::new(processors, harvest_interval, dummy_log_processor, dummy_platform_processor));
+    let harvester_clone = Arc::clone(&harvester);
+    let handle = tokio::spawn(async move {
+        harvester_clone.run().await;
+    });
+    (harvester, handle)
+}
 
-/// Registers the extension with the Lambda Runtime API.
-async fn register(client: &Client) -> Result<RegisterResponse> {
-    let config = config::get_config();
-    let url = format!("http://{}/2020-01-01/extension/register", &config.aws.runtime_api);
-
-    let mut map = HashMap::new();
-    map.insert("events", vec!["INVOKE", "SHUTDOWN"]);
-
-    let resp = client
-        .post(&url)
-        .header(EXTENSION_NAME_HEADER, &config.extension.name)
-        .json(&map)
-        .send()
-        .await
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
-
-    if !resp.status().is_success() {
-        let err_msg = format!("Failed to register extension: {}", resp.status());
-        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
+/// Infinite event loop - handles first invoke (cold start) and all subsequent invokes (warm starts)
+async fn run_infinite_event_loop(mut extension_components: ExtensionComponents) -> (u32, tokio::task::JoinHandle<()>) {
+    // Check if this is a no-op mode
+    if !extension_components.config.new_relic.extension_enabled || extension_components.config.new_relic.license_key.is_none() {
+        info!("Running in no-op mode");
+        execute_noop_event_loop(&extension_components.client, &extension_components.extension_id).await;
+        return (0, extension_components.harvester_handle);
     }
 
-    let extension_id = resp
-        .headers()
-        .get(EXTENSION_ID_HEADER)
-        .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "Extension ID header not found"))?
-        .to_str()
-        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?
-        .to_string();
+    // Execute main telemetry processing loop
+    let total_events = execute_main_telemetry_processing_loop(&mut extension_components).await;
+    (total_events, extension_components.harvester_handle)
+}
 
-    // Parse the response JSON to get the other fields (function_name, etc.)
-    let response_json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
+/// INFINITE EVENT LOOP - Core of Lambda Extension Lifecycle
+/// 
+/// This loop implements the correct Lambda extension pattern:
+/// 1. GET /next (blocks here - Lambda freezes extension)
+/// 2. Receive INVOKE event (Lambda unfreezes extension)  
+/// 3. Process event quickly (< 50ms for warm starts)
+/// 4. Return to step 1 (loops forever until SHUTDOWN)
+///
+/// First iteration = Cold Start, subsequent iterations = Warm Starts
+async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
+    let mut event_counter = 0;
 
-    let register_response = RegisterResponse {
-        extension_id,
-        function_name: response_json.get("functionName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        function_version: response_json.get("functionVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        handler: response_json.get("handler")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
+    loop {
+        debug!("mainLoop: waiting for next lambda invocation event...");
+
+        // Fetch next Lambda runtime event
+        let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
+            Ok(event) => event,
+            Err(e) => {
+                error!("Error receiving next event: {:?}. Continuing.", e);
+                continue;
+            }
+        };
+
+        event_counter += 1;
+
+        match runtime_event {
+            LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
+                let event_processing_start_time = std::time::Instant::now();
+                
+                // Update global context for telemetry processors
+                if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.lock() {
+                    global_context.request_id = request_id.clone();
+                    global_context.invoked_function_arn = invoked_function_arn.clone();
+                    global_context.trace_id = None; // Reset trace ID for new request
+                }
+                
+                // Process any logs that were buffered waiting for request_id
+                components.global_log_processor.process_buffered_logs_with_request_id(&request_id);
+                
+                // Create request-scoped processing state
+                let request_state = create_request_processing_state(
+                    &request_id,
+                    &invoked_function_arn,
+                    &components.processor_factory
+                );
+
+                // Update global log processor context for this request
+                components.global_log_processor.update_invocation_context(request_state.context.clone());
+
+                // Store request processing state
+                if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+                    processors.insert(request_id.clone(), request_state);
+                }
+                
+                // Process the request concurrently but wait for completion
+                let request_id_clone = request_id.clone();
+                let invoked_function_arn_clone = invoked_function_arn.clone();
+                let processor_factory_clone = components.processor_factory.clone();
+                let newrelic_client_clone = components.newrelic_client.clone();
+                let config_clone = components.config.clone();
+                let global_log_processor_clone = components.global_log_processor.clone();
+
+                let processing_handle = tokio::spawn(async move {
+                    process_request_concurrently(
+                        request_id_clone,
+                        invoked_function_arn_clone,
+                        processor_factory_clone,
+                        newrelic_client_clone,
+                        config_clone,
+                        global_log_processor_clone,
+                    ).await;
+                });
+                
+                // Wait for the concurrent processing to complete before moving to next event
+                // This ensures agent payloads are fully sent before function freeze
+                if let Err(e) = processing_handle.await {
+                    error!("Error in concurrent request processing: {}", e);
+                }
+                
+                let event_processing_time = event_processing_start_time.elapsed();
+                
+                if event_counter == 1 {
+                    info!("COLD START: First invocation processed in {:?} (request_id: {})", 
+                          event_processing_time, request_id);
+                } else {
+                    // Set warm start flag for performance optimization
+                    IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                    info!("WARM START: Event {} processed in {:?} (request_id: {})", 
+                          event_counter, event_processing_time, request_id);
+                }
+            }
+            LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+                info!("Extension shutting down: {}", shutdown_reason);
+                
+                // Wait for all concurrent requests to complete
+                wait_for_all_requests_completion().await;
+                break;
+            }
+        }
+    }
+
+    event_counter
+}
+
+/// Concurrent request processing function
+async fn process_request_concurrently(
+    request_id: String,
+    invoked_function_arn: String,
+    _processor_factory: Arc<ProcessorFactory>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<config::ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+) {
+    info!("Starting concurrent processing for request: {}", request_id);
+    
+    // Get request processing state
+    let state = {
+        if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+            processors.remove(&request_id)
+        } else {
+            error!("Failed to get processing state for request: {}", request_id);
+            return;
+        }
+    };
+    
+    let Some(mut state) = state else {
+        error!("No processing state found for request: {}", request_id);
+        return;
+    };
+    
+    // Set invocation start time using global log processor
+    let invocation_start_time = chrono::Utc::now();
+    global_log_processor.set_invocation_start_time(invocation_start_time);
+    global_log_processor.reset_trace_id_state();
+    state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
+    
+    // Wait for function completion and process payloads
+    tokio::select! {
+        _ = state.coordination_rx.as_mut().unwrap().recv() => {
+            info!("Function completed for request: {}", request_id);
+        }
+        // _ = tokio::time::sleep(Duration::from_secs(300)) => {
+        //     warn!("Timeout waiting for function completion for request: {}", request_id);
+        // }
+    }
+    
+    // Process agent payloads for this specific request
+    process_request_agent_payloads(
+        &request_id,
+        &invoked_function_arn,
+        &state,
+        &newrelic_client,
+        &config,
+        &global_log_processor,
+    ).await;
+    
+    // Final flush: Retry any failed agent payloads before function freeze
+    retry_failed_agent_payloads(&newrelic_client, &config).await;
+    
+    // Final flush: Flush any remaining logs (should be minimal if trace ID disabled)
+    // When trace ID collection is disabled, logs are sent immediately, so this is just cleanup
+    if let Err(e) = global_log_processor.flush().await {
+        error!("Failed to flush global log processor for request {}: {}", request_id, e);
+    }
+    
+    if let Err(e) = state.platform_processor.flush().await {
+        error!("Failed to flush platform processor for request {}: {}", request_id, e);
+    }
+    
+    // Cleanup request resources
+    cleanup_request_processing_state(&request_id);
+    
+    info!("Completed concurrent processing for request: {} (including final flush)", request_id);
+}
+
+/// Process agent payloads for specific request
+async fn process_request_agent_payloads(
+    request_id: &str,
+    invoked_function_arn: &str,
+    state: &RequestProcessingState,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+) {
+    // Get payloads from request-specific buffer
+    let payloads = {
+        if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
+        } else {
+            error!("Failed to lock agent buffer for request: {}", request_id);
+            return;
+        }
+    };
+    
+    if payloads.is_empty() {
+        debug!("No agent payloads to process for request: {}", request_id);
+        return;
+    }
+    
+    info!("Processing {} agent payloads for request: {}", payloads.len(), request_id);
+    
+    // Process each payload using the global log processor
+    for payload_bytes in payloads {
+        if let Err(e) = process_and_send_agent_payload(
+            &payload_bytes,
+            request_id,
+            invoked_function_arn,
+            global_log_processor,
+            newrelic_client,
+            config,
+        ).await {
+            error!("Error processing agent payload for request {}: {}", request_id, e);
+        }
+    }
+}
+
+/// Wait for all concurrent requests to complete
+async fn wait_for_all_requests_completion() {
+    info!("Waiting for all concurrent requests to complete...");
+    
+    // Wait a reasonable time for requests to complete
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    
+    // Force cleanup of any remaining requests
+    let remaining_requests = {
+        if let Ok(processors) = REQUEST_PROCESSORS.lock() {
+            processors.keys().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        }
+    };
+    
+    for request_id in remaining_requests {
+        warn!("Force cleaning up request: {}", request_id);
+        cleanup_request_processing_state(&request_id);
+    }
+    
+    info!("All concurrent requests completed");
+}
+
+/// Create per-request context for concurrent request handling
+/// Create per-request processing state for concurrent request handling
+fn create_request_processing_state(
+    request_id: &str,
+    invoked_function_arn: &str,
+    processor_factory: &Arc<ProcessorFactory>
+) -> RequestProcessingState {
+    // Create context
+    let context = Arc::new(Mutex::new(InvocationContext {
+        request_id: request_id.to_string(),
+        invoked_function_arn: invoked_function_arn.to_string(),
+        trace_id: None,
+    }));
+
+    // Create only platform processor - log processor will be global
+    let platform_processor = processor_factory.create_platform_processor(context.clone());
+
+    // Create agent buffer
+    let agent_buffer = Arc::new(Mutex::new(Vec::new()));
+
+    // Create coordination channel
+    let (tx, rx) = mpsc::unbounded_channel();
+
+    // Store coordination sender
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+        channels.insert(request_id.to_string(), tx);
+    }
+
+    let state = RequestProcessingState {
+        request_id: request_id.to_string(),
+        context: context.clone(),
+        platform_processor,
+        agent_buffer: agent_buffer.clone(),
+        coordination_rx: Some(rx),
     };
 
-    Ok(register_response)
+    // Store in global maps for backward compatibility
+    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
+        contexts.insert(request_id.to_string(), context);
+    }
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+        buffers.insert(request_id.to_string(), agent_buffer);
+    }
+
+    info!("Created per-request processing state for {} (using global log processor)", request_id);
+    state
+}
+
+/// Create per-request agent buffer for concurrent request handling
+fn create_request_agent_buffer(request_id: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    
+    // Store in per-request buffers map
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+        buffers.insert(request_id.to_string(), buffer.clone());
+        info!("Created per-request agent buffer for {}", request_id);
+    } else {
+        error!("Failed to lock REQUEST_AGENT_BUFFERS for request {}", request_id);
+    }
+    
+    buffer
+}
+
+/// Get per-request context (for concurrent requests)
+fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>> {
+    if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
+        return contexts.get(request_id).cloned();
+    }
+    None
+}
+
+/// Get per-request agent buffer (for concurrent requests)
+fn get_request_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
+    if let Ok(buffers) = REQUEST_AGENT_BUFFERS.lock() {
+        return buffers.get(request_id).cloned();
+    }
+    None
+}
+
+/// Clean up per-request processing state after processing
+fn cleanup_request_processing_state(request_id: &str) {
+    // Clean up request processing state
+    if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+        if processors.remove(request_id).is_some() {
+            debug!("Cleaned up request processing state for {}", request_id);
+        }
+    }
+    
+    // Clean up context
+    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
+        if contexts.remove(request_id).is_some() {
+            debug!("Cleaned up context for request {}", request_id);
+        }
+    }
+    
+    // Clean up agent buffer
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+        if buffers.remove(request_id).is_some() {
+            debug!("Cleaned up agent buffer for request {}", request_id);
+        }
+    }
+    
+    // Clean up payload coordination channel
+    cleanup_payload_coordination_channel(request_id);
+}
+
+
+
+/// Check pending agent payloads for a given request context
+/// Returns (request_buffer_size, global_buffer_size)
+fn check_pending_agent_payloads(context: &Option<(String, String)>) -> (usize, usize) {
+    if let Some((request_id, _)) = context {
+        let request_buffer = get_request_agent_buffer(request_id);
+        let request_size = if let Some(request_buffer) = request_buffer {
+            if let Ok(buffer) = request_buffer.lock() {
+                buffer.len()
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        
+        (request_size, 0)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Cleanup old failed payloads (called during initialization)
+fn cleanup_old_failed_payloads() {
+    if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+        let initial_count = failed_payloads.len();
+        let now = chrono::Utc::now();
+        
+        failed_payloads.retain(|payload| {
+            let age = now.signed_duration_since(payload.failed_at);
+            age.num_hours() <= 24 // Keep payloads newer than 24 hours
+        });
+        
+        let removed_count = initial_count - failed_payloads.len();
+        if removed_count > 0 {
+            info!("Cleaned up {} old failed agent payloads (kept {} recent ones)", 
+                 removed_count, failed_payloads.len());
+        }
+    }
+}
+
+/// Retry failed agent payloads during final flush
+async fn retry_failed_agent_payloads(
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) {
+    let mut retry_successful_count = 0;
+    let mut retry_failed_count = 0;
+    
+    // Take all failed payloads for retry (this clears the buffer)
+    let failed_payloads = {
+        if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            std::mem::take(&mut *failed_payloads)
+        } else {
+            error!("Failed to lock FAILED_AGENT_PAYLOADS for retry");
+            return;
+        }
+    };
+    
+    if failed_payloads.is_empty() {
+        debug!("No failed agent payloads to retry");
+        return;
+    }
+    
+    info!("Retrying {} failed agent payloads during final flush", failed_payloads.len());
+    
+    for mut failed_payload in failed_payloads {
+        failed_payload.retry_count += 1;
+        
+        // Skip payloads that are too old (older than 24 hours)
+        let age = chrono::Utc::now().signed_duration_since(failed_payload.failed_at);
+        if age.num_hours() > 24 {
+            warn!("Dropping agent payload that's too old ({} hours) for request {}", 
+                 age.num_hours(), failed_payload.request_id);
+            continue;
+        }
+        
+        // Skip payloads that have been retried too many times
+        if failed_payload.retry_count > 5 {
+            warn!("Dropping agent payload after {} retries for request {}", 
+                 failed_payload.retry_count, failed_payload.request_id);
+            continue;
+        }
+        
+        debug!("Retrying agent payload for request {} (attempt {})", 
+               failed_payload.request_id, failed_payload.retry_count);
+        
+        match send_agent_payload_to_newrelic(
+            &failed_payload.payload_bytes,
+            &failed_payload.request_id,
+            &failed_payload.invoked_function_arn,
+            newrelic_client,
+            config,
+        ).await {
+            Ok(_) => {
+                retry_successful_count += 1;
+                info!("Successfully retried agent payload for request {}", failed_payload.request_id);
+            }
+            Err(_) => {
+                retry_failed_count += 1;
+                
+                // Put it back in the buffer for next invocation if not too many retries
+                if failed_payload.retry_count <= 5 {
+                    if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+                        failed_payloads.push(failed_payload);
+                    }
+                }
+            }
+        }
+    }
+    
+    if retry_successful_count > 0 || retry_failed_count > 0 {
+        info!("Agent payload retry results: {} successful, {} still failed", 
+             retry_successful_count, retry_failed_count);
+    }
+}
+
+/// Comprehensive flush of all telemetry before freeze mode
+
+/// Update global invocation context (legacy function, now also creates per-request context)
+
+
+
+
+
+
+
+
+
+
+
+/// No-op event loop when extension is disabled
+/// Equivalent to Go's noopLoop function
+async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
+    info!("Starting no-op mode, no telemetry will be sent");
+
+    loop {
+        let loop_start = std::time::Instant::now();
+        match fetch_next_lambda_runtime_event(client, extension_id).await {
+            Ok(LambdaRuntimeEvent::Shutdown { shutdown_reason: _ }) => {
+                info!("Extension shutting down");
+                break;
+            }
+            Ok(LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
+                // WARM START PATH: This is where no-op warm starts spend their time
+                trace!("No-op mode invocation processed in {:?} (request_id: {})", loop_start.elapsed(), request_id);
+            }
+            Err(_) => { /* Ignore errors and continue polling */ }
+        }
+    }
+}
+
+/// Perform extension shutdown cleanup
+async fn perform_extension_shutdown_cleanup(
+    total_events_processed: u32,
+    harvester_handle: tokio::task::JoinHandle<()>,
+    extension_startup_time: std::time::Instant,
+) {
+    info!("New Relic Extension shutting down after {} events", total_events_processed);
+    
+    // Stop harvester background task
+    harvester_handle.abort();
+    
+    let shutdown_at = std::time::Instant::now();
+    let total_runtime = shutdown_at.duration_since(extension_startup_time);
+    info!("Extension shutdown after {}ms", total_runtime.as_millis());
+}
+
+
+
+/// Create wrapped agent payload JSON string
+/// Create New Relic log format with agent data in message field
+/// NOTE: Trace ID extraction is handled separately in process_and_send_agent_payload
+fn create_wrapped_agent_payload_json(
+    payload_bytes: &[u8],
+    function_name: &str,
+    invoked_function_arn: &str,
+    log_group_name: &str,
+    request_id: &str,
+) -> String {
+    debug!("Processing agent data of {} bytes for function: {}", payload_bytes.len(), function_name);
+    
+    // Create New Relic log event format with agent data as message
+    create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id)
+}
+
+/// Create New Relic format with Lambda context and stringified log events in entry field
+/// Returns JSON with context and entry fields matching New Relic expected format
+/// NOTE: This is for AGENT payload wrapping, not regular log processing
+fn create_newrelic_log_format(
+    agent_data: &[u8],
+    function_name: &str,
+    invoked_function_arn: &str,
+    log_group_name: &str,
+    request_id: &str,
+) -> String {
+    // Convert agent data to string (should be JSON array like [1,"NR_LAMBDA_MONITORING","compressed_data"])
+    let agent_data_str = String::from_utf8_lossy(agent_data);
+    debug!("Agent data to wrap in log format: {}", agent_data_str);
+
+    // Generate timestamp in milliseconds
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    // Create the log events structure first (for agent payload wrapping)
+    let log_events_payload = serde_json::json!({
+        "logEvents": [{
+            "id": request_id,
+            "message": agent_data_str,
+            "timestamp": timestamp
+        }],
+        "logGroup": log_group_name,
+        "logStream": "",
+        "messageType": "",
+        "owner": ""
+    });
+
+    // Stringify the log events payload to put in entry field (this is required for agent payload format)
+    let log_events_string = log_events_payload.to_string();
+
+    // Create final payload with context and stringified entry
+    let final_payload = serde_json::json!({
+        "context": {
+            "function_name": function_name,
+            "invoked_function_arn": invoked_function_arn,
+            "log_group_name": log_group_name,
+            "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+        },
+        "entry": log_events_string
+    });
+
+    // Convert to string and return
+    final_payload.to_string()
+}
+
+/// Registers the extension with the Lambda Runtime API.
+async fn register_extension_with_lambda_runtime(client: &Client) -> Result<(ExtensionRegistrationResponse, String), Box<dyn std::error::Error + Send + Sync>> {
+    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
+        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
+
+    let url = format!("http://{}/2020-01-01/extension/register", runtime_api);
+    
+    let payload = serde_json::json!({
+        "events": ["INVOKE", "SHUTDOWN"]
+    });
+
+    let response = client
+        .post(&url)
+        .header(EXTENSION_NAME_HEADER, EXTENSION_NAME)
+        .json(&payload)
+        .timeout(Duration::from_secs(30)) // 30 second timeout for registration
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+        error!("Registration failed with status: {}, body: {}", status, body);
+        return Err(format!("Registration failed with status: {}", status).into());
+    }
+
+    // Get extension ID from headers
+    let extension_id = response
+        .headers()
+        .get(EXTENSION_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or("Missing extension ID in response headers")?
+        .to_string();
+
+    let registration: ExtensionRegistrationResponse = response
+        .json()
+        .await?;
+
+    Ok((registration, extension_id))
 }
 
 /// Subscribes to the Lambda Telemetry API.
-async fn subscribe_to_telemetry(client: &Client, ext_id: &str, port: u16) -> Result<()> {
-    let config = config::get_config();
-    let url = format!("http://{}/2022-07-01/telemetry", &config.aws.runtime_api);
-    // Always include platform; optionally include function/extension based on config flags.
-    let mut types = vec!["platform".to_string()];
-    if config.extension.send_function_logs {
-        types.push("function".to_string());
-    }
-    if config.extension.send_extension_logs {
-        types.push("extension".to_string());
-    }
+async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
+        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
 
-    let body = serde_json::json!({
+    let url = format!("http://{}/2022-07-01/telemetry", runtime_api);
+    
+    let payload = serde_json::json!({
         "schemaVersion": "2022-07-01",
+        "types": ["platform", "function", "extension"],
+        "buffering": {
+            "maxBytes": 262144,
+            "maxItems": 10000,
+            "timeoutMs": 100  // Reduced from 1000ms to 100ms for faster cold start log delivery
+        },
         "destination": {
             "protocol": "HTTP",
-            "URI": format!("http://sandbox:{}", port),
-        },
-        "types": types,
-        "buffering": {
-            "maxItems": config.extension.max_batch_items,
-            "maxBytes": config.extension.max_batch_size,
-            "timeoutMs": config.extension.telemetry_timeout,
+            "URI": format!("http://sandbox:{}/telemetry", port)
         }
     });
 
-    let resp = client
+    let response = client
         .put(&url)
         .header(EXTENSION_ID_HEADER, ext_id)
-        .json(&body)
+        .json(&payload)
+        .timeout(Duration::from_secs(30)) // 30 second timeout for telemetry subscription
         .send()
-        .await
-        .map_err(|e| Error::new(std::io::ErrorKind::Other, e))?;
+        .await?;
 
-    if !resp.status().is_success() {
-        let err_msg = format!("Failed to subscribe to telemetry: {}", resp.status());
-        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+        error!("Telemetry subscription failed with status: {}, body: {}", status, body);
+        return Err(format!("Telemetry subscription failed with status: {}", status).into());
     }
 
     Ok(())
 }
 
 /// Fetches the next event from the Lambda Runtime API.
-async fn next_event(client: &Client, ext_id: &str) -> Result<NextEventResponse> {
-    let config = config::get_config();
-    let url = format!("http://{}/2020-01-01/extension/event/next", &config.aws.runtime_api);
+async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Result<LambdaRuntimeEvent, Box<dyn std::error::Error + Send + Sync>> {
+    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
+        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
 
-    let resp = client
-        .get(&url)
-        .header(EXTENSION_ID_HEADER, ext_id)
-        .timeout(Duration::from_secs(300)) // Increase timeout to 5 minutes
-        .send()
-        .await
-        .map_err(|e| {
-            // Log more details about timeout errors
-            if e.is_timeout() {
-                tracing::warn!("Timeout waiting for next Lambda event (this is normal during idle periods)");
-            } else {
-                tracing::error!("Network error getting next event: {}", e);
+    let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
+
+    // Retry logic for extension event polling - this is critical for reliability
+    const MAX_RETRIES: u32 = 3;
+    let mut retry_count = 0;
+
+    loop {
+        let response = client
+            .get(&url)
+            .header(EXTENSION_ID_HEADER, ext_id)
+            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                // Success case - process the response
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+                    error!("Next event request failed with status: {}, body: {}", status, body);
+                    return Err(format!("Next event request failed with status: {}", status).into());
+                }
+
+                let event: LambdaRuntimeEvent = resp.json().await?;
+                return Ok(event);
+            },
+            Err(e) => {
+                // Handle timeout and connection errors with retry
+                retry_count += 1;
+                
+                if e.is_timeout() {
+                    warn!("Extension event polling timeout (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                } else if e.is_connect() {
+                    warn!("Extension event polling connection error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                } else {
+                    warn!("Extension event polling error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
+                }
+
+                if retry_count >= MAX_RETRIES {
+                    error!("Extension event polling failed after {} retries, giving up", MAX_RETRIES);
+                    return Err(e.into());
+                }
+
+                // Exponential backoff: 1s, 2s, 4s
+                let delay = Duration::from_secs(2_u64.pow(retry_count - 1));
+                warn!("Retrying extension event polling in {:?}...", delay);
+                tokio::time::sleep(delay).await;
             }
-            Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-    if !resp.status().is_success() {
-        let err_msg = format!("Failed to get next event: {}", resp.status());
-        return Err(Error::new(std::io::ErrorKind::Other, err_msg));
+        }
     }
-
-    let event = resp
-        .json()
-        .await
-        .map_err(|e| Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    Ok(event)
 }
+
+
 

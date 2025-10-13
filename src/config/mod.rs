@@ -58,23 +58,20 @@ pub struct AwsConfig {
 
     /// Lambda function name
     pub function_name: String,
+
+    /// Lambda function version (from registration response)
+    pub function_version: Option<String>,
+
+    /// AWS account ID (from registration response)  
+    pub account_id: Option<String>,
+
+    /// AWS region (extracted from runtime API endpoint or environment)
+    pub region: Option<String>,
 }
 
 /// Extension specific settings
 #[derive(Debug, Clone)]
 pub struct ExtensionSettings {
-    /// Extension name
-    pub name: String,
-
-    /// Maximum telemetry items per batch
-    pub max_batch_items: usize,
-
-    /// Maximum telemetry batch size in bytes
-    pub max_batch_size: usize,
-
-    /// Telemetry timeout in milliseconds
-    pub telemetry_timeout: u64,
-
     /// Whether to subscribe to function telemetry/logs (Lambda 'function' type)
     pub send_function_logs: bool,
 
@@ -134,6 +131,49 @@ impl Default for AwsConfig {
         Self {
             runtime_api: "127.0.0.1:9001".to_string(),
             function_name: "unknown".to_string(),
+            function_version: None,
+            account_id: None,
+            region: None,
+        }
+    }
+}
+
+impl AwsConfig {
+    /// Construct the complete Lambda function ARN using registration details
+    /// Format: arn:aws:lambda:region:account-id:function:function-name  
+    /// This matches the Go implementation: getLambdaARN()
+    pub fn construct_function_arn(&self) -> Option<String> {
+        // Get function name from registration response  
+        if self.function_name.is_empty() {
+            return None;
+        }
+
+        // Get region from environment variables (AWS_REGION or AWS_DEFAULT_REGION)
+        let region = env::var("AWS_REGION")
+            .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string()); // Default region if not set
+        
+        // Use account ID if available, otherwise use placeholder
+        // In practice, the invocation ARN from Lambda events is more reliable
+        let account_id = self.account_id.as_ref()
+            .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
+            .unwrap_or("123456789012"); // Standard placeholder account ID
+        
+        Some(format!(
+            "arn:aws:lambda:{}:{}:function:{}",
+            region, account_id, self.function_name
+        ))
+    }
+
+    /// Update configuration with Lambda registration response details  
+    pub fn update_from_registration(&mut self, function_name: String, function_version: String, account_id: Option<String>) {
+        self.function_name = function_name;
+        self.function_version = Some(function_version);
+        self.account_id = account_id;
+        
+        // Try to extract region from environment if not already set
+        if self.region.is_none() {
+            self.region = env::var("AWS_REGION").ok();
         }
     }
 }
@@ -141,10 +181,6 @@ impl Default for AwsConfig {
 impl Default for ExtensionSettings {
     fn default() -> Self {
         Self {
-            name: "newrelic-lambda-extension".to_string(),
-            max_batch_size: 262_144, // 256KB
-            max_batch_items: 1000,
-            telemetry_timeout: 25, // 25ms for immediate delivery
             send_function_logs: false,
             send_extension_logs: false,
             log_level: "info".to_string(),
@@ -212,6 +248,8 @@ impl ExtensionConfig {
 
         config
     }
+
+
 }
 
 /// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
@@ -228,12 +266,12 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
-        // Add the static prefix
-        write!(writer, "[NR_EXT]")?;
+        // Add the static prefix with proper spacing
+        write!(writer, "[NR_EXT] ")?;
 
-        // Add the log level
+        // Add the log level without colons
         let metadata = event.metadata();
-        write!(writer, ":{}:", metadata.level())?;
+        write!(writer, "{} ", metadata.level())?;
 
         // OPTIMIZATION: Only include file and line numbers in debug builds.
         #[cfg(debug_assertions)]
@@ -294,17 +332,5 @@ pub fn init_config() -> &'static ExtensionConfig {
     }
 }
 
-/// Get the global configuration
-pub fn get_config() -> &'static ExtensionConfig {
-    unsafe {
-        #[allow(static_mut_refs)]
-        {
-            GLOBAL_CONFIG
-                .as_ref()
-                .unwrap_or_else(|| {
-                panic!("Configuration not initialized. Call init_config() first.");
-            })
-        }
-    }
-}
+
 

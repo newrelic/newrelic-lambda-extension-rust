@@ -38,7 +38,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::{debug, warn};
+use tracing::warn;
 use crate::config::Configuration;
 
 /// License key secret structure for JSON parsing
@@ -215,7 +215,7 @@ fn decode_license_key(raw_json: &str) -> Result<String> {
     let secret: LicenseKeySecret = serde_json::from_str(raw_json)?;
     
     if secret.license_key.is_empty() {
-        return Err(anyhow!("malformed license key secret; missing \"LicenseKey\" attribute"));
+        return Err(anyhow!("malformed license key secret; missing LicenseKey attribute"));
     }
     
     Ok(secret.license_key)
@@ -226,13 +226,13 @@ async fn try_license_key_from_secret(secret_id: &str) -> Result<String> {
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("Secrets Manager client not initialized"))?;
     
-    debug!("Fetching license key from AWS Secrets Manager");
+
     
     let secret_string = clients.secrets_manager.get_secret_value(secret_id).await?;
     
     let license_key = decode_license_key(&secret_string)?;
     
-    debug!("Successfully fetched license key from AWS Secrets Manager");
+
     
     Ok(license_key)
 }
@@ -242,11 +242,11 @@ async fn try_license_key_from_ssm_parameter(parameter_name: &str) -> Result<Stri
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("SSM client not initialized"))?;
     
-    debug!("Fetching license key from AWS SSM Parameter Store");
+
     
     let parameter_value = clients.ssm.get_parameter(parameter_name).await?;
 
-    debug!("Successfully fetched license key from AWS SSM Parameter Store");
+
 
     Ok(parameter_value)
 }
@@ -271,7 +271,7 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     // 1. Try environment variable for Secrets Manager secret name/ARN first
     if let Ok(secret_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SECRET) {
         if !secret_name_or_arn.is_empty() {
-            debug!("Fetching license key from Secrets Manager using environment variable");
+
             return try_license_key_from_secret(&secret_name_or_arn).await;
         }
     }
@@ -279,7 +279,7 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     // 2. Try environment variable for SSM parameter name/ARN
     if let Ok(parameter_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SSM_PARAMETER) {
         if !parameter_name_or_arn.is_empty() {
-            debug!("Fetching license key from SSM Parameter Store using environment variable");
+
             return try_license_key_from_ssm_parameter(&parameter_name_or_arn).await;
         }
     }
@@ -287,18 +287,18 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     // 3. Try configured secret ID from configuration
     let secret_id = &conf.license_key_secret_id;
     if !secret_id.is_empty() {
-        debug!("Fetching license key from configured secret id");
+
         return try_license_key_from_secret(secret_id).await;
     }
     
     // 4. Try configured SSM parameter name from configuration
     let parameter_name = &conf.license_key_ssm_parameter_name;
     if !parameter_name.is_empty() {
-        debug!("Fetching license key from configured SSM parameter");
+
         return try_license_key_from_ssm_parameter(parameter_name).await;
     }
     
-    debug!("No configured AWS sources found, attempting fallback to default AWS sources");
+
     
     // 5. Try default secret ID
     if let Ok(license_key) = try_license_key_from_secret(DEFAULT_SECRET_ID).await {

@@ -23,7 +23,7 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
 
     // 1. Remove the pipe if it already exists, ignoring "Not Found" errors.
     match fs::remove_file(path) {
-        Ok(_) => debug!("Removed existing telemetry pipe."),
+        Ok(_) => {},
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
