@@ -166,12 +166,18 @@ impl LogProcessor {
     /// Applies current invocation metadata to a failed log before retry
     fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
-            // Apply current request_id if available
-            if !context.request_id.is_empty() && context.request_id != "unknown" {
+            // Apply current request_id if available and valid
+            if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
                 log_message.attributes.insert("aws.lambda_request_id".to_string(), 
                     serde_json::Value::String(context.request_id.clone()));
                 log_message.attributes.insert("faas.execution".to_string(), 
                     serde_json::Value::String(context.request_id.clone()));
+            }
+            
+            // Apply current invoked_function_arn if available and valid
+            if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
+                log_message.attributes.insert("faas.arn".to_string(), 
+                    serde_json::Value::String(context.invoked_function_arn.clone()));
             }
             
             // Apply current trace_id if available
@@ -377,26 +383,26 @@ impl LogProcessor {
             return;
         }
     
-        if let Some(mut log_message) = self.to_log_message(record) {
-            // First check: Do we have a valid request_id?
-            let has_request_id = {
+        if let Some(log_message) = self.to_log_message(record) {
+            // CRITICAL FIX: Always check if we have valid invocation context before processing
+            let has_valid_context = {
                 let context = self.invocation_context.lock().unwrap();
-                !context.request_id.is_empty()
+                !context.request_id.is_empty() && 
+                context.request_id != "temp" && 
+                !context.invoked_function_arn.is_empty() && 
+                context.invoked_function_arn != "temp"
             };
     
-            // If we don't have a request_id yet, buffer the log
-            if !has_request_id {
+            // If we don't have valid invocation context, buffer the log
+            if !has_valid_context {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
                 request_buffer.push(log_message);
+               
                 return;
             }
     
-            // We have a request_id - update the log message attributes with it
-            {
-                let context = self.invocation_context.lock().unwrap();
-                log_message.attributes.insert("aws.lambda_request_id".to_string(), 
-                                serde_json::Value::String(context.request_id.clone()));
-            }
+            // Apply current invocation metadata (this will now have valid values)
+            let log_message = self.apply_current_invocation_metadata(log_message);
     
             // Check if trace ID collection is enabled and we should buffer for trace ID
             if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
@@ -413,7 +419,6 @@ impl LogProcessor {
                     drop(state); // Release lock before modifying buffer
                     let mut buffered = buffered_logs.lock().unwrap();
                     buffered.push(log_message);
-                    debug!("Buffered log for trace ID extraction, buffer size: {}", buffered.len());
                     return;
                 }
             }
@@ -478,28 +483,6 @@ impl LogProcessor {
         
         let mut attributes = serde_json::Map::new();
         
-        // Get request_id, invoked_function_arn and trace_id from the context
-        let context = self.invocation_context.lock().unwrap();
-        let request_id = &context.request_id;
-        let invoked_function_arn = &context.invoked_function_arn;
-        let trace_id = &context.trace_id;
-        
-        // Only add AWS Lambda specific attributes if we have a valid request_id
-        if !request_id.is_empty() {
-            attributes.insert("aws.lambda_request_id".to_string(), request_id.clone().into());
-            attributes.insert("faas.execution".to_string(), request_id.clone().into());
-        }
-        
-        // Only add faas.arn if we have a valid invoked_function_arn
-        if !invoked_function_arn.is_empty() {
-            attributes.insert("faas.arn".to_string(), invoked_function_arn.clone().into());
-        }
-        
-        // Only add trace ID if it's present (not None)
-        if let Some(ref trace_id_value) = trace_id {
-            attributes.insert("trace.id".to_string(), serde_json::Value::String(trace_id_value.clone()));
-        }
-        
         // Add log level - extract from message content for proper filtering in New Relic UI
         let log_level = self.extract_log_level(&message);
         attributes.insert("level".to_string(), log_level.into());
@@ -509,7 +492,10 @@ impl LogProcessor {
         
         // Add newrelic.source
         attributes.insert("newrelic.source".to_string(), "api.logs".into());
-
+    
+        // NOTE: Do NOT add AWS Lambda attributes here - they will be added later
+        // when we have valid invocation context via apply_current_invocation_metadata()
+    
         Some(payload::LogMessage {
             timestamp,
             message,
