@@ -1420,7 +1420,7 @@ async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: 
         "buffering": {
             "maxBytes": 262144,
             "maxItems": 10000,
-            "timeoutMs": 1000
+            "timeoutMs": 100  // Reduced from 1000ms to 100ms for faster cold start log delivery
         },
         "destination": {
             "protocol": "HTTP",

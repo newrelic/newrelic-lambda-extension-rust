@@ -133,7 +133,11 @@ async fn handle_telemetry_request(
             
             // Summary logging instead of per-record logging
             if function_count > 0 || extension_count > 0 || platform_count > 0 {
-                info!("Processed telemetry records - function: {}, extension: {}, platform: {}", 
+                let is_cold_start = !crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+                if is_cold_start && function_count > 0 {
+                    info!("COLD START: Successfully received {} function logs via telemetry API!", function_count);
+                }
+                info!("Processed telemetry records - function: {}, extension: {}, platform: {}",
                        function_count, extension_count, platform_count);
             } else {
                 // Log when no records were processed to help debug
