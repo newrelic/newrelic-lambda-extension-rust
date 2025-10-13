@@ -137,8 +137,7 @@ async fn handle_telemetry_request(
                 if is_cold_start && function_count > 0 {
                     info!("COLD START: Successfully received {} function logs via telemetry API!", function_count);
                 }
-                info!("Processed telemetry records - function: {}, extension: {}, platform: {}",
-                       function_count, extension_count, platform_count);
+               
             } else {
                 // Log when no records were processed to help debug
                 debug!("No telemetry records processed in this batch");
