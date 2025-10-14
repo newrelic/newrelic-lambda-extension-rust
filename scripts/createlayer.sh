@@ -64,22 +64,19 @@ package_extension_layer() {
 }
 
 # Builds a layer for a specific Python version
-build_python_layer() {
-  local py_version="$1"
-  local target="$2"
+build_python_layer_all() {
+  local target="$1"
   local arch="${target%%-*}"
-  local py_dot_version
-  py_dot_version=$(echo "$py_version" | sed 's/\(.\)/\1./')
-  local zip_name="$DIST_DIR/python${py_version}-${arch}.zip"
+  local zip_name="$DIST_DIR/python-all-${arch}.zip"
 
-  echo "Building New Relic layer for python$py_dot_version ($arch)" >&2
+  echo "Building single New Relic layer for all python ($arch)" >&2
 
   rm -rf "$LAYER_DIR"
-  mkdir -p "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
-  
-  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
+  mkdir -p "$LAYER_DIR/python/"
+
+  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/"
   cp "$SCRIPT_DIR/newrelic_lambda_wrapper.py" "$LAYER_DIR/python/newrelic_lambda_wrapper.py"
-  
+
   mkdir -p "$LAYER_DIR/extensions"
   cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
 
@@ -90,26 +87,22 @@ build_python_layer() {
 }
 
 # Builds a layer for a specific Node.js version
-build_nodejs_layer() {
-  local node_version="$1"
-  local target="$2"
+build_nodejs_layer_all() {
+  local target="$1"
   local arch="${target%%-*}"
-  local zip_name="$DIST_DIR/nodejs${node_version}-${arch}.zip"
+  local zip_name="$DIST_DIR/nodejs-all-${arch}.zip"
 
-  echo "Building New Relic layer for nodejs${node_version}.x ($arch)" >&2
+  echo "Building single New Relic layer for all nodejs ($arch)" >&2
 
   rm -rf "$LAYER_DIR"
   mkdir -p "$LAYER_DIR/nodejs/node_modules"
 
-  # npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
   npm install --install-strategy=nested --prefix $LAYER_DIR/nodejs newrelic@latest
   rm -rf $LAYER_DIR/nodejs/node_modules/newrelic/node_modules/@opentelemetry
 
-  # Create the newrelic-lambda-wrapper as a proper Node.js module
   mkdir -p "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper"
   cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/index.js"
-  
-  # Create a package.json for the newrelic-lambda-wrapper module
+
   cat > "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/package.json" << 'EOF'
 {
   "name": "newrelic-lambda-wrapper",
@@ -195,27 +188,21 @@ main() {
 
   # Package and publish standalone extension
   package_extension_layer "$target_x86"
-  # for region in $REGIONS_X86_64; do
-  #   publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRTestRustExtensionX86"
-  # done
-
-  # # Package and publish Python layers
-  # build_python_layer "312" "$target_x86"
-  # for region in $REGIONS_X86_64; do
-  #   publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRTestRustExtensionPython312X86"
-  # done
-
-  # # Package and publish Python layers
-  build_python_layer "313" "$target_x86"
   for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRTestRustExtensionPython313X86"
+    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRTestRustExtensionX86"
   done
 
-  # Package and publish Node.js layers
-  # build_nodejs_layer "20" "$target_x86"
-  # for region in $REGIONS_X86_64; do
-  #   publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRTestRustExtensionNodejs20X86"
-  # done
+  # Package and publish single Python layer
+  build_python_layer_all "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/python-all-x86_64.zip" "$region" "python" "x86_64" "NRTestRustExtensionPythonX86"
+  done
+
+  # Package and publish single Node.js layer
+  build_nodejs_layer_all "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "NRTestRustExtensionNodejsX86"
+  done
 
   #--- Build for arm64 ---
   # local target_arm="aarch64-unknown-linux-musl"
@@ -227,16 +214,16 @@ main() {
   #   publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
   # done
 
-  # # Package and publish Python layers
-  # build_python_layer "311" "$target_arm"
+  # # Package and publish single Python layer
+  # build_python_layer_all "$target_arm"
   # for region in $REGIONS_ARM64; do
-  #   publish_layer "$DIST_DIR/python311-aarch64.zip" "$region" "python3.11" "arm64" "NRTestExtensionPython311ARM64"
+  #   publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "NRTestExtensionPythonAllARM64"
   # done
 
-  # # Package and publish Node.js layers
-  # build_nodejs_layer "20" "$target_arm"
+  # # Package and publish single Node.js layer
+  # build_nodejs_layer_all "$target_arm"
   # for region in $REGIONS_ARM64; do
-  #   publish_layer "$DIST_DIR/nodejs20-aarch64.zip" "$region" "nodejs20.x" "arm64" "NRTestExtensionNodejs20ARM64"
+  #   publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "NRTestExtensionNodejsAllARM64"
   # done
 
   echo "All layers published. Environment variables saved to $TMP_ENV_FILE_NAME"

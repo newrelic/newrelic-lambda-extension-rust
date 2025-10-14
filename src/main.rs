@@ -12,6 +12,7 @@ mod context;
 mod agent;
 mod credentials;
 mod trace;
+mod version;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -392,12 +393,34 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     info!("License key validated and extension registered - proceeding with full initialization");
 
     info!("NEW_RELIC_COLLECT_TRACE_ID setting: {}", config.new_relic.collect_trace_id);
-    info!("Log forwarding settings: send_function_logs={}, send_extension_logs={}", 
-          config.extension.send_function_logs, 
+    info!("NEW_RELIC_ADD_VERSION_DETAIL_TAGS setting: {}", config.new_relic.add_version_detail_tags);
+
+    // Detect versions early if tagging is enabled (using async for AWS API calls)
+    if config.new_relic.add_version_detail_tags {
+        let version_info = version::VersionInfo::detect_async().await;
+        info!("Version detection results:");
+        info!("  Extension version: {}", version_info.extension_version);
+        if let Some(ref agent_name) = version_info.agent_name {
+            if let Some(ref agent_version) = version_info.agent_version {
+                info!("  Agent: {} version {}", agent_name, agent_version);
+            }
+        } else {
+            info!("  Agent: Not detected");
+        }
+        if let Some(ref layer_version) = version_info.layer_version {
+            info!("  Layer: {}", layer_version);
+        } else {
+            info!("  Layer: Not detected (AWS API call may have failed)");
+        }
+
+    }
+
+    info!("Log forwarding settings: send_function_logs={}, send_extension_logs={}",
+          config.extension.send_function_logs,
           config.extension.send_extension_logs);
 
     // --- PHASE 2: PARALLEL INITIALIZATION (using already registered extension) ---
-    
+
     // Update config with registration details first (needed for NewRelic client)
     let mut updated_config = (*config).clone();
     updated_config.aws.update_from_registration(
@@ -406,6 +429,12 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         registration.account_id,
     );
     let config = Arc::new(updated_config);
+
+    // Note: Lambda function tagging will happen on first invocation when we have the real ARN
+    // The constructed ARN here may have a placeholder account ID
+    if config.new_relic.add_version_detail_tags {
+        debug!("Version detail tagging enabled - will tag function on first invocation with actual ARN");
+    }
     
     // 4. MAXIMALLY PARALLEL: Initialize remaining core components simultaneously 
     let (
@@ -723,13 +752,14 @@ async fn send_agent_payload_to_newrelic(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let function_name = invoked_function_arn.split(':').last().unwrap_or("");
     let log_group_name = format!("/aws/lambda/{}", function_name);
-    
+
     let wrapped_payload = create_wrapped_agent_payload_json(
         payload_bytes,
         function_name,
         invoked_function_arn,
         &log_group_name,
         request_id,
+        config,
     );
     
     match newrelic_client.send_agent_payload(config, &wrapped_payload).await {
@@ -810,7 +840,24 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
         match runtime_event {
             LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
                 let event_processing_start_time = std::time::Instant::now();
-                
+
+                // Tag Lambda function on first invocation (with real ARN)
+                static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
+                let should_tag = components.config.new_relic.add_version_detail_tags;
+                let arn_for_tagging = invoked_function_arn.clone();
+                if should_tag {
+                    TAGGING_DONE.call_once(|| {
+                        info!("Spawning background task to tag Lambda function with version information");
+                        let version_info = version::VersionInfo::get_or_detect();
+                        version::tagging::tag_lambda_function_background(
+                            version_info.extension_version.clone(),
+                            version_info.agent_version.clone(),
+                            version_info.layer_version.clone(),
+                            arn_for_tagging,
+                        );
+                    });
+                }
+
                 // Update global context for telemetry processors
                 if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.lock() {
                     global_context.request_id = request_id.clone();
@@ -1308,11 +1355,12 @@ fn create_wrapped_agent_payload_json(
     invoked_function_arn: &str,
     log_group_name: &str,
     request_id: &str,
+    config: &Arc<config::ExtensionConfig>,
 ) -> String {
     debug!("Processing agent data of {} bytes for function: {}", payload_bytes.len(), function_name);
-    
+
     // Create New Relic log event format with agent data as message
-    create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id)
+    create_newrelic_log_format(payload_bytes, function_name, invoked_function_arn, log_group_name, request_id, config)
 }
 
 /// Create New Relic format with Lambda context and stringified log events in entry field
@@ -1324,6 +1372,7 @@ fn create_newrelic_log_format(
     invoked_function_arn: &str,
     log_group_name: &str,
     request_id: &str,
+    config: &Arc<config::ExtensionConfig>,
 ) -> String {
     // Convert agent data to string (should be JSON array like [1,"NR_LAMBDA_MONITORING","compressed_data"])
     let agent_data_str = String::from_utf8_lossy(agent_data);
@@ -1351,14 +1400,31 @@ fn create_newrelic_log_format(
     // Stringify the log events payload to put in entry field (this is required for agent payload format)
     let log_events_string = log_events_payload.to_string();
 
+    // Create context object with base fields
+    let mut context = serde_json::json!({
+        "function_name": function_name,
+        "invoked_function_arn": invoked_function_arn,
+        "log_group_name": log_group_name,
+        "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+    });
+
+    // Add version detail tags to context if enabled
+    if config.new_relic.add_version_detail_tags {
+        // Use cached version info (already detected once during initialization)
+        let version_info = version::VersionInfo::get_or_detect();
+        let version_tags = version_info.as_tags();
+
+        if let Some(context_obj) = context.as_object_mut() {
+            for (key, value) in version_tags {
+                context_obj.insert(key, serde_json::json!(value));
+            }
+            debug!("Added {} version detail tags to agent payload context", context_obj.len() - 4); // Subtract the 4 base fields
+        }
+    }
+
     // Create final payload with context and stringified entry
     let final_payload = serde_json::json!({
-        "context": {
-            "function_name": function_name,
-            "invoked_function_arn": invoked_function_arn,
-            "log_group_name": log_group_name,
-            "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
-        },
+        "context": context,
         "entry": log_events_string
     });
 
