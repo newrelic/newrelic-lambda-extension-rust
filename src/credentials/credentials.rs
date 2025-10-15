@@ -148,12 +148,14 @@ pub fn start_aws_initialization_background() {
 /// Initialize AWS clients with maximum performance optimizations
 async fn initialize_aws_clients() -> Result<()> {
     use std::time::Duration;
-    
+
     // Skip AWS initialization entirely if we're clearly not in AWS Lambda
     if std::env::var("AWS_LAMBDA_RUNTIME_API").is_err() {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
-    
+
+    tracing::info!("Initializing AWS clients for credential resolution (this may take 200-800ms)");
+
     // Ultra-fast AWS configuration with minimal overhead
     let config_future = tokio::spawn(async {
         // Use the most minimal AWS config possible
@@ -164,13 +166,14 @@ async fn initialize_aws_clients() -> Result<()> {
             .load()
             .await
     });
-    
-    // Very short timeout to fail fast if AWS isn't available
+
+    // Short timeout to fail fast if AWS isn't available
+    // This is intentionally blocking - only called when AWS credentials are explicitly configured
     let config = tokio::time::timeout(
-        Duration::from_millis(1000), // Only 1 second timeout
+        Duration::from_millis(1500), // 1.5 second timeout (AWS config can be slow in cold starts)
         config_future
     ).await
-    .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?
+    .map_err(|_| anyhow!("AWS config initialization timeout (1.5s)"))?
     .map_err(|e| anyhow!("AWS config failed: {}", e))?;
     
     // Create clients in parallel with minimal overhead
@@ -252,17 +255,23 @@ async fn try_license_key_from_ssm_parameter(parameter_name: &str) -> Result<Stri
 }
 
 /// Get New Relic license key from AWS sources only
-/// 
-/// This function is called only when environment variables are not available.
+///
+/// This function is called ONLY when:
+/// - NEW_RELIC_LICENSE_KEY is not set, AND
+/// - AWS credential sources are explicitly configured
+///
 /// It tries to get the license key from:
 /// 1. NEW_RELIC_LICENSE_KEY_SECRET environment variable (Secrets Manager)
 /// 2. NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME environment variable (SSM Parameter Store)
 /// 3. Configured AWS Secrets Manager secret ID from configuration
 /// 4. Configured AWS SSM parameter name from configuration
-/// 5. Default AWS Secrets Manager secret (NEW_RELIC_LICENSE_KEY)
-/// 6. Default AWS SSM parameter (NEW_RELIC_LICENSE_KEY)
+///
+/// NOTE: This function will initialize AWS SDK (200-800ms overhead) on first call
 pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
+    tracing::debug!("Attempting to fetch license key from AWS credential sources");
+
     // Initialize AWS clients only when we need them (lazy initialization)
+    // This is the expensive operation (200-800ms) that we want to avoid when license key is provided
     if let Err(e) = initialize_aws_clients().await {
         warn!("Failed to initialize AWS clients: {}. Skipping AWS credential sources.", e);
         return Err(anyhow!("Failed to initialize AWS clients"));
@@ -287,28 +296,17 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     // 3. Try configured secret ID from configuration
     let secret_id = &conf.license_key_secret_id;
     if !secret_id.is_empty() {
-
+        tracing::debug!("Trying configured Secrets Manager secret ID: {}", secret_id);
         return try_license_key_from_secret(secret_id).await;
     }
-    
+
     // 4. Try configured SSM parameter name from configuration
     let parameter_name = &conf.license_key_ssm_parameter_name;
     if !parameter_name.is_empty() {
-
+        tracing::debug!("Trying configured SSM parameter name: {}", parameter_name);
         return try_license_key_from_ssm_parameter(parameter_name).await;
     }
-    
 
-    
-    // 5. Try default secret ID
-    if let Ok(license_key) = try_license_key_from_secret(DEFAULT_SECRET_ID).await {
-        return Ok(license_key);
-    }
-    
-    // 6. Try default SSM parameter name
-    if let Ok(license_key) = try_license_key_from_ssm_parameter(DEFAULT_SECRET_ID).await {
-        return Ok(license_key);
-    }
-    
-    Err(anyhow!("No license key found from any AWS source"))
+    tracing::warn!("No AWS credential sources found - checked NEW_RELIC_LICENSE_KEY_SECRET and NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME");
+    Err(anyhow!("No license key found from configured AWS sources"))
 }

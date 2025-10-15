@@ -19,7 +19,7 @@ mod test_telemetry;
 
 use std::{
     env,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -56,21 +56,23 @@ const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 // --- CONCURRENT REQUEST HANDLING ---
 // --- CONCURRENT REQUEST HANDLING ---
 // Per-request contexts to handle concurrent Lambda invocations safely
-static REQUEST_CONTEXTS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<InvocationContext>>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
-static REQUEST_AGENT_BUFFERS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+// Using RwLock for read-heavy structures (many reads per telemetry event, few writes on invoke/cleanup)
+static REQUEST_CONTEXTS: Lazy<Arc<RwLock<HashMap<String, Arc<Mutex<InvocationContext>>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+static REQUEST_AGENT_BUFFERS: Lazy<Arc<RwLock<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 // Global coordination channels per request for agent payload processing
-static PAYLOAD_COORDINATION: Lazy<Arc<Mutex<HashMap<String, mpsc::UnboundedSender<()>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static PAYLOAD_COORDINATION: Lazy<Arc<RwLock<HashMap<String, mpsc::UnboundedSender<()>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 // Per-request processing state management
-static REQUEST_PROCESSORS: Lazy<Arc<Mutex<HashMap<String, RequestProcessingState>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static REQUEST_PROCESSORS: Lazy<Arc<RwLock<HashMap<String, RequestProcessingState>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
 
 // Failed agent payloads buffer for retry across invocations
-static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> = 
+// Keep as Mutex - write-heavy (every failure writes)
+static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 // Global current invocation context for telemetry processors
@@ -336,10 +338,13 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     // 2. PARALLEL CRITICAL OPERATIONS: License key validation + Extension registration
     //    Both are required regardless of no-op mode (extension needs SHUTDOWN events)
     info!("Starting parallel license key validation and extension registration...");
+    let parallel_start = std::time::Instant::now();
     let (license_key_result, registration_result) = tokio::join!(
         resolve_license_key_with_aws_fallback(&config),
         initialize_lambda_runtime_client_and_register()
     );
+    let parallel_duration = parallel_start.elapsed();
+    info!("License key resolution + registration completed in {:?}", parallel_duration);
 
     let license_key_option = license_key_result?;
     let (client, extension_id, registration) = registration_result?;
@@ -503,22 +508,26 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
 async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionConfig>) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Fix: Dereference the Arc to get &ExtensionConfig
     let credentials_config = config::Configuration::from(config.as_ref());
-    
-    // Check if AWS services are needed for license key resolution
-    let aws_services_required = credentials_config.license_key.is_empty() && (
+
+    // FAST PATH: If license key is directly provided, return immediately without AWS initialization
+    if !credentials_config.license_key.is_empty() {
+        debug!("License key provided directly via NEW_RELIC_LICENSE_KEY, skipping AWS credential resolution");
+        return Ok(Some(credentials_config.license_key.clone()));
+    }
+
+    // SLOW PATH: Check if AWS services are actually needed for license key resolution
+    // Only initialize AWS clients if user explicitly configured AWS-based credential sources
+    let aws_services_required =
         std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok() ||
         std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok() ||
         !credentials_config.license_key_secret_id.is_empty() ||
-        !credentials_config.license_key_ssm_parameter_name.is_empty() ||
-        std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok()
-    );
+        !credentials_config.license_key_ssm_parameter_name.is_empty();
 
-    if !credentials_config.license_key.is_empty() {
-        Ok(Some(credentials_config.license_key.clone()))
-    } else if aws_services_required {
+    if aws_services_required {
+        debug!("AWS credential sources configured, initializing AWS clients for license key resolution");
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
-                debug!("Successfully obtained New Relic license key from AWS");
+                info!("Successfully obtained New Relic license key from AWS");
                 Ok(Some(key))
             }
             Err(e) => {
@@ -527,7 +536,7 @@ async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionCon
             }
         }
     } else {
-        warn!("No license key available and not in AWS Lambda environment. Extension will run in no-op mode.");
+        warn!("No license key available and no AWS credential sources configured. Extension will run in no-op mode.");
         Ok(None)
     }
 }
@@ -597,7 +606,7 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
 async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     // Find the most recent active request
     let current_request_id = {
-        if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
+        if let Ok(contexts) = REQUEST_CONTEXTS.read() {
             // Get the most recent request (assumes HashMap iteration order reflects insertion order)
             contexts.keys().last().cloned()
         } else {
@@ -613,9 +622,9 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                     buffer.push(payload_bytes);
                     info!("Stored agent payload in request buffer for {} (buffer size now {})", 
                          request_id, buffer.len());
-                    
+
                     // Notify the request's coordination channel if available
-                    if let Ok(channels) = PAYLOAD_COORDINATION.lock() {
+                    if let Ok(channels) = PAYLOAD_COORDINATION.read() {
                         if let Some(tx) = channels.get(&request_id) {
                             let _ = tx.send(());
                         }
@@ -638,16 +647,16 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
 // Channel coordination helper functions
 fn create_payload_coordination_channel(request_id: &str) -> mpsc::UnboundedReceiver<()> {
     let (tx, rx) = mpsc::unbounded_channel();
-    
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.write() {
         channels.insert(request_id.to_string(), tx);
     }
-    
+
     rx
 }
 
 fn cleanup_payload_coordination_channel(request_id: &str) {
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.write() {
         if channels.remove(request_id).is_some() {
             debug!("Cleaned up coordination channel for request {}", request_id);
         }
@@ -879,11 +888,13 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 components.global_log_processor.update_invocation_context(request_state.context.clone());
 
                 // Store request processing state
-                if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+                if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
                     processors.insert(request_id.clone(), request_state);
                 }
                 
-                // Process the request concurrently but wait for completion
+                // Process the request concurrently in background (fire-and-forget)
+                // The background task will wait for function completion and flush before returning
+                // Lambda won't freeze until we return to /next, which happens immediately after this
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
                 let processor_factory_clone = components.processor_factory.clone();
@@ -891,7 +902,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
 
-                let processing_handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     process_request_concurrently(
                         request_id_clone,
                         invoked_function_arn_clone,
@@ -901,13 +912,13 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                         global_log_processor_clone,
                     ).await;
                 });
-                
-                // Wait for the concurrent processing to complete before moving to next event
-                // This ensures agent payloads are fully sent before function freeze
-                if let Err(e) = processing_handle.await {
-                    error!("Error in concurrent request processing: {}", e);
-                }
-                
+
+                // Don't wait! Return immediately to /next for the next event
+                // The background task will complete before Lambda freezes because:
+                // 1. It waits for runtime_done signal (function completion)
+                // 2. It processes and flushes all telemetry
+                // 3. Lambda won't freeze until we call /next again (which we're about to do)
+
                 let event_processing_time = event_processing_start_time.elapsed();
                 
                 if event_counter == 1 {
@@ -942,11 +953,12 @@ async fn process_request_concurrently(
     config: Arc<config::ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
 ) {
-    info!("Starting concurrent processing for request: {}", request_id);
+    let processing_start = std::time::Instant::now();
+    info!("Starting background processing for request: {}", request_id);
     
     // Get request processing state
     let state = {
-        if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+        if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
             processors.remove(&request_id)
         } else {
             error!("Failed to get processing state for request: {}", request_id);
@@ -1000,8 +1012,10 @@ async fn process_request_concurrently(
     
     // Cleanup request resources
     cleanup_request_processing_state(&request_id);
-    
-    info!("Completed concurrent processing for request: {} (including final flush)", request_id);
+
+    let processing_duration = processing_start.elapsed();
+    info!("Completed background processing for request: {} in {:?} (including function wait + flush)",
+         request_id, processing_duration);
 }
 
 /// Process agent payloads for specific request
@@ -1054,7 +1068,7 @@ async fn wait_for_all_requests_completion() {
     
     // Force cleanup of any remaining requests
     let remaining_requests = {
-        if let Ok(processors) = REQUEST_PROCESSORS.lock() {
+        if let Ok(processors) = REQUEST_PROCESSORS.read() {
             processors.keys().cloned().collect::<Vec<_>>()
         } else {
             Vec::new()
@@ -1093,7 +1107,7 @@ fn create_request_processing_state(
     let (tx, rx) = mpsc::unbounded_channel();
 
     // Store coordination sender
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
+    if let Ok(mut channels) = PAYLOAD_COORDINATION.write() {
         channels.insert(request_id.to_string(), tx);
     }
 
@@ -1106,10 +1120,10 @@ fn create_request_processing_state(
     };
 
     // Store in global maps for backward compatibility
-    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
+    if let Ok(mut contexts) = REQUEST_CONTEXTS.write() {
         contexts.insert(request_id.to_string(), context);
     }
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.write() {
         buffers.insert(request_id.to_string(), agent_buffer);
     }
 
@@ -1120,21 +1134,21 @@ fn create_request_processing_state(
 /// Create per-request agent buffer for concurrent request handling
 fn create_request_agent_buffer(request_id: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
     let buffer = Arc::new(Mutex::new(Vec::new()));
-    
+
     // Store in per-request buffers map
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.write() {
         buffers.insert(request_id.to_string(), buffer.clone());
         info!("Created per-request agent buffer for {}", request_id);
     } else {
         error!("Failed to lock REQUEST_AGENT_BUFFERS for request {}", request_id);
     }
-    
+
     buffer
 }
 
 /// Get per-request context (for concurrent requests)
 fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>> {
-    if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
+    if let Ok(contexts) = REQUEST_CONTEXTS.read() {
         return contexts.get(request_id).cloned();
     }
     None
@@ -1142,7 +1156,7 @@ fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>
 
 /// Get per-request agent buffer (for concurrent requests)
 fn get_request_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
-    if let Ok(buffers) = REQUEST_AGENT_BUFFERS.lock() {
+    if let Ok(buffers) = REQUEST_AGENT_BUFFERS.read() {
         return buffers.get(request_id).cloned();
     }
     None
@@ -1151,26 +1165,26 @@ fn get_request_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>
 /// Clean up per-request processing state after processing
 fn cleanup_request_processing_state(request_id: &str) {
     // Clean up request processing state
-    if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
+    if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
         if processors.remove(request_id).is_some() {
             debug!("Cleaned up request processing state for {}", request_id);
         }
     }
-    
+
     // Clean up context
-    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
+    if let Ok(mut contexts) = REQUEST_CONTEXTS.write() {
         if contexts.remove(request_id).is_some() {
             debug!("Cleaned up context for request {}", request_id);
         }
     }
-    
+
     // Clean up agent buffer
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
+    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.write() {
         if buffers.remove(request_id).is_some() {
             debug!("Cleaned up agent buffer for request {}", request_id);
         }
     }
-    
+
     // Clean up payload coordination channel
     cleanup_payload_coordination_channel(request_id);
 }
