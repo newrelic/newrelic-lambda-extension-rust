@@ -1,7 +1,7 @@
-use crate::{config::ExtensionConfig, newrelic::payload};
+use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
 use reqwest::{header, Client, Error};
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 // Extension name and version from Cargo.toml
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
@@ -11,6 +11,9 @@ const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 fn get_extension_name_with_version() -> String {
     format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
 }
+
+// Note: Version detection is done during initialization in main.rs
+// We detect on each call here (fast, filesystem-based detection only)
 
 #[derive(Debug)]
 pub struct NewRelicClient {
@@ -80,7 +83,18 @@ impl NewRelicClient {
         common_attributes.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
-        
+
+        // Add version detail tags if enabled
+        if config.new_relic.add_version_detail_tags {
+            // Use cached version info (already detected once during initialization)
+            let version_info = VersionInfo::get_or_detect();
+            let version_tags = version_info.as_tags();
+            for (key, value) in version_tags {
+                common_attributes.insert(key, serde_json::json!(value));
+            }
+            debug!("Added {} version detail tags to log payload", common_attributes.len() - 3); // Subtract the 3 base attributes
+        }
+
         let log_data = vec![payload::LogPayload {
             common: payload::Common { attributes: common_attributes },
             logs: batch,

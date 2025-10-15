@@ -48,6 +48,9 @@ pub struct NewRelicConfig {
 
     /// Enable/disable trace ID collection from agent payloads
     pub collect_trace_id: bool,
+
+    /// Enable/disable adding version detail tags (agent, extension, layer versions)
+    pub add_version_detail_tags: bool,
 }
 
 /// AWS Lambda specific configuration
@@ -122,6 +125,7 @@ impl Default for NewRelicConfig {
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
             harvest_interval: Duration::from_secs(2), // More frequent flushing
             collect_trace_id: false, // Disabled by default
+            add_version_detail_tags: false, // Disabled by default
         }
     }
 }
@@ -139,11 +143,23 @@ impl Default for AwsConfig {
 }
 
 impl AwsConfig {
+    /// Extract account ID from Lambda execution role ARN
+    /// Role ARN format: arn:aws:iam::123456789012:role/lambda-role-name
+    ///
+    /// Note: Currently not implemented as Lambda doesn't expose account ID in env vars
+    /// The best source is the invocation ARN from actual invoke events
+    fn extract_account_id_from_role() -> Option<String> {
+        // In Lambda, we don't have direct access to account ID from environment variables
+        // AWS_EXECUTION_ENV, AWS_LAMBDA_LOG_GROUP_NAME, etc. don't contain account ID
+        // The only reliable source is the invocation ARN from invoke events
+        None
+    }
+
     /// Construct the complete Lambda function ARN using registration details
-    /// Format: arn:aws:lambda:region:account-id:function:function-name  
+    /// Format: arn:aws:lambda:region:account-id:function:function-name
     /// This matches the Go implementation: getLambdaARN()
     pub fn construct_function_arn(&self) -> Option<String> {
-        // Get function name from registration response  
+        // Get function name from registration response
         if self.function_name.is_empty() {
             return None;
         }
@@ -152,13 +168,21 @@ impl AwsConfig {
         let region = env::var("AWS_REGION")
             .or_else(|_| env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string()); // Default region if not set
-        
-        // Use account ID if available, otherwise use placeholder
-        // In practice, the invocation ARN from Lambda events is more reliable
+
+        // Try multiple sources for account ID:
+        // 1. From registration response (if available - often not provided)
+        // 2. From environment extraction (limited options in Lambda)
+        // 3. Use placeholder (tagging will work if we use invocation ARN later)
+        let extracted_account = Self::extract_account_id_from_role();
         let account_id = self.account_id.as_ref()
             .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
+            .or_else(|| extracted_account.as_deref())
             .unwrap_or("123456789012"); // Standard placeholder account ID
-        
+
+        if account_id == "123456789012" {
+            info!("Using placeholder account ID - tagging will use actual ARN from invocation event");
+        }
+
         Some(format!(
             "arn:aws:lambda:{}:{}:function:{}",
             region, account_id, self.function_name
@@ -215,6 +239,10 @@ impl ExtensionConfig {
         }
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
+
+        // Parse the version detail tags flag
+        let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
+        config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
 
@@ -308,7 +336,15 @@ pub fn init_config() -> &'static ExtensionConfig {
                 config.extension.log_level.clone()
             };
 
-            let env_filter = EnvFilter::new(log_level);
+            // Configure EnvFilter to reduce AWS SDK verbosity while keeping extension logs detailed
+            // Format: "crate1=level1,crate2=level2,default_level"
+            let filter_directive = format!(
+                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,{}",
+                log_level,
+                log_level
+            );
+
+            let env_filter = EnvFilter::new(filter_directive);
 
             // Use the custom formatter
             let subscriber = fmt::Subscriber::builder()

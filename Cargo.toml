@@ -34,6 +34,7 @@ once_cell = "1.19"
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
 aws-sdk-secretsmanager = { version = "1.88", features = ["behavior-version-latest"] }
 aws-sdk-ssm = { version = "1.93", features = ["behavior-version-latest"] }
+aws-sdk-lambda = { version = "1.66", features = ["behavior-version-latest"] }
 
 [profile.release]
 lto = "fat"          # Maximum link-time optimization
