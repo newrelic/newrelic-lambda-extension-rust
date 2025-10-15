@@ -205,26 +205,26 @@ main() {
   done
 
   #--- Build for arm64 ---
-  # local target_arm="aarch64-unknown-linux-musl"
-  # build_extension "$target_arm"
+  local target_arm="aarch64-unknown-linux-musl"
+  build_extension "$target_arm"
 
-  # # Package and publish standalone extension
-  # package_extension_layer "$target_arm"
-  # for region in $REGIONS_ARM64; do
-  #   publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
-  # done
+  # Package and publish standalone extension
+  package_extension_layer "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
+  done
 
-  # # Package and publish single Python layer
-  # build_python_layer_all "$target_arm"
-  # for region in $REGIONS_ARM64; do
-  #   publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "NRTestExtensionPythonAllARM64"
-  # done
+  # Package and publish single Python layer
+  build_python_layer_all "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "NRTestExtensionPythonARM64"
+  done
 
-  # # Package and publish single Node.js layer
-  # build_nodejs_layer_all "$target_arm"
-  # for region in $REGIONS_ARM64; do
-  #   publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "NRTestExtensionNodejsAllARM64"
-  # done
+  # Package and publish single Node.js layer
+  build_nodejs_layer_all "$target_arm"
+  for region in $REGIONS_ARM64; do
+    publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "NRTestExtensionNodejsARM64"
+  done
 
   echo "All layers published. Environment variables saved to $TMP_ENV_FILE_NAME"
   cat "$TMP_ENV_FILE_NAME"
