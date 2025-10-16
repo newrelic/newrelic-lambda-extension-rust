@@ -836,10 +836,12 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
         debug!("mainLoop: waiting for next lambda invocation event...");
 
         // Fetch next Lambda runtime event
+        // CRITICAL: This call blocks until Lambda sends INVOKE or SHUTDOWN event
         let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
             Ok(event) => event,
             Err(e) => {
-                error!("Error receiving next event: {:?}. Continuing.", e);
+                // Match Go implementation: just log and continue
+                error!("NextEventError.Main: {}", e);
                 continue;
             }
         };
@@ -892,9 +894,9 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                     processors.insert(request_id.clone(), request_state);
                 }
                 
-                // Process the request concurrently in background (fire-and-forget)
-                // The background task will wait for function completion and flush before returning
-                // Lambda won't freeze until we return to /next, which happens immediately after this
+                // Process the request and WAIT for it to complete before calling /next again
+                // This matches Go's behavior where it waits for telemetry before continuing
+                // CRITICAL: Must wait for function completion before calling /next again
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
                 let processor_factory_clone = components.processor_factory.clone();
@@ -902,22 +904,16 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
 
-                tokio::spawn(async move {
-                    process_request_concurrently(
-                        request_id_clone,
-                        invoked_function_arn_clone,
-                        processor_factory_clone,
-                        newrelic_client_clone,
-                        config_clone,
-                        global_log_processor_clone,
-                    ).await;
-                });
-
-                // Don't wait! Return immediately to /next for the next event
-                // The background task will complete before Lambda freezes because:
-                // 1. It waits for runtime_done signal (function completion)
-                // 2. It processes and flushes all telemetry
-                // 3. Lambda won't freeze until we call /next again (which we're about to do)
+                // WAIT for request processing to complete before calling /next again
+                // This prevents concurrent /next calls while function is still executing
+                process_request_concurrently(
+                    request_id_clone,
+                    invoked_function_arn_clone,
+                    processor_factory_clone,
+                    newrelic_client_clone,
+                    config_clone,
+                    global_log_processor_clone,
+                ).await;
 
                 let event_processing_time = event_processing_start_time.elapsed();
                 
@@ -1337,7 +1333,20 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                 // WARM START PATH: This is where no-op warm starts spend their time
                 trace!("No-op mode invocation processed in {:?} (request_id: {})", loop_start.elapsed(), request_id);
             }
-            Err(_) => { /* Ignore errors and continue polling */ }
+            Err(e) => {
+                // In no-op mode, if we get errors (especially 403), we need to handle gracefully
+                warn!("No-op mode: Error fetching next event: {:?}", e);
+
+                // If we get 403 errors even in no-op mode, the extension state is completely broken
+                // Wait longer and keep trying - this prevents the container from being killed
+                if e.to_string().contains("403") || e.to_string().contains("Forbidden") {
+                    error!("No-op mode: Extension API state is broken, waiting 5s before retry");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                } else {
+                    // For other errors, wait 1 second
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
     }
 }
@@ -1533,55 +1542,27 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
 
     let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
 
-    // Retry logic for extension event polling - this is critical for reliability
-    const MAX_RETRIES: u32 = 3;
-    let mut retry_count = 0;
+    // Make a single /next call - DO NOT retry here!
+    // Retrying causes concurrent /next calls which AWS Extensions API rejects with 403
+    // The outer event loop will handle calling /next again if needed
+    let response = client
+        .get(&url)
+        .header(EXTENSION_ID_HEADER, ext_id)
+        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
+        .send()
+        .await?;
 
-    loop {
-        let response = client
-            .get(&url)
-            .header(EXTENSION_ID_HEADER, ext_id)
-            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) => {
-                // Success case - process the response
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-                    error!("Next event request failed with status: {}, body: {}", status, body);
-                    return Err(format!("Next event request failed with status: {}", status).into());
-                }
-
-                let event: LambdaRuntimeEvent = resp.json().await?;
-                return Ok(event);
-            },
-            Err(e) => {
-                // Handle timeout and connection errors with retry
-                retry_count += 1;
-                
-                if e.is_timeout() {
-                    warn!("Extension event polling timeout (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                } else if e.is_connect() {
-                    warn!("Extension event polling connection error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                } else {
-                    warn!("Extension event polling error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                }
-
-                if retry_count >= MAX_RETRIES {
-                    error!("Extension event polling failed after {} retries, giving up", MAX_RETRIES);
-                    return Err(e.into());
-                }
-
-                // Exponential backoff: 1s, 2s, 4s
-                let delay = Duration::from_secs(2_u64.pow(retry_count - 1));
-                warn!("Retrying extension event polling in {:?}...", delay);
-                tokio::time::sleep(delay).await;
-            }
-        }
+    // Check if response was successful
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+        error!("Next event request failed with status: {}, body: {}", status, body);
+        return Err(format!("Next event request failed with status: {}", status).into());
     }
+
+    // Parse and return the event
+    let event: LambdaRuntimeEvent = response.json().await?;
+    Ok(event)
 }
 
 
