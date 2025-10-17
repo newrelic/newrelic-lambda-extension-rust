@@ -545,10 +545,7 @@ async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionCon
 async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Client::builder()
         // Remove global timeout - let individual requests set their own timeouts
-        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
-        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer for Lambda runtime API
-        .pool_max_idle_per_host(2) // Limit idle connections
-        .tcp_keepalive(Duration::from_secs(60)) // Enable TCP keepalive
+        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones// Enable TCP keepalive
         .build()?)
 }
 
@@ -821,16 +818,18 @@ async fn run_infinite_event_loop(mut extension_components: ExtensionComponents) 
 }
 
 /// INFINITE EVENT LOOP - Core of Lambda Extension Lifecycle
-/// 
+///
 /// This loop implements the correct Lambda extension pattern:
 /// 1. GET /next (blocks here - Lambda freezes extension)
-/// 2. Receive INVOKE event (Lambda unfreezes extension)  
+/// 2. Receive INVOKE event (Lambda unfreezes extension)
 /// 3. Process event quickly (< 50ms for warm starts)
 /// 4. Return to step 1 (loops forever until SHUTDOWN)
 ///
 /// First iteration = Cold Start, subsequent iterations = Warm Starts
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
+    let mut probably_timeout = false;
+    let mut last_request_id = String::new();
 
     loop {
         debug!("mainLoop: waiting for next lambda invocation event...");
@@ -848,9 +847,23 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 
         event_counter += 1;
 
+        // Check if previous request timed out and process any late-arriving telemetry
+        if probably_timeout && !last_request_id.is_empty() {
+            info!("Checking for late telemetry after suspected timeout for request {}", last_request_id);
+            // Process any telemetry that arrived late (non-blocking check)
+            process_pending_agent_payloads_non_blocking(
+                &last_request_id,
+                &components.newrelic_client,
+                &components.config,
+                &components.global_log_processor,
+            ).await;
+            probably_timeout = false;
+        }
+
         match runtime_event {
             LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
                 let event_processing_start_time = std::time::Instant::now();
+                last_request_id = request_id.clone();
 
                 // Tag Lambda function on first invocation (with real ARN)
                 static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
@@ -890,30 +903,75 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 components.global_log_processor.update_invocation_context(request_state.context.clone());
 
                 // Store request processing state
-                if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
-                    processors.insert(request_id.clone(), request_state);
-                }
-                
-                // Process the request and WAIT for it to complete before calling /next again
-                // This matches Go's behavior where it waits for telemetry before continuing
-                // CRITICAL: Must wait for function completion before calling /next again
-                let request_id_clone = request_id.clone();
-                let invoked_function_arn_clone = invoked_function_arn.clone();
-                let processor_factory_clone = components.processor_factory.clone();
-                let newrelic_client_clone = components.newrelic_client.clone();
-                let config_clone = components.config.clone();
-                let global_log_processor_clone = components.global_log_processor.clone();
+                let coordination_rx = if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
+                    let mut state = request_state;
+                    let rx = state.coordination_rx.take();
+                    processors.insert(request_id.clone(), state);
+                    rx
+                } else {
+                    None
+                };
 
-                // WAIT for request processing to complete before calling /next again
-                // This prevents concurrent /next calls while function is still executing
-                process_request_concurrently(
-                    request_id_clone,
-                    invoked_function_arn_clone,
-                    processor_factory_clone,
-                    newrelic_client_clone,
-                    config_clone,
-                    global_log_processor_clone,
-                ).await;
+                // CRITICAL: Wait for platform.runtimeDone, then wait 400ms for agent telemetry
+                // This is the correct flow:
+                // 1. Wait for EITHER platform.runtimeDone OR agent telemetry (whichever comes first)
+                // 2. If runtimeDone comes first, wait additional 400ms for agent telemetry
+                // 3. If agent telemetry comes first, process immediately
+                // 4. Return to /next call
+
+                if let Some(mut agent_rx) = coordination_rx {
+                    // Wait for either runtime done or agent telemetry
+                    tokio::select! {
+                        _ = components.runtime_done_rx.recv() => {
+                            info!("Received platform.runtimeDone for request {}, waiting 400ms for agent telemetry", request_id);
+
+                            // Now wait 400ms for agent telemetry
+                            let telemetry_timeout = Duration::from_millis(400);
+                            tokio::select! {
+                                _ = agent_rx.recv() => {
+                                    info!("Agent telemetry received within 400ms after runtimeDone for request {}", request_id);
+                                    process_agent_payloads_for_request(
+                                        &request_id,
+                                        &invoked_function_arn,
+                                        &components.newrelic_client,
+                                        &components.config,
+                                        &components.global_log_processor,
+                                    ).await;
+                                    probably_timeout = false;
+                                }
+                                _ = tokio::time::sleep(telemetry_timeout) => {
+                                    info!("No agent telemetry within 400ms after runtimeDone for request {}", request_id);
+                                    probably_timeout = true;
+                                }
+                            }
+                        }
+                        _ = agent_rx.recv() => {
+                            info!("Agent telemetry arrived before runtimeDone for request {}", request_id);
+                            process_agent_payloads_for_request(
+                                &request_id,
+                                &invoked_function_arn,
+                                &components.newrelic_client,
+                                &components.config,
+                                &components.global_log_processor,
+                            ).await;
+                            probably_timeout = false;
+
+                            // Still wait for runtimeDone to ensure function completed
+                            let _ = components.runtime_done_rx.recv().await;
+                        }
+                    }
+                } else {
+                    warn!("No coordination channel for request {} - just waiting for runtimeDone", request_id);
+                    let _ = components.runtime_done_rx.recv().await;
+                }
+
+                // Flush logs and platform data before returning to /next
+                if let Err(e) = components.global_log_processor.flush().await {
+                    error!("Failed to flush logs for request {}: {}", request_id, e);
+                }
+
+                // Clean up request state
+                cleanup_request_processing_state(&request_id);
 
                 let event_processing_time = event_processing_start_time.elapsed();
                 
@@ -940,107 +998,52 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
     event_counter
 }
 
-/// Concurrent request processing function
-async fn process_request_concurrently(
-    request_id: String,
-    invoked_function_arn: String,
-    _processor_factory: Arc<ProcessorFactory>,
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<config::ExtensionConfig>,
-    global_log_processor: Arc<LogProcessor>,
-) {
-    let processing_start = std::time::Instant::now();
-    info!("Starting background processing for request: {}", request_id);
-    
-    // Get request processing state
-    let state = {
-        if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
-            processors.remove(&request_id)
-        } else {
-            error!("Failed to get processing state for request: {}", request_id);
-            return;
-        }
-    };
-    
-    let Some(mut state) = state else {
-        error!("No processing state found for request: {}", request_id);
-        return;
-    };
-    
-    // Set invocation start time using global log processor
-    let invocation_start_time = chrono::Utc::now();
-    global_log_processor.set_invocation_start_time(invocation_start_time);
-    global_log_processor.reset_trace_id_state();
-    state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
-    
-    // Wait for function completion and process payloads
-    tokio::select! {
-        _ = state.coordination_rx.as_mut().unwrap().recv() => {
-            info!("Function completed for request: {}", request_id);
-        }
-        // _ = tokio::time::sleep(Duration::from_secs(300)) => {
-        //     warn!("Timeout waiting for function completion for request: {}", request_id);
-        // }
-    }
-    
-    // Process agent payloads for this specific request
-    process_request_agent_payloads(
-        &request_id,
-        &invoked_function_arn,
-        &state,
-        &newrelic_client,
-        &config,
-        &global_log_processor,
-    ).await;
-    
-    // Final flush: Retry any failed agent payloads before function freeze
-    retry_failed_agent_payloads(&newrelic_client, &config).await;
-    
-    // Final flush: Flush any remaining logs (should be minimal if trace ID disabled)
-    // When trace ID collection is disabled, logs are sent immediately, so this is just cleanup
-    if let Err(e) = global_log_processor.flush().await {
-        error!("Failed to flush global log processor for request {}: {}", request_id, e);
-    }
-    
-    if let Err(e) = state.platform_processor.flush().await {
-        error!("Failed to flush platform processor for request {}: {}", request_id, e);
-    }
-    
-    // Cleanup request resources
-    cleanup_request_processing_state(&request_id);
-
-    let processing_duration = processing_start.elapsed();
-    info!("Completed background processing for request: {} in {:?} (including function wait + flush)",
-         request_id, processing_duration);
-}
-
-/// Process agent payloads for specific request
-async fn process_request_agent_payloads(
+/// Process agent payloads for a specific request (called after telemetry arrives)
+async fn process_agent_payloads_for_request(
     request_id: &str,
     invoked_function_arn: &str,
-    state: &RequestProcessingState,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
 ) {
+    info!("Processing agent payloads for request: {}", request_id);
+
+    // Get agent buffer and platform processor from state
+    let (agent_buffer, platform_processor) = {
+        if let Ok(processors) = REQUEST_PROCESSORS.read() {
+            if let Some(state) = processors.get(request_id) {
+                (Some(state.agent_buffer.clone()), Some(state.platform_processor.clone()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        }
+    };
+
+    let Some(agent_buffer) = agent_buffer else {
+        warn!("No processing state found for request: {}", request_id);
+        return;
+    };
+
     // Get payloads from request-specific buffer
     let payloads = {
-        if let Ok(mut buffer) = state.agent_buffer.lock() {
+        if let Ok(mut buffer) = agent_buffer.lock() {
             std::mem::take(&mut *buffer)
         } else {
             error!("Failed to lock agent buffer for request: {}", request_id);
             return;
         }
     };
-    
+
     if payloads.is_empty() {
         debug!("No agent payloads to process for request: {}", request_id);
         return;
     }
-    
+
     info!("Processing {} agent payloads for request: {}", payloads.len(), request_id);
-    
-    // Process each payload using the global log processor
+
+    // Process each payload
     for payload_bytes in payloads {
         if let Err(e) = process_and_send_agent_payload(
             &payload_bytes,
@@ -1053,7 +1056,62 @@ async fn process_request_agent_payloads(
             error!("Error processing agent payload for request {}: {}", request_id, e);
         }
     }
+
+    // Flush platform processor
+    if let Some(platform_processor) = platform_processor {
+        if let Err(e) = platform_processor.flush().await {
+            error!("Failed to flush platform processor for request {}: {}", request_id, e);
+        }
+    }
 }
+
+/// Process any pending agent payloads non-blocking (for timeout recovery)
+async fn process_pending_agent_payloads_non_blocking(
+    request_id: &str,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+) {
+    // Check if there are any payloads in the buffer
+    let buffer = get_request_agent_buffer(request_id);
+
+    if let Some(buffer) = buffer {
+        let has_payloads = {
+            if let Ok(buf) = buffer.lock() {
+                !buf.is_empty()
+            } else {
+                false
+            }
+        };
+
+        if has_payloads {
+            info!("Processing late-arriving telemetry for request: {}", request_id);
+            // We don't have invoked_function_arn here, but it's stored in the context
+            let invoked_function_arn = {
+                if let Some(context) = get_request_context(request_id) {
+                    if let Ok(ctx) = context.lock() {
+                        ctx.invoked_function_arn.clone()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            };
+
+            if !invoked_function_arn.is_empty() {
+                process_agent_payloads_for_request(
+                    request_id,
+                    &invoked_function_arn,
+                    newrelic_client,
+                    config,
+                    global_log_processor,
+                ).await;
+            }
+        }
+    }
+}
+
 
 /// Wait for all concurrent requests to complete
 async fn wait_for_all_requests_completion() {

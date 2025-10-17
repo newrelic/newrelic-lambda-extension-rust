@@ -38,7 +38,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::warn;
+use tracing::{info, warn};
 use crate::config::Configuration;
 
 /// License key secret structure for JSON parsing
@@ -228,15 +228,14 @@ fn decode_license_key(raw_json: &str) -> Result<String> {
 async fn try_license_key_from_secret(secret_id: &str) -> Result<String> {
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("Secrets Manager client not initialized"))?;
-    
 
-    
-    let secret_string = clients.secrets_manager.get_secret_value(secret_id).await?;
-    
+    let secret_string = clients.secrets_manager.get_secret_value(secret_id).await
+        .map_err(|e| anyhow!("Failed to fetch license key from Secrets Manager secret '{}': {}", secret_id, e))?;
+
     let license_key = decode_license_key(&secret_string)?;
-    
 
-    
+    info!("Successfully fetched license key from AWS Secrets Manager (secret: {})", secret_id);
+
     Ok(license_key)
 }
 
@@ -244,12 +243,11 @@ async fn try_license_key_from_secret(secret_id: &str) -> Result<String> {
 async fn try_license_key_from_ssm_parameter(parameter_name: &str) -> Result<String> {
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("SSM client not initialized"))?;
-    
 
-    
-    let parameter_value = clients.ssm.get_parameter(parameter_name).await?;
+    let parameter_value = clients.ssm.get_parameter(parameter_name).await
+        .map_err(|e| anyhow!("Failed to fetch license key from SSM Parameter Store parameter '{}': {}", parameter_name, e))?;
 
-
+    info!("Successfully fetched license key from AWS Systems Manager Parameter Store (parameter: {})", parameter_name);
 
     Ok(parameter_value)
 }

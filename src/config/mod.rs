@@ -339,7 +339,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             // Configure EnvFilter to reduce AWS SDK verbosity while keeping extension logs detailed
             // Format: "crate1=level1,crate2=level2,default_level"
             let filter_directive = format!(
-                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,{}",
+                "newrelic_lambda_extension={},aws_config=warn,aws_sdk_lambda=warn,aws_sdk_secretsmanager=warn,aws_sdk_ssm=warn,aws_smithy_runtime=warn,aws_smithy_runtime_api=warn,hyper=warn,h2=warn,{}",
                 log_level,
                 log_level
             );
