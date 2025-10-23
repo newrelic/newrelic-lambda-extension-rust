@@ -1140,7 +1140,7 @@ async fn wait_for_all_requests_completion() {
     info!("Waiting for all concurrent requests to complete...");
     
     // Wait a reasonable time for requests to complete
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
     
     // Force cleanup of any remaining requests
     let remaining_requests = {
@@ -1426,11 +1426,11 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                 // If we get 403 errors even in no-op mode, the extension state is completely broken
                 // Wait longer and keep trying - this prevents the container from being killed
                 if e.to_string().contains("403") || e.to_string().contains("Forbidden") {
-                    error!("No-op mode: Extension API state is broken, waiting 5s before retry");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    error!("No-op mode: Extension API state is broken, waiting 200ms before retry");
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 } else {
-                    // For other errors, wait 1 second
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // For other errors, wait 200ms
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
         }

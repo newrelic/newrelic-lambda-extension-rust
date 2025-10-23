@@ -117,7 +117,7 @@ impl Harvester {
                 info!("Starting request-specific flush loop for {} (trace ID enabled - will wait for agent payload)", request_id);
                 
                 // Wait for agent payload or reasonable timeout, then start aggressive flushing
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 
                 // Aggressive flushing every 50ms to ensure quick delivery
                 let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(50));
