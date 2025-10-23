@@ -541,11 +541,26 @@ async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionCon
     }
 }
 
-/// Initialize HTTP client with appropriate timeout
+/// Initialize HTTP client with appropriate timeout and connection settings
+/// Matches Go's http.Client default behavior with connection pooling and keepalive
 async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Client::builder()
         // Remove global timeout - let individual requests set their own timeouts
-        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones// Enable TCP keepalive
+        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
+
+        // Enable TCP keepalive to maintain persistent connections (matches Go's http.Client defaults)
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+
+        // Enable connection pooling (keeps connections alive between requests)
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(10)
+
+        // Enable HTTP/1.1 keepalive headers
+        .http1_title_case_headers()
+
+        // Don't fail on connection errors immediately - let retry logic handle it
+        .connect_timeout(Duration::from_secs(10))
+
         .build()?)
 }
 
@@ -839,8 +854,15 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
         let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
             Ok(event) => event,
             Err(e) => {
-                // Match Go implementation: just log and continue
+                // Match Go implementation: log error, report to Extension API, and continue
                 error!("NextEventError.Main: {}", e);
+
+                // Report error to Lambda Extension API (critical for maintaining proper state)
+                let error_ref: &dyn std::error::Error = &*e;
+                if let Err(report_err) = report_exit_error(&components.client, &components.extension_id, "NextEventError.Main", error_ref).await {
+                    error!("Failed to report exit error: {}", report_err);
+                }
+
                 continue;
             }
         };
@@ -1395,6 +1417,12 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                 // In no-op mode, if we get errors (especially 403), we need to handle gracefully
                 warn!("No-op mode: Error fetching next event: {:?}", e);
 
+                // Report error to Lambda Extension API to maintain proper state
+                let error_ref: &dyn std::error::Error = &*e;
+                if let Err(report_err) = report_exit_error(client, extension_id, "NextEventError.Noop", error_ref).await {
+                    error!("No-op mode: Failed to report exit error: {}", report_err);
+                }
+
                 // If we get 403 errors even in no-op mode, the extension state is completely broken
                 // Wait longer and keep trying - this prevents the container from being killed
                 if e.to_string().contains("403") || e.to_string().contains("Forbidden") {
@@ -1593,34 +1621,122 @@ async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: 
     Ok(())
 }
 
+/// Reports an error to the Lambda Extension API
+/// This is critical for maintaining proper state with the Lambda Extensions API
+async fn report_exit_error(client: &Client, ext_id: &str, error_type: &str, error: &dyn std::error::Error) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let runtime_api = match env::var("AWS_LAMBDA_RUNTIME_API") {
+        Ok(api) => api,
+        Err(_) => {
+            error!("AWS_LAMBDA_RUNTIME_API not set, cannot report error");
+            return Ok(()); // Don't fail if we can't report
+        }
+    };
+
+    let url = format!("http://{}/2020-01-01/extension/exit/error", runtime_api);
+
+    let payload = serde_json::json!({
+        "errorMessage": error.to_string(),
+        "errorType": error_type
+    });
+
+    debug!("Reporting exit error to Lambda Extension API: {} - {}", error_type, error);
+
+    // Best effort - don't fail if we can't report the error
+    match client
+        .post(&url)
+        .header(EXTENSION_ID_HEADER, ext_id)
+        .json(&payload)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+                warn!("Failed to report exit error with status: {}, body: {}", status, body);
+            } else {
+                debug!("Successfully reported exit error to Lambda Extension API");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to send exit error report: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 /// Fetches the next event from the Lambda Runtime API.
+/// Handles transient connection errors that can occur after container freeze/thaw cycles
 async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Result<LambdaRuntimeEvent, Box<dyn std::error::Error + Send + Sync>> {
     let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
         .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
 
     let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
 
-    // Make a single /next call - DO NOT retry here!
-    // Retrying causes concurrent /next calls which AWS Extensions API rejects with 403
-    // The outer event loop will handle calling /next again if needed
-    let response = client
-        .get(&url)
-        .header(EXTENSION_ID_HEADER, ext_id)
-        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
-        .send()
-        .await?;
+    // Make a single /next call with retry ONLY for connection errors (not HTTP errors)
+    // Connection errors can happen after Lambda freeze/thaw cycles when TCP connections go stale
+    // We retry connection errors up to 3 times with exponential backoff
+    // HTTP errors (like 403) are NOT retried to avoid concurrent /next calls
+    const MAX_CONNECTION_RETRIES: u32 = 3;
+    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
 
-    // Check if response was successful
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Next event request failed with status: {}, body: {}", status, body);
-        return Err(format!("Next event request failed with status: {}", status).into());
+    for attempt in 1..=MAX_CONNECTION_RETRIES {
+        debug!("Calling /next API (attempt {})", attempt);
+
+        match client
+            .get(&url)
+            .header(EXTENSION_ID_HEADER, ext_id)
+            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
+            .send()
+            .await
+        {
+            Ok(response) => {
+                // Check if response was successful
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
+                    error!("Next event request failed with status: {}, body: {}", status, body);
+                    // HTTP errors are NOT retried - return immediately
+                    return Err(format!("Next event request failed with status: {}", status).into());
+                }
+
+                // Parse and return the event
+                let event: LambdaRuntimeEvent = response.json().await?;
+                if attempt > 1 {
+                    info!("Successfully connected to /next API after {} attempts", attempt);
+                }
+                return Ok(event);
+            }
+            Err(e) => {
+                // Check if this is a connection error (not an HTTP error)
+                let is_connection_error = e.is_connect() || e.is_timeout() ||
+                    e.to_string().contains("error sending request") ||
+                    e.to_string().contains("connection") ||
+                    e.to_string().contains("broken pipe");
+
+                if is_connection_error && attempt < MAX_CONNECTION_RETRIES {
+                    // Transient connection error - wait and retry
+                    let backoff_ms = 100 * (2_u64.pow(attempt - 1)); // Exponential backoff: 100ms, 200ms, 400ms
+                    warn!("Connection error on /next call (attempt {}): {}. Retrying in {}ms...",
+                         attempt, e, backoff_ms);
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(Box::new(e));
+                    continue;
+                } else {
+                    // Non-retryable error or max retries exceeded
+                    if attempt >= MAX_CONNECTION_RETRIES {
+                        error!("Failed to connect to /next API after {} attempts", MAX_CONNECTION_RETRIES);
+                    }
+                    return Err(Box::new(e));
+                }
+            }
+        }
     }
 
-    // Parse and return the event
-    let event: LambdaRuntimeEvent = response.json().await?;
-    Ok(event)
+    // Should never reach here, but handle it just in case
+    Err(last_error.unwrap_or_else(|| "Failed to fetch next event after retries".into()))
 }
 
 
