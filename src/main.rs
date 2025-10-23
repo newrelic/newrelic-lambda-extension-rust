@@ -948,10 +948,10 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                             info!("Received platform.runtimeDone for request {}, waiting 400ms for agent telemetry", request_id);
 
                             // Now wait 400ms for agent telemetry
-                            let telemetry_timeout = Duration::from_millis(400);
+                            let telemetry_timeout = Duration::from_millis(250);
                             tokio::select! {
                                 _ = agent_rx.recv() => {
-                                    info!("Agent telemetry received within 400ms after runtimeDone for request {}", request_id);
+                                    info!("Agent telemetry received within 250ms after runtimeDone for request {}", request_id);
                                     process_agent_payloads_for_request(
                                         &request_id,
                                         &invoked_function_arn,
