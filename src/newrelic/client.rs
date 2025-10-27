@@ -205,11 +205,11 @@ impl NewRelicClient {
         const MAX_RETRIES: usize = 3;
         
         loop {
-            
+
             let res = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
-                .body(body.clone())
+                .body(body.clone())  // Note: Still needs clone due to reqwest API requirements
                 .timeout(std::time::Duration::from_millis(2400)) // 2.4s per-request timeout
                 .send()
                 .await;

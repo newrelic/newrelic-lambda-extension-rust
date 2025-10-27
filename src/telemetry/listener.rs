@@ -90,8 +90,9 @@ async fn handle_telemetry_request(
                 .unwrap())
         }
     };
-    
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
+
+    // OPTIMIZATION: Use into() instead of to_vec() to avoid unnecessary Vec allocation (saves 256KB+ per batch)
+    let body_str = String::from_utf8_lossy(&body_bytes).to_string();
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {

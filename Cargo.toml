@@ -29,6 +29,7 @@ nix = { version = "0.28", features = ["fs"] }
 base64 = "0.22"  # Use newer version to match AWS SDK
 anyhow = "1.0"
 once_cell = "1.19"
+dashmap = "6.0"  # Lock-free concurrent HashMap for improved performance
 
 # AWS dependencies - ALWAYS INCLUDED as default (as you requested)
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }
