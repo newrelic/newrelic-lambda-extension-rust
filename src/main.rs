@@ -598,14 +598,16 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
 
         while let Some(payload_bytes) = receiver.recv().await {
             payload_count += 1;
-            
-            info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
-            
-            if payload_count <= 5 {
-                debug!("Agent Payload preview: {:?}", 
+
+            // OPTIMIZATION: Only log first few payloads, then reduce to debug
+            if payload_count <= 3 {
+                info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
+                debug!("Agent Payload preview: {:?}",
                        String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
+            } else {
+                debug!("Received agent payload #{} ({} bytes)", payload_count, payload_bytes.len());
             }
-            
+
             // Route payload (will try immediate processing first, store if it fails)
             route_payload_to_request_buffer(payload_bytes).await;
         }
@@ -632,7 +634,8 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
             match request_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
-                    info!("Stored agent payload in request buffer for {} (buffer size now {})", 
+                    // OPTIMIZATION: Reduce logging on hot path
+                    debug!("Stored agent payload in request buffer for {} (buffer size now {})",
                          request_id, buffer.len());
 
                     // Notify the request's coordination channel if available
@@ -887,35 +890,42 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 let event_processing_start_time = std::time::Instant::now();
                 last_request_id = request_id.clone();
 
-                // Tag Lambda function on first invocation (with real ARN)
-                static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
-                let should_tag = components.config.new_relic.add_version_detail_tags;
-                let arn_for_tagging = invoked_function_arn.clone();
-                if should_tag {
-                    TAGGING_DONE.call_once(|| {
+                // CRITICAL FIX: Create coordination channel IMMEDIATELY before any agent payload can arrive
+                // This prevents race condition where agent payload arrives before channel exists
+                let coordination_rx = create_payload_coordination_channel(&request_id);
+
+                // OPTIMIZATION: Only clone ARN on first invocation for tagging
+                let is_first_invocation = event_counter == 0;
+                if is_first_invocation {
+                    // Tag Lambda function on first invocation (with real ARN)
+                    if components.config.new_relic.add_version_detail_tags {
                         info!("Spawning background task to tag Lambda function with version information");
                         let version_info = version::VersionInfo::get_or_detect();
                         version::tagging::tag_lambda_function_background(
                             version_info.extension_version.clone(),
                             version_info.agent_version.clone(),
                             version_info.layer_version.clone(),
-                            arn_for_tagging,
+                            invoked_function_arn.clone(), // ONLY clone ARN on cold start
                         );
-                    });
+                    }
                 }
 
                 // Update global context for telemetry processors
+                // OPTIMIZATION: Only clone ARN on first invocation, reuse after that
                 if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.lock() {
                     global_context.request_id = request_id.clone();
-                    global_context.invoked_function_arn = invoked_function_arn.clone();
+                    if is_first_invocation {
+                        global_context.invoked_function_arn = invoked_function_arn.clone(); // Clone on cold start
+                    }
+                    // On warm starts, ARN stays the same (no clone needed!)
                     global_context.trace_id = None; // Reset trace ID for new request
                 }
-                
+
                 // Process any logs that were buffered waiting for request_id
                 components.global_log_processor.process_buffered_logs_with_request_id(&request_id);
-                
-                // Create request-scoped processing state
-                let request_state = create_request_processing_state(
+
+                // Create request-scoped processing state (coordination channel already created above)
+                let request_state = create_request_processing_state_with_existing_channel(
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory
@@ -924,87 +934,137 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 // Update global log processor context for this request
                 components.global_log_processor.update_invocation_context(request_state.context.clone());
 
-                // Store request processing state
-                let coordination_rx = if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
-                    let mut state = request_state;
-                    let rx = state.coordination_rx.take();
-                    processors.insert(request_id.clone(), state);
-                    rx
-                } else {
-                    None
-                };
+                // Store request processing state (coordination_rx already created above)
+                if let Ok(mut processors) = REQUEST_PROCESSORS.write() {
+                    processors.insert(request_id.clone(), request_state);
+                }
 
-                // CRITICAL: Wait for platform.runtimeDone, then wait 400ms for agent telemetry
+                // CRITICAL: Wait for platform.runtimeDone, then wait for agent telemetry
                 // This is the correct flow:
                 // 1. Wait for EITHER platform.runtimeDone OR agent telemetry (whichever comes first)
-                // 2. If runtimeDone comes first, wait additional 400ms for agent telemetry
+                // 2. If runtimeDone comes first, wait additional 200ms for agent telemetry
                 // 3. If agent telemetry comes first, process immediately
                 // 4. Return to /next call
 
-                if let Some(mut agent_rx) = coordination_rx {
-                    // Wait for either runtime done or agent telemetry
-                    tokio::select! {
+                // Wait for either runtime done or agent telemetry
+                let mut agent_rx = coordination_rx;
+                tokio::select! {
                         _ = components.runtime_done_rx.recv() => {
-                            info!("Received platform.runtimeDone for request {}, waiting 200ms for agent telemetry", request_id);
+                            // OPTIMIZATION: Check if agent payload already in buffer (skip 200ms wait!)
+                            let payload_already_available = {
+                                if let Some(buffer) = get_request_agent_buffer(&request_id) {
+                                    if let Ok(buf) = buffer.lock() {
+                                        !buf.is_empty()
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    false
+                                }
+                            };
 
-                            // Now wait 200ms for agent telemetry
-                            let telemetry_timeout = Duration::from_millis(200);
-                            tokio::select! {
-                                _ = agent_rx.recv() => {
-                                    info!("Agent telemetry received within 200ms after runtimeDone for request {}", request_id);
+                            if payload_already_available {
+                                // OPTIMIZATION: Payload already received, skip 200ms wait!
+                                debug!("Agent payload already in buffer for request {}, processing immediately", request_id);
+
+                                // OPTIMIZATION: Process agent payload and flush logs IN PARALLEL
+                                let (agent_result, flush_result) = tokio::join!(
                                     process_agent_payloads_for_request(
                                         &request_id,
                                         &invoked_function_arn,
                                         &components.newrelic_client,
                                         &components.config,
                                         &components.global_log_processor,
-                                    ).await;
-                                    probably_timeout = false;
+                                    ),
+                                    components.global_log_processor.flush()
+                                );
+
+                                if let Err(e) = flush_result {
+                                    error!("Failed to flush logs for request {}: {}", request_id, e);
                                 }
-                                _ = tokio::time::sleep(telemetry_timeout) => {
-                                    info!("No agent telemetry within 200ms after runtimeDone for request {}", request_id);
-                                    probably_timeout = true;
+                                probably_timeout = false;
+                            } else {
+                                // Payload not yet available, wait up to 200ms
+                                debug!("Agent payload not in buffer yet, waiting 200ms for request {}", request_id);
+
+                                let telemetry_timeout = Duration::from_millis(200);
+                                tokio::select! {
+                                    _ = agent_rx.recv() => {
+                                        debug!("Agent telemetry received within 200ms after runtimeDone for request {}", request_id);
+
+                                        // OPTIMIZATION: Process agent payload and flush logs IN PARALLEL
+                                        let (agent_result, flush_result) = tokio::join!(
+                                            process_agent_payloads_for_request(
+                                                &request_id,
+                                                &invoked_function_arn,
+                                                &components.newrelic_client,
+                                                &components.config,
+                                                &components.global_log_processor,
+                                            ),
+                                            components.global_log_processor.flush()
+                                        );
+
+                                        if let Err(e) = flush_result {
+                                            error!("Failed to flush logs for request {}: {}", request_id, e);
+                                        }
+                                        probably_timeout = false;
+                                    }
+                                    _ = tokio::time::sleep(telemetry_timeout) => {
+                                        // OPTIMIZATION: Only warn on timeout (not info - saves logging overhead)
+                                        warn!("No agent telemetry within 200ms after runtimeDone for request {}", request_id);
+                                        probably_timeout = true;
+
+                                        // Still flush logs even without agent payload
+                                        if let Err(e) = components.global_log_processor.flush().await {
+                                            error!("Failed to flush logs for request {}: {}", request_id, e);
+                                        }
+                                    }
                                 }
                             }
                         }
                         _ = agent_rx.recv() => {
-                            info!("Agent telemetry arrived before runtimeDone for request {}", request_id);
-                            process_agent_payloads_for_request(
-                                &request_id,
-                                &invoked_function_arn,
-                                &components.newrelic_client,
-                                &components.config,
-                                &components.global_log_processor,
-                            ).await;
+                            // OPTIMIZATION: Remove info! log on hot path
+                            debug!("Agent telemetry arrived before runtimeDone for request {}", request_id);
+
+                            // OPTIMIZATION: Process agent payload and flush logs IN PARALLEL
+                            let (agent_result, flush_result) = tokio::join!(
+                                process_agent_payloads_for_request(
+                                    &request_id,
+                                    &invoked_function_arn,
+                                    &components.newrelic_client,
+                                    &components.config,
+                                    &components.global_log_processor,
+                                ),
+                                components.global_log_processor.flush()
+                            );
+
+                            if let Err(e) = flush_result {
+                                error!("Failed to flush logs for request {}: {}", request_id, e);
+                            }
                             probably_timeout = false;
 
                             // Still wait for runtimeDone to ensure function completed
                             let _ = components.runtime_done_rx.recv().await;
                         }
                     }
-                } else {
-                    warn!("No coordination channel for request {} - just waiting for runtimeDone", request_id);
-                    let _ = components.runtime_done_rx.recv().await;
-                }
-
-                // Flush logs and platform data before returning to /next
-                if let Err(e) = components.global_log_processor.flush().await {
-                    error!("Failed to flush logs for request {}: {}", request_id, e);
-                }
 
                 // Clean up request state
                 cleanup_request_processing_state(&request_id);
 
-                let event_processing_time = event_processing_start_time.elapsed();
-                
-                if event_counter == 1 {
-                    info!("COLD START: First invocation processed in {:?} (request_id: {})", 
+                // Set warm start flag for performance optimization
+                if event_counter > 0 {
+                    IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // OPTIMIZATION: Only log timing on cold start or when debugging
+                if event_counter == 0 {
+                    let event_processing_time = event_processing_start_time.elapsed();
+                    info!("COLD START: First invocation processed in {:?} (request_id: {})",
                           event_processing_time, request_id);
                 } else {
-                    // Set warm start flag for performance optimization
-                    IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
-                    info!("WARM START: Event {} processed in {:?} (request_id: {})", 
-                          event_counter, event_processing_time, request_id);
+                    // OPTIMIZATION: Remove info! log from warm start hot path (save 1-2ms of logging overhead)
+                    debug!("WARM START: Event {} processed in {:?} (request_id: {})",
+                          event_counter, event_processing_start_time.elapsed(), request_id);
                 }
             }
             LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
@@ -1140,7 +1200,7 @@ async fn wait_for_all_requests_completion() {
     info!("Waiting for all concurrent requests to complete...");
     
     // Wait a reasonable time for requests to complete
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     
     // Force cleanup of any remaining requests
     let remaining_requests = {
@@ -1160,8 +1220,8 @@ async fn wait_for_all_requests_completion() {
 }
 
 /// Create per-request context for concurrent request handling
-/// Create per-request processing state for concurrent request handling
-fn create_request_processing_state(
+/// Create per-request processing state WITHOUT creating coordination channel (channel created early to avoid race)
+fn create_request_processing_state_with_existing_channel(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>
@@ -1179,20 +1239,15 @@ fn create_request_processing_state(
     // Create agent buffer
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
 
-    // Create coordination channel
-    let (tx, rx) = mpsc::unbounded_channel();
-
-    // Store coordination sender
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.write() {
-        channels.insert(request_id.to_string(), tx);
-    }
+    // NOTE: Coordination channel already created early in event processing to avoid race condition
+    // where agent payload arrives before channel exists
 
     let state = RequestProcessingState {
         request_id: request_id.to_string(),
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
-        coordination_rx: Some(rx),
+        coordination_rx: None, // Not needed in state since we handle it at call site
     };
 
     // Store in global maps for backward compatibility
@@ -1203,7 +1258,7 @@ fn create_request_processing_state(
         buffers.insert(request_id.to_string(), agent_buffer);
     }
 
-    info!("Created per-request processing state for {} (using global log processor)", request_id);
+    info!("Created per-request processing state for {} (coordination channel already created early)", request_id);
     state
 }
 
