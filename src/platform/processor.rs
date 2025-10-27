@@ -56,7 +56,16 @@ impl PlatformProcessor {
     pub fn process_record(&self, record: TelemetryRecord) {
         // Convert platform event to a proper log message format
         let (message, level) = self.create_platform_log_message(&record);
-        
+
+        // If this is a REPORT line and batching is enabled, notify the warm start batch
+        if record.record_type == "platform.report" && self.config.new_relic.enable_warm_start_batching {
+            if let Some(request_id) = self.extract_request_id_from_record(&record) {
+                // Notify warm start batch that REPORT line is available
+                crate::add_report_to_warm_start_batch(request_id.clone(), message.clone());
+                debug!("Notified warm start batch of REPORT line for request {}", request_id);
+            }
+        }
+
         // Create structured log event
         let log_event = serde_json::json!({
             "timestamp": record.time,
@@ -65,10 +74,10 @@ impl PlatformProcessor {
             "type": record.record_type,
             "requestId": self.extract_request_id_from_record(&record)
         });
-        
+
         let mut batch = self.platform_events_batch.lock().unwrap();
         batch.push(log_event);
-        
+
         // Only log batch size every 10th addition to reduce noise
         if batch.len() % 10 == 1 {
             trace!("Added platform event to batch. Current batch size: {}", batch.len());

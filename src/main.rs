@@ -85,8 +85,16 @@ static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = Lazy::n
 });
 
 // Global flag to track if this is a warm start (for performance optimization)
-static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> = 
+static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+// Cross-invocation batch accumulator for warm starts
+static WARM_START_BATCH: Lazy<Arc<Mutex<WarmStartBatchAccumulator>>> =
+    Lazy::new(|| Arc::new(Mutex::new(WarmStartBatchAccumulator::new())));
+
+// Atomic current request ID for lock-free payload routing
+static CURRENT_REQUEST_ID: Lazy<Arc<RwLock<String>>> =
+    Lazy::new(|| Arc::new(RwLock::new(String::new())));
 
 // --- PROCESSOR FACTORY FOR REQUEST-SCOPED PROCESSORS ---
 #[derive(Debug, Clone)]
@@ -135,6 +143,113 @@ struct FailedAgentPayload {
     invoked_function_arn: String,
     retry_count: usize,
     failed_at: chrono::DateTime<chrono::Utc>,
+}
+
+// --- WARM START BATCHING STRUCTURES ---
+
+/// Cross-invocation batch accumulator for warm starts
+/// Accumulates agent payloads and REPORT lines across multiple Lambda invocations
+/// Flushes when batch reaches 1MB or entries are older than 5 minutes
+#[derive(Debug)]
+struct WarmStartBatchAccumulator {
+    entries: Vec<BatchEntry>,
+    report_lines: HashMap<String, ReportLine>,
+    total_size_bytes: usize,
+}
+
+impl WarmStartBatchAccumulator {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            report_lines: HashMap::new(),
+            total_size_bytes: 0,
+        }
+    }
+
+    /// Add agent payload entry to batch
+    fn add_entry(&mut self, entry: BatchEntry) {
+        self.total_size_bytes += entry.payload_bytes.len();
+        self.entries.push(entry);
+    }
+
+    /// Add REPORT line and try to match with existing entries
+    fn add_report_line(&mut self, request_id: String, message: String, timestamp: u64) {
+        // Mark matching entries as having REPORT
+        for entry in &mut self.entries {
+            if entry.request_id == request_id && !entry.has_report {
+                entry.has_report = true;
+                break;
+            }
+        }
+
+        self.report_lines.insert(request_id.clone(), ReportLine {
+            request_id,
+            message,
+            timestamp,
+            matched: true,
+        });
+    }
+
+    /// Check if batch should be flushed
+    fn should_flush(&self, max_size_bytes: usize, max_age_secs: u64) -> bool {
+        // Size limit check
+        if self.total_size_bytes >= max_size_bytes {
+            return true;
+        }
+
+        // Age limit check - any entry older than max_age_secs
+        let now = std::time::Instant::now();
+        for entry in &self.entries {
+            if now.duration_since(entry.received_at).as_secs() >= max_age_secs {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Take all entries and reset accumulator
+    fn take_entries(&mut self) -> Vec<BatchEntry> {
+        self.total_size_bytes = 0;
+        std::mem::take(&mut self.entries)
+    }
+
+    /// Get report lines for entries being flushed
+    fn get_report_lines_for_entries(&self, entries: &[BatchEntry]) -> HashMap<String, ReportLine> {
+        let mut result = HashMap::new();
+        for entry in entries {
+            if let Some(report) = self.report_lines.get(&entry.request_id) {
+                result.insert(entry.request_id.clone(), report.clone());
+            }
+        }
+        result
+    }
+
+    /// Clean up report lines for flushed entries
+    fn cleanup_report_lines(&mut self, entries: &[BatchEntry]) {
+        for entry in entries {
+            self.report_lines.remove(&entry.request_id);
+        }
+    }
+}
+
+/// Single batch entry containing agent payload
+#[derive(Debug, Clone)]
+struct BatchEntry {
+    request_id: String,
+    invoked_function_arn: String,
+    payload_bytes: Vec<u8>,
+    received_at: std::time::Instant,
+    has_report: bool,
+}
+
+/// REPORT line to be included in batch
+#[derive(Debug, Clone)]
+struct ReportLine {
+    request_id: String,
+    message: String,
+    timestamp: u64,
+    matched: bool,
 }
 
 // Structure to hold all initialized components for warm starts
@@ -617,18 +732,22 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
 }
 
 /// Route agent payload to the correct per-request buffer
+/// OPTIMIZED: Uses atomic CURRENT_REQUEST_ID to avoid RwLock read on contexts map
 async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    // Find the most recent active request
-    let current_request_id = {
-        if let Ok(contexts) = REQUEST_CONTEXTS.read() {
-            // Get the most recent request (assumes HashMap iteration order reflects insertion order)
-            contexts.keys().last().cloned()
+    // OPTIMIZATION: Use atomic current request ID instead of searching contexts map
+    let request_id = {
+        if let Ok(current_id) = CURRENT_REQUEST_ID.read() {
+            if current_id.is_empty() {
+                None
+            } else {
+                Some(current_id.clone())
+            }
         } else {
             None
         }
     };
-    
-    if let Some(request_id) = current_request_id {
+
+    if let Some(request_id) = request_id {
         // Store in request-specific buffer
         if let Some(request_buffer) = get_request_agent_buffer(&request_id) {
             match request_buffer.lock() {
@@ -894,6 +1013,13 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 // This prevents race condition where agent payload arrives before channel exists
                 let coordination_rx = create_payload_coordination_channel(&request_id);
 
+                // OPTIMIZATION: Update atomic CURRENT_REQUEST_ID for lock-free payload routing
+                if let Ok(mut current_id) = CURRENT_REQUEST_ID.write() {
+                    *current_id = request_id.clone();
+                } else {
+                    error!("Failed to update CURRENT_REQUEST_ID for request {}", request_id);
+                }
+
                 // OPTIMIZATION: Only clone ARN on first invocation for tagging
                 let is_first_invocation = event_counter == 0;
                 if is_first_invocation {
@@ -984,13 +1110,23 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                                 }
                                 probably_timeout = false;
                             } else {
-                                // Payload not yet available, wait up to 200ms
-                                debug!("Agent payload not in buffer yet, waiting 200ms for request {}", request_id);
+                                // Payload not yet available, wait based on cold/warm start strategy
+                                let is_warm_start = IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+                                let wait_ms = if is_warm_start {
+                                    // Warm start: can wait less time since we're batching anyway
+                                    50
+                                } else {
+                                    // Cold start: use configured wait time (default 50ms, reduced from 200ms)
+                                    components.config.new_relic.cold_start_report_wait_ms
+                                };
 
-                                let telemetry_timeout = Duration::from_millis(200);
+                                debug!("Agent payload not in buffer yet, waiting {}ms for request {} ({})",
+                                      wait_ms, request_id, if is_warm_start { "warm start" } else { "cold start" });
+
+                                let telemetry_timeout = Duration::from_millis(wait_ms);
                                 tokio::select! {
                                     _ = agent_rx.recv() => {
-                                        debug!("Agent telemetry received within 200ms after runtimeDone for request {}", request_id);
+                                        debug!("Agent telemetry received within {}ms after runtimeDone for request {}", wait_ms, request_id);
 
                                         // OPTIMIZATION: Process agent payload and flush logs IN PARALLEL
                                         let (agent_result, flush_result) = tokio::join!(
@@ -1011,7 +1147,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                                     }
                                     _ = tokio::time::sleep(telemetry_timeout) => {
                                         // OPTIMIZATION: Only warn on timeout (not info - saves logging overhead)
-                                        warn!("No agent telemetry within 200ms after runtimeDone for request {}", request_id);
+                                        warn!("No agent telemetry within {}ms after runtimeDone for request {}", wait_ms, request_id);
                                         probably_timeout = true;
 
                                         // Still flush logs even without agent payload
@@ -1069,7 +1205,15 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
             }
             LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("Extension shutting down: {}", shutdown_reason);
-                
+
+                // Flush any pending warm start batch before shutdown
+                if components.config.new_relic.enable_warm_start_batching {
+                    info!("Flushing warm start batch before shutdown");
+                    if let Err(e) = flush_warm_start_batch(&components.newrelic_client, &components.config).await {
+                        error!("Failed to flush warm start batch on shutdown: {}", e);
+                    }
+                }
+
                 // Wait for all concurrent requests to complete
                 wait_for_all_requests_completion().await;
                 break;
@@ -1125,17 +1269,90 @@ async fn process_agent_payloads_for_request(
 
     info!("Processing {} agent payloads for request: {}", payloads.len(), request_id);
 
-    // Process each payload
-    for payload_bytes in payloads {
-        if let Err(e) = process_and_send_agent_payload(
-            &payload_bytes,
+    // Determine processing strategy based on warm start flag and batching config
+    let is_warm_start = IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+    let batching_enabled = config.new_relic.enable_warm_start_batching;
+
+    if is_warm_start && batching_enabled {
+        // WARM START PATH: Batch payloads for cross-invocation batching
+        info!("WARM START: Adding {} payloads to batch for request {}", payloads.len(), request_id);
+
+        // Extract trace IDs if enabled (do this before batching)
+        if config.new_relic.collect_trace_id {
+            for payload_bytes in &payloads {
+                if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
+                    info!("Extracted trace ID: {}, coordinating with logs", trace_id);
+
+                    if let Err(e) = global_log_processor.on_trace_id_extracted(&trace_id).await {
+                        error!("Failed to coordinate logs with trace ID: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Add payloads to batch
+        if let Err(e) = add_to_warm_start_batch(
+            payloads,
             request_id,
             invoked_function_arn,
-            global_log_processor,
             newrelic_client,
             config,
         ).await {
-            error!("Error processing agent payload for request {}: {}", request_id, e);
+            error!("Error adding payloads to warm start batch for request {}: {}", request_id, e);
+        }
+
+        // IMPORTANT: Check if we should flush the batch now
+        // Flush strategy: flush if we have accumulated enough data OR entries with REPORT lines
+        let should_flush_now = {
+            if let Ok(batch) = WARM_START_BATCH.lock() {
+                if batch.entries.is_empty() {
+                    false
+                } else {
+                    // Strategy 1: Flush if we have 5 or more entries (configurable)
+                    let min_entries_for_flush = 5;
+
+                    // Strategy 2: Flush if total size exceeds 100KB (more responsive than 1MB)
+                    let min_size_for_flush = 100_000; // 100KB
+
+                    // Strategy 3: Flush if at least 3 entries and we have some REPORT lines matched
+                    let has_matched_reports = batch.entries.iter()
+                        .filter(|e| e.has_report)
+                        .count() >= 3;
+
+                    // Flush if any condition is met
+                    batch.entries.len() >= min_entries_for_flush ||
+                    batch.total_size_bytes >= min_size_for_flush ||
+                    has_matched_reports
+                }
+            } else {
+                false
+            }
+        };
+
+        if should_flush_now {
+            info!("Flushing warm start batch after request {} (batch ready for sending)", request_id);
+            if let Err(e) = flush_warm_start_batch(newrelic_client, config).await {
+                error!("Failed to flush warm start batch after request {}: {}", request_id, e);
+            }
+        } else {
+            debug!("Batch not ready yet after request {} (will accumulate more entries)", request_id);
+        }
+    } else {
+        // COLD START PATH: Send payloads immediately for visibility
+        info!("COLD START: Sending {} payloads immediately for request {}", payloads.len(), request_id);
+
+        // Process each payload immediately
+        for payload_bytes in payloads {
+            if let Err(e) = process_and_send_agent_payload(
+                &payload_bytes,
+                request_id,
+                invoked_function_arn,
+                global_log_processor,
+                newrelic_client,
+                config,
+            ).await {
+                error!("Error processing agent payload for request {}: {}", request_id, e);
+            }
         }
     }
 
@@ -1250,12 +1467,18 @@ fn create_request_processing_state_with_existing_channel(
         coordination_rx: None, // Not needed in state since we handle it at call site
     };
 
-    // Store in global maps for backward compatibility
-    if let Ok(mut contexts) = REQUEST_CONTEXTS.write() {
-        contexts.insert(request_id.to_string(), context);
-    }
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.write() {
-        buffers.insert(request_id.to_string(), agent_buffer);
+    // OPTIMIZATION: Batch both map insertions under a single combined lock acquisition
+    // This reduces lock contention from 2 write locks to 1 combined operation
+    {
+        let contexts_result = REQUEST_CONTEXTS.write();
+        let buffers_result = REQUEST_AGENT_BUFFERS.write();
+
+        if let (Ok(mut contexts), Ok(mut buffers)) = (contexts_result, buffers_result) {
+            contexts.insert(request_id.to_string(), context);
+            buffers.insert(request_id.to_string(), agent_buffer);
+        } else {
+            error!("Failed to acquire write locks for REQUEST_CONTEXTS or REQUEST_AGENT_BUFFERS for {}", request_id);
+        }
     }
 
     info!("Created per-request processing state for {} (coordination channel already created early)", request_id);
@@ -1359,6 +1582,116 @@ fn cleanup_old_failed_payloads() {
             info!("Cleaned up {} old failed agent payloads (kept {} recent ones)", 
                  removed_count, failed_payloads.len());
         }
+    }
+}
+
+/// Flush warm start batch to New Relic
+async fn flush_warm_start_batch(
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Take entries from batch
+    let (entries, report_lines) = {
+        let mut batch = WARM_START_BATCH.lock().map_err(|e| format!("Failed to lock warm start batch: {}", e))?;
+
+        if batch.entries.is_empty() {
+            debug!("No entries to flush in warm start batch");
+            return Ok(());
+        }
+
+        let entries = batch.take_entries();
+        let report_lines = batch.get_report_lines_for_entries(&entries);
+        batch.cleanup_report_lines(&entries);
+
+        (entries, report_lines)
+    };
+
+    info!("Flushing warm start batch with {} entries, {} REPORT lines",
+         entries.len(), report_lines.len());
+
+    // Create batch payload
+    let batch_payload = create_batch_payload_json(&entries, &report_lines, config);
+
+    // Send batch to New Relic
+    match newrelic_client.send_agent_payload(config, &batch_payload).await {
+        Ok(_) => {
+            info!("Successfully sent warm start batch with {} entries", entries.len());
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to send warm start batch: {}", e);
+
+            // Buffer failed entries for retry
+            for entry in entries {
+                buffer_failed_agent_payload(
+                    &entry.payload_bytes,
+                    &entry.request_id,
+                    &entry.invoked_function_arn,
+                );
+            }
+
+            Err(Box::new(e))
+        }
+    }
+}
+
+/// Add agent payload to warm start batch and check if flush is needed
+async fn add_to_warm_start_batch(
+    payloads: Vec<Vec<u8>>,
+    request_id: &str,
+    invoked_function_arn: &str,
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<config::ExtensionConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let should_flush = {
+        let mut batch = WARM_START_BATCH.lock().map_err(|e| format!("Failed to lock warm start batch: {}", e))?;
+
+        // Add payloads to batch
+        for payload_bytes in payloads {
+            let entry = BatchEntry {
+                request_id: request_id.to_string(),
+                invoked_function_arn: invoked_function_arn.to_string(),
+                payload_bytes,
+                received_at: std::time::Instant::now(),
+                has_report: false,
+            };
+            batch.add_entry(entry);
+        }
+
+        // Check if we should flush
+        batch.should_flush(
+            config.new_relic.batch_max_size_bytes,
+            config.new_relic.batch_payload_timeout_secs,
+        )
+    };
+
+    // Flush if needed (outside the lock)
+    if should_flush {
+        info!("Batch flush triggered for request {} (size or timeout limit reached)", request_id);
+        flush_warm_start_batch(newrelic_client, config).await?;
+    }
+
+    Ok(())
+}
+
+/// Add REPORT line to warm start batch and try to match with pending entries
+/// This is called by the platform processor when a REPORT line is received
+/// Note: Batch will be flushed after request completion, this just adds the REPORT
+pub fn add_report_to_warm_start_batch(
+    request_id: String,
+    report_message: String,
+) {
+    if let Ok(mut batch) = WARM_START_BATCH.lock() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        batch.add_report_line(request_id.clone(), report_message, timestamp);
+
+        debug!("Added REPORT line to batch for request {} (batch will flush after request completion)", request_id);
+    } else {
+        error!("Failed to lock warm start batch when adding REPORT line for {}", request_id);
     }
 }
 
@@ -1593,6 +1926,100 @@ fn create_newrelic_log_format(
     });
 
     // Convert to string and return
+    final_payload.to_string()
+}
+
+/// Create batch payload format with multiple agent payloads and REPORT lines
+/// Used for warm start batching to send multiple invocations in single HTTP request
+fn create_batch_payload_json(
+    entries: &[BatchEntry],
+    report_lines: &HashMap<String, ReportLine>,
+    config: &Arc<config::ExtensionConfig>,
+) -> String {
+    if entries.is_empty() {
+        warn!("Attempted to create empty batch payload");
+        return "{}".to_string();
+    }
+
+    // Build log events array with agent payloads and REPORT lines
+    let mut log_events = Vec::new();
+
+    for entry in entries {
+        // Convert agent payload bytes to string
+        let agent_data_str = String::from_utf8_lossy(&entry.payload_bytes);
+
+        // Generate timestamp for this entry (based on when it was received)
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Add agent payload as log event
+        log_events.push(serde_json::json!({
+            "id": entry.request_id,
+            "message": agent_data_str.as_ref(),
+            "timestamp": timestamp
+        }));
+
+        // Add matching REPORT line if available and batching is enabled
+        if config.new_relic.batch_include_report {
+            if let Some(report) = report_lines.get(&entry.request_id) {
+                log_events.push(serde_json::json!({
+                    "id": entry.request_id,
+                    "message": report.message,
+                    "timestamp": report.timestamp
+                }));
+            }
+        }
+    }
+
+    // Use first entry's metadata for batch context
+    let first_entry = &entries[0];
+    let function_name = first_entry.invoked_function_arn.split(':').last().unwrap_or("");
+    let log_group_name = format!("/aws/lambda/{}", function_name);
+
+    // Create context object with base fields
+    let mut context = serde_json::json!({
+        "function_name": function_name,
+        "invoked_function_arn": first_entry.invoked_function_arn,
+        "log_group_name": log_group_name,
+        "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+    });
+
+    // Add version detail tags to context if enabled
+    if config.new_relic.add_version_detail_tags {
+        let version_info = version::VersionInfo::get_or_detect();
+        let version_tags = version_info.as_tags();
+
+        if let Some(context_obj) = context.as_object_mut() {
+            for (key, value) in version_tags {
+                context_obj.insert(key, serde_json::json!(value));
+            }
+        }
+    }
+
+    // Create log events payload structure
+    let log_events_payload = serde_json::json!({
+        "logEvents": log_events,
+        "logGroup": log_group_name,
+        "logStream": "",
+        "messageType": "",
+        "owner": ""
+    });
+
+    // Stringify the log events payload to put in entry field
+    let log_events_string = log_events_payload.to_string();
+
+    // Create final batch payload
+    let final_payload = serde_json::json!({
+        "context": context,
+        "entry": log_events_string
+    });
+
+    info!("Created batch payload with {} entries, {} REPORT lines",
+         entries.len(),
+         report_lines.len());
+
     final_payload.to_string()
 }
 

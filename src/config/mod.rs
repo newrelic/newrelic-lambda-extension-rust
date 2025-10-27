@@ -51,6 +51,22 @@ pub struct NewRelicConfig {
 
     /// Enable/disable adding version detail tags (agent, extension, layer versions)
     pub add_version_detail_tags: bool,
+
+    // --- BATCHING CONFIGURATION ---
+    /// Enable/disable warm start batching of agent payloads
+    pub enable_warm_start_batching: bool,
+
+    /// Maximum batch size in bytes (default: 1MB)
+    pub batch_max_size_bytes: usize,
+
+    /// Include REPORT lines in batches
+    pub batch_include_report: bool,
+
+    /// Maximum age of payload in batch before forcing flush (default: 300 seconds / 5 minutes)
+    pub batch_payload_timeout_secs: u64,
+
+    /// Wait time for REPORT line in cold starts (default: 50ms)
+    pub cold_start_report_wait_ms: u64,
 }
 
 /// AWS Lambda specific configuration
@@ -126,6 +142,11 @@ impl Default for NewRelicConfig {
             harvest_interval: Duration::from_secs(2), // More frequent flushing
             collect_trace_id: false, // Disabled by default
             add_version_detail_tags: false, // Disabled by default
+            enable_warm_start_batching: true, // Enabled by default for performance
+            batch_max_size_bytes: 1_000_000, // 1MB default
+            batch_include_report: true, // Include REPORT lines by default
+            batch_payload_timeout_secs: 300, // 5 minutes default
+            cold_start_report_wait_ms: 50, // 50ms default (reduced from 200ms)
         }
     }
 }
@@ -243,6 +264,35 @@ impl ExtensionConfig {
         // Parse the version detail tags flag
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
+
+        // Parse batching configuration
+        let enable_warm_start_batching_str = env::var("NEW_RELIC_ENABLE_WARM_START_BATCHING").unwrap_or_default();
+        if !enable_warm_start_batching_str.is_empty() {
+            config.new_relic.enable_warm_start_batching = parse_bool(&enable_warm_start_batching_str);
+        }
+
+        if let Ok(batch_size) = env::var("NEW_RELIC_BATCH_MAX_SIZE_BYTES") {
+            if let Ok(size) = batch_size.parse::<usize>() {
+                config.new_relic.batch_max_size_bytes = size;
+            }
+        }
+
+        let batch_include_report_str = env::var("NEW_RELIC_BATCH_INCLUDE_REPORT").unwrap_or_default();
+        if !batch_include_report_str.is_empty() {
+            config.new_relic.batch_include_report = parse_bool(&batch_include_report_str);
+        }
+
+        if let Ok(timeout) = env::var("NEW_RELIC_BATCH_PAYLOAD_TIMEOUT_SECS") {
+            if let Ok(secs) = timeout.parse::<u64>() {
+                config.new_relic.batch_payload_timeout_secs = secs;
+            }
+        }
+
+        if let Ok(wait_ms) = env::var("NEW_RELIC_COLD_START_REPORT_WAIT_MS") {
+            if let Ok(ms) = wait_ms.parse::<u64>() {
+                config.new_relic.cold_start_report_wait_ms = ms;
+            }
+        }
 
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
 
