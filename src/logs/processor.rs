@@ -12,21 +12,18 @@ use std::{
     time::Duration,
 };
 
-/// Safe mutex operations that won't panic and allow graceful degradation
+/// Safe mutex operations that recover from poisoned mutexes
 trait SafeMutexOps<T> {
-    /// Safely lock a mutex, returning None if poisoned (instead of panicking)
-    fn safe_lock(&self) -> Option<std::sync::MutexGuard<T>>;
+    /// Safely lock a mutex, recovering from poisoned state by clearing the poison
+    fn safe_lock(&self) -> std::sync::MutexGuard<T>;
 }
 
 impl<T> SafeMutexOps<T> for Mutex<T> {
-    fn safe_lock(&self) -> Option<std::sync::MutexGuard<T>> {
-        match self.lock() {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                error!("Mutex poisoned (extension will continue in degraded mode): {}", e);
-                None
-            }
-        }
+    fn safe_lock(&self) -> std::sync::MutexGuard<T> {
+        self.lock().unwrap_or_else(|poisoned| {
+            warn!("Mutex was poisoned. Recovering by clearing poison and continuing...");
+            poisoned.into_inner()
+        })
     }
 }
 
@@ -137,21 +134,16 @@ impl LogProcessor {
     /// Update the invocation context for a new request (used by global log processor)
     pub fn update_invocation_context(&self, new_context: Arc<Mutex<InvocationContext>>) {
         // Copy the new context data to the existing context to maintain the same Arc reference
-        if let (Some(mut current), Some(new)) = (self.invocation_context.safe_lock(), new_context.safe_lock()) {
-            current.request_id = new.request_id.clone();
-            current.invoked_function_arn = new.invoked_function_arn.clone();
-            current.trace_id = new.trace_id.clone();
-        } else {
-            warn!("Failed to update invocation context - mutex poisoned, extension continuing in degraded mode");
-        }
+        let mut current = self.invocation_context.safe_lock();
+        let new = new_context.safe_lock();
+        current.request_id = new.request_id.clone();
+        current.invoked_function_arn = new.invoked_function_arn.clone();
+        current.trace_id = new.trace_id.clone();
     }
     /// Updates the invocation start time (called when new invocation begins)
     pub fn set_invocation_start_time(&self, start_time: chrono::DateTime<chrono::Utc>) {
-        if let Some(mut guard) = self.invocation_start_time.safe_lock() {
-            *guard = start_time;
-        } else {
-            warn!("Failed to update invocation start time - mutex poisoned, extension continuing in degraded mode");
-        }
+        let mut guard = self.invocation_start_time.safe_lock();
+        *guard = start_time;
     }
 
     /// Strips invocation-specific metadata from a log message for safe storage in failed buffer
@@ -165,59 +157,53 @@ impl LogProcessor {
 
     /// Applies current invocation metadata to a failed log before retry
     fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
-        if let Some(context) = self.invocation_context.safe_lock() {
-            // Apply current request_id if available and valid
-            if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
-                log_message.attributes.insert("aws.lambda_request_id".to_string(), 
-                    serde_json::Value::String(context.request_id.clone()));
-                log_message.attributes.insert("faas.execution".to_string(), 
-                    serde_json::Value::String(context.request_id.clone()));
-            }
-            
-            // Apply current invoked_function_arn if available and valid
-            if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
-                log_message.attributes.insert("faas.arn".to_string(), 
-                    serde_json::Value::String(context.invoked_function_arn.clone()));
-            }
-            
-            // Apply current trace_id if available
-            if let Some(ref trace_id) = context.trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
-                    serde_json::Value::String(trace_id.clone()));
-            }
-        } else {
-            warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
+        let context = self.invocation_context.safe_lock();
+        // Apply current request_id if available and valid
+        if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
+            log_message.attributes.insert("aws.lambda_request_id".to_string(),
+                serde_json::Value::String(context.request_id.clone()));
+            log_message.attributes.insert("faas.execution".to_string(),
+                serde_json::Value::String(context.request_id.clone()));
         }
-        
+
+        // Apply current invoked_function_arn if available and valid
+        if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
+            log_message.attributes.insert("faas.arn".to_string(),
+                serde_json::Value::String(context.invoked_function_arn.clone()));
+        }
+
+        // Apply current trace_id if available
+        if let Some(ref trace_id) = context.trace_id {
+            log_message.attributes.insert("trace.id".to_string(),
+                serde_json::Value::String(trace_id.clone()));
+        }
+
         log_message
     }
 
     /// Cleans up old failed logs and limits buffer size
     fn cleanup_failed_logs_buffer(&self) {
-        if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-            let now = chrono::Utc::now();
-            
-            // Remove logs older than MAX_FAILED_LOG_AGE_HOURS
-            let initial_count = failed_buffer.len();
-            failed_buffer.retain(|entry| {
-                let age_hours = (now - entry.failed_at).num_hours();
-                age_hours < MAX_FAILED_LOG_AGE_HOURS
-            });
-            
-            let after_age_cleanup = failed_buffer.len();
-            if after_age_cleanup < initial_count {
-                info!("Cleaned up {} old failed logs (older than {} hours)", 
-                      initial_count - after_age_cleanup, MAX_FAILED_LOG_AGE_HOURS);
-            }
-            
-            // If still too many, remove oldest logs to stay within limit
-            if failed_buffer.len() > MAX_FAILED_LOGS_BUFFER_SIZE {
-                let excess = failed_buffer.len() - MAX_FAILED_LOGS_BUFFER_SIZE;
-                failed_buffer.drain(0..excess);
-                warn!("Failed logs buffer exceeded limit, dropped {} oldest entries", excess);
-            }
-        } else {
-            warn!("Cannot cleanup failed logs buffer - mutex poisoned, skipping cleanup");
+        let mut failed_buffer = self.failed_logs_buffer.safe_lock();
+        let now = chrono::Utc::now();
+
+        // Remove logs older than MAX_FAILED_LOG_AGE_HOURS
+        let initial_count = failed_buffer.len();
+        failed_buffer.retain(|entry| {
+            let age_hours = now.signed_duration_since(entry.failed_at).num_hours();
+            age_hours < MAX_FAILED_LOG_AGE_HOURS
+        });
+
+        let after_age_cleanup = failed_buffer.len();
+        if after_age_cleanup < initial_count {
+            info!("Cleaned up {} old failed logs (older than {} hours)",
+                  initial_count - after_age_cleanup, MAX_FAILED_LOG_AGE_HOURS);
+        }
+
+        // If still too many, remove oldest logs to stay within limit
+        if failed_buffer.len() > MAX_FAILED_LOGS_BUFFER_SIZE {
+            let excess = failed_buffer.len() - MAX_FAILED_LOGS_BUFFER_SIZE;
+            failed_buffer.drain(0..excess);
+            warn!("Failed logs buffer exceeded limit, dropped {} oldest entries", excess);
         }
     }
 
@@ -227,12 +213,8 @@ impl LogProcessor {
         self.cleanup_failed_logs_buffer();
         
         let failed_entries = {
-            if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-                std::mem::take(&mut *failed_buffer)
-            } else {
-                warn!("Cannot retry failed logs - buffer mutex poisoned, skipping retry");
-                return Ok(());
-            }
+            let mut failed_buffer = self.failed_logs_buffer.safe_lock();
+            std::mem::take(&mut *failed_buffer)
         };
 
         if failed_entries.is_empty() {
@@ -289,7 +271,7 @@ impl LogProcessor {
                 
                 // Put back the failed entries (with incremented retry count)
                 {
-                    let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                    let mut failed_buffer = self.failed_logs_buffer.safe_lock();
                     for entry in logs_to_retry {
                         // Strip metadata again before storing back
                         let stripped_log = self.strip_invocation_metadata(entry.log_message);
@@ -386,7 +368,7 @@ impl LogProcessor {
         if let Some(log_message) = self.to_log_message(record) {
             // CRITICAL FIX: Always check if we have valid invocation context before processing
             let has_valid_context = {
-                let context = self.invocation_context.lock().unwrap();
+                let context = self.invocation_context.safe_lock();
                 !context.request_id.is_empty() && 
                 context.request_id != "temp" && 
                 !context.invoked_function_arn.is_empty() && 
@@ -395,7 +377,7 @@ impl LogProcessor {
     
             // If we don't have valid invocation context, buffer the log
             if !has_valid_context {
-                let mut request_buffer = self.request_id_buffer.lock().unwrap();
+                let mut request_buffer = self.request_id_buffer.safe_lock();
                 request_buffer.push(log_message);
                
                 return;
@@ -408,23 +390,23 @@ impl LogProcessor {
             if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
                 (&self.trace_extraction_state, &self.buffered_logs) {
                 
-                let state = extraction_state.lock().unwrap();
+                let state = extraction_state.safe_lock();
                 let has_trace_id = {
-                    let context = self.invocation_context.lock().unwrap();
+                    let context = self.invocation_context.safe_lock();
                     context.trace_id.is_some()
                 };
                 
                 // Buffer logs only if we're still waiting for trace ID extraction attempt
                 if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                     drop(state); // Release lock before modifying buffer
-                    let mut buffered = buffered_logs.lock().unwrap();
+                    let mut buffered = buffered_logs.safe_lock();
                     buffered.push(log_message);
                     return;
                 }
             }
             
             // Add to main batch for sending
-            let mut batch = self.log_batch.lock().unwrap();
+            let mut batch = self.log_batch.safe_lock();
             batch.push(log_message);
             let batch_size = batch.len();
             
@@ -446,7 +428,7 @@ impl LogProcessor {
                 
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
-                let context = self.invocation_context.lock().unwrap().clone();
+                let context = self.invocation_context.safe_lock().clone();
                 
                 // Send async to not block other processing
                 tokio::spawn(async move {
@@ -532,11 +514,11 @@ impl LogProcessor {
         };
 
         // Mark that we've successfully extracted the trace ID
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
+        *extraction_state.safe_lock() = TraceIdExtractionState::Extracted;
         
         // Get all buffered logs
         let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
+            let mut buffered = buffered_logs_arc.safe_lock();
             std::mem::take(&mut *buffered)
         };
         
@@ -547,7 +529,7 @@ impl LogProcessor {
         debug!("Moving {} trace-buffered logs to main batch with trace ID: {}", buffered_logs.len(), trace_id);
         
         // Update all buffered logs with the trace ID and move to main batch
-        let mut batch = self.log_batch.lock().unwrap();
+        let mut batch = self.log_batch.safe_lock();
         for mut log in buffered_logs {
             log.attributes.insert("trace.id".to_string(), trace_id.into());
             batch.push(log);
@@ -562,11 +544,11 @@ impl LogProcessor {
         };
 
         // Mark that we've successfully extracted the trace ID
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
+        *extraction_state.safe_lock() = TraceIdExtractionState::Extracted;
         
         // Get all buffered logs
         let mut buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
+            let mut buffered = buffered_logs_arc.safe_lock();
             std::mem::take(&mut *buffered)
         };
         
@@ -593,11 +575,11 @@ impl LogProcessor {
         };
 
         // Mark that we've attempted extraction but failed
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Failed;
+        *extraction_state.safe_lock() = TraceIdExtractionState::Failed;
         
         // Get all buffered logs
         let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
+            let mut buffered = buffered_logs_arc.safe_lock();
             std::mem::take(&mut *buffered)
         };
         
@@ -615,8 +597,8 @@ impl LogProcessor {
     pub fn reset_trace_id_state(&self) {
         if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
             (&self.trace_extraction_state, &self.buffered_logs) {
-            *extraction_state.lock().unwrap() = TraceIdExtractionState::Waiting;
-            buffered_logs.lock().unwrap().clear();
+            *extraction_state.safe_lock() = TraceIdExtractionState::Waiting;
+            buffered_logs.safe_lock().clear();
         }
     }
 
@@ -631,7 +613,7 @@ impl LogProcessor {
     ) -> std::io::Result<()> {
         // Flush request_id buffer with previous context
         let mut request_buffered_logs = {
-            let mut buffered = self.request_id_buffer.lock().unwrap();
+            let mut buffered = self.request_id_buffer.safe_lock();
             std::mem::take(&mut *buffered)
         };
 
@@ -649,7 +631,7 @@ impl LogProcessor {
 
         // Flush trace_id buffer with previous context if enabled
         let mut trace_buffered_logs = if let Some(ref buffered_logs_arc) = self.buffered_logs {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
+            let mut buffered = buffered_logs_arc.safe_lock();
             std::mem::take(&mut *buffered)
         } else {
             Vec::new()
@@ -669,7 +651,7 @@ impl LogProcessor {
 
         // Also flush current batch
         let current_batch = {
-            let mut batch_guard = self.log_batch.lock().unwrap();
+            let mut batch_guard = self.log_batch.safe_lock();
             std::mem::take(&mut *batch_guard)
         };
         all_logs.extend(current_batch);
@@ -690,7 +672,7 @@ impl LogProcessor {
     /// This moves logs from request_id_buffer to the main processing flow
     pub fn process_buffered_logs_with_request_id(&self, request_id: &str) {
         let buffered_logs = {
-            let mut buffer = self.request_id_buffer.lock().unwrap();
+            let mut buffer = self.request_id_buffer.safe_lock();
             std::mem::take(&mut *buffer)
         };
         
@@ -709,23 +691,23 @@ impl LogProcessor {
                 if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
                     (&self.trace_extraction_state, &self.buffered_logs) {
                     
-                    let state = extraction_state.lock().unwrap();
+                    let state = extraction_state.safe_lock();
                     let has_trace_id = {
-                        let context = self.invocation_context.lock().unwrap();
+                        let context = self.invocation_context.safe_lock();
                         context.trace_id.is_some()
                     };
                     
                     // Buffer logs only if we're still waiting for trace ID extraction attempt
                     if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                         drop(state);
-                        let mut buffered = buffered_logs_arc.lock().unwrap();
+                        let mut buffered = buffered_logs_arc.safe_lock();
                         buffered.push(log_message);
                         continue;
                     }
                 }
                 
                 // Add to main batch for sending
-                let mut batch = self.log_batch.lock().unwrap();
+                let mut batch = self.log_batch.safe_lock();
                 batch.push(log_message);
             }
         }
@@ -735,17 +717,17 @@ impl LogProcessor {
     /// This ensures logs are buffered again for the next invocation until new request_id arrives
     /// Note: We keep invoked_function_arn since it doesn't change between invocations
     pub fn clear_request_id(&self) {
-        let mut context = self.invocation_context.lock().unwrap();
+        let mut context = self.invocation_context.safe_lock();
         context.request_id = String::new(); // Use empty string instead of "unknown"
         // Keep invoked_function_arn - it's the same for all invocations of this function
         // context.invoked_function_arn = String::new(); // DON'T clear this
         context.trace_id = None;
         // Clear all buffers to prevent cross-invocation pollution
-        self.request_id_buffer.lock().unwrap().clear();
-        self.log_batch.lock().unwrap().clear();
-        self.failed_logs_buffer.lock().unwrap().clear();
+        self.request_id_buffer.safe_lock().clear();
+        self.log_batch.safe_lock().clear();
+        self.failed_logs_buffer.safe_lock().clear();
         if let Some(ref buffered_logs) = self.buffered_logs {
-            buffered_logs.lock().unwrap().clear();
+            buffered_logs.safe_lock().clear();
         }
     }
 
@@ -760,7 +742,7 @@ impl LogProcessor {
         
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = self.invocation_context.safe_lock().clone();
 
         // OPTIMIZATION: Process chunks without unnecessary cloning (saves 2-10MB per invocation)
         // Split large batches into smaller chunks to avoid 413 errors
@@ -807,7 +789,7 @@ impl LogProcessor {
     /// Robust send method with chunking, retry logic, and proper error handling
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
         let batch = {
-            let mut batch_guard = self.log_batch.lock().unwrap();
+            let mut batch_guard = self.log_batch.safe_lock();
             std::mem::take(&mut *batch_guard)
         };
         
@@ -820,7 +802,7 @@ impl LogProcessor {
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = self.invocation_context.safe_lock().clone();
 
         // OPTIMIZATION: Process chunks without unnecessary cloning (saves 2-10MB per invocation)
         // Split large batches into smaller chunks to avoid 413 errors
@@ -862,7 +844,7 @@ impl LogProcessor {
             info!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
             // Store failed logs with metadata stripped for safe retry in next invocation
             {
-                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                let mut failed_buffer = self.failed_logs_buffer.safe_lock();
                 let now = chrono::Utc::now();
                 
                 for log in failed_logs {
@@ -931,7 +913,7 @@ impl LogProcessor {
                             // Move failed logs to failed buffer for retry later
                             warn!("Max retries exceeded - moving {} logs to failed buffer for retry", chunk.len());
                             {
-                                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                                let mut failed_buffer = self.failed_logs_buffer.safe_lock();
                                 let now = chrono::Utc::now();
                                 
                                 for log in chunk {

@@ -37,36 +37,70 @@ pub async fn setup_telemetry_listener(
     let local_addr = listener.local_addr()?;
 
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let log_processor = log_processor.clone();
-                    let platform_processor = platform_processor.clone();
-                    let runtime_done_tx_clone = runtime_done_tx.clone();
-                    
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(stream);
-                        let service = service_fn(move |req| {
-                            handle_telemetry_request(
-                                req,
-                                log_processor.clone(),
-                                platform_processor.clone(),
-                                runtime_done_tx_clone.clone(),
-                            )
-                        });
-                        
-                        if let Err(e) = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, service)
-                            .await 
-                        {
-                            error!("Error serving connection: {}", e);
+        // Wrap main telemetry listener loop in panic recovery
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let log_processor = log_processor.clone();
+                            let platform_processor = platform_processor.clone();
+                            let runtime_done_tx_clone = runtime_done_tx.clone();
+
+                            tokio::spawn(async move {
+                                // Wrap connection handler in panic recovery
+                                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    tokio::runtime::Handle::current().block_on(async {
+                                        let io = TokioIo::new(stream);
+                                        let service = service_fn(move |req| {
+                                            handle_telemetry_request(
+                                                req,
+                                                log_processor.clone(),
+                                                platform_processor.clone(),
+                                                runtime_done_tx_clone.clone(),
+                                            )
+                                        });
+
+                                        if let Err(e) = hyper::server::conn::http1::Builder::new()
+                                            .serve_connection(io, service)
+                                            .await
+                                        {
+                                            error!("Error serving connection: {}", e);
+                                        }
+                                    })
+                                }));
+
+                                if let Err(panic_info) = result {
+                                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                        s.to_string()
+                                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                        s.clone()
+                                    } else {
+                                        "unknown panic".to_string()
+                                    };
+                                    eprintln!("[NR_EXT] ERROR Telemetry connection handler panicked: {}. Connection dropped.", panic_msg);
+                                    error!("Telemetry connection handler panicked: {}. Connection dropped.", panic_msg);
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            error!("Failed to accept connection: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                }
-            }
+            })
+        }));
+
+        if let Err(panic_info) = result {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("[NR_EXT] ERROR Telemetry listener task panicked: {}. Extension will continue in degraded mode.", panic_msg);
+            error!("Telemetry listener task panicked: {}. Extension will continue in degraded mode.", panic_msg);
         }
     });
 

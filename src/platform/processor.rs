@@ -9,7 +9,7 @@ use std::{
     io::Result,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
@@ -75,7 +75,10 @@ impl PlatformProcessor {
             "requestId": self.extract_request_id_from_record(&record)
         });
 
-        let mut batch = self.platform_events_batch.lock().unwrap();
+        let mut batch = self.platform_events_batch.lock().unwrap_or_else(|poisoned| {
+            warn!("Platform events batch mutex was poisoned. Recovering...");
+            poisoned.into_inner()
+        });
         batch.push(log_event);
 
         // Only log batch size every 10th addition to reduce noise
@@ -245,7 +248,10 @@ impl PlatformProcessor {
 
     /// Updates the invocation context with the latest invoke event details.
     pub fn process_invoke_event(&self, request_id: &str, invoked_function_arn: &str) {
-        let mut context = self.invocation_context.lock().unwrap();
+        let mut context = self.invocation_context.lock().unwrap_or_else(|poisoned| {
+            warn!("Invocation context mutex was poisoned. Recovering...");
+            poisoned.into_inner()
+        });
         context.request_id = request_id.to_string();
         context.invoked_function_arn = invoked_function_arn.to_string();
     }
@@ -253,7 +259,10 @@ impl PlatformProcessor {
     /// Simple synchronous send method for platform events - sends as LOGS to log endpoint
     pub async fn send_and_clear_batch_simple(&self) -> Result<()> {
         let batch = {
-            let mut batch_guard = self.platform_events_batch.lock().unwrap();
+            let mut batch_guard = self.platform_events_batch.lock().unwrap_or_else(|poisoned| {
+                warn!("Platform events batch mutex was poisoned. Recovering...");
+                poisoned.into_inner()
+            });
             std::mem::take(&mut *batch_guard)
         };
 
@@ -265,7 +274,10 @@ impl PlatformProcessor {
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = self.invocation_context.lock().unwrap_or_else(|poisoned| {
+            warn!("Invocation context mutex was poisoned. Recovering...");
+            poisoned.into_inner()
+        }).clone();
         
         // Convert platform events to log messages format
         let log_messages: Vec<crate::newrelic::payload::LogMessage> = batch
@@ -304,7 +316,10 @@ impl PlatformProcessor {
                 let mut attributes = serde_json::Map::new();
                 
                 // Get the invocation context for standard attributes
-                let context = self.invocation_context.lock().unwrap();
+                let context = self.invocation_context.lock().unwrap_or_else(|poisoned| {
+                    warn!("Invocation context mutex was poisoned. Recovering...");
+                    poisoned.into_inner()
+                });
                 
                 // Extract RequestId from the message itself (for REPORT logs) or use context
                 let request_id = if message.starts_with("REPORT RequestId: ") {

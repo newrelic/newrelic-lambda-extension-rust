@@ -42,7 +42,7 @@ lto = "fat"          # Maximum link-time optimization
 codegen-units = 1    # Single codegen unit for better optimization
 opt-level = "z"      # Optimize for size (important for Lambda cold starts)
 strip = true         # Strip debug symbols
-panic = "abort"      # Reduce binary size and improve performance
+panic = "unwind"     # Allow panic hooks to catch and handle panics gracefully
 debug = false        # No debug info in release
 
 # Optimize dependencies for release builds - aggressive settings

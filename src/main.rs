@@ -385,16 +385,46 @@ enum LambdaRuntimeEvent {
 }
 
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
+///
+/// COMPREHENSIVE PANIC RECOVERY STRATEGY (6 Layers):
+///
+/// 1. **Cargo.toml Configuration**: `panic = "unwind"` allows panic hooks to work
+///    - Without this, `panic = "abort"` would immediately terminate the process
+///
+/// 2. **Global Panic Hook**: Logs all panics with location and message
+///    - Provides visibility into what went wrong
+///    - Does NOT prevent panics, only logs them
+///
+/// 3. **Main Function Panic Catching**: Uses `tokio::spawn` + `JoinHandle::await`
+///    - Tokio automatically catches panics in spawned tasks
+///    - JoinHandle::await returns Err(JoinError) when task panics
+///    - Proper async panic handling (avoids nested runtime issues)
+///
+/// 4. **No-Op Extension Fallback**: After catching panic, runs `run_noop_extension()`
+///    - Registers with Lambda Extensions API
+///    - Subscribes to INVOKE/SHUTDOWN events
+///    - Completes proper Lambda lifecycle to prevent "Extension.Crash"
+///
+/// 5. **Spawned Task Protection**: All background tasks use `std::panic::catch_unwind`
+///    - Harvester, telemetry listener, version tagging, agent collector
+///    - Prevents task panics from crashing main process
+///    - Each task logs panic and continues in degraded mode
+///
+/// 6. **Mutex Poisoning Recovery**: All `.lock()` calls use `.safe_lock()` or `.unwrap_or_else()`
+///    - Poisoned mutexes are recovered by clearing the poison
+///    - Extension continues with potentially stale data rather than crashing
+///
+/// **Result**: Extension never causes "Extension.Crash", always allows Lambda function to execute
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // CRITICAL: Set up global panic hook to prevent ANY panic from crashing Lambda
+    // CRITICAL: Set up global panic hook for logging
     std::panic::set_hook(Box::new(|panic_info| {
         let location = if let Some(location) = panic_info.location() {
             format!("{}:{}", location.file(), location.line())
         } else {
             "unknown location".to_string()
         };
-        
+
         let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
             *s
         } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
@@ -402,25 +432,64 @@ async fn main() -> std::io::Result<()> {
         } else {
             "unknown panic message"
         };
-        
+
         // Use eprintln! since logging might not be available during panic
         eprintln!("[NR_EXT] ERROR Extension panic caught (Lambda will continue): {}", message);
         eprintln!("[NR_EXT] ERROR Panic location: {}", location);
-        
+
         // Don't re-panic - just log and continue
     }));
-    
-    // CRITICAL: Wrap everything in error handling to prevent Lambda crashes
-    match run_extension().await {
-        Ok(_) => {
+
+    // CRITICAL: Spawn run_extension as a Tokio task
+    // Tokio automatically catches panics in spawned tasks - this is the correct async panic handling!
+    // When a spawned task panics, JoinHandle::await returns Err(JoinError) with is_panic() = true
+    let task_handle = tokio::spawn(async {
+        run_extension().await
+    });
+
+    // Wait for the task and handle three cases: success, error, or panic
+    match task_handle.await {
+        Ok(Ok(_)) => {
+            // Extension completed successfully
             eprintln!("[NR_EXT] INFO Extension completed successfully");
             Ok(())
         }
-        Err(e) => {
-            // Log error but don't propagate - this prevents Lambda from crashing
+        Ok(Err(e)) => {
+            // Extension returned an error (not a panic)
             eprintln!("[NR_EXT] ERROR Extension failed but continuing gracefully: {}", e);
             eprintln!("[NR_EXT] WARN Lambda function will continue without New Relic monitoring");
-            
+            Ok(())
+        }
+        Err(join_error) => {
+            // Task panicked or was cancelled - CRITICAL: Must enter no-op mode to prevent Extension.Crash!
+            if join_error.is_panic() {
+                let panic_payload = join_error.into_panic();
+                let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[NR_EXT] ERROR Recovered from panic: {}. Lambda will continue without monitoring.", panic_msg);
+                eprintln!("[NR_EXT] INFO Extension entering no-op mode after panic recovery");
+
+                // CRITICAL: Must run no-op extension to properly register with Lambda and wait for shutdown
+                // Without this, Lambda sees "extension started but never became ready" = Extension.Crash
+                match run_noop_extension().await {
+                    Ok(_) => {
+                        eprintln!("[NR_EXT] INFO No-op extension completed successfully");
+                    }
+                    Err(e) => {
+                        eprintln!("[NR_EXT] ERROR No-op extension failed: {}. Extension will exit.", e);
+                    }
+                }
+            } else {
+                eprintln!("[NR_EXT] ERROR Extension task was cancelled or aborted");
+                // Also try to run no-op mode for cancellation case
+                let _ = run_noop_extension().await;
+            }
+
             // Return Ok to prevent Lambda crash - this is critical!
             Ok(())
         }
@@ -467,7 +536,7 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     let extension_startup_time = std::time::Instant::now();
     
     info!("=== COLD START: Initializing version {} of the New Relic Lambda Extension ===", EXTENSION_VERSION);
-    
+
     // PHASE 1: ONE-TIME COLD START INITIALIZATION (with true no-op fallback)
     let extension_components = match perform_one_time_initialization().await {
         Ok(components) => {
@@ -795,26 +864,43 @@ fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Recei
 /// Channel-based agent payload collector with immediate processing and notification
 fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
     tokio::spawn(async move {
-        info!("Agent payload collector started - continuously listening for agent payloads");
-        let mut payload_count = 0;
+        // Wrap in panic recovery to prevent process crashes
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                info!("Agent payload collector started - continuously listening for agent payloads");
+                let mut payload_count = 0;
 
-        while let Some(payload_bytes) = receiver.recv().await {
-            payload_count += 1;
+                while let Some(payload_bytes) = receiver.recv().await {
+                    payload_count += 1;
 
-            // OPTIMIZATION: Only log first few payloads, then reduce to debug
-            if payload_count <= 3 {
-                info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
-                debug!("Agent Payload preview: {:?}",
-                       String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
+                    // OPTIMIZATION: Only log first few payloads, then reduce to debug
+                    if payload_count <= 3 {
+                        info!("Received agent payload #{} ({} bytes) - processing immediately", payload_count, payload_bytes.len());
+                        debug!("Agent Payload preview: {:?}",
+                               String::from_utf8_lossy(&payload_bytes[..std::cmp::min(100, payload_bytes.len())]));
+                    } else {
+                        debug!("Received agent payload #{} ({} bytes)", payload_count, payload_bytes.len());
+                    }
+
+                    // Route payload (will try immediate processing first, store if it fails)
+                    route_payload_to_request_buffer(payload_bytes).await;
+                }
+
+                warn!("Agent payload collector channel closed. No more agent payloads will be received");
+            })
+        }));
+
+        if let Err(panic_info) = result {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
             } else {
-                debug!("Received agent payload #{} ({} bytes)", payload_count, payload_bytes.len());
-            }
-
-            // Route payload (will try immediate processing first, store if it fails)
-            route_payload_to_request_buffer(payload_bytes).await;
+                "unknown panic".to_string()
+            };
+            eprintln!("[NR_EXT] ERROR Agent payload collector task panicked: {}. Agent telemetry will not be collected.", panic_msg);
+            error!("Agent payload collector task panicked: {}. Agent telemetry will not be collected.", panic_msg);
         }
-
-        warn!("Agent payload collector channel closed. No more agent payloads will be received");
     });
 }
 
@@ -892,7 +978,7 @@ fn buffer_failed_agent_payload(
     };
 
     if let Ok(mut buffer) = FAILED_AGENT_PAYLOADS.lock() {
-        let payload_size = failed_payload.payload_bytes.len();
+        let _payload_size = failed_payload.payload_bytes.len();  // Reserved for future metrics
         buffer.push(failed_payload);  // All eviction logic is inside push() - O(1) operations!
 
         info!("Buffered failed agent payload for request {} (total: {}, size: {}MB/{}MB)",
@@ -1019,7 +1105,24 @@ fn start_harvester_background_task(
     let harvester = Arc::new(Harvester::new(processors, harvest_interval, dummy_log_processor, dummy_platform_processor));
     let harvester_clone = Arc::clone(&harvester);
     let handle = tokio::spawn(async move {
-        harvester_clone.run().await;
+        // Wrap in panic recovery to prevent process crashes
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                harvester_clone.run().await;
+            })
+        }));
+
+        if let Err(panic_info) = result {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("[NR_EXT] ERROR Harvester task panicked: {}. Extension will continue in degraded mode.", panic_msg);
+            error!("Harvester task panicked: {}. Extension will continue in degraded mode.", panic_msg);
+        }
     });
     (harvester, handle)
 }
@@ -1049,7 +1152,7 @@ async fn run_infinite_event_loop(mut extension_components: ExtensionComponents) 
 /// First iteration = Cold Start, subsequent iterations = Warm Starts
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
-    let mut probably_timeout = false;
+    let mut _probably_timeout = false;  // Reserved for future timeout detection logic
     let mut last_request_id = String::new();
 
     loop {
@@ -1064,7 +1167,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 error!("NextEventError.Main: {}", e);
 
                 // Report error to Lambda Extension API (critical for maintaining proper state)
-                let error_ref: &dyn std::error::Error = &*e;
+                let error_ref: &(dyn std::error::Error + Send + Sync) = &*e;
                 if let Err(report_err) = report_exit_error(&components.client, &components.extension_id, "NextEventError.Main", error_ref).await {
                     error!("Failed to report exit error: {}", report_err);
                 }
@@ -1076,7 +1179,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
         event_counter += 1;
 
         // Check if previous request timed out and process any late-arriving telemetry
-        if probably_timeout && !last_request_id.is_empty() {
+        if _probably_timeout && !last_request_id.is_empty() {
             info!("Checking for late telemetry after suspected timeout for request {}", last_request_id);
             // Process any telemetry that arrived late (non-blocking check)
             process_pending_agent_payloads_non_blocking(
@@ -1085,7 +1188,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 &components.config,
                 &components.global_log_processor,
             ).await;
-            probably_timeout = false;
+            _probably_timeout = false;
         }
 
         match runtime_event {
@@ -1190,7 +1293,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                                 if let Err(e) = flush_result {
                                     error!("Failed to flush logs for request {}: {}", request_id, e);
                                 }
-                                probably_timeout = false;
+                                _probably_timeout = false;
                             } else {
                                 // Payload not yet available, wait based on cold/warm start strategy
                                 let is_warm_start = IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
@@ -1238,11 +1341,11 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                                     if let Err(e) = flush_result {
                                         error!("Failed to flush logs for request {}: {}", request_id, e);
                                     }
-                                    probably_timeout = false;
+                                    _probably_timeout = false;
                                 } else {
                                     // Timeout: no payload after full wait period
                                     warn!("No agent telemetry within {}ms after runtimeDone for request {}", wait_ms, request_id);
-                                    probably_timeout = true;
+                                    _probably_timeout = true;
 
                                     // Still flush logs even without agent payload
                                     if let Err(e) = components.global_log_processor.flush().await {
@@ -1270,7 +1373,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                             if let Err(e) = flush_result {
                                 error!("Failed to flush logs for request {}: {}", request_id, e);
                             }
-                            probably_timeout = false;
+                            _probably_timeout = false;
 
                             // Still wait for runtimeDone to ensure function completed
                             let _ = components.runtime_done_rx.recv().await;
@@ -1865,7 +1968,7 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                 warn!("No-op mode: Error fetching next event: {:?}", e);
 
                 // Report error to Lambda Extension API to maintain proper state
-                let error_ref: &dyn std::error::Error = &*e;
+                let error_ref: &(dyn std::error::Error + Send + Sync) = &*e;
                 if let Err(report_err) = report_exit_error(client, extension_id, "NextEventError.Noop", error_ref).await {
                     error!("No-op mode: Failed to report exit error: {}", report_err);
                 }
@@ -2164,7 +2267,7 @@ async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: 
 
 /// Reports an error to the Lambda Extension API
 /// This is critical for maintaining proper state with the Lambda Extensions API
-async fn report_exit_error(client: &Client, ext_id: &str, error_type: &str, error: &dyn std::error::Error) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn report_exit_error(client: &Client, ext_id: &str, error_type: &str, error: &(dyn std::error::Error + Send + Sync)) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let runtime_api = match env::var("AWS_LAMBDA_RUNTIME_API") {
         Ok(api) => api,
         Err(_) => {

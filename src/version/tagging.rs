@@ -3,7 +3,7 @@
 //! This module handles tagging the Lambda function with New Relic version information.
 //! Tags are applied asynchronously in the background to avoid blocking cold start.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use std::collections::HashMap;
 
 /// Tags the Lambda function with New Relic version information
@@ -105,13 +105,30 @@ pub fn tag_lambda_function_background(
     function_arn: String,
 ) {
     tokio::spawn(async move {
-        tag_lambda_function_with_versions(
-            extension_version,
-            agent_version,
-            layer_version,
-            function_arn,
-        )
-        .await;
+        // Wrap in panic recovery to prevent process crashes
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tag_lambda_function_with_versions(
+                    extension_version,
+                    agent_version,
+                    layer_version,
+                    function_arn,
+                )
+                .await;
+            })
+        }));
+
+        if let Err(panic_info) = result {
+            let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            eprintln!("[NR_EXT] ERROR Version tagging task panicked: {}. Tagging skipped.", panic_msg);
+            error!("Version tagging task panicked: {}. Tagging skipped.", panic_msg);
+        }
     });
     debug!("Lambda function tagging task spawned in background");
 }
