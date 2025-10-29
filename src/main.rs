@@ -25,7 +25,7 @@ use std::{
 
 use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
@@ -54,23 +54,26 @@ const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
 
 // --- CONCURRENT REQUEST HANDLING ---
-// --- CONCURRENT REQUEST HANDLING ---
-// Per-request contexts to handle concurrent Lambda invocations safely
-static REQUEST_CONTEXTS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<InvocationContext>>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
-static REQUEST_AGENT_BUFFERS: Lazy<Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+// Per-request contexts to handle concurrent Lambda invocations safely using DashMap for lock-free concurrent access
+static REQUEST_CONTEXTS: Lazy<Arc<DashMap<String, Arc<Mutex<InvocationContext>>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
 
 // Global coordination channels per request for agent payload processing
-static PAYLOAD_COORDINATION: Lazy<Arc<Mutex<HashMap<String, mpsc::UnboundedSender<()>>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static PAYLOAD_COORDINATION: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
+
+// Per-request runtime.done signal channels (signaled by telemetry listener on platform.runtimeDone)
+static RUNTIME_DONE_CHANNELS: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
 
 // Per-request processing state management
-static REQUEST_PROCESSORS: Lazy<Arc<Mutex<HashMap<String, RequestProcessingState>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(HashMap::new())));
+static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>> =
+    Lazy::new(|| Arc::new(DashMap::new()));
 
-// Failed agent payloads buffer for retry across invocations
-static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> = 
+// Failed agent payloads buffer for retry across invocations - using Mutex for Vec as DashMap is for key-value
+static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 // Global current invocation context for telemetry processors
@@ -123,6 +126,7 @@ struct RequestProcessingState {
     platform_processor: Arc<PlatformProcessor>,
     agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
+    runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 // --- FAILED AGENT PAYLOAD FOR RETRY ---
@@ -595,30 +599,24 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
 
 /// Route agent payload to the correct per-request buffer
 async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    // Find the most recent active request
-    let current_request_id = {
-        if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
-            // Get the most recent request (assumes HashMap iteration order reflects insertion order)
-            contexts.keys().last().cloned()
-        } else {
-            None
-        }
-    };
-    
+    // Find the most recent active request using DashMap's concurrent iteration
+    // Note: DashMap doesn't guarantee insertion order, so we'll use the last entry we find
+    let current_request_id = REQUEST_CONTEXTS.iter()
+        .last()
+        .map(|entry| entry.key().clone());
+
     if let Some(request_id) = current_request_id {
         // Store in request-specific buffer
-        if let Some(request_buffer) = get_request_agent_buffer(&request_id) {
+        if let Some(request_buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
             match request_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
-                    info!("Stored agent payload in request buffer for {} (buffer size now {})", 
+                    info!("Stored agent payload in request buffer for {} (buffer size now {})",
                          request_id, buffer.len());
-                    
+
                     // Notify the request's coordination channel if available
-                    if let Ok(channels) = PAYLOAD_COORDINATION.lock() {
-                        if let Some(tx) = channels.get(&request_id) {
-                            let _ = tx.send(());
-                        }
+                    if let Some(tx) = PAYLOAD_COORDINATION.get(&request_id) {
+                        let _ = tx.send(());
                     }
                 }
                 Err(e) => {
@@ -638,19 +636,13 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
 // Channel coordination helper functions
 fn create_payload_coordination_channel(request_id: &str) -> mpsc::UnboundedReceiver<()> {
     let (tx, rx) = mpsc::unbounded_channel();
-    
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
-        channels.insert(request_id.to_string(), tx);
-    }
-    
+    PAYLOAD_COORDINATION.insert(request_id.to_string(), tx);
     rx
 }
 
 fn cleanup_payload_coordination_channel(request_id: &str) {
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
-        if channels.remove(request_id).is_some() {
-            debug!("Cleaned up coordination channel for request {}", request_id);
-        }
+    if PAYLOAD_COORDINATION.remove(request_id).is_some() {
+        debug!("Cleaned up coordination channel for request {}", request_id);
     }
 }
 
@@ -879,9 +871,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 components.global_log_processor.update_invocation_context(request_state.context.clone());
 
                 // Store request processing state
-                if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
-                    processors.insert(request_id.clone(), request_state);
-                }
+                REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
                 
                 // Process the request concurrently but wait for completion
                 let request_id_clone = request_id.clone();
@@ -945,14 +935,7 @@ async fn process_request_concurrently(
     info!("Starting concurrent processing for request: {}", request_id);
     
     // Get request processing state
-    let state = {
-        if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
-            processors.remove(&request_id)
-        } else {
-            error!("Failed to get processing state for request: {}", request_id);
-            return;
-        }
-    };
+    let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
     
     let Some(mut state) = state else {
         error!("No processing state found for request: {}", request_id);
@@ -964,39 +947,81 @@ async fn process_request_concurrently(
     global_log_processor.set_invocation_start_time(invocation_start_time);
     global_log_processor.reset_trace_id_state();
     state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
-    
-    // Wait for function completion and process payloads
-    tokio::select! {
-        _ = state.coordination_rx.as_mut().unwrap().recv() => {
-            info!("Function completed for request: {}", request_id);
+
+    // STEP 1: Wait for platform.runtimeDone event (function execution completed)
+    // We MUST wait for this - function could run for up to 15 minutes
+    // runtime.done is guaranteed to arrive when function completes
+    if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
+        debug!("Waiting for platform.runtimeDone event for request: {}", request_id);
+        match runtime_done_rx.recv().await {
+            Some(_) => {
+                debug!("Runtime.done event received for request: {}", request_id);
+            }
+            None => {
+                // Channel closed - this means telemetry listener crashed or shutdown
+                warn!("Runtime.done channel closed for request: {} - proceeding anyway", request_id);
+            }
         }
-        // _ = tokio::time::sleep(Duration::from_secs(300)) => {
-        //     warn!("Timeout waiting for function completion for request: {}", request_id);
-        // }
+    } else {
+        // This shouldn't happen - every request should have a runtime_done channel
+        warn!("No runtime.done channel for request: {} (shouldn't happen)", request_id);
     }
-    
-    // Process agent payloads for this specific request
-    process_request_agent_payloads(
+
+    // STEP 2: Now wait for agent payload (function is done, agent should send soon)
+    // Check if payload already arrived, otherwise wait up to 200ms
+    let payload_already_arrived = {
+        if let Ok(buffer) = state.agent_buffer.lock() {
+            !buffer.is_empty()
+        } else {
+            false
+        }
+    };
+
+    if payload_already_arrived {
+        debug!("Agent payload already arrived for request {}, proceeding immediately", request_id);
+    } else {
+        // Wait up to 200ms for agent payload to arrive after runtime.done
+        debug!("Waiting up to 200ms for agent payload for request: {}", request_id);
+        tokio::select! {
+            _ = state.coordination_rx.as_mut().unwrap().recv() => {
+                debug!("Agent payload received for request: {}", request_id);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {
+                debug!("Agent payload wait timeout (200ms) - proceeding without agent data for request: {}", request_id);
+            }
+        }
+    }
+
+    // STEP 3: Process agent payloads AND flush logs in parallel for better performance
+    let agent_processing = process_request_agent_payloads(
         &request_id,
         &invoked_function_arn,
         &state,
         &newrelic_client,
         &config,
         &global_log_processor,
-    ).await;
-    
-    // Final flush: Retry any failed agent payloads before function freeze
-    retry_failed_agent_payloads(&newrelic_client, &config).await;
-    
-    // Final flush: Flush any remaining logs (should be minimal if trace ID disabled)
-    // When trace ID collection is disabled, logs are sent immediately, so this is just cleanup
-    if let Err(e) = global_log_processor.flush().await {
+    );
+
+    let log_flushing = global_log_processor.flush();
+    let platform_flushing = state.platform_processor.flush();
+    let failed_retry = retry_failed_agent_payloads(&newrelic_client, &config);
+
+    // Run all final operations in parallel
+    let (agent_result, log_result, platform_result, _) = tokio::join!(
+        agent_processing,
+        log_flushing,
+        platform_flushing,
+        failed_retry
+    );
+
+    // Log any errors
+    if let Err(e) = log_result {
         error!("Failed to flush global log processor for request {}: {}", request_id, e);
     }
-    
-    if let Err(e) = state.platform_processor.flush().await {
+    if let Err(e) = platform_result {
         error!("Failed to flush platform processor for request {}: {}", request_id, e);
     }
+    // agent_result is () so no error to check
     
     // Cleanup request resources
     cleanup_request_processing_state(&request_id);
@@ -1047,25 +1072,29 @@ async fn process_request_agent_payloads(
 
 /// Wait for all concurrent requests to complete
 async fn wait_for_all_requests_completion() {
-    info!("Waiting for all concurrent requests to complete...");
-    
+    // Check if there are any pending requests
+    let pending_count = REQUEST_PROCESSORS.len();
+
+    if pending_count == 0 {
+        debug!("No pending requests at shutdown - proceeding immediately");
+        return;
+    }
+
+    info!("Waiting for {} concurrent request(s) to complete...", pending_count);
+
     // Wait a reasonable time for requests to complete
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     // Force cleanup of any remaining requests
-    let remaining_requests = {
-        if let Ok(processors) = REQUEST_PROCESSORS.lock() {
-            processors.keys().cloned().collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        }
-    };
-    
+    let remaining_requests: Vec<String> = REQUEST_PROCESSORS.iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+
     for request_id in remaining_requests {
         warn!("Force cleaning up request: {}", request_id);
         cleanup_request_processing_state(&request_id);
     }
-    
+
     info!("All concurrent requests completed");
 }
 
@@ -1089,29 +1118,26 @@ fn create_request_processing_state(
     // Create agent buffer
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
 
-    // Create coordination channel
-    let (tx, rx) = mpsc::unbounded_channel();
+    // Create coordination channel for agent payload arrival
+    let (payload_tx, payload_rx) = mpsc::unbounded_channel();
+    PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
-    // Store coordination sender
-    if let Ok(mut channels) = PAYLOAD_COORDINATION.lock() {
-        channels.insert(request_id.to_string(), tx);
-    }
+    // Create runtime.done channel (telemetry listener will signal this)
+    let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
+    RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
 
     let state = RequestProcessingState {
         request_id: request_id.to_string(),
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
-        coordination_rx: Some(rx),
+        coordination_rx: Some(payload_rx),
+        runtime_done_rx: Some(runtime_done_rx),
     };
 
-    // Store in global maps for backward compatibility
-    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
-        contexts.insert(request_id.to_string(), context);
-    }
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
-        buffers.insert(request_id.to_string(), agent_buffer);
-    }
+    // Store in global DashMaps for concurrent access
+    REQUEST_CONTEXTS.insert(request_id.to_string(), context);
+    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer);
 
     info!("Created per-request processing state for {} (using global log processor)", request_id);
     state
@@ -1120,59 +1146,45 @@ fn create_request_processing_state(
 /// Create per-request agent buffer for concurrent request handling
 fn create_request_agent_buffer(request_id: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
     let buffer = Arc::new(Mutex::new(Vec::new()));
-    
-    // Store in per-request buffers map
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
-        buffers.insert(request_id.to_string(), buffer.clone());
-        info!("Created per-request agent buffer for {}", request_id);
-    } else {
-        error!("Failed to lock REQUEST_AGENT_BUFFERS for request {}", request_id);
-    }
-    
+    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), buffer.clone());
+    info!("Created per-request agent buffer for {}", request_id);
     buffer
 }
 
 /// Get per-request context (for concurrent requests)
 fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>> {
-    if let Ok(contexts) = REQUEST_CONTEXTS.lock() {
-        return contexts.get(request_id).cloned();
-    }
-    None
+    REQUEST_CONTEXTS.get(request_id).map(|entry| entry.value().clone())
 }
 
 /// Get per-request agent buffer (for concurrent requests)
 fn get_request_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
-    if let Ok(buffers) = REQUEST_AGENT_BUFFERS.lock() {
-        return buffers.get(request_id).cloned();
-    }
-    None
+    REQUEST_AGENT_BUFFERS.get(request_id).map(|entry| entry.value().clone())
 }
 
 /// Clean up per-request processing state after processing
 fn cleanup_request_processing_state(request_id: &str) {
     // Clean up request processing state
-    if let Ok(mut processors) = REQUEST_PROCESSORS.lock() {
-        if processors.remove(request_id).is_some() {
-            debug!("Cleaned up request processing state for {}", request_id);
-        }
+    if REQUEST_PROCESSORS.remove(request_id).is_some() {
+        debug!("Cleaned up request processing state for {}", request_id);
     }
-    
+
     // Clean up context
-    if let Ok(mut contexts) = REQUEST_CONTEXTS.lock() {
-        if contexts.remove(request_id).is_some() {
-            debug!("Cleaned up context for request {}", request_id);
-        }
+    if REQUEST_CONTEXTS.remove(request_id).is_some() {
+        debug!("Cleaned up context for request {}", request_id);
     }
-    
+
     // Clean up agent buffer
-    if let Ok(mut buffers) = REQUEST_AGENT_BUFFERS.lock() {
-        if buffers.remove(request_id).is_some() {
-            debug!("Cleaned up agent buffer for request {}", request_id);
-        }
+    if REQUEST_AGENT_BUFFERS.remove(request_id).is_some() {
+        debug!("Cleaned up agent buffer for request {}", request_id);
     }
-    
+
     // Clean up payload coordination channel
     cleanup_payload_coordination_channel(request_id);
+
+    // Clean up runtime.done channel
+    if RUNTIME_DONE_CHANNELS.remove(request_id).is_some() {
+        debug!("Cleaned up runtime.done channel for request {}", request_id);
+    }
 }
 
 
@@ -1561,8 +1573,12 @@ async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Resul
                     return Err(e.into());
                 }
 
-                // Exponential backoff: 1s, 2s, 4s
-                let delay = Duration::from_secs(2_u64.pow(retry_count - 1));
+                // Standardized backoff: 200ms, 400ms, 900ms
+                let delay = match retry_count {
+                    1 => Duration::from_millis(200),
+                    2 => Duration::from_millis(400),
+                    _ => Duration::from_millis(900),
+                };
                 warn!("Retrying extension event polling in {:?}...", delay);
                 tokio::time::sleep(delay).await;
             }

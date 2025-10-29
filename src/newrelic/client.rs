@@ -12,6 +12,15 @@ fn get_extension_name_with_version() -> String {
     format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
 }
 
+// Standardized backoff delays: 200ms, 400ms, 900ms
+fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
+    match retry_attempt {
+        1 => std::time::Duration::from_millis(200),
+        2 => std::time::Duration::from_millis(400),
+        _ => std::time::Duration::from_millis(900),
+    }
+}
+
 // Note: Version detection is done during initialization in main.rs
 // We detect on each call here (fast, filesystem-based detection only)
 
@@ -77,7 +86,7 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        info!("Sending {} log messages to NR", batch.len());
+        debug!("Sending {} log messages to NR", batch.len());
 
         let mut common_attributes = serde_json::Map::new();
         common_attributes.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
@@ -95,11 +104,12 @@ impl NewRelicClient {
             debug!("Added {} version detail tags to log payload", common_attributes.len() - 3); // Subtract the 3 base attributes
         }
 
+        let log_count = batch.len();
         let log_data = vec![payload::LogPayload {
             common: payload::Common { attributes: common_attributes },
             logs: batch,
         }];
-        self.send_payload(&config.new_relic.log_endpoint, &log_data).await
+        self.send_payload(&config.new_relic.log_endpoint, &log_data, Some(log_count)).await
     }
 
     /// Sends the wrapped agent payload to the New Relic collector.
@@ -115,7 +125,7 @@ impl NewRelicClient {
         
         let start_time = std::time::Instant::now();
         let payload_size = payload_json.len();
-        info!("[agentsend] Sending agent payload to NR: {} bytes", payload_size);
+        debug!("Sending agent payload to NR: {} bytes", payload_size);
         
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
@@ -137,7 +147,7 @@ impl NewRelicClient {
                     
                     if status.is_success() {
                         let duration = start_time.elapsed();
-                        info!("[agentsend] Successfully sent agent payload - size: {} bytes, duration: {:?}", payload_size, duration);
+                        info!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
@@ -152,7 +162,7 @@ impl NewRelicClient {
                         
                         if retries < MAX_RETRIES {
                             retries += 1;
-                            let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
+                            let delay = get_backoff_delay(retries);
                             tokio::time::sleep(delay).await;
                         } else {
                             warn!("[agentsend] Max retries exceeded");
@@ -175,7 +185,7 @@ impl NewRelicClient {
 
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
+                        let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                     } else {
                         warn!("[agentsend] Max network retries exceeded");
@@ -187,7 +197,7 @@ impl NewRelicClient {
     }
 
     /// Sends a JSON payload to a specified endpoint.
-    async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T) -> Result<(), Error> {
+    async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T, log_count: Option<usize>) -> Result<(), Error> {
         let start_time = std::time::Instant::now();
         let body = match serde_json::to_string(payload) {
             Ok(json) => json,
@@ -198,7 +208,7 @@ impl NewRelicClient {
         };
 
         let payload_size = body.len();
-        info!("Sending payload to NR endpoint: {} bytes", payload_size);
+        debug!("Sending payload to NR endpoint: {} bytes", payload_size);
 
         // Retry logic with exponential backoff
         let mut retries = 0;
@@ -220,7 +230,11 @@ impl NewRelicClient {
                     
                     if status.is_success() {
                         let duration = start_time.elapsed();
-                        info!("Successfully sent payload to NR - size: {} bytes, duration: {:?}", payload_size, duration);
+                        if let Some(count) = log_count {
+                            info!("Logs sent: {} logs, {} bytes, duration: {:?}", count, payload_size, duration);
+                        } else {
+                            info!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
+                        }
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
@@ -237,7 +251,7 @@ impl NewRelicClient {
                         // Retry on server errors (5xx) or other issues
                         if retries < MAX_RETRIES {
                             retries += 1;
-                            let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
+                            let delay = get_backoff_delay(retries);
                             tokio::time::sleep(delay).await;
                             continue;
                         } else {
@@ -261,7 +275,7 @@ impl NewRelicClient {
 
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = std::time::Duration::from_millis(200 * (2_u64.pow(retries as u32 - 1)));
+                        let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {

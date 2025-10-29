@@ -74,9 +74,17 @@ struct FailedLogEntry {
 /// Configuration constants for batching and retry logic
 const MAX_BATCH_SIZE: usize = 100; // Maximum logs per batch to avoid 413 errors
 const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
-const RETRY_DELAY_MS: u64 = 200; // Base retry delay in milliseconds
 const MAX_FAILED_LOG_AGE_HOURS: i64 = 24; // Drop failed logs older than 24 hours
 const MAX_FAILED_LOGS_BUFFER_SIZE: usize = 1000; // Limit failed buffer size
+
+// Standardized backoff delays: 200ms, 400ms, 900ms
+fn get_backoff_delay(retry_attempt: usize) -> Duration {
+    match retry_attempt {
+        1 => Duration::from_millis(200),
+        2 => Duration::from_millis(400),
+        _ => Duration::from_millis(900),
+    }
+}
 
 impl LogProcessor {
     
@@ -811,7 +819,7 @@ impl LogProcessor {
             return Ok(());
         }
 
-        info!("Sending {} logs to New Relic", batch.len());
+        debug!("Sending {} logs to New Relic", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -845,10 +853,10 @@ impl LogProcessor {
         }
         
         if successful_chunks > 0 {
-            info!("Successfully sent {} log chunks", successful_chunks);
+            debug!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
-            info!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
+            warn!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
             // Store failed logs with metadata stripped for safe retry in next invocation
             {
                 let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
@@ -912,7 +920,7 @@ impl LogProcessor {
                     
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (2_u64.pow(retries as u32 - 1)));
+                        let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
