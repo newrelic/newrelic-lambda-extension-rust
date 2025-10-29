@@ -27,6 +27,7 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
 #[derive(Debug)]
 pub struct NewRelicClient {
     client: Client,
+    cached_version_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl NewRelicClient {
@@ -52,11 +53,14 @@ impl NewRelicClient {
             .default_headers(headers)
             .timeout(std::time::Duration::from_millis(2400)) // 2.4s timeout for New Relic requests
             .pool_idle_timeout(std::time::Duration::from_secs(90)) // Keep connections alive longer for Lambda warm starts
-            .pool_max_idle_per_host(10) // Allow more connections for concurrent batching
+            .pool_max_idle_per_host(10) // Allow more connections for  batching
             .tcp_keepalive(std::time::Duration::from_secs(30)) // TCP keepalive for better connection reuse
             .build().unwrap();
 
-        Self { client }
+        Self {
+            client,
+            cached_version_attrs: std::sync::OnceLock::new(),
+        }
     }
 
     /// Creates a no-op New Relic client for disabled mode.
@@ -65,7 +69,10 @@ impl NewRelicClient {
             .timeout(std::time::Duration::from_millis(100)) // Very short timeout for no-op
             .build().unwrap();
 
-        Self { client }
+        Self {
+            client,
+            cached_version_attrs: std::sync::OnceLock::new(),
+        }
     }
 
     /// Sends a batch of logs to New Relic.
@@ -93,15 +100,18 @@ impl NewRelicClient {
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
 
-        // Add version detail tags if enabled
+        // Add version detail tags if enabled (cached for performance)
         if config.new_relic.add_version_detail_tags {
-            // Use cached version info (already detected once during initialization)
-            let version_info = VersionInfo::get_or_detect();
-            let version_tags = version_info.as_tags();
-            for (key, value) in version_tags {
-                common_attributes.insert(key, serde_json::json!(value));
-            }
-            debug!("Added {} version detail tags to log payload", common_attributes.len() - 3); // Subtract the 3 base attributes
+            let version_attrs = self.cached_version_attrs.get_or_init(|| {
+                let version_info = VersionInfo::get_or_detect();
+                let version_tags = version_info.as_tags();
+                let mut attrs = serde_json::Map::new();
+                for (key, value) in version_tags {
+                    attrs.insert(key, serde_json::json!(value));
+                }
+                attrs
+            });
+            common_attributes.extend(version_attrs.clone());
         }
 
         let log_count = batch.len();

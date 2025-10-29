@@ -1466,6 +1466,7 @@ dependencies = [
  "aws-sdk-secretsmanager",
  "aws-sdk-ssm",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "dashmap",
  "flate2",

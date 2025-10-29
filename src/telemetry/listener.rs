@@ -124,7 +124,33 @@ async fn handle_telemetry_request(
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
-                    "platform.report" | "platform.end" => {
+                    "platform.report" => {
+                        // Extract request_id and match with batched agent or store as pending
+                        if let Some(request_id_value) = record.record.get("requestId") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                // Create report line using platform processor
+                                if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
+                                    // Try to match with already batched agent first
+                                    if let Some(mut batch_item) = crate::AGENT_BATCH_BUFFER.get_mut(request_id_str) {
+                                        batch_item.report_line = Some(report_line);
+                                        debug!("Matched platform.report with batched agent for request: {}", request_id_str);
+                                    }
+                                    // If not batched yet, check if it's the current/active request
+                                    else if crate::REQUEST_PROCESSORS.contains_key(request_id_str) {
+                                        crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                        debug!("Stored pending platform.report for current request: {}", request_id_str);
+                                    }
+                                    // Otherwise drop (old request, already sent)
+                                    else {
+                                        debug!("Dropping platform.report for non-current request: {}", request_id_str);
+                                    }
+                                }
+                            }
+                        }
+                        platform_processor.process_record(record);
+                        function_completed = true;
+                    }
+                    "platform.end" => {
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
