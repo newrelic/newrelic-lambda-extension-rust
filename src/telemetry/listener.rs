@@ -98,11 +98,11 @@ async fn handle_telemetry_request(
 
             
             let mut function_completed = false;
-            let mut runtime_done_received = false;
+            let mut runtime_done_request_id: Option<String> = None;
             let mut function_count = 0;
             let mut extension_count = 0;
             let mut platform_count = 0;
-            
+
             for record in records {
                 match record.record_type.as_str() {
                     "function" => {
@@ -114,13 +114,43 @@ async fn handle_telemetry_request(
                         log_processor.process_record(record);
                     }
                     "platform.runtimeDone" => {
-
+                        // Extract request_id from the record
+                        if let Some(request_id_value) = record.record.get("requestId") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                runtime_done_request_id = Some(request_id_str.to_string());
+                                debug!("platform.runtimeDone received for request: {}", request_id_str);
+                            }
+                        }
                         platform_processor.process_record(record);
-                        runtime_done_received = true;
                         function_completed = true;
                     }
-                    "platform.report" | "platform.end" => {
-
+                    "platform.report" => {
+                        // Extract request_id and match with batched agent or store as pending
+                        if let Some(request_id_value) = record.record.get("requestId") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                // Create report line using platform processor
+                                if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
+                                    // Try to match with already batched agent first
+                                    if let Some(mut batch_item) = crate::AGENT_BATCH_BUFFER.get_mut(request_id_str) {
+                                        batch_item.report_line = Some(report_line);
+                                        debug!("Matched platform.report with batched agent for request: {}", request_id_str);
+                                    }
+                                    // If not batched yet, check if it's the current/active request
+                                    else if crate::REQUEST_PROCESSORS.contains_key(request_id_str) {
+                                        crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                        debug!("Stored pending platform.report for current request: {}", request_id_str);
+                                    }
+                                    // Otherwise drop (old request, already sent)
+                                    else {
+                                        debug!("Dropping platform.report for non-current request: {}", request_id_str);
+                                    }
+                                }
+                            }
+                        }
+                        platform_processor.process_record(record);
+                        function_completed = true;
+                    }
+                    "platform.end" => {
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
@@ -143,14 +173,22 @@ async fn handle_telemetry_request(
                 debug!("No telemetry records processed in this batch");
             }
             
-            // If runtime is done, signal the main loop to process agent telemetry
-            if runtime_done_received {
-                if let Some(ref tx) = runtime_done_tx {
+            // If runtime is done, signal the per-request channel
+            if let Some(request_id) = runtime_done_request_id {
+                // Signal the per-request runtime.done channel
+                if let Some(tx) = crate::RUNTIME_DONE_CHANNELS.get(&request_id) {
                     if let Err(e) = tx.send(()) {
-                        warn!("Failed to send runtime done signal: {}", e);
+                        warn!("Failed to send runtime.done signal for request {}: {}", request_id, e);
                     } else {
-
+                        debug!("Successfully sent runtime.done signal for request: {}", request_id);
                     }
+                } else {
+                    warn!("No runtime.done channel found for request: {}", request_id);
+                }
+
+                // Also signal the global channel for backward compatibility (if it exists)
+                if let Some(ref tx) = runtime_done_tx {
+                    let _ = tx.send(());
                 }
             }
             

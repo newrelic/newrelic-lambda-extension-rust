@@ -11,14 +11,11 @@ cd "$ROOT_DIR"
 
 # --- Configuration ---
 # Layer naming prefix - change this to customize all layer names
-LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NewRelicLambdaRustExtension"}
-# eu-west-1 eu-west-2 eu-west-3 us-east-1 us-east-2 us-west-1 us-west-2
+LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NRTestRustExtension"}
 
-# sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2
-# sa-east-1 me-central-1 me-south-1 eu-central-2 eu-north-1 eu-south-2 eu-south-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 ap-south-2 ap-southeast-4 ap-southeast-3 af-south-1
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
-REGIONS_ARM64=${REGIONS_ARM64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
+REGIONS_X86_64=${REGIONS_X86_64:-"us-west-1"}
+REGIONS_ARM64=${REGIONS_ARM64:-"us-west-2"}
 
 BIN_NAME="newrelic-lambda-extension"
 DIST_DIR="$ROOT_DIR/dist"
@@ -192,19 +189,6 @@ publish_layer() {
   echo "Published ${runtime_name} layer version ${layer_version} to ${region}"
   echo "Full Layer ARN: ${full_layer_arn}"
 
-  echo "→ Setting public permissions for layer version ${layer_version}" >&2
-  aws lambda add-layer-version-permission \
-    --layer-name "${layer_name}" \
-    --version-number "$layer_version" \
-    --statement-id public \
-    --action lambda:GetLayerVersion \
-    --principal "*" \
-    --region "$region" \
-    --output json >/dev/null
-
-  echo "✓ Layer is now publicly accessible" >&2
-
-
   local arch_upper
   arch_upper=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
   local runtime_nodots
@@ -273,26 +257,26 @@ main() {
   done
 
   #--- Build for arm64 ---
-  local target_arm="aarch64-unknown-linux-musl"
-  build_extension "$target_arm"
+  # local target_arm="aarch64-unknown-linux-musl"
+  # build_extension "$target_arm"
 
-  # Package and publish standalone extension
-  package_extension_layer "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "${LAYER_NAME_PREFIX}ARM64"
-  done
+  # # Package and publish standalone extension
+  # package_extension_layer "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "${LAYER_NAME_PREFIX}ARM64"
+  # done
 
-  # Package and publish single Python layer
-  build_python_layer_all "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "${LAYER_NAME_PREFIX}PythonARM64"
-  done
+  # # Package and publish single Python layer
+  # build_python_layer_all "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "${LAYER_NAME_PREFIX}PythonARM64"
+  # done
 
-  # Package and publish single Node.js layer
-  build_nodejs_layer_all "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "${LAYER_NAME_PREFIX}NodejsARM64"
-  done
+  # # Package and publish single Node.js layer
+  # build_nodejs_layer_all "$target_arm"
+  # for region in $REGIONS_ARM64; do
+  #   publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "${LAYER_NAME_PREFIX}NodejsARM64"
+  # done
 
   echo ""
   echo "=========================================="

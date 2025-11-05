@@ -63,8 +63,14 @@ pub struct LogProcessor {
 /// Failed log entry that stores the original log without invocation-specific metadata
 #[derive(Debug, Clone)]
 struct FailedLogEntry {
-    /// Original log message with invocation-specific metadata stripped
+    /// Original log message (with original attribution preserved)
     log_message: payload::LogMessage,
+    /// Original request ID where this log was generated
+    original_request_id: String,
+    /// Original function ARN where this log was generated
+    original_arn: String,
+    /// When the log was originally generated
+    original_timestamp: chrono::DateTime<chrono::Utc>,
     /// When this log failed (for cleanup of very old logs)
     failed_at: chrono::DateTime<chrono::Utc>,
     /// Number of retry attempts for this specific log
@@ -74,9 +80,17 @@ struct FailedLogEntry {
 /// Configuration constants for batching and retry logic
 const MAX_BATCH_SIZE: usize = 100; // Maximum logs per batch to avoid 413 errors
 const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
-const RETRY_DELAY_MS: u64 = 200; // Base retry delay in milliseconds
 const MAX_FAILED_LOG_AGE_HOURS: i64 = 24; // Drop failed logs older than 24 hours
 const MAX_FAILED_LOGS_BUFFER_SIZE: usize = 1000; // Limit failed buffer size
+
+// Standardized backoff delays: 200ms, 400ms, 900ms
+fn get_backoff_delay(retry_attempt: usize) -> Duration {
+    match retry_attempt {
+        1 => Duration::from_millis(200),
+        2 => Duration::from_millis(400),
+        _ => Duration::from_millis(900),
+    }
+}
 
 impl LogProcessor {
     
@@ -154,41 +168,71 @@ impl LogProcessor {
         }
     }
 
-    /// Strips invocation-specific metadata from a log message for safe storage in failed buffer
-    fn strip_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
-        // Remove invocation-specific attributes that should not persist across invocations
-        log_message.attributes.remove("aws.lambda_request_id");
-        log_message.attributes.remove("faas.execution");
-        log_message.attributes.remove("trace.id");
-        log_message
-    }
-
-    /// Applies current invocation metadata to a failed log before retry
+    /// Applies current invocation metadata to a log message
     fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
             // Apply current request_id if available and valid
             if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
-                log_message.attributes.insert("aws.lambda_request_id".to_string(), 
+                log_message.attributes.insert("aws.lambda_request_id".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
-                log_message.attributes.insert("faas.execution".to_string(), 
+                log_message.attributes.insert("faas.execution".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
             }
-            
+
             // Apply current invoked_function_arn if available and valid
             if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
-                log_message.attributes.insert("faas.arn".to_string(), 
+                log_message.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(context.invoked_function_arn.clone()));
             }
-            
+
             // Apply current trace_id if available
             if let Some(ref trace_id) = context.trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
+                log_message.attributes.insert("trace.id".to_string(),
                     serde_json::Value::String(trace_id.clone()));
             }
         } else {
             warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
         }
-        
+
+        log_message
+    }
+
+    /// Adds dual attribution metadata to a failed log being retried
+    /// Preserves original request_id while adding retry context
+    fn add_retry_metadata(
+        &self,
+        mut log_message: payload::LogMessage,
+        original_request_id: &str,
+        retry_attempt: usize,
+        original_timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> payload::LogMessage {
+        // Get current invocation context for retry metadata
+        if let Some(context) = self.invocation_context.safe_lock() {
+            // Add retry metadata while keeping original attribution
+            log_message.attributes.insert(
+                "retry_request_id".to_string(),
+                serde_json::Value::String(context.request_id.clone())
+            );
+            log_message.attributes.insert(
+                "retry_attempt".to_string(),
+                serde_json::Value::Number(retry_attempt.into())
+            );
+            log_message.attributes.insert(
+                "original_request_id".to_string(),
+                serde_json::Value::String(original_request_id.to_string())
+            );
+            log_message.attributes.insert(
+                "original_timestamp".to_string(),
+                serde_json::Value::Number(original_timestamp.timestamp_millis().into())
+            );
+            log_message.attributes.insert(
+                "retry_timestamp".to_string(),
+                serde_json::Value::Number(chrono::Utc::now().timestamp_millis().into())
+            );
+        } else {
+            warn!("Cannot add retry metadata - context mutex poisoned, log will be sent without retry info");
+        }
+
         log_message
     }
 
@@ -250,16 +294,21 @@ impl LogProcessor {
         }
 
         // Convert failed entries back to log messages with current invocation metadata
-        let mut logs_to_retry = Vec::new();
-        let mut logs_to_drop = Vec::new();
+        let mut logs_to_retry = Vec::with_capacity(failed_entries.len());
+        let mut logs_to_drop = Vec::with_capacity(failed_entries.len() / 10); // Estimate 10% might be dropped
 
         for mut entry in failed_entries {
             // Check if this log has exceeded max retries
             if entry.retry_count >= MAX_RETRIES {
                 logs_to_drop.push(entry);
             } else {
-                // Apply current invocation metadata
-                entry.log_message = self.apply_current_invocation_metadata(entry.log_message);
+                // Add dual attribution (original + retry metadata)
+                entry.log_message = self.add_retry_metadata(
+                    entry.log_message,
+                    &entry.original_request_id,
+                    entry.retry_count + 1,
+                    entry.original_timestamp,
+                );
                 entry.retry_count += 1;
                 logs_to_retry.push(entry);
             }
@@ -287,17 +336,12 @@ impl LogProcessor {
             Err(e) => {
                 error!("Failed to send previously failed logs: {}", e);
                 
-                // Put back the failed entries (with incremented retry count)
+                // Put back the failed entries (with incremented retry count, keeping original attribution)
                 {
                     let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                    for entry in logs_to_retry {
-                        // Strip metadata again before storing back
-                        let stripped_log = self.strip_invocation_metadata(entry.log_message);
-                        failed_buffer.push(FailedLogEntry {
-                            log_message: stripped_log,
-                            failed_at: chrono::Utc::now(),
-                            retry_count: entry.retry_count,
-                        });
+                    for mut entry in logs_to_retry {
+                        entry.failed_at = chrono::Utc::now();
+                        failed_buffer.push(entry);
                     }
                 }
             }
@@ -503,20 +547,20 @@ impl LogProcessor {
         })
     }
 
-    /// Extract log level from log message content - simple and fast implementation
+    /// Extract log level from log message content - optimized case-insensitive check
     fn extract_log_level(&self, message: &str) -> &'static str {
-        let message_upper = message.to_uppercase();
-        
-        // Check for common log level patterns (case insensitive)
-        if message_upper.contains("ERROR") || message_upper.contains("FATAL") {
+        // Check for common log level patterns (case insensitive) without allocating
+        if message.contains("ERROR") || message.contains("error")
+           || message.contains("FATAL") || message.contains("fatal") {
             "ERROR"
-        } else if message_upper.contains("WARN") || message_upper.contains("WARNING") {
+        } else if message.contains("WARN") || message.contains("warn")
+                  || message.contains("WARNING") || message.contains("warning") {
             "WARN"
-        } else if message_upper.contains("DEBUG") {
+        } else if message.contains("DEBUG") || message.contains("debug") {
             "DEBUG"
-        } else if message_upper.contains("TRACE") {
+        } else if message.contains("TRACE") || message.contains("trace") {
             "TRACE"
-        } else if message_upper.contains("INFO") {
+        } else if message.contains("INFO") || message.contains("info") {
             "INFO"
         } else {
             // Default to INFO if no level detected
@@ -811,7 +855,7 @@ impl LogProcessor {
             return Ok(());
         }
 
-        info!("Sending {} logs to New Relic", batch.len());
+        debug!("Sending {} logs to New Relic", batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -827,7 +871,7 @@ impl LogProcessor {
             debug!("Chunking {} logs into {} batches", batch.len(), chunks.len());
         }
         
-        let mut failed_logs = Vec::new();
+        let mut failed_logs = Vec::with_capacity(batch.len() / 10); // Estimate 10% might fail
         let mut successful_chunks = 0;
         
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
@@ -845,19 +889,21 @@ impl LogProcessor {
         }
         
         if successful_chunks > 0 {
-            info!("Successfully sent {} log chunks", successful_chunks);
+            debug!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
-            info!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
-            // Store failed logs with metadata stripped for safe retry in next invocation
+            warn!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
+            // Store failed logs with original attribution for accurate retry
             {
                 let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
                 let now = chrono::Utc::now();
-                
+
                 for log in failed_logs {
-                    let stripped_log = self.strip_invocation_metadata(log);
                     failed_buffer.push(FailedLogEntry {
-                        log_message: stripped_log,
+                        log_message: log,
+                        original_request_id: context.request_id.clone(),
+                        original_arn: context.invoked_function_arn.clone(),
+                        original_timestamp: now,
                         failed_at: now,
                         retry_count: 0, // This is the first failure
                     });
@@ -912,7 +958,7 @@ impl LogProcessor {
                     
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = Duration::from_millis(RETRY_DELAY_MS * (2_u64.pow(retries as u32 - 1)));
+                        let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
@@ -920,13 +966,16 @@ impl LogProcessor {
                             // Move failed logs to failed buffer for retry later
                             warn!("Max retries exceeded - moving {} logs to failed buffer for retry", chunk.len());
                             {
+                                let context = self.invocation_context.lock().unwrap().clone();
                                 let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
                                 let now = chrono::Utc::now();
-                                
+
                                 for log in chunk {
-                                    let stripped_log = self.strip_invocation_metadata(log);
                                     failed_buffer.push(FailedLogEntry {
-                                        log_message: stripped_log,
+                                        log_message: log,
+                                        original_request_id: context.request_id.clone(),
+                                        original_arn: context.invoked_function_arn.clone(),
+                                        original_timestamp: now,
                                         failed_at: now,
                                         retry_count: 0,
                                     });

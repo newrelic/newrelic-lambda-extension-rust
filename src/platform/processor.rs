@@ -155,7 +155,7 @@ impl PlatformProcessor {
     }
 
     /// Convert platform.report event to AWS CloudWatch REPORT log format
-    fn convert_platform_report_to_log_line(&self, record: &TelemetryRecord) -> Option<String> {
+    pub fn convert_platform_report_to_log_line(&self, record: &TelemetryRecord) -> Option<String> {
         // Record is already a serde_json::Value, no need to parse from string
         let request_id = record.record.get("requestId")?.as_str()?;
         let metrics = record.record.get("metrics")?;
