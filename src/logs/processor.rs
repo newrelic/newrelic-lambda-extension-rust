@@ -12,6 +12,8 @@ use std::{
     time::Duration,
 };
 
+use crate::apm::app::ApmApp;
+
 /// Safe mutex operations that won't panic and allow graceful degradation
 trait SafeMutexOps<T> {
     /// Safely lock a mutex, returning None if poisoned (instead of panicking)
@@ -58,6 +60,8 @@ pub struct LogProcessor {
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
     /// Failed logs buffer - logs that failed to send after all retries (with metadata stripped)
     failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
+    /// APM application instance for error event generation and entity.guid
+    apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
 }
 
 /// Failed log entry that stores the original log without invocation-specific metadata
@@ -99,6 +103,7 @@ impl LogProcessor {
         newrelic_client: Arc<NewRelicClient>,
         config: Arc<ExtensionConfig>,
         invocation_context: Arc<Mutex<InvocationContext>>,
+        apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     ) -> Self {
         // Only allocate trace ID structures if collection is enabled
         let (buffered_logs, trace_extraction_state) = if config.new_relic.collect_trace_id {
@@ -120,30 +125,25 @@ impl LogProcessor {
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+            apm_app,
         }
     }
 
-    /// Creates a no-op LogProcessor for disabled mode.
     pub fn new_noop() -> Self {
-        use crate::config::ExtensionConfig;
-        use crate::context::InvocationContext;
-        
-        let noop_config = Arc::new(ExtensionConfig::default());
-        let noop_invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
-        let noop_client = Arc::new(NewRelicClient::new_noop());
-        
         Self {
             log_batch: Arc::new(Mutex::new(Vec::new())),
-            newrelic_client: noop_client,
-            config: noop_config,
-            invocation_context: noop_invocation_context,
+            newrelic_client: Arc::new(NewRelicClient::new_noop()),
+            config: Arc::new(ExtensionConfig::default()),
+            invocation_context: Arc::new(Mutex::new(InvocationContext::default())),
             buffered_logs: None,
             trace_extraction_state: None,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+            apm_app: None,
         }
     }
+
     pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
         Arc::clone(&self.invocation_context)
     }
@@ -192,6 +192,20 @@ impl LogProcessor {
             }
         } else {
             warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
+        }
+        
+        // Add entity.guid if APM mode is active
+        if let Some(ref apm_app_arc) = self.apm_app {
+            // Try to read the APM app without blocking
+            if let Ok(apm_guard) = apm_app_arc.try_read() {
+                if let Some(ref app) = *apm_guard {
+                    let entity_guid = app.get_entity_guid();
+                    if !entity_guid.is_empty() {
+                        log_message.attributes.insert("entity.guid".to_string(),
+                            serde_json::Value::String(entity_guid.to_string()));
+                    }
+                }
+            }
         }
 
         log_message
@@ -427,7 +441,7 @@ impl LogProcessor {
             return;
         }
     
-        if let Some(log_message) = self.to_log_message(record) {
+        if let Some(log_message) = self.to_log_message(record.clone()) {
             // CRITICAL FIX: Always check if we have valid invocation context before processing
             let has_valid_context = {
                 let context = self.invocation_context.lock().unwrap();
@@ -443,6 +457,37 @@ impl LogProcessor {
                 request_buffer.push(log_message);
                
                 return;
+            }
+            
+            // APM MODE: Check for function log faults and generate error events
+            if let Some(ref apm_app_arc) = self.apm_app {
+                // Only check function logs, not extension logs
+                if record.record_type == "function" && message_str.len() > 0 {
+                    // Check if this looks like a fault/timeout/error
+                    if message_str.contains("Task timed out") ||
+                       message_str.contains("error") || message_str.contains("Error") ||
+                       message_str.contains("Exception") || message_str.contains("exception") ||
+                       message_str.contains("Fatal") || message_str.contains("fatal") {
+                        
+                        // Get context for error event
+                        let (request_id, function_arn) = {
+                            let context = self.invocation_context.lock().unwrap();
+                            (context.request_id.clone(), context.invoked_function_arn.clone())
+                        };
+                        
+                        // Send error event async (don't block log processing)
+                        let apm_clone = Arc::clone(apm_app_arc);
+                        let msg_clone = message_str.to_string();
+                        tokio::spawn(async move {
+                            let apm_guard = apm_clone.read().await;
+                            if let Some(ref app) = *apm_guard {
+                                if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
+                                    debug!("Failed to send error event from function log fault: {}", e);
+                                }
+                            }
+                        });
+                    }
+                }
             }
     
             // Apply current invocation metadata (this will now have valid values)

@@ -31,6 +31,8 @@ anyhow = "1.0"
 once_cell = "1.19"
 dashmap = "6.1"
 bytes = "1.5"
+regex = "1.10"  # For parsing platform REPORT logs in APM mode
+rand = "0.8"  # For TraceID/SpanID generation in APM mode
 
 # AWS dependencies - ALWAYS INCLUDED as default (as you requested)
 aws-config = { version = "1.8", features = ["behavior-version-latest"] }

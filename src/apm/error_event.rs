@@ -1,0 +1,227 @@
+//! Error event generation for platform faults and timeouts
+//!
+//! Based on error_event.go from Go implementation
+
+use super::id_generator::TraceIDGenerator;
+use serde_json::{json, Value};
+use tracing::debug;
+
+/// Generate error event from platform fault/timeout log
+/// Returns full APM error event structure matching Go implementation
+pub fn generate_error_event_from_fault(
+    log_line: &str,
+    request_id: &str,
+    function_arn: &str,
+) -> Option<Vec<Value>> {
+    // Check if this is a Task timed out or fault log
+    let is_timeout = log_line.contains("Task timed out");
+    let is_fault = log_line.contains("error") 
+        || log_line.contains("ERROR") 
+        || log_line.contains("Error")
+        || log_line.contains("exception")
+        || log_line.contains("Exception");
+
+    if !is_timeout && !is_fault {
+        return None;
+    }
+
+    let error_message = if is_timeout {
+        "Task timed out".to_string()
+    } else {
+        // Extract error message from log line
+        extract_error_message(log_line)
+    };
+
+    let error_class = if is_timeout {
+        "LambdaTimeout"
+    } else {
+        "LambdaError"
+    };
+
+    debug!(
+        "Generating error event for request {}: {} - {}",
+        request_id, error_class, error_message
+    );
+
+    // Generate distributed tracing IDs
+    let trace_gen = TraceIDGenerator::new(1453);
+    let span_id = trace_gen.generate_span_id();
+    let trace_id = trace_gen.generate_trace_id();
+    let guid = trace_gen.generate_trace_id();
+    let priority = trace_gen.float32() as f64 * 2.0; // Priority between 0.0 and 2.0
+
+    // Create full APM error event structure matching Go MapToErrorEventData
+    // Format: [run_id, {events_seen, reservoir_size}, [[[event_detail, {}, user_attrs]]]]
+    let timestamp_ms = chrono::Utc::now().timestamp_millis();
+    
+    let function_name = extract_function_name(function_arn);
+    let transaction_name = format!("OtherTransaction/Function/{}", function_name);
+    
+    // Extract function version from ARN if available
+    let function_version = extract_function_version(function_arn);
+    
+    // Event detail (intrinsic attributes)
+    let event_detail = json!({
+        "duration": 0.1,
+        "error.class": error_class,
+        "error.expected": false,
+        "error.message": error_message,
+        "guid": guid,
+        "nr.transactionGuid": guid,
+        "priority": priority,
+        "sampled": true,
+        "spanId": span_id,
+        "timestamp": timestamp_ms,
+        "traceId": trace_id,
+        "transactionName": transaction_name,
+        "type": "TransactionError",
+    });
+
+    // Agent attributes (empty object)
+    let agent_attrs = json!({});
+
+    // User attributes
+    let user_attrs = json!({
+        "aws.lambda.arn": function_arn,
+        "aws.lambda.functionVersion": function_version,
+        "aws.requestId": request_id,
+    });
+
+    // Full event array: [[event_detail, agent_attrs, user_attrs]]
+    let event_array = vec![json!([event_detail, agent_attrs, user_attrs])];
+
+    // Return placeholder - will be wrapped with run_id in collector
+    Some(event_array)
+}
+
+/// Extract function name from ARN
+fn extract_function_name(arn: &str) -> String {
+    // ARN format: arn:aws:lambda:region:account-id:function:function-name[:version]
+    let parts: Vec<&str> = arn.split(':').collect();
+    if parts.len() >= 7 {
+        parts[6].to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Extract function version from ARN
+fn extract_function_version(arn: &str) -> String {
+    // ARN format: arn:aws:lambda:region:account-id:function:function-name[:version]
+    let parts: Vec<&str> = arn.split(':').collect();
+    if parts.len() >= 8 {
+        parts[7].to_string()
+    } else {
+        "$LATEST".to_string()
+    }
+}
+
+/// Extract error message from log line
+fn extract_error_message(log_line: &str) -> String {
+    // Try to find the actual error message
+    if let Some(pos) = log_line.find("error:") {
+        log_line[pos..].chars().take(200).collect()
+    } else if let Some(pos) = log_line.find("ERROR") {
+        log_line[pos..].chars().take(200).collect()
+    } else if let Some(pos) = log_line.find("Error:") {
+        log_line[pos..].chars().take(200).collect()
+    } else if let Some(pos) = log_line.find("Exception:") {
+        log_line[pos..].chars().take(200).collect()
+    } else {
+        // Return first 200 chars as fallback
+        log_line.chars().take(200).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_error_event_from_timeout() {
+        let log = "2024-01-15T12:34:56.789Z abc123 Task timed out after 30.00 seconds";
+        let events = generate_error_event_from_fault(
+            log,
+            "abc123",
+            "arn:aws:lambda:us-east-1:123456789:function:my-function:1",
+        );
+        
+        assert!(events.is_some());
+        let events = events.unwrap();
+        assert_eq!(events.len(), 1);
+        
+        // Verify structure: [[event_detail, agent_attrs, user_attrs]]
+        let event_array = &events[0];
+        assert!(event_array.is_array());
+        let inner_array = event_array.as_array().unwrap();
+        assert_eq!(inner_array.len(), 3); // [event_detail, agent_attrs, user_attrs]
+        
+        let event_detail = &inner_array[0];
+        let user_attrs = &inner_array[2];
+        
+        // Verify event detail
+        assert_eq!(event_detail["error.class"], "LambdaTimeout");
+        assert_eq!(event_detail["error.message"], "Task timed out");
+        assert_eq!(event_detail["type"], "TransactionError");
+        assert_eq!(event_detail["error.expected"], false);
+        assert_eq!(event_detail["sampled"], true);
+        assert!(event_detail["spanId"].is_string());
+        assert!(event_detail["traceId"].is_string());
+        assert!(event_detail["guid"].is_string());
+        assert!(event_detail["priority"].is_number());
+        
+        // Verify user attributes
+        assert_eq!(user_attrs["aws.requestId"], "abc123");
+        assert_eq!(user_attrs["aws.lambda.functionVersion"], "1");
+    }
+
+    #[test]
+    fn test_extract_function_name() {
+        assert_eq!(
+            extract_function_name("arn:aws:lambda:us-east-1:123456789:function:my-function"),
+            "my-function"
+        );
+        assert_eq!(
+            extract_function_name("arn:aws:lambda:us-east-1:123456789:function:my-function:2"),
+            "my-function"
+        );
+        assert_eq!(extract_function_name("unknown"), "unknown");
+    }
+
+    #[test]
+    fn test_extract_function_version() {
+        assert_eq!(
+            extract_function_version("arn:aws:lambda:us-east-1:123456789:function:my-function:2"),
+            "2"
+        );
+        assert_eq!(
+            extract_function_version("arn:aws:lambda:us-east-1:123456789:function:my-function"),
+            "$LATEST"
+        );
+    }
+
+    #[test]
+    fn test_no_error_event_for_normal_log() {
+        let log = "INFO: Processing request";
+        let events = generate_error_event_from_fault(log, "abc", "arn");
+        assert!(events.is_none());
+    }
+    
+    #[test]
+    fn test_error_event_with_fault() {
+        let log = "ERROR: Something went wrong in the function";
+        let events = generate_error_event_from_fault(
+            log,
+            "xyz789",
+            "arn:aws:lambda:us-west-2:987654321:function:error-function",
+        );
+        
+        assert!(events.is_some());
+        let events = events.unwrap();
+        let event_array = &events[0].as_array().unwrap();
+        let event_detail = &event_array[0];
+        
+        assert_eq!(event_detail["error.class"], "LambdaError");
+        assert!(event_detail["error.message"].as_str().unwrap().contains("ERROR"));
+    }
+}

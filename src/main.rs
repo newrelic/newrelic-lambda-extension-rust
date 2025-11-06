@@ -13,6 +13,7 @@ mod agent;
 mod credentials;
 mod trace;
 mod version;
+mod apm;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -116,11 +117,12 @@ static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
 struct ProcessorFactory {
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<config::ExtensionConfig>,
+    apm_app: apm::SharedApmApp,
 }
 
 impl ProcessorFactory {
-    fn new(newrelic_client: Arc<NewRelicClient>, config: Arc<config::ExtensionConfig>) -> Self {
-        Self { newrelic_client, config }
+    fn new(newrelic_client: Arc<NewRelicClient>, config: Arc<config::ExtensionConfig>, apm_app: apm::SharedApmApp) -> Self {
+        Self { newrelic_client, config, apm_app }
     }
     
     fn create_log_processor(&self, request_context: Arc<Mutex<InvocationContext>>) -> Arc<LogProcessor> {
@@ -128,6 +130,7 @@ impl ProcessorFactory {
             Arc::clone(&self.newrelic_client),
             Arc::clone(&self.config),
             request_context,
+            Some(Arc::clone(&self.apm_app)),
         ))
     }
     
@@ -183,6 +186,7 @@ struct ExtensionComponents {
     harvester: Arc<Harvester>,
     harvester_handle: tokio::task::JoinHandle<()>,
     global_log_processor: Arc<LogProcessor>,
+    apm_app: apm::SharedApmApp,
 }
 
 // --- Structs for API Responses ---
@@ -342,9 +346,11 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         
         // Create noop processor factory
         let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
+        let noop_apm_app = Arc::new(tokio::sync::RwLock::new(None));
         let noop_processor_factory = Arc::new(ProcessorFactory::new(
             noop_newrelic_client.clone(),
-            config.clone()
+            config.clone(),
+            noop_apm_app.clone()
         ));
         
         // Create dummy processors for harvester
@@ -366,6 +372,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
+            apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         });
     }
 
@@ -394,9 +401,11 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         
         // Return no-op components (extension already registered for SHUTDOWN events)
         let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
+        let noop_apm_app = Arc::new(tokio::sync::RwLock::new(None));
         let noop_processor_factory = Arc::new(ProcessorFactory::new(
             noop_newrelic_client.clone(),
-            config.clone()
+            config.clone(),
+            noop_apm_app.clone()
         ));
         
         // Create dummy processors for harvester
@@ -418,6 +427,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
+            apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         });
     };
 
@@ -497,10 +507,40 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     // Start batch timeout background task (checks every 30 seconds for 5-minute timeout)
     start_batch_timeout_task(Arc::clone(&newrelic_client), Arc::clone(&config));
 
-    // Create processor factory for request-scoped processors
+    // 9. Initialize APM app if APM mode is enabled (before processor factory)
+    let apm_app = if config.new_relic.apm_lambda_mode {
+        info!("APM Lambda mode enabled - initializing APM connection");
+        let license_key = config.new_relic.license_key.clone()
+            .expect("License key must be available for APM mode");
+        
+        match apm::ApmApp::new(
+            license_key,
+            config.new_relic.apm_host.clone(),
+            config.new_relic.metric_endpoint.clone(),
+            (*client).clone(),
+        ).await {
+            Ok(app) => {
+                info!(
+                    "APM app initialized successfully - Entity GUID: {}",
+                    app.get_entity_guid()
+                );
+                Arc::new(tokio::sync::RwLock::new(Some(app)))
+            }
+            Err(e) => {
+                warn!("Failed to initialize APM app: {} - continuing without APM mode", e);
+                Arc::new(tokio::sync::RwLock::new(None))
+            }
+        }
+    } else {
+        debug!("APM Lambda mode disabled");
+        Arc::new(tokio::sync::RwLock::new(None))
+    };
+
+    // Create processor factory for request-scoped processors (with apm_app)
     let processor_factory = Arc::new(ProcessorFactory::new(
         Arc::clone(&newrelic_client),
-        Arc::clone(&config)
+        Arc::clone(&config),
+        Arc::clone(&apm_app)
     ));
     
     // Setup telemetry listener (use global current context that gets updated per request)
@@ -535,6 +575,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         harvester,
         harvester_handle,
         global_log_processor: temp_log_processor,
+        apm_app,
     })
 }
 
@@ -576,8 +617,9 @@ async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::er
     Ok(Client::builder()
         // Remove global timeout - let individual requests set their own timeouts
         // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
+        .connect_timeout(Duration::from_secs(10)) // Connection establishment timeout
         .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer for Lambda runtime API
-        .pool_max_idle_per_host(2) // Limit idle connections
+        .pool_max_idle_per_host(10) // Allow more parallel connections for APM telemetry sending
         .tcp_keepalive(Duration::from_secs(60)) // Enable TCP keepalive
         .build()?)
 }
@@ -744,6 +786,7 @@ async fn process_and_send_agent_payload(
     log_processor: &Arc<LogProcessor>,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
+    apm_app: &apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Extract trace ID only if enabled via config
     if config.new_relic.collect_trace_id {
@@ -760,28 +803,50 @@ async fn process_and_send_agent_payload(
         debug!("Trace ID collection disabled, skipping extraction");
     }
     
-    // Actually send the agent payload to New Relic
-    match send_agent_payload_to_newrelic(
-        payload_bytes,
-        request_id,
-        invoked_function_arn,
-        newrelic_client,
-        config,
-    ).await {
-        Ok(_) => {
-            info!("Agent payload processed and sent (size: {} bytes)", payload_bytes.len());
+    // Route to APM mode or standard mode
+    let apm_app_guard = apm_app.read().await;
+    if let Some(ref app) = *apm_app_guard {
+        // APM mode: parse and send to APM collector
+        info!("APM mode: Processing agent payload (size: {} bytes)", payload_bytes.len());
+        match app.process_agent_payload(payload_bytes.to_vec()).await {
+            Ok(_) => {
+                info!("APM agent payload processed and sent successfully");
+            }
+            Err(e) => {
+                error!("Failed to send agent payload to APM collector: {}", e);
+                // Buffer for retry
+                buffer_failed_agent_payload(
+                    payload_bytes,
+                    request_id,
+                    invoked_function_arn,
+                );
+                warn!("APM agent payload buffered for retry (size: {} bytes)", payload_bytes.len());
+            }
         }
-        Err(e) => {
-            error!("Failed to send agent payload for request {}: {}", request_id, e);
-            
-            // Buffer the failed payload for retry
-            buffer_failed_agent_payload(
-                payload_bytes,
-                request_id,
-                invoked_function_arn,
-            );
-            
-            warn!("Agent payload buffered for retry (size: {} bytes)", payload_bytes.len());
+    } else {
+        // Standard mode: send to serverless ingest API
+        match send_agent_payload_to_newrelic(
+            payload_bytes,
+            request_id,
+            invoked_function_arn,
+            newrelic_client,
+            config,
+        ).await {
+            Ok(_) => {
+                info!("Agent payload processed and sent (size: {} bytes)", payload_bytes.len());
+            }
+            Err(e) => {
+                error!("Failed to send agent payload for request {}: {}", request_id, e);
+                
+                // Buffer the failed payload for retry
+                buffer_failed_agent_payload(
+                    payload_bytes,
+                    request_id,
+                    invoked_function_arn,
+                );
+                
+                warn!("Agent payload buffered for retry (size: {} bytes)", payload_bytes.len());
+            }
         }
     }
     
@@ -946,6 +1011,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                 let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
+                let apm_app_clone = components.apm_app.clone();
 
                 let processing_handle = tokio::spawn(async move {
                     process_request_concurrently(
@@ -955,6 +1021,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
                         newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
+                        apm_app_clone,
                     ).await;
                 });
 
@@ -1000,6 +1067,7 @@ async fn process_request_concurrently(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<config::ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
+    apm_app: apm::SharedApmApp,
 ) {
     debug!("Starting processing for request: {}", request_id);
 
@@ -1092,6 +1160,7 @@ async fn process_request_concurrently(
         let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
+        let apm_app_clone = apm_app.clone();
 
         Some(tokio::spawn(async move {
             send_agent_with_report_immediately(
@@ -1102,6 +1171,7 @@ async fn process_request_concurrently(
                 newrelic_client_clone,
                 config_clone,
                 global_log_processor_clone,
+                apm_app_clone,
             ).await;
         }))
     } else if report_line.is_some() {
@@ -1112,6 +1182,7 @@ async fn process_request_concurrently(
         let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
+        let apm_app_clone = apm_app.clone();
 
         Some(tokio::spawn(async move {
             send_agent_with_report_immediately(
@@ -1122,6 +1193,7 @@ async fn process_request_concurrently(
                 newrelic_client_clone,
                 config_clone,
                 global_log_processor_clone,
+                apm_app_clone,
             ).await;
         }))
     } else {
@@ -1194,6 +1266,7 @@ async fn process_request_agent_payloads(
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<config::ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
+    apm_app: &apm::SharedApmApp,
 ) {
     // Get payloads from request-specific buffer
     let payloads = {
@@ -1221,6 +1294,7 @@ async fn process_request_agent_payloads(
             global_log_processor,
             newrelic_client,
             config,
+            apm_app,
         ).await {
             error!("Error processing agent payload for request {}: {}", request_id, e);
         }
@@ -1438,59 +1512,93 @@ async fn send_agent_with_report_immediately(
     newrelic_client: Arc<crate::newrelic::client::NewRelicClient>,
     config: Arc<crate::config::ExtensionConfig>,
     _global_log_processor: Arc<crate::logs::processor::LogProcessor>,
+    apm_app: apm::SharedApmApp,
 ) {
     let has_report = report_line.is_some();
     debug!("Sending agent payload immediately for {} (with report: {})", request_id, has_report);
 
+    // Check if APM mode is enabled
+    let apm_app_guard = apm_app.read().await;
+    let is_apm_mode = apm_app_guard.is_some();
+
     for payload_bytes in agent_payloads {
-        // Build log events array with optional report
-        let mut log_events = Vec::new();
+        if let Some(ref app) = *apm_app_guard {
+            // APM MODE: Send agent payload to APM collector
+            info!("APM mode: Sending agent payload for request: {}", request_id);
+            if let Err(e) = app.process_agent_payload(payload_bytes.clone()).await {
+                error!("Failed to send agent payload to APM collector for {}: {}", request_id, e);
+            }
+            
+            // Send REPORT log metrics to APM if available
+            if let Some(ref report) = report_line {
+                debug!("APM mode: Sending platform REPORT metrics for request: {}", request_id);
+                if let Err(e) = app.send_platform_report_metrics(report).await {
+                    error!("Failed to send platform REPORT metrics for {}: {}", request_id, e);
+                }
+                
+                // Check for faults/timeouts in REPORT log and generate error events
+                if report.contains("Task timed out") || report.contains("error") || report.contains("Error") {
+                    debug!("APM mode: Detected fault/timeout in REPORT log, generating error event");
+                    if let Err(e) = app.send_error_event_from_fault(report, &request_id, &invoked_function_arn).await {
+                        error!("Failed to send error event for fault in {}: {}", request_id, e);
+                    }
+                }
+            }
+        } else {
+            // STANDARD MODE: Send to serverless ingest API
+            // Build log events array with optional report
+            let mut log_events = Vec::new();
 
-        // Add agent payload FIRST (try UTF-8 first to avoid allocation)
-        let agent_str = match std::str::from_utf8(&payload_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(&payload_bytes).to_string(),
-        };
-        log_events.push(serde_json::json!({
-            "id": request_id,
-            "message": agent_str,
-            "timestamp": chrono::Utc::now().timestamp_millis(),
-        }));
-
-        // Add report line SECOND (if available)
-        if let Some(ref report) = report_line {
+            // Add agent payload FIRST (try UTF-8 first to avoid allocation)
+            let agent_str = match std::str::from_utf8(&payload_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(&payload_bytes).to_string(),
+            };
             log_events.push(serde_json::json!({
                 "id": request_id,
-                "message": report,
+                "message": agent_str,
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             }));
+
+            // Add report line SECOND (if available)
+            if let Some(ref report) = report_line {
+                log_events.push(serde_json::json!({
+                    "id": request_id,
+                    "message": report,
+                    "timestamp": chrono::Utc::now().timestamp_millis(),
+                }));
+            }
+
+            // Wrap in New Relic format
+            let entry = serde_json::json!({
+                "logEvents": log_events,
+                "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
+                "logStream": format!("newrelic-lambda-extension:{}", crate::EXTENSION_VERSION),
+                "messageType": "",
+                "owner": "",
+            });
+
+            let payload = serde_json::json!({
+                "context": {
+                    "function_name": config.aws.function_name,
+                    "invoked_function_arn": invoked_function_arn,
+                    "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
+                    "log_stream_name": format!("newrelic-lambda-extension:{}", crate::EXTENSION_VERSION),
+                },
+                "entry": entry.to_string(),
+            });
+
+            let payload_json = payload.to_string();
+
+            // Send to New Relic
+            if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
+                error!("Failed to send agent payload for {}: {}", request_id, e);
+            }
         }
-
-        // Wrap in New Relic format
-        let entry = serde_json::json!({
-            "logEvents": log_events,
-            "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
-            "logStream": format!("newrelic-lambda-extension:{}", crate::EXTENSION_VERSION),
-            "messageType": "",
-            "owner": "",
-        });
-
-        let payload = serde_json::json!({
-            "context": {
-                "function_name": config.aws.function_name,
-                "invoked_function_arn": invoked_function_arn,
-                "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
-                "log_stream_name": format!("newrelic-lambda-extension:{}", crate::EXTENSION_VERSION),
-            },
-            "entry": entry.to_string(),
-        });
-
-        let payload_json = payload.to_string();
-
-        // Send to New Relic
-        if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
-            error!("Failed to send agent payload for {}: {}", request_id, e);
-        }
+    }
+    
+    if is_apm_mode {
+        info!("APM mode: Agent payload and platform metrics sent for request: {}", request_id);
     }
 }
 

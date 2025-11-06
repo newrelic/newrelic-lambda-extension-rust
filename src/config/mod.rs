@@ -51,6 +51,15 @@ pub struct NewRelicConfig {
 
     /// Enable/disable adding version detail tags (agent, extension, layer versions)
     pub add_version_detail_tags: bool,
+
+    /// Enable APM Lambda Mode (sends to APM collector instead of serverless endpoint)
+    pub apm_lambda_mode: bool,
+
+    /// APM collector host (overridable via NEW_RELIC_HOST)
+    pub apm_host: String,
+
+    /// Metric API endpoint for platform metrics in APM mode
+    pub metric_endpoint: String,
 }
 
 /// AWS Lambda specific configuration
@@ -126,6 +135,9 @@ impl Default for NewRelicConfig {
             harvest_interval: Duration::from_secs(2), // More frequent flushing
             collect_trace_id: false, // Disabled by default
             add_version_detail_tags: false, // Disabled by default
+            apm_lambda_mode: false, // Disabled by default
+            apm_host: "collector.newrelic.com".to_string(),
+            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
         }
     }
 }
@@ -244,7 +256,25 @@ impl ExtensionConfig {
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
+        // Parse APM Lambda Mode flag
+        let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
+        config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
+
+        // Set APM collector host (can be overridden via NEW_RELIC_HOST)
+        if let Ok(host) = env::var("NEW_RELIC_HOST") {
+            config.new_relic.apm_host = host;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+        }
+
+        // Set Metric API endpoint (can be overridden via NEW_RELIC_METRIC_ENDPOINT)
+        if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
+            config.new_relic.metric_endpoint = endpoint;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+        }
 
         if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
             config.new_relic.telemetry_endpoint = endpoint;
