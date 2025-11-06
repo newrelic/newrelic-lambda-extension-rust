@@ -89,13 +89,14 @@ pub async fn send_error_events(
     let compressed = encoder.finish()?;
 
     debug!(
-        "Sending {} error events to APM collector: {} bytes compressed (from {} bytes)",
+        "Sending {} error events: compressed={} bytes, uncompressed={} bytes",
         error_events.len(),
         compressed.len(),
         uncompressed_len
     );
 
-    // NOTE: Do NOT set Content-Length header - let reqwest calculate it from the compressed body
+    // NOTE: NOT setting Content-Length - let reqwest auto-calculate from body
+    // Go sets Content-Length=uncompressed but this causes issues with strict HTTP servers
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -104,7 +105,7 @@ pub async fn send_error_events(
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20))  // Match Go's 20-second timeout
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
 
@@ -182,12 +183,15 @@ pub async fn send_apm_telemetry(
     );
     
     debug!(
-        "Request headers: User-Agent={}, Content-Type=application/octet-stream, Content-Encoding=gzip",
-        get_user_agent()
+        "Sending {} to APM: compressed={} bytes, uncompressed={} bytes",
+        command,
+        compressed.len(),
+        uncompressed_len
     );
 
-    // NOTE: Do NOT set Content-Length header - let reqwest calculate it from the compressed body
-    // Go code incorrectly sets Content-Length to uncompressed size, but collector ignores it when Content-Encoding: gzip is present
+    // NOTE: NOT setting Content-Length - let reqwest auto-calculate from body
+    // Go sets Content-Length=uncompressed but this causes issues with strict HTTP servers
+    // Reqwest will either set Content-Length=compressed or use chunked encoding
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -196,7 +200,7 @@ pub async fn send_apm_telemetry(
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20))  // Match Go's 20-second timeout
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
 

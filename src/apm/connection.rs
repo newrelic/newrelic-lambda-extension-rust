@@ -107,8 +107,6 @@ pub async fn preconnect(
     let compressed_body = encoder.finish()?;
 
     debug!("PreConnect request to: {}", url);
-    debug!("PreConnect request body (uncompressed): {}", String::from_utf8_lossy(&body));
-    debug!("Compressed body size: {} bytes", compressed_body.len());
 
     let response = client
         .post(&url)
@@ -182,8 +180,6 @@ pub async fn connect(
     let compressed_body = encoder.finish()?;
 
     debug!("Connect request to: {}", url);
-    debug!("Connect payload (uncompressed): {}", String::from_utf8_lossy(&body));
-    debug!("Compressed body size: {} bytes", compressed_body.len());
 
     let response = client
         .post(&url)

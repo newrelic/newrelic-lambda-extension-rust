@@ -75,7 +75,6 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
         }
         "1" | _ => {
             // Protocol v1: unmarshal to wrapper with "metadata" and "data" fields
-            trace!("Parsing v1 payload: {}", String::from_utf8_lossy(&uncompressed_json));
             let wrapper: LambdaRawData = serde_json::from_slice(&uncompressed_json)
                 .map_err(|e| anyhow!("Failed to parse v1 payload: {} - Payload preview: {}", e, 
                     String::from_utf8_lossy(&uncompressed_json).chars().take(500).collect::<String>()))?;
