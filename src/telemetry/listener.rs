@@ -130,6 +130,19 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 // Create report line using platform processor
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
+                                    
+                                    // APM MODE: Send platform.report metrics to Metric API
+                                    {
+                                        let apm_app_read = crate::APM_APP.read().await;
+                                        if let Some(ref app) = *apm_app_read {
+                                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                                                warn!("Failed to send platform.report metrics for {}: {}", request_id_str, e);
+                                            } else {
+                                                debug!("Sent platform.report metrics for request: {}", request_id_str);
+                                            }
+                                        }
+                                    }
+                                    
                                     // Strategy 1: Try to match with already batched agent first (most common warm start case)
                                     if let Some(mut batch_item) = crate::AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                         batch_item.report_line = Some(report_line);

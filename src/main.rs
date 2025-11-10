@@ -82,6 +82,11 @@ static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>> =
 static FAILED_AGENT_PAYLOADS: Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
+// Global APM app instance (for sending platform.report metrics in APM mode)
+static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
+    Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+
+
 // --- AGENT PAYLOAD BATCHING ---
 // Batch buffer for agent payloads with optional report lines (warm starts only)
 static AGENT_BATCH_BUFFER: Lazy<Arc<DashMap<String, BatchedAgentPayload>>> =
@@ -530,7 +535,13 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
                     "APM app initialized successfully - Entity GUID: {}",
                     app.get_entity_guid()
                 );
-                Arc::new(tokio::sync::RwLock::new(Some(app)))
+                // Store in global APM_APP for access by telemetry listener
+                {
+                    let mut global_apm = APM_APP.write().await;
+                    *global_apm = Some(app);
+                }
+                // Return a clone of the global Arc
+                Arc::clone(&APM_APP)
             }
             Err(e) => {
                 warn!("Failed to initialize APM app: {} - continuing without APM mode", e);
@@ -1356,6 +1367,69 @@ async fn process_apm_request(
         *active_request = Some(request_id.clone());
     }
 
+    // WARM START: Check for and process any pending late agent payloads from previous invocations
+    if !is_cold_start {
+        // Find all buffers that have payloads (excluding current request)
+        let pending_buffers: Vec<String> = REQUEST_AGENT_BUFFERS
+            .iter()
+            .filter_map(|entry| {
+                let req_id = entry.key();
+                if req_id != &request_id {
+                    if let Ok(buffer) = entry.value().lock() {
+                        if !buffer.is_empty() {
+                            return Some(req_id.clone());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
+        if !pending_buffers.is_empty() {
+            info!(
+                "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
+                pending_buffers.len()
+            );
+
+            for old_request_id in pending_buffers {
+                debug!("Processing late agent payload for request: {}", old_request_id);
+                
+                // Extract payloads from buffer
+                let late_payloads = if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
+                    if let Ok(mut buffer) = buffer_ref.lock() {
+                        std::mem::take(&mut *buffer)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                // Send late payloads to APM collector
+                for payload_bytes in late_payloads {
+                    debug!("Sending late agent payload for request: {} ({} bytes)", old_request_id, payload_bytes.len());
+                    
+                    if let Err(e) = send_to_apm_collector(
+                        &payload_bytes,
+                        &old_request_id,
+                        &invoked_function_arn,
+                        &newrelic_client,
+                        &config,
+                        &apm_app,
+                    ).await {
+                        error!("Failed to send late agent payload for {}: {}", old_request_id, e);
+                    } else {
+                        info!("Successfully sent late agent payload for request: {}", old_request_id);
+                    }
+                }
+
+                // Cleanup old request resources after sending late payload
+                debug!("Cleaning up resources for old request after late payload: {}", old_request_id);
+                cleanup_request_processing_state_internal(&old_request_id, false);
+            }
+        }
+    }
+
     // Get request processing state
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
@@ -1407,7 +1481,7 @@ async fn process_apm_request(
                 debug!("Agent payload received early for request: {} (saved wait time)", request_id);
             }
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                debug!("Agent payload wait timeout (200ms) for request: {}", request_id);
+                debug!("Agent payload wait timeout (200ms) for request: {} - may arrive late", request_id);
             }
         }
     } else {
@@ -1423,11 +1497,11 @@ async fn process_apm_request(
         }
     };
 
-    // Send agent payload immediately to APM collector
-    let send_agent_task = if agent_payloads.is_empty() {
-        info!("APM mode: No agent payload for request: {}", request_id);
-        None
-    } else {
+    // Track if we got the payload now or need to wait for late arrival
+    let got_payload_now = !agent_payloads.is_empty();
+    
+    // Send agent payload immediately to APM collector if available
+    let send_agent_task = if got_payload_now {
         info!("APM mode: Sending {} agent payload(s) immediately to APM collector", agent_payloads.len());
         let request_id_clone = request_id.clone();
         let invoked_function_arn_clone = invoked_function_arn.clone();
@@ -1454,6 +1528,9 @@ async fn process_apm_request(
                 }
             }
         }))
+    } else {
+        debug!("APM mode: No agent payload yet for request: {} - buffer kept alive for late arrival", request_id);
+        None
     };
 
     // Flush logs, platform data, and agent send ALL IN PARALLEL
@@ -1483,24 +1560,28 @@ async fn process_apm_request(
         error!("Agent send task failed for request {}: {}", request_id, e);
     }
     
-    // APM WARM START: Keep buffer alive for late payloads
-    // COLD START or cleanup: Remove everything
-    let skip_buffer_cleanup = !is_cold_start;
-    
-    if skip_buffer_cleanup {
-        debug!("APM warm start - keeping buffer alive for late agent payload (will process on next invoke)");
-    }
-    
-    cleanup_request_processing_state_internal(&request_id, skip_buffer_cleanup);
-    
-    // CRITICAL: Keep active request ID for warm starts (so late payloads route correctly)
-    // Only clear for cold starts when buffer is also cleared
-    if is_cold_start {
+    // APM Mode Cleanup Strategy:
+    // - If we got the payload now and sent it: CLEANUP immediately
+    // - If payload not arrived yet: KEEP buffer alive for late arrival (next invocation will process it)
+    if got_payload_now {
+        debug!("APM mode: Agent payload sent - cleaning up all resources for request: {}", request_id);
+        cleanup_request_processing_state_internal(&request_id, false);
+        
+        // Clear active request ID
         if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
             *active_request = None;
         }
     } else {
-        debug!("APM warm start - keeping active request ID for late payload routing");
+        debug!("APM mode: No payload yet - keeping buffer alive for late arrival (will process on next invoke)");
+        // Keep buffer and context alive - cleanup will happen when:
+        // 1. Next invocation arrives and processes pending buffers
+        // 2. Or late payload arrives and gets sent
+        cleanup_request_processing_state_internal(&request_id, true); // skip_buffer_cleanup = true
+        
+        // Keep active request ID so late payloads route correctly
+        if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active_request = Some(request_id.clone());
+        }
     }
     
     debug!("APM mode: Completed processing for request: {}", request_id);
