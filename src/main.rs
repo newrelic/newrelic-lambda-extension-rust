@@ -154,10 +154,8 @@ impl ProcessorFactory {
     }
 }
 
-// --- PER-REQUEST PROCESSING STATE ---
 #[derive(Debug)]
 struct RequestProcessingState {
-    request_id: String,
     context: Arc<Mutex<InvocationContext>>,
     platform_processor: Arc<PlatformProcessor>,
     agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -165,7 +163,6 @@ struct RequestProcessingState {
     runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
-// --- FAILED AGENT PAYLOAD FOR RETRY ---
 #[derive(Debug, Clone)]
 struct FailedAgentPayload {
     payload_bytes: Vec<u8>,
@@ -193,14 +190,10 @@ struct ExtensionComponents {
     processor_factory: Arc<ProcessorFactory>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<config::ExtensionConfig>,
-    runtime_done_rx: mpsc::UnboundedReceiver<()>,
-    harvester: Arc<Harvester>,
     harvester_handle: tokio::task::JoinHandle<()>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: apm::SharedApmApp,
 }
-
-// --- Structs for API Responses ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ExtensionRegistrationResponse {
@@ -371,7 +364,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             trace_id: None,
         }));
         let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
-        let noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
+        let _noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
         
         return Ok(ExtensionComponents {
             client,
@@ -379,17 +372,12 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             processor_factory: noop_processor_factory,
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
-            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         });
     }
 
-    // 2. PARALLEL CRITICAL OPERATIONS: License key validation + Extension registration
-    //    Both are required regardless of no-op mode (extension needs SHUTDOWN events)
-    info!("Starting parallel license key validation and extension registration...");
     let (license_key_result, registration_result) = tokio::join!(
         resolve_license_key_with_aws_fallback(&config),
         initialize_lambda_runtime_client_and_register()
@@ -426,7 +414,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             trace_id: None,
         }));
         let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
-        let noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
+        let _noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
         
         return Ok(ExtensionComponents {
             client,
@@ -434,15 +422,12 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
             processor_factory: noop_processor_factory,
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
-            runtime_done_rx: mpsc::unbounded_channel::<()>().1,
-            harvester: Arc::new(Harvester::new(vec![], Duration::from_secs(1), noop_log_processor.clone(), noop_platform_processor)),
             harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         });
     };
 
-    // 3. Update config with validated license key
     let mut updated_config = (*config).clone();
     updated_config.new_relic.license_key = Some(license_key);
     let config = Arc::new(updated_config);
@@ -505,11 +490,10 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     );
 
     let agent_telemetry_rx = agent_telemetry_rx_result?;
-    let (runtime_done_tx, runtime_done_rx) = runtime_done_channels;
+    let (runtime_done_tx, _runtime_done_rx) = runtime_done_channels;
 
     info!("Extension components initialized - ID: {} (license key pre-validated)", extension_id);
 
-    // Start agent payload collector (background task)
     start_agent_payload_collector_background_task(agent_telemetry_rx);
 
     // Clean up very old failed payloads (older than 24 hours)
@@ -574,29 +558,24 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
     // 9. Subscribe to Lambda Telemetry API
     subscribe_to_lambda_telemetry_api(&client, &extension_id, telemetry_listener_address.port()).await?;
 
-    // 10. Start harvester background task (will be populated with per-request processors)
-    let (harvester, harvester_handle) = start_harvester_background_task(
-        vec![], // Empty processors vector - will be populated per request
+    let (_harvester, harvester_handle) = start_harvester_background_task(
+        vec![],
         config.new_relic.harvest_interval,
         &processor_factory,
     );
 
-    // 11. Return initialized components directly
     Ok(ExtensionComponents {
         client,
         extension_id,
         processor_factory,
         newrelic_client,
         config,
-        runtime_done_rx,
-        harvester,
         harvester_handle,
         global_log_processor: temp_log_processor,
         apm_app,
     })
 }
 
-/// Resolve license key with AWS fallback if needed
 async fn resolve_license_key_with_aws_fallback(config: &Arc<config::ExtensionConfig>) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Fix: Dereference the Arc to get &ExtensionConfig
     let credentials_config = config::Configuration::from(config.as_ref());
@@ -779,15 +758,6 @@ async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     }
 }
 
-
-
-// Channel coordination helper functions
-fn create_payload_coordination_channel(request_id: &str) -> mpsc::UnboundedReceiver<()> {
-    let (tx, rx) = mpsc::unbounded_channel();
-    PAYLOAD_COORDINATION.insert(request_id.to_string(), tx);
-    rx
-}
-
 fn cleanup_payload_coordination_channel(request_id: &str) {
     if PAYLOAD_COORDINATION.remove(request_id).is_some() {
         debug!("Cleaned up coordination channel for request {}", request_id);
@@ -891,19 +861,6 @@ async fn process_and_send_agent_payload(
     }
     
     Ok(())
-}
-
-fn update_trace_id_in_context(request_id: &str, trace_id: &str) {
-    if let Some(context) = get_request_context(request_id) {
-        if let Ok(mut ctx) = context.lock() {
-            ctx.trace_id = Some(trace_id.to_string());
-            debug!("Updated trace ID {} for request {}", trace_id, request_id);
-        } else {
-            error!("Failed to lock context for trace ID update for request {}", request_id);
-        }
-    } else {
-        error!("No context found for request {} during trace ID update", request_id);
-    }
 }
 
 async fn send_agent_payload_to_newrelic(
@@ -1814,50 +1771,6 @@ async fn process_request_concurrently(
     debug!("Standard mode: Completed processing for request: {}", request_id);
 }
 
-/// Process agent payloads for specific request
-async fn process_request_agent_payloads(
-    request_id: &str,
-    invoked_function_arn: &str,
-    state: &RequestProcessingState,
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<config::ExtensionConfig>,
-    global_log_processor: &Arc<LogProcessor>,
-    apm_app: &apm::SharedApmApp,
-) {
-    // Get payloads from request-specific buffer
-    let payloads = {
-        if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            error!("Failed to lock agent buffer for request: {}", request_id);
-            return;
-        }
-    };
-    
-    if payloads.is_empty() {
-        debug!("No agent payloads to process for request: {}", request_id);
-        return;
-    }
-    
-    debug!("Processing {} agent payloads for request: {}", payloads.len(), request_id);
-    
-    // Process each payload using the global log processor
-    for payload_bytes in payloads {
-        if let Err(e) = process_and_send_agent_payload(
-            &payload_bytes,
-            request_id,
-            invoked_function_arn,
-            global_log_processor,
-            newrelic_client,
-            config,
-            apm_app,
-        ).await {
-            error!("Error processing agent payload for request {}: {}", request_id, e);
-        }
-    }
-}
-
-/// Wait for all  requests to complete and flush batched payloads
 async fn wait_for_all_requests_completion(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<config::ExtensionConfig>,
@@ -1923,7 +1836,6 @@ fn create_request_processing_state(
     RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
 
     let state = RequestProcessingState {
-        request_id: request_id.to_string(),
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
@@ -1931,30 +1843,11 @@ fn create_request_processing_state(
         runtime_done_rx: Some(runtime_done_rx),
     };
 
-    // Store in global DashMaps for  access
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);
     REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer);
 
     debug!("Created per-request processing state for {} (using global log processor)", request_id);
     state
-}
-
-/// Create per-request agent buffer for  request handling
-fn create_request_agent_buffer(request_id: &str) -> Arc<Mutex<Vec<Vec<u8>>>> {
-    let buffer = Arc::new(Mutex::new(Vec::new()));
-    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), buffer.clone());
-    info!("Created per-request agent buffer for {}", request_id);
-    buffer
-}
-
-/// Get per-request context (for  requests)
-fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>> {
-    REQUEST_CONTEXTS.get(request_id).map(|entry| entry.value().clone())
-}
-
-/// Get per-request agent buffer (for  requests)
-fn get_request_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
-    REQUEST_AGENT_BUFFERS.get(request_id).map(|entry| entry.value().clone())
 }
 
 /// Clean up per-request processing state after processing
@@ -2325,28 +2218,6 @@ async fn send_batched_payloads(
     }
 }
 
-/// Check pending agent payloads for a given request context
-/// Returns (request_buffer_size, global_buffer_size)
-fn check_pending_agent_payloads(context: &Option<(String, String)>) -> (usize, usize) {
-    if let Some((request_id, _)) = context {
-        let request_buffer = get_request_agent_buffer(request_id);
-        let request_size = if let Some(request_buffer) = request_buffer {
-            if let Ok(buffer) = request_buffer.lock() {
-                buffer.len()
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        
-        (request_size, 0)
-    } else {
-        (0, 0)
-    }
-}
-
-/// Cleanup old failed payloads (called during initialization)
 fn cleanup_old_failed_payloads() {
     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
         let initial_count = failed_payloads.len();

@@ -16,25 +16,20 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Main APM application
 #[derive(Debug)]
 pub struct ApmApp {
     pub run_id: String,
     pub entity_guid: String,
     pub collector_host: String,
     pub license_key: String,
-    pub metric_endpoint: String,
     pub client: Client,
 }
 
 impl ApmApp {
-    /// Create new APM app with connection to APM collector
-    ///
-    /// Based on internal_app.go connectRoutine() with retry logic
     pub async fn new(
         license_key: String,
         apm_host: String,
-        metric_endpoint: String,
+        _metric_endpoint: String,
         client: Client,
     ) -> Result<Self> {
         info!("Initializing APM app connection");
@@ -122,23 +117,15 @@ impl ApmApp {
             .entity_guid
             .context("Missing entity_guid in Connect response")?;
 
-        // Get metric endpoint from environment or use US default
-        let metric_endpoint = std::env::var("NEW_RELIC_METRIC_ENDPOINT")
-            .unwrap_or_else(|_| "https://metric-api.newrelic.com/metric/v1".to_string());
-
         Ok(ApmApp {
             run_id,
             entity_guid,
             collector_host,
             license_key: license_key.to_string(),
-            metric_endpoint,
             client: client.clone(),
         })
     }
 
-    /// Process agent payload and send to APM collector
-    ///
-    /// Based on internal_app.go doHarvest()
     pub async fn process_agent_payload(&self, payload: Vec<u8>) -> Result<()> {
         debug!("Processing agent payload ({} bytes)", payload.len());
 
@@ -258,17 +245,15 @@ impl ApmApp {
         // Convert to APM metrics with entity GUID and function name
         let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
 
-        // Send to Metric API
         send_platform_metrics(
             &self.client,
             &self.license_key,
-            &self.metric_endpoint,
+            "https://metric-api.newrelic.com/metric/v1",
             metrics,
         )
         .await
     }
 
-    /// Send error event from platform fault/timeout
     pub async fn send_error_event_from_fault(
         &self,
         log_line: &str,
@@ -317,14 +302,12 @@ mod tests {
 
     #[test]
     fn test_apm_app_creation() {
-        // Test that ApmApp struct can be created
         let client = Client::new();
         let app = ApmApp {
             run_id: "test_run_id".to_string(),
             entity_guid: "test_guid".to_string(),
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
-            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             client,
         };
 

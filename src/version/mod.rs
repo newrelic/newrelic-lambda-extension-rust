@@ -26,7 +26,6 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
 const LAYER_AGENT_PATH_DOTNET: &[&str] = &["/opt/lib/newrelic-dotnet-agent"];
-const LAYER_AGENT_PATH_RUBY: &[&str] = &["/opt/ruby"];
 const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
     "/opt/ruby/gems/3.2.0/gems/newrelic_rpm",
     "/opt/ruby/gems/3.3.0/gems/newrelic_rpm",
@@ -36,9 +35,6 @@ const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
 const VENDOR_AGENT_PATH_NODE: &str = "/var/task/node_modules/newrelic";
 const VENDOR_AGENT_PATH_PYTHON: &str = "/var/task/newrelic";
 const VENDOR_AGENT_PATH_RUBY: &str = "/var/task/vendor/bundle/ruby/3.3.0/gems/newrelic_rpm";
-
-/// Runtime lookup path
-const RUNTIME_LOOKUP_PATH: &str = "/var/lang/bin";
 
 /// Version information structure
 #[derive(Debug, Clone)]

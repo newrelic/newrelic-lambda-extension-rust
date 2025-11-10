@@ -21,15 +21,12 @@ pub struct LambdaData {
     pub error_event_data: Vec<Value>,
     pub error_data: Vec<Value>,
     pub span_event_data: Vec<Value>,
-    pub update_loaded_modules: Vec<Value>,
     pub transaction_sample_data: Vec<Value>,
 }
 
 /// Protocol v1 wrapper with metadata and data fields
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LambdaRawData {
-    #[serde(default)]
-    pub metadata: Option<Value>,
     pub data: LambdaData,
 }
 
@@ -165,7 +162,6 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             error_event_data: get_field(&raw_map, "error_event_data", "errorEventData"),
             error_data: get_field(&raw_map, "error_data", "errorData"),
             span_event_data: get_field(&raw_map, "span_event_data", "spanEventData"),
-            update_loaded_modules: get_field(&raw_map, "update_loaded_modules", "updateLoadedModules"),
             transaction_sample_data: get_field(&raw_map, "transaction_sample_data", "transactionSampleData"),
         })
     }

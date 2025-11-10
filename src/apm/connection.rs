@@ -283,13 +283,6 @@ pub fn detect_agent_version(runtime: &str) -> String {
     "unknown".to_string()
 }
 
-/// Get AWS region from environment variables
-pub fn get_aws_region() -> String {
-    env::var("AWS_REGION")
-        .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-        .unwrap_or_else(|_| "us-east-1".to_string())
-}
-
 /// Parse NR_TAGS environment variable into key-value pairs
 /// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
 fn parse_nr_tags() -> Vec<(String, String)> {

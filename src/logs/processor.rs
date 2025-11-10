@@ -39,8 +39,6 @@ enum TraceIdExtractionState {
     Waiting,
     /// Successfully extracted a trace ID
     Extracted,
-    /// Attempted extraction but failed (error or no trace ID found)
-    Failed,
 }
 
 /// The LogProcessor is responsible for handling and transforming function and extension logs.
@@ -66,6 +64,7 @@ pub struct LogProcessor {
 
 /// Failed log entry that stores the original log without invocation-specific metadata
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FailedLogEntry {
     /// Original log message (with original attribution preserved)
     log_message: payload::LogMessage,
@@ -84,8 +83,6 @@ struct FailedLogEntry {
 /// Configuration constants for batching and retry logic
 const MAX_BATCH_SIZE: usize = 100; // Maximum logs per batch to avoid 413 errors
 const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
-const MAX_FAILED_LOG_AGE_HOURS: i64 = 24; // Drop failed logs older than 24 hours
-const MAX_FAILED_LOGS_BUFFER_SIZE: usize = 1000; // Limit failed buffer size
 
 // Standardized backoff delays: 200ms, 400ms, 900ms
 fn get_backoff_delay(retry_attempt: usize) -> Duration {
@@ -127,25 +124,6 @@ impl LogProcessor {
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
             apm_app,
         }
-    }
-
-    pub fn new_noop() -> Self {
-        Self {
-            log_batch: Arc::new(Mutex::new(Vec::new())),
-            newrelic_client: Arc::new(NewRelicClient::new_noop()),
-            config: Arc::new(ExtensionConfig::default()),
-            invocation_context: Arc::new(Mutex::new(InvocationContext::default())),
-            buffered_logs: None,
-            trace_extraction_state: None,
-            request_id_buffer: Arc::new(Mutex::new(Vec::new())),
-            invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
-            failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
-            apm_app: None,
-        }
-    }
-
-    pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
-        Arc::clone(&self.invocation_context)
     }
 
     /// Update the invocation context for a new request (used by global log processor)
@@ -209,159 +187,6 @@ impl LogProcessor {
         }
 
         log_message
-    }
-
-    /// Adds dual attribution metadata to a failed log being retried
-    /// Preserves original request_id while adding retry context
-    fn add_retry_metadata(
-        &self,
-        mut log_message: payload::LogMessage,
-        original_request_id: &str,
-        retry_attempt: usize,
-        original_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> payload::LogMessage {
-        // Get current invocation context for retry metadata
-        if let Some(context) = self.invocation_context.safe_lock() {
-            // Add retry metadata while keeping original attribution
-            log_message.attributes.insert(
-                "retry_request_id".to_string(),
-                serde_json::Value::String(context.request_id.clone())
-            );
-            log_message.attributes.insert(
-                "retry_attempt".to_string(),
-                serde_json::Value::Number(retry_attempt.into())
-            );
-            log_message.attributes.insert(
-                "original_request_id".to_string(),
-                serde_json::Value::String(original_request_id.to_string())
-            );
-            log_message.attributes.insert(
-                "original_timestamp".to_string(),
-                serde_json::Value::Number(original_timestamp.timestamp_millis().into())
-            );
-            log_message.attributes.insert(
-                "retry_timestamp".to_string(),
-                serde_json::Value::Number(chrono::Utc::now().timestamp_millis().into())
-            );
-        } else {
-            warn!("Cannot add retry metadata - context mutex poisoned, log will be sent without retry info");
-        }
-
-        log_message
-    }
-
-    /// Cleans up old failed logs and limits buffer size
-    fn cleanup_failed_logs_buffer(&self) {
-        if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-            let now = chrono::Utc::now();
-            
-            // Remove logs older than MAX_FAILED_LOG_AGE_HOURS
-            let initial_count = failed_buffer.len();
-            failed_buffer.retain(|entry| {
-                let age_hours = (now - entry.failed_at).num_hours();
-                age_hours < MAX_FAILED_LOG_AGE_HOURS
-            });
-            
-            let after_age_cleanup = failed_buffer.len();
-            if after_age_cleanup < initial_count {
-                info!("Cleaned up {} old failed logs (older than {} hours)", 
-                      initial_count - after_age_cleanup, MAX_FAILED_LOG_AGE_HOURS);
-            }
-            
-            // If still too many, remove oldest logs to stay within limit
-            if failed_buffer.len() > MAX_FAILED_LOGS_BUFFER_SIZE {
-                let excess = failed_buffer.len() - MAX_FAILED_LOGS_BUFFER_SIZE;
-                failed_buffer.drain(0..excess);
-                warn!("Failed logs buffer exceeded limit, dropped {} oldest entries", excess);
-            }
-        } else {
-            warn!("Cannot cleanup failed logs buffer - mutex poisoned, skipping cleanup");
-        }
-    }
-
-    /// Retry failed logs from previous invocations at the start of a new invocation
-    pub async fn retry_failed_logs_before_invocation(&self) -> std::io::Result<()> {
-        // First, cleanup old logs and limit buffer size
-        self.cleanup_failed_logs_buffer();
-        
-        let failed_entries = {
-            if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-                std::mem::take(&mut *failed_buffer)
-            } else {
-                warn!("Cannot retry failed logs - buffer mutex poisoned, skipping retry");
-                return Ok(());
-            }
-        };
-
-        if failed_entries.is_empty() {
-            return Ok(());
-        }
-
-        let total_failed = failed_entries.len();
-        let high_retry_logs = failed_entries.iter().filter(|e| e.retry_count >= MAX_RETRIES - 1).count();
-        
-        if high_retry_logs > 0 {
-            warn!("Retrying {} failed logs (including {} near max retry limit) from previous invocations", 
-                  total_failed, high_retry_logs);
-        } else {
-            info!("Retrying {} failed logs from previous invocations with current context", total_failed);
-        }
-
-        // Convert failed entries back to log messages with current invocation metadata
-        let mut logs_to_retry = Vec::with_capacity(failed_entries.len());
-        let mut logs_to_drop = Vec::with_capacity(failed_entries.len() / 10); // Estimate 10% might be dropped
-
-        for mut entry in failed_entries {
-            // Check if this log has exceeded max retries
-            if entry.retry_count >= MAX_RETRIES {
-                logs_to_drop.push(entry);
-            } else {
-                // Add dual attribution (original + retry metadata)
-                entry.log_message = self.add_retry_metadata(
-                    entry.log_message,
-                    &entry.original_request_id,
-                    entry.retry_count + 1,
-                    entry.original_timestamp,
-                );
-                entry.retry_count += 1;
-                logs_to_retry.push(entry);
-            }
-        }
-
-        if !logs_to_drop.is_empty() {
-            warn!("Dropping {} failed logs that exceeded max retry attempts", logs_to_drop.len());
-        }
-
-        if logs_to_retry.is_empty() {
-            return Ok(());
-        }
-
-        // Extract just the log messages for sending
-        let log_messages: Vec<payload::LogMessage> = logs_to_retry
-            .iter()
-            .map(|entry| entry.log_message.clone())
-            .collect();
-
-        // Try to send the logs with current context
-        match self.send_buffered_logs_with_retry(log_messages).await {
-            Ok(()) => {
-                info!("Successfully sent {} previously failed logs", logs_to_retry.len());
-            }
-            Err(e) => {
-                error!("Failed to send previously failed logs: {}", e);
-                
-                // Put back the failed entries (with incremented retry count, keeping original attribution)
-                {
-                    let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                    for mut entry in logs_to_retry {
-                        entry.failed_at = chrono::Utc::now();
-                        failed_buffer.push(entry);
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
 
     /// Processes a single log telemetry record, adding it to the batch if valid.
@@ -613,36 +438,6 @@ impl LogProcessor {
         }
     }
 
-    /// Called when a trace ID is extracted - updates all buffered logs and moves them to main batch for coordinated sending
-    pub fn on_trace_id_extracted_to_batch(&self, trace_id: &str) {
-        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) else {
-            return; // Nothing to do if trace ID collection is disabled
-        };
-
-        // Mark that we've successfully extracted the trace ID
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
-        
-        // Get all buffered logs
-        let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-        
-        if buffered_logs.is_empty() {
-            return;
-        }
-        
-        debug!("Moving {} trace-buffered logs to main batch with trace ID: {}", buffered_logs.len(), trace_id);
-        
-        // Update all buffered logs with the trace ID and move to main batch
-        let mut batch = self.log_batch.lock().unwrap();
-        for mut log in buffered_logs {
-            log.attributes.insert("trace.id".to_string(), trace_id.into());
-            batch.push(log);
-        }
-    }
-
     /// Called when a trace ID is extracted - updates all buffered logs and sends them immediately
     pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
@@ -674,32 +469,6 @@ impl LogProcessor {
         self.send_buffered_logs_with_retry(buffered_logs).await
     }
 
-    /// Called when trace ID extraction fails - sends all buffered logs without trace ID
-    pub async fn on_trace_id_extraction_failed(&self) -> std::io::Result<()> {
-        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) else {
-            return Ok(()); // Nothing to do if trace ID collection is disabled
-        };
-
-        // Mark that we've attempted extraction but failed
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Failed;
-        
-        // Get all buffered logs
-        let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-        
-        if buffered_logs.is_empty() {
-            return Ok(());
-        }
-        
-        warn!("Trace ID extraction failed - sending {} buffered logs without trace ID", buffered_logs.len());
-        
-        // Send buffered logs immediately with chunking and retry logic (without trace ID)
-        self.send_buffered_logs_with_retry(buffered_logs).await
-    }
-
     /// Reset the trace ID collection state for a new invocation
     pub fn reset_trace_id_state(&self) {
         if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
@@ -707,72 +476,6 @@ impl LogProcessor {
             *extraction_state.lock().unwrap() = TraceIdExtractionState::Waiting;
             buffered_logs.lock().unwrap().clear();
         }
-    }
-
-
-
-    /// Flush all buffers with the previous invocation's context before starting new invocation
-    /// This ensures logs from previous invocation get the correct request_id and trace_id
-    pub async fn flush_with_previous_context(
-        &self, 
-        previous_request_id: &str, 
-        previous_trace_id: Option<&str>
-    ) -> std::io::Result<()> {
-        // Flush request_id buffer with previous context
-        let mut request_buffered_logs = {
-            let mut buffered = self.request_id_buffer.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-
-        // Update request_id buffered logs with previous context
-        for log_message in &mut request_buffered_logs {
-            log_message.attributes.insert("aws.lambda_request_id".to_string(), 
-                            serde_json::Value::String(previous_request_id.to_string()));
-            log_message.attributes.insert("faas.execution".to_string(), 
-                            serde_json::Value::String(previous_request_id.to_string()));
-            if let Some(trace_id) = previous_trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
-                                serde_json::Value::String(trace_id.to_string()));
-            }
-        }
-
-        // Flush trace_id buffer with previous context if enabled
-        let mut trace_buffered_logs = if let Some(ref buffered_logs_arc) = self.buffered_logs {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        } else {
-            Vec::new()
-        };
-
-        // Update trace_id buffered logs with previous context
-        for log_message in &mut trace_buffered_logs {
-            if let Some(trace_id) = previous_trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
-                                serde_json::Value::String(trace_id.to_string()));
-            }
-        }
-
-        // Combine all logs and send them
-        let mut all_logs = request_buffered_logs;
-        all_logs.extend(trace_buffered_logs);
-
-        // Also flush current batch
-        let current_batch = {
-            let mut batch_guard = self.log_batch.lock().unwrap();
-            std::mem::take(&mut *batch_guard)
-        };
-        all_logs.extend(current_batch);
-
-        if !all_logs.is_empty() {
-            info!("Flushing {} logs with previous invocation context (request_id: {})", 
-                  all_logs.len(), previous_request_id);
-            self.send_buffered_logs_with_retry(all_logs).await?;
-        }
-
-        // Reset trace ID state for new invocation
-        self.reset_trace_id_state();
-
-        Ok(())
     }
 
     /// Process buffered logs when request_id becomes available
@@ -817,24 +520,6 @@ impl LogProcessor {
                 let mut batch = self.log_batch.lock().unwrap();
                 batch.push(log_message);
             }
-        }
-    }
-
-    /// Clear the request_id when the invocation is complete
-    /// This ensures logs are buffered again for the next invocation until new request_id arrives
-    /// Note: We keep invoked_function_arn since it doesn't change between invocations
-    pub fn clear_request_id(&self) {
-        let mut context = self.invocation_context.lock().unwrap();
-        context.request_id = String::new(); // Use empty string instead of "unknown"
-        // Keep invoked_function_arn - it's the same for all invocations of this function
-        // context.invoked_function_arn = String::new(); // DON'T clear this
-        context.trace_id = None;
-        // Clear all buffers to prevent cross-invocation pollution
-        self.request_id_buffer.lock().unwrap().clear();
-        self.log_batch.lock().unwrap().clear();
-        self.failed_logs_buffer.lock().unwrap().clear();
-        if let Some(ref buffered_logs) = self.buffered_logs {
-            buffered_logs.lock().unwrap().clear();
         }
     }
 

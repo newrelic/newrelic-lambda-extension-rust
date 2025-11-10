@@ -35,8 +35,6 @@ pub enum CollectorError {
     Disconnect,
     /// 401/409 - Restart exception, should reconnect
     RestartException,
-    /// Other HTTP error
-    Other,
 }
 
 impl std::fmt::Display for CollectorError {
@@ -44,7 +42,6 @@ impl std::fmt::Display for CollectorError {
         match self {
             CollectorError::Disconnect => write!(f, "Collector disconnected (410)"),
             CollectorError::RestartException => write!(f, "Collector restart exception (401/409)"),
-            CollectorError::Other => write!(f, "Collector error"),
         }
     }
 }
