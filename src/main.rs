@@ -1087,6 +1087,10 @@ async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u3
                 // WARM START: Process pending payloads in PARALLEL with current request
                 // This prevents blocking the current request while processing old late payloads
                 let pending_task = if !is_cold_start {
+                    // Log buffer state before processing
+                    let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                    info!("APM warm start: Found {} request buffer(s) before processing (current: {})", buffer_count, request_id);
+                    
                     Some(tokio::spawn({
                         let newrelic_client = components.newrelic_client.clone();
                         let config = components.config.clone();
@@ -1310,7 +1314,8 @@ async fn process_apm_request(
     state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
 
     // COLD START: Wait for platform.runtimeDone
-    // WARM START: Skip this wait for performance
+    // WARM START: Also wait for APM mode (agent sends payload when function completes)
+    // Standard mode can skip for performance since it uses batching
     if is_cold_start {
         if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
             match runtime_done_rx.recv().await {
@@ -1319,7 +1324,14 @@ async fn process_apm_request(
             }
         }
     } else {
-        debug!("Skipping runtime.done wait for WARM START request: {} (performance optimization)", request_id);
+        // APM WARM START: Wait for runtime.done because agent sends payload when function completes
+        debug!("APM warm start: Waiting for runtime.done (agent sends payload at function completion)");
+        if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
+            match runtime_done_rx.recv().await {
+                Some(_) => debug!("Runtime.done received for APM warm start request: {}", request_id),
+                None => warn!("Runtime.done channel closed for request: {} - proceeding anyway", request_id),
+            }
+        }
     }
 
     // Wait up to 200ms for agent payload (early exit on arrival)
@@ -1424,9 +1436,14 @@ async fn process_apm_request(
     
     cleanup_request_processing_state_internal(&request_id, skip_buffer_cleanup);
     
-    // CRITICAL: Clear the active request ID now that processing is done
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = None;
+    // CRITICAL: Keep active request ID for warm starts (so late payloads route correctly)
+    // Only clear for cold starts when buffer is also cleared
+    if is_cold_start {
+        if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active_request = None;
+        }
+    } else {
+        debug!("APM warm start - keeping active request ID for late payload routing");
     }
     
     debug!("APM mode: Completed processing for request: {}", request_id);
@@ -1861,6 +1878,16 @@ async fn process_pending_agent_payloads(
     current_request_id: &str,  // NEW: Exclude this request from processing
 ) {
     // Get all pending request buffers EXCEPT the current request
+    let all_buffers: Vec<(String, usize)> = REQUEST_AGENT_BUFFERS
+        .iter()
+        .map(|entry| {
+            let buffer_size = entry.value().lock().map(|b| b.len()).unwrap_or(0);
+            (entry.key().clone(), buffer_size)
+        })
+        .collect();
+    
+    debug!("APM pending check: Total buffers={}, Details: {:?}", all_buffers.len(), all_buffers);
+    
     let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_AGENT_BUFFERS
         .iter()
         .filter(|entry| entry.key() != current_request_id)  // Exclude current request
