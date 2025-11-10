@@ -164,7 +164,8 @@ pub fn convert_to_apm_metrics(
     }
 
     // Add error metric (for faults or errors)
-    if let Some(ref error) = metrics.error {
+    // Check if error exists - we don't need to use the value, just check presence
+    if metrics.error.is_some() {
         let mut error_attrs = common_attrs.clone();
         if let Some(ref error_type) = metrics.error_type {
             error_attrs.insert("Error Type".to_string(), json!(error_type));
