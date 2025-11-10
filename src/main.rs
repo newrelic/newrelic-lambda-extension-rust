@@ -1215,6 +1215,63 @@ async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) 
                 // Process buffered logs
                 components.global_log_processor.process_buffered_logs_with_request_id(&request_id);
                 
+                // WARM START: Clean up old buffers from previous request and process any late agent payloads
+                if !is_cold_start {
+                    // Find old request buffers (from previous invocation)
+                    let old_requests: Vec<String> = REQUEST_AGENT_BUFFERS.iter()
+                        .map(|entry| entry.key().clone())
+                        .collect();
+                    
+                    for old_request_id in old_requests {
+                        // Check if there's a late agent payload in the buffer
+                        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
+                            if let Ok(buffer_guard) = buffer.lock() {
+                                if !buffer_guard.is_empty() {
+                                    info!("Found {} late agent payload(s) for previous request: {}", 
+                                         buffer_guard.len(), old_request_id);
+                                    
+                                    // Check if there's a matching platform.report in PENDING_REPORTS
+                                    let report_line = PENDING_REPORTS.remove(&old_request_id).map(|(_, report)| {
+                                        debug!("Found matching platform.report for late agent payload: {}", old_request_id);
+                                        report
+                                    });
+                                    
+                                    // Add to batch for sending
+                                    for payload_bytes in buffer_guard.iter() {
+                                        let context = REQUEST_CONTEXTS.get(&old_request_id)
+                                            .map(|ctx_entry| {
+                                                ctx_entry.lock()
+                                                    .ok()
+                                                    .map(|ctx| ctx.invoked_function_arn.clone())
+                                                    .unwrap_or_else(|| "unknown".to_string())
+                                            })
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        
+                                        add_to_batch(
+                                            old_request_id.clone(),
+                                            payload_bytes.clone(),
+                                            report_line.clone(),
+                                            context,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        
+                        debug!("Cleaning up old buffer from previous request: {}", old_request_id);
+                        cleanup_request_processing_state(&old_request_id);
+                    }
+                    
+                    // Check if batch should be sent now
+                    if should_send_batch() {
+                        let newrelic_client = components.newrelic_client.clone();
+                        let config = components.config.clone();
+                        tokio::spawn(async move {
+                            send_batched_payloads(newrelic_client, config).await;
+                        });
+                    }
+                }
+                
                 // Create request state
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -1566,58 +1623,47 @@ async fn process_request_concurrently(
         None
     } else if is_cold_start {
         // COLD START: Send immediately with or without report
-        info!("Standard mode: Cold start - sending agent payload immediately");
+        info!("Standard mode: Cold start - sending agent payload immediately (with report: {})", report_line.is_some());
         let request_id_clone = request_id.clone();
         let invoked_function_arn_clone = invoked_function_arn.clone();
         let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
+        let apm_app_clone = _apm_app.clone();
 
         Some(tokio::spawn(async move {
-            for payload_bytes in agent_payloads {
-                // Extract trace ID if enabled
-                extract_and_coordinate_trace_id(&payload_bytes, &config_clone, &global_log_processor_clone).await;
-                
-                // Send to serverless ingest API
-                if let Err(e) = send_agent_payload_to_newrelic(
-                    &payload_bytes,
-                    &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &newrelic_client_clone,
-                    &config_clone,
-                ).await {
-                    error!("Failed to send agent payload: {}", e);
-                    // Buffer for retry
-                    buffer_failed_agent_payload(&payload_bytes, &request_id_clone, &invoked_function_arn_clone);
-                }
-            }
+            send_agent_with_report_immediately(
+                request_id_clone,
+                invoked_function_arn_clone,
+                agent_payloads,
+                report_line,
+                newrelic_client_clone,
+                config_clone,
+                global_log_processor_clone,
+                apm_app_clone,
+            ).await;
         }))
     } else if report_line.is_some() {
-        // WARM START + REPORT AVAILABLE: Send immediately with report
-        info!("Standard mode: Warm start - agent+report ready, sending immediately");
+        // WARM START + REPORT AVAILABLE: Send immediately with report combined
+        info!("Standard mode: Warm start - agent+report ready, sending combined");
         let request_id_clone = request_id.clone();
         let invoked_function_arn_clone = invoked_function_arn.clone();
         let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
+        let apm_app_clone = _apm_app.clone();
 
         Some(tokio::spawn(async move {
-            for payload_bytes in agent_payloads {
-                // Extract trace ID if enabled
-                extract_and_coordinate_trace_id(&payload_bytes, &config_clone, &global_log_processor_clone).await;
-                
-                // Send to serverless ingest API
-                if let Err(e) = send_agent_payload_to_newrelic(
-                    &payload_bytes,
-                    &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &newrelic_client_clone,
-                    &config_clone,
-                ).await {
-                    error!("Failed to send agent payload: {}", e);
-                    buffer_failed_agent_payload(&payload_bytes, &request_id_clone, &invoked_function_arn_clone);
-                }
-            }
+            send_agent_with_report_immediately(
+                request_id_clone,
+                invoked_function_arn_clone,
+                agent_payloads,
+                report_line,
+                newrelic_client_clone,
+                config_clone,
+                global_log_processor_clone,
+                apm_app_clone,
+            ).await;
         }))
     } else {
         // WARM START + NO REPORT: Batch for later (5 min or count threshold)
@@ -1674,8 +1720,10 @@ async fn process_request_concurrently(
         error!("Agent send task failed for request {}: {}", request_id, e);
     }
     
-    // STANDARD MODE: Always cleanup immediately (no buffer keep-alive)
-    cleanup_request_processing_state(&request_id);
+    // Standard mode: Keep buffers alive on WARM STARTS to catch late agent payloads
+    // Late payloads are processed at the START of the NEXT request (not via pending payload processing)
+    // Cold starts: cleanup immediately since no late payloads expected
+    cleanup_request_processing_state_conditional(&request_id, is_cold_start);
     
     // CRITICAL: Clear the active request ID now that processing is done
     if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
@@ -1833,7 +1881,15 @@ fn cleanup_request_processing_state(request_id: &str) {
     cleanup_request_processing_state_internal(request_id, false);
 }
 
-/// Clean up with option to skip buffer cleanup (for APM mode warm starts)
+/// Clean up per-request processing state - for both Standard and APM modes
+/// Cold start: cleanup everything
+/// Warm start: keep buffer alive for late agent payloads (both modes use this strategy)
+fn cleanup_request_processing_state_conditional(request_id: &str, is_cold_start: bool) {
+    let skip_buffer_cleanup = !is_cold_start;
+    cleanup_request_processing_state_internal(request_id, skip_buffer_cleanup);
+}
+
+/// Clean up with option to skip buffer cleanup (for warm starts in both modes)
 fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_cleanup: bool) {
     // Clean up request processing state
     if REQUEST_PROCESSORS.remove(request_id).is_some() {
@@ -1854,7 +1910,7 @@ fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_clean
         // Clean up payload coordination channel
         cleanup_payload_coordination_channel(request_id);
     } else {
-        debug!("Skipping buffer cleanup for request {} (APM mode - keeping alive for late payload)", request_id);
+        debug!("Keeping buffer alive for request {} to catch late agent payloads (will be processed on next invocation)", request_id);
     }
 
     // Always clean up runtime.done channel

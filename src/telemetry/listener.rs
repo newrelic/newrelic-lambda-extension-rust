@@ -130,19 +130,49 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 // Create report line using platform processor
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
-                                    // Try to match with already batched agent first
+                                    // Strategy 1: Try to match with already batched agent first (most common warm start case)
                                     if let Some(mut batch_item) = crate::AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                         batch_item.report_line = Some(report_line);
                                         debug!("Matched platform.report with batched agent for request: {}", request_id_str);
                                     }
-                                    // If not batched yet, check if it's the current/active request
-                                    else if crate::REQUEST_PROCESSORS.contains_key(request_id_str) {
-                                        crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
-                                        debug!("Stored pending platform.report for current request: {}", request_id_str);
+                                    // Strategy 2: Check if agent payload is in buffer (late report scenario)
+                                    else if let Some(buffer) = crate::REQUEST_AGENT_BUFFERS.get(request_id_str) {
+                                        let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
+                                        if has_agent {
+                                            // Agent payload exists in buffer - add both to batch immediately
+                                            debug!("Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                            
+                                            // Get context for ARN
+                                            let arn = crate::REQUEST_CONTEXTS.get(request_id_str)
+                                                .map(|ctx_ref| {
+                                                    ctx_ref.lock()
+                                                        .ok()
+                                                        .map(|ctx| ctx.invoked_function_arn.clone())
+                                                        .unwrap_or_else(|| "unknown".to_string())
+                                                })
+                                                .unwrap_or_else(|| "unknown".to_string());
+                                            
+                                            // Add each agent payload to batch with report line
+                                            if let Ok(buffer_guard) = buffer.lock() {
+                                                for payload_bytes in buffer_guard.iter() {
+                                                    crate::add_to_batch(
+                                                        request_id_str.to_string(),
+                                                        payload_bytes.clone(),
+                                                        Some(report_line.clone()),
+                                                        arn.clone(),
+                                                    );
+                                                }
+                                            }
+                                        } else {
+                                            // No agent yet - store in PENDING_REPORTS
+                                            crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                        }
                                     }
-                                    // Otherwise drop (old request, already sent)
                                     else {
-                                        debug!("Dropping platform.report for non-current request: {}", request_id_str);
+                                        // No batch and no buffer - store in PENDING_REPORTS
+                                        crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                        debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                     }
                                 }
                             }
