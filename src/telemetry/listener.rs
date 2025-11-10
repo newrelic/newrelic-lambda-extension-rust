@@ -163,6 +163,11 @@ async fn handle_telemetry_request(
                                                     );
                                                 }
                                             }
+                                            
+                                            // CRITICAL: Clear buffer to prevent event loop from processing it again
+                                            drop(buffer); // Release the reference first
+                                            crate::REQUEST_AGENT_BUFFERS.remove(request_id_str);
+                                            debug!("Cleared agent buffer for request {} after matching with report", request_id_str);
                                         } else {
                                             // No agent yet - store in PENDING_REPORTS
                                             crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
