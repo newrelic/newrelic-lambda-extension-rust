@@ -1,20 +1,20 @@
 //! Per-request state management for concurrent request handling
 //!
 //! This module manages the lifecycle of per-request state including:
-//! - Request contexts (request_id, invoked_function_arn, trace_id)
+//! - Request contexts (`request_id`, `invoked_function_arn`, `trace_id`)
 //! - Agent payload buffers (per-request buffers for incoming agent data)
 //! - Coordination channels (for agent payload arrival notifications)
-//! - Runtime.done channels (signaled by telemetry listener)
+//! - `Runtime.done` channels (signaled by telemetry listener)
 //! - Platform processors (per-request platform telemetry processing)
 //!
 //! Global state stores:
-//! - REQUEST_PROCESSORS: Main per-request state
-//! - REQUEST_CONTEXTS: Per-request invocation contexts
-//! - REQUEST_AGENT_BUFFERS: Per-request agent payload buffers
-//! - PAYLOAD_COORDINATION: Coordination channels for agent payload arrival
-//! - RUNTIME_DONE_CHANNELS: Runtime.done signal channels
-//! - PENDING_REPORTS: Pending platform.report lines (when report arrives before agent)
-//! - CURRENT_ACTIVE_REQUEST_ID: Currently active request for agent payload routing
+//! - `REQUEST_PROCESSORS`: Main per-request state
+//! - `REQUEST_CONTEXTS`: Per-request invocation contexts
+//! - `REQUEST_AGENT_BUFFERS`: Per-request agent payload buffers
+//! - `PAYLOAD_COORDINATION`: Coordination channels for agent payload arrival
+//! - `RUNTIME_DONE_CHANNELS`: `Runtime.done` signal channels
+//! - `PENDING_REPORTS`: Pending `platform.report` lines (when report arrives before agent)
+//! - `CURRENT_ACTIVE_REQUEST_ID`: Currently active request for agent payload routing
 
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
@@ -105,13 +105,13 @@ pub static PAYLOAD_COORDINATION: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<
 pub static RUNTIME_DONE_CHANNELS: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Pending platform.report lines (stored when report arrives before agent is batched)
-/// Key: request_id, Value: report log line
+/// Pending `platform.report` lines (stored when report arrives before agent is batched)
+/// Key: `request_id`, Value: report log line
 pub static PENDING_REPORTS: Lazy<Arc<DashMap<String, String>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// CRITICAL: Track currently active request for agent payload routing
-/// Since agent payloads don't include request_id, we route to the most recent ACTIVE request
+/// Since agent payloads don't include `request_id`, we route to the most recent ACTIVE request
 /// This works because Lambda typically processes requests sequentially (though concurrent is possible)
 pub static CURRENT_ACTIVE_REQUEST_ID: Lazy<Arc<Mutex<Option<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -181,7 +181,12 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         debug!("Cleaned up request processing state for {}", request_id);
     }
 
-    if !skip_buffer_cleanup {
+    if skip_buffer_cleanup {
+        debug!(
+            "Keeping buffer alive for request {} to catch late agent payloads (will be processed on next invocation)",
+            request_id
+        );
+    } else {
         // Clean up context
         if REQUEST_CONTEXTS.remove(request_id).is_some() {
             debug!("Cleaned up context for request {}", request_id);
@@ -194,11 +199,6 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
 
         // Clean up payload coordination channel
         cleanup_payload_coordination_channel(request_id);
-    } else {
-        debug!(
-            "Keeping buffer alive for request {} to catch late agent payloads (will be processed on next invocation)",
-            request_id
-        );
     }
 
     // Always clean up runtime.done channel
@@ -224,10 +224,10 @@ fn cleanup_payload_coordination_channel(request_id: &str) {
 
 /// Route agent payload to the correct per-request buffer
 ///
-/// CRITICAL: Agent payloads don't include request_id, so we route to the currently active request.
+/// CRITICAL: Agent payloads don't include `request_id`, so we route to the currently active request.
 /// This works because:
 /// 1. Lambda typically processes requests sequentially (though concurrent is possible)
-/// 2. We track the active request_id in CURRENT_ACTIVE_REQUEST_ID
+/// 2. We track the active `request_id` in `CURRENT_ACTIVE_REQUEST_ID`
 /// 3. Each request sets this before waiting for agent payload
 /// 4. Each request clears this after processing
 pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
@@ -375,12 +375,11 @@ pub async fn process_warm_start_old_buffers(
                     for payload_bytes in buffer_guard.iter() {
                         let context = REQUEST_CONTEXTS
                             .get(&old_request_id)
-                            .map(|ctx_entry| {
+                            .and_then(|ctx_entry| {
                                 ctx_entry
                                     .lock()
                                     .ok()
                                     .map(|ctx| ctx.invoked_function_arn.clone())
-                                    .unwrap_or_else(|| "unknown".to_string())
                             })
                             .unwrap_or_else(|| "unknown".to_string());
 

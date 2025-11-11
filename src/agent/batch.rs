@@ -2,12 +2,12 @@
 //!
 //! This module handles batching of agent payloads for efficient sending to New Relic.
 //! Batching strategies:
-//! - Cold starts: Send immediately with platform.report
+//! - Cold starts: Send immediately with `platform.report`
 //! - Warm starts: Batch multiple payloads until threshold (3+ payloads or 5-minute timeout)
 //!
 //! Global state:
-//! - AGENT_BATCH_BUFFER: Stores batched agent payloads with optional platform.report
-//! - BATCH_META: Tracks batch metadata (count, oldest timestamp)
+//! - `AGENT_BATCH_BUFFER`: Stores batched agent payloads with optional `platform.report`
+//! - `BATCH_META`: Tracks batch metadata (count, oldest timestamp)
 
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
@@ -239,9 +239,9 @@ pub async fn send_batched_payloads(
 
     for item in &batch_items {
         // Add agent payload FIRST (try UTF-8 first to avoid allocation)
-        let agent_str = match std::str::from_utf8(&*item.agent_payload_bytes) {
+        let agent_str = match std::str::from_utf8(&item.agent_payload_bytes) {
             Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(&*item.agent_payload_bytes).to_string(),
+            Err(_) => String::from_utf8_lossy(&item.agent_payload_bytes).to_string(),
         };
         log_events.push(serde_json::json!({
             "id": item.request_id,

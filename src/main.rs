@@ -161,7 +161,6 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
                     "Error receiving next event in no-op mode: {:?}. Continuing.",
                     e
                 );
-                continue;
             }
         }
     }

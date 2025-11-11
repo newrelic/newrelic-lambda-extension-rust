@@ -24,8 +24,8 @@ pub async fn send_agent_payload_to_newrelic(
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let function_name = invoked_function_arn.split(':').last().unwrap_or("");
-    let log_group_name = format!("/aws/lambda/{}", function_name);
+    let function_name = invoked_function_arn.split(':').next_back().unwrap_or("");
+    let log_group_name = format!("/aws/lambda/{function_name}");
 
     let wrapped_payload = create_wrapped_agent_payload_json(
         payload_bytes,
@@ -40,7 +40,7 @@ pub async fn send_agent_payload_to_newrelic(
         .send_agent_payload(config, &wrapped_payload)
         .await
     {
-        Ok(_) => {
+        Ok(()) => {
             debug!(
                 "Successfully sent agent payload for request {}",
                 request_id
@@ -59,7 +59,7 @@ pub async fn send_agent_payload_to_newrelic(
 
 /// Create wrapped agent payload JSON string
 /// Create New Relic log format with agent data in message field
-/// NOTE: Trace ID extraction is handled separately in process_and_send_agent_payload
+/// NOTE: `Trace ID` extraction is handled separately in `process_and_send_agent_payload`
 fn create_wrapped_agent_payload_json(
     payload_bytes: &[u8],
     function_name: &str,
@@ -101,6 +101,7 @@ fn create_newrelic_log_format(
     debug!("Agent data to wrap in log format: {}", agent_data_str);
 
     // Generate timestamp in milliseconds
+    #[allow(clippy::cast_possible_truncation)]
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
