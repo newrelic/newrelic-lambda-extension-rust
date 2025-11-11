@@ -1,6 +1,8 @@
 use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
+    agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
+    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -144,19 +146,19 @@ async fn handle_telemetry_request(
                                     }
                                     
                                     // Strategy 1: Try to match with already batched agent first (most common warm start case)
-                                    if let Some(mut batch_item) = crate::AGENT_BATCH_BUFFER.get_mut(request_id_str) {
+                                    if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                         batch_item.report_line = Some(report_line);
                                         debug!("Matched platform.report with batched agent for request: {}", request_id_str);
                                     }
                                     // Strategy 2: Check if agent payload is in buffer (late report scenario)
-                                    else if let Some(buffer) = crate::REQUEST_AGENT_BUFFERS.get(request_id_str) {
+                                    else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
                                         let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
                                         if has_agent {
                                             // Agent payload exists in buffer - add both to batch immediately
                                             debug!("Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                             
                                             // Get context for ARN
-                                            let arn = crate::REQUEST_CONTEXTS.get(request_id_str)
+                                            let arn = REQUEST_CONTEXTS.get(request_id_str)
                                                 .map(|ctx_ref| {
                                                     ctx_ref.lock()
                                                         .ok()
@@ -168,7 +170,7 @@ async fn handle_telemetry_request(
                                             // Add each agent payload to batch with report line
                                             if let Ok(buffer_guard) = buffer.lock() {
                                                 for payload_bytes in buffer_guard.iter() {
-                                                    crate::add_to_batch(
+                                                    add_to_batch(
                                                         request_id_str.to_string(),
                                                         payload_bytes.clone(),
                                                         Some(report_line.clone()),
@@ -179,17 +181,17 @@ async fn handle_telemetry_request(
                                             
                                             // CRITICAL: Clear buffer to prevent event loop from processing it again
                                             drop(buffer); // Release the reference first
-                                            crate::REQUEST_AGENT_BUFFERS.remove(request_id_str);
+                                            REQUEST_AGENT_BUFFERS.remove(request_id_str);
                                             debug!("Cleared agent buffer for request {} after matching with report", request_id_str);
                                         } else {
                                             // No agent yet - store in PENDING_REPORTS
-                                            crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
                                             debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
                                     else {
                                         // No batch and no buffer - store in PENDING_REPORTS
-                                        crate::PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                        PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
                                         debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                     }
                                 }
@@ -224,7 +226,7 @@ async fn handle_telemetry_request(
             // If runtime is done, signal the per-request channel
             if let Some(request_id) = runtime_done_request_id {
                 // Signal the per-request runtime.done channel
-                if let Some(tx) = crate::RUNTIME_DONE_CHANNELS.get(&request_id) {
+                if let Some(tx) = RUNTIME_DONE_CHANNELS.get(&request_id) {
                     if let Err(e) = tx.send(()) {
                         warn!("Failed to send runtime.done signal for request {}: {}", request_id, e);
                     } else {
