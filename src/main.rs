@@ -14,6 +14,7 @@ mod credentials;
 mod trace;
 mod version;
 mod apm;
+mod runtime;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -28,7 +29,6 @@ use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, trace, warn};
 use reqwest::Client;
 
@@ -48,14 +48,6 @@ use crate::{
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// --- Extension Constants ---
-const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
-const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
-
-
-
-// --- CONCURRENT REQUEST HANDLING ---
-// Per-request contexts to handle  Lambda invocations safely using DashMap for lock-free  access
 static REQUEST_CONTEXTS: Lazy<Arc<DashMap<String, Arc<Mutex<InvocationContext>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>> =
@@ -195,35 +187,6 @@ struct ExtensionComponents {
     apm_app: apm::SharedApmApp,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ExtensionRegistrationResponse {
-    #[serde(rename = "functionName")]
-    function_name: String,
-    #[serde(rename = "functionVersion")]
-    function_version: String,
-    #[serde(rename = "handler")]
-    handler: String,
-    #[serde(rename = "accountId", default)]
-    account_id: Option<String>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(tag = "eventType")]
-enum LambdaRuntimeEvent {
-    #[serde(rename(deserialize = "INVOKE"))]
-    Invoke {
-        #[serde(rename(deserialize = "requestId"))]
-        request_id: String,
-        #[serde(rename(deserialize = "invokedFunctionArn"))]
-        invoked_function_arn: String,
-    },
-    #[serde(rename(deserialize = "SHUTDOWN"))]
-    Shutdown {
-        #[serde(rename(deserialize = "shutdownReason"))]
-        shutdown_reason: String,
-    },
-}
-
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -283,12 +246,12 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
     
     // Follow proper Extension API lifecycle - wait for events but do nothing with them
     loop {
-        match fetch_next_lambda_runtime_event(&client, &extension_id).await {
-            Ok(LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
+        match runtime::fetch_next_event(&client, &extension_id).await {
+            Ok(runtime::LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
                 debug!("No-op mode: Received INVOKE event for request {}, doing nothing", request_id);
                 // Do absolutely nothing - no telemetry, no processing, no network calls
             }
-            Ok(LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
+            Ok(runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
                 info!("No-op mode: Extension shutting down: {}", shutdown_reason);
                 break;
             }
@@ -555,8 +518,7 @@ async fn perform_one_time_initialization() -> Result<ExtensionComponents, Box<dy
         Some(runtime_done_tx)
     ).await?;
     
-    // 9. Subscribe to Lambda Telemetry API
-    subscribe_to_lambda_telemetry_api(&client, &extension_id, telemetry_listener_address.port()).await?;
+    runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port()).await?;
 
     let (_harvester, harvester_handle) = start_harvester_background_task(
         vec![],
@@ -621,9 +583,9 @@ async fn initialize_http_client_with_timeout() -> Result<Client, Box<dyn std::er
 }
 
 /// Initialize Lambda runtime client and register extension
-async fn initialize_lambda_runtime_client_and_register() -> Result<(Arc<Client>, String, ExtensionRegistrationResponse), Box<dyn std::error::Error + Send + Sync>> {
+async fn initialize_lambda_runtime_client_and_register() -> Result<(Arc<Client>, String, runtime::ExtensionRegistrationResponse), Box<dyn std::error::Error + Send + Sync>> {
     let client = Arc::new(initialize_http_client_with_timeout().await?);
-    let (registration, extension_id) = register_extension_with_lambda_runtime(&client).await?;
+    let (registration, extension_id) = runtime::register_extension(&client, EXTENSION_NAME).await?;
     Ok((client, extension_id, registration))
 }
 
@@ -1017,8 +979,7 @@ async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u3
     loop {
         debug!("APM mode: waiting for next lambda invocation event...");
 
-        // Fetch next Lambda runtime event
-        let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
+        let runtime_event = match runtime::fetch_next_event(&components.client, &components.extension_id).await {
             Ok(event) => event,
             Err(e) => {
                 error!("Error receiving next event: {:?}. Continuing.", e);
@@ -1030,7 +991,7 @@ async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u3
         let is_cold_start = event_counter == 1;
 
         match runtime_event {
-            LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
+            runtime::LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
                 let event_start = std::time::Instant::now();
 
                 // Tag Lambda function on first invocation (with real ARN)
@@ -1125,7 +1086,7 @@ async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u3
                     info!("WARM START: Event {} processed in {:?} (request_id: {})", event_counter, event_time, request_id);
                 }
             }
-            LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+            runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("APM mode: Extension shutting down: {}", shutdown_reason);
                 // Process any final pending payloads (use empty string to process ALL buffers)
                 process_pending_agent_payloads(
@@ -1156,8 +1117,7 @@ async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) 
     loop {
         debug!("Standard mode: waiting for next lambda invocation event...");
 
-        // Fetch next Lambda runtime event
-        let runtime_event = match fetch_next_lambda_runtime_event(&components.client, &components.extension_id).await {
+        let runtime_event = match runtime::fetch_next_event(&components.client, &components.extension_id).await {
             Ok(event) => event,
             Err(e) => {
                 error!("Error receiving next event: {:?}. Continuing.", e);
@@ -1169,7 +1129,7 @@ async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) 
         let is_cold_start = event_counter == 1;
 
         match runtime_event {
-            LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
+            runtime::LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn } => {
                 let event_start = std::time::Instant::now();
 
                 // Tag Lambda function on first invocation (with real ARN)
@@ -1286,7 +1246,7 @@ async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) 
                     info!("WARM START: Event {} processed in {:?} (request_id: {})", event_counter, event_time, request_id);
                 }
             }
-            LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+            runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("Standard mode: Extension shutting down: {}", shutdown_reason);
 
                 // Wait for all requests to complete and flush batched payloads
@@ -2333,13 +2293,12 @@ async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
 
     loop {
         let loop_start = std::time::Instant::now();
-        match fetch_next_lambda_runtime_event(client, extension_id).await {
-            Ok(LambdaRuntimeEvent::Shutdown { shutdown_reason: _ }) => {
+        match runtime::fetch_next_event(client, extension_id).await {
+            Ok(runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason: _ }) => {
                 info!("Extension shutting down");
                 break;
             }
-            Ok(LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
-                // WARM START PATH: This is where no-op warm starts spend their time
+            Ok(runtime::LambdaRuntimeEvent::Invoke { request_id, invoked_function_arn: _ }) => {
                 trace!("No-op mode invocation processed in {:?} (request_id: {})", loop_start.elapsed(), request_id);
             }
             Err(_) => { /* Ignore errors and continue polling */ }
@@ -2450,148 +2409,5 @@ fn create_newrelic_log_format(
     // Convert to string and return
     final_payload.to_string()
 }
-
-/// Registers the extension with the Lambda Runtime API.
-async fn register_extension_with_lambda_runtime(client: &Client) -> Result<(ExtensionRegistrationResponse, String), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
-
-    let url = format!("http://{}/2020-01-01/extension/register", runtime_api);
-    
-    let payload = serde_json::json!({
-        "events": ["INVOKE", "SHUTDOWN"]
-    });
-
-    let response = client
-        .post(&url)
-        .header(EXTENSION_NAME_HEADER, EXTENSION_NAME)
-        .json(&payload)
-        .timeout(Duration::from_secs(30)) // 30 second timeout for registration
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Registration failed with status: {}, body: {}", status, body);
-        return Err(format!("Registration failed with status: {}", status).into());
-    }
-
-    // Get extension ID from headers
-    let extension_id = response
-        .headers()
-        .get(EXTENSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or("Missing extension ID in response headers")?
-        .to_string();
-
-    let registration: ExtensionRegistrationResponse = response
-        .json()
-        .await?;
-
-    Ok((registration, extension_id))
-}
-
-/// Subscribes to the Lambda Telemetry API.
-async fn subscribe_to_lambda_telemetry_api(client: &Client, ext_id: &str, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
-
-    let url = format!("http://{}/2022-07-01/telemetry", runtime_api);
-    
-    let payload = serde_json::json!({
-        "schemaVersion": "2022-07-01",
-        "types": ["platform", "function", "extension"],
-        "buffering": {
-            "maxBytes": 262144,
-            "maxItems": 10000,
-            "timeoutMs": 100  // Reduced from 1000ms to 100ms for faster cold start log delivery
-        },
-        "destination": {
-            "protocol": "HTTP",
-            "URI": format!("http://sandbox:{}/telemetry", port)
-        }
-    });
-
-    let response = client
-        .put(&url)
-        .header(EXTENSION_ID_HEADER, ext_id)
-        .json(&payload)
-        .timeout(Duration::from_secs(30)) // 30 second timeout for telemetry subscription
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Telemetry subscription failed with status: {}, body: {}", status, body);
-        return Err(format!("Telemetry subscription failed with status: {}", status).into());
-    }
-
-    Ok(())
-}
-
-/// Fetches the next event from the Lambda Runtime API.
-async fn fetch_next_lambda_runtime_event(client: &Client, ext_id: &str) -> Result<LambdaRuntimeEvent, Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
-
-    let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
-
-    // Retry logic for extension event polling - this is critical for reliability
-    const MAX_RETRIES: u32 = 3;
-    let mut retry_count = 0;
-
-    loop {
-        let response = client
-            .get(&url)
-            .header(EXTENSION_ID_HEADER, ext_id)
-            .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout for event polling
-            .send()
-            .await;
-
-        match response {
-            Ok(resp) => {
-                // Success case - process the response
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-                    error!("Next event request failed with status: {}, body: {}", status, body);
-                    return Err(format!("Next event request failed with status: {}", status).into());
-                }
-
-                let event: LambdaRuntimeEvent = resp.json().await?;
-                return Ok(event);
-            },
-            Err(e) => {
-                // Handle timeout and connection errors with retry
-                retry_count += 1;
-                
-                if e.is_timeout() {
-                    warn!("Extension event polling timeout (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                } else if e.is_connect() {
-                    warn!("Extension event polling connection error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                } else {
-                    warn!("Extension event polling error (attempt {}/{}): {}", retry_count, MAX_RETRIES, e);
-                }
-
-                if retry_count >= MAX_RETRIES {
-                    error!("Extension event polling failed after {} retries, giving up", MAX_RETRIES);
-                    return Err(e.into());
-                }
-
-                // Standardized backoff: 200ms, 400ms, 900ms
-                let delay = match retry_count {
-                    1 => Duration::from_millis(200),
-                    2 => Duration::from_millis(400),
-                    _ => Duration::from_millis(900),
-                };
-                warn!("Retrying extension event polling in {:?}...", delay);
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
 
 
