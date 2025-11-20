@@ -13,8 +13,8 @@ pub struct InvocationContext {
 impl Default for InvocationContext {
     fn default() -> Self {
         Self {
-            invoked_function_arn: String::new(), // Empty string instead of "unknown"
-            request_id: String::new(), // Empty string instead of "unknown"
+            invoked_function_arn: String::new(),
+            request_id: String::new(),
             trace_id: None,
         }
     }
