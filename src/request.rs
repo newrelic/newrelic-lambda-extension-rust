@@ -1,20 +1,4 @@
-//! Per-request state management for concurrent request handling
-//!
-//! This module manages the lifecycle of per-request state including:
-//! - Request contexts (`request_id`, `invoked_function_arn`, `trace_id`)
-//! - Agent payload buffers (per-request buffers for incoming agent data)
-//! - Coordination channels (for agent payload arrival notifications)
-//! - `Runtime.done` channels (signaled by telemetry listener)
-//! - Platform processors (per-request platform telemetry processing)
-//!
-//! Global state stores:
-//! - `REQUEST_PROCESSORS`: Main per-request state
-//! - `REQUEST_CONTEXTS`: Per-request invocation contexts
-//! - `REQUEST_AGENT_BUFFERS`: Per-request agent payload buffers
-//! - `PAYLOAD_COORDINATION`: Coordination channels for agent payload arrival
-//! - `RUNTIME_DONE_CHANNELS`: `Runtime.done` signal channels
-//! - `PENDING_REPORTS`: Pending `platform.report` lines (when report arrives before agent)
-//! - `CURRENT_ACTIVE_REQUEST_ID`: Currently active request for agent payload routing
+
 
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
@@ -30,7 +14,6 @@ use crate::{
     agent::batch::{add_to_batch, should_send_batch, send_batched_payloads},
 };
 
-/// Per-request processing state
 #[derive(Debug)]
 pub struct RequestProcessingState {
     pub context: Arc<Mutex<InvocationContext>>,
@@ -40,7 +23,6 @@ pub struct RequestProcessingState {
     pub runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
-/// Processor factory for creating per-request processors
 #[derive(Debug, Clone)]
 pub struct ProcessorFactory {
     pub newrelic_client: Arc<NewRelicClient>,
@@ -85,61 +67,46 @@ impl ProcessorFactory {
     }
 }
 
-/// Global per-request processing state
 pub static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Global per-request contexts
 pub static REQUEST_CONTEXTS: Lazy<Arc<DashMap<String, Arc<Mutex<InvocationContext>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Global per-request agent buffers
 pub static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Global coordination channels per request for agent payload processing
 pub static PAYLOAD_COORDINATION: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Per-request runtime.done signal channels (signaled by telemetry listener on platform.runtimeDone)
 pub static RUNTIME_DONE_CHANNELS: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// Pending `platform.report` lines (stored when report arrives before agent is batched)
-/// Key: `request_id`, Value: report log line
 pub static PENDING_REPORTS: Lazy<Arc<DashMap<String, String>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-/// CRITICAL: Track currently active request for agent payload routing
-/// Since agent payloads don't include `request_id`, we route to the most recent ACTIVE request
-/// This works because Lambda typically processes requests sequentially (though concurrent is possible)
+/// Agent payloads lack request_id - route to currently active request
 pub static CURRENT_ACTIVE_REQUEST_ID: Lazy<Arc<Mutex<Option<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 
-/// Create per-request processing state for concurrent request handling
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>,
 ) -> RequestProcessingState {
-    // Create context
     let context = Arc::new(Mutex::new(InvocationContext {
         request_id: request_id.to_string(),
         invoked_function_arn: invoked_function_arn.to_string(),
         trace_id: None,
     }));
 
-    // Create only platform processor - log processor will be global
     let platform_processor = processor_factory.create_platform_processor(context.clone());
 
-    // Create agent buffer
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
 
-    // Create coordination channel for agent payload arrival
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
-    // Create runtime.done channel (telemetry listener will signal this)
     let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
     RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
 
@@ -161,22 +128,17 @@ pub fn create_request_processing_state(
     state
 }
 
-/// Clean up per-request processing state after processing
 pub fn cleanup_request_processing_state(request_id: &str) {
     cleanup_request_processing_state_internal(request_id, false);
 }
 
-/// Clean up per-request processing state - for both Standard and APM modes
-/// Cold start: cleanup everything
-/// Warm start: keep buffer alive for late agent payloads (both modes use this strategy)
+/// Conditional cleanup: cold start clears all, warm start keeps buffer for late payloads
 pub fn cleanup_request_processing_state_conditional(request_id: &str, is_cold_start: bool) {
     let skip_buffer_cleanup = !is_cold_start;
     cleanup_request_processing_state_internal(request_id, skip_buffer_cleanup);
 }
 
-/// Clean up with option to skip buffer cleanup (for warm starts in both modes)
 pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_cleanup: bool) {
-    // Clean up request processing state
     if REQUEST_PROCESSORS.remove(request_id).is_some() {
         debug!("Cleaned up request processing state for {}", request_id);
     }
@@ -187,26 +149,21 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
             request_id
         );
     } else {
-        // Clean up context
         if REQUEST_CONTEXTS.remove(request_id).is_some() {
             debug!("Cleaned up context for request {}", request_id);
         }
 
-        // Clean up agent buffer
         if REQUEST_AGENT_BUFFERS.remove(request_id).is_some() {
             debug!("Cleaned up agent buffer for request {}", request_id);
         }
 
-        // Clean up payload coordination channel
         cleanup_payload_coordination_channel(request_id);
     }
 
-    // Always clean up runtime.done channel
     if RUNTIME_DONE_CHANNELS.remove(request_id).is_some() {
         debug!("Cleaned up runtime.done channel for request {}", request_id);
     }
 
-    // Clean up any pending report for this request
     if PENDING_REPORTS.remove(request_id).is_some() {
         debug!(
             "Cleaned up pending platform.report for request {}",
@@ -215,30 +172,20 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
     }
 }
 
-/// Clean up payload coordination channel
 fn cleanup_payload_coordination_channel(request_id: &str) {
     if PAYLOAD_COORDINATION.remove(request_id).is_some() {
         debug!("Cleaned up coordination channel for request {}", request_id);
     }
 }
 
-/// Route agent payload to the correct per-request buffer
-///
-/// CRITICAL: Agent payloads don't include `request_id`, so we route to the currently active request.
-/// This works because:
-/// 1. Lambda typically processes requests sequentially (though concurrent is possible)
-/// 2. We track the active `request_id` in `CURRENT_ACTIVE_REQUEST_ID`
-/// 3. Each request sets this before waiting for agent payload
-/// 4. Each request clears this after processing
+/// Route agent payload to active request (payloads lack request_id)
 pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    // Get the currently active request ID
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
         .lock()
         .ok()
         .and_then(|guard| guard.clone());
 
     if let Some(request_id) = current_request_id {
-        // Store in request-specific buffer
         if let Some(request_buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
             match request_buffer.lock() {
                 Ok(mut buffer) => {
@@ -249,7 +196,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         buffer.len()
                     );
 
-                    // Notify the request's coordination channel if available
                     if let Some(tx) = PAYLOAD_COORDINATION.get(&request_id) {
                         let _ = tx.send(());
                     }
@@ -265,8 +211,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
             warn!("No buffer found for request: {} - payload lost!", request_id);
         }
     } else {
-        // No active request - this could be a late payload from a previous request
-        // Try to find ANY request buffer that's still alive (for APM mode warm starts)
         let any_request_id = REQUEST_AGENT_BUFFERS.iter().next().map(|entry| entry.key().clone());
 
         if let Some(request_id) = any_request_id {
@@ -290,12 +234,10 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     }
 }
 
-/// Wait for all requests to complete and flush batched payloads
 pub async fn wait_for_all_requests_completion(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    // Check if there are any pending requests
     let pending_count = REQUEST_PROCESSORS.len();
 
     if pending_count == 0 {
@@ -306,10 +248,8 @@ pub async fn wait_for_all_requests_completion(
             pending_count
         );
 
-        // Wait a reasonable time for requests to complete
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-        // Force cleanup of any remaining requests
         let remaining_requests: Vec<String> = REQUEST_PROCESSORS
             .iter()
             .map(|entry| entry.key().clone())
@@ -323,7 +263,6 @@ pub async fn wait_for_all_requests_completion(
         info!("All requests completed");
     }
 
-    // Phase 9: Flush any batched agent payloads before shutdown
     let batch_count = crate::agent::batch::AGENT_BATCH_BUFFER.len();
     if batch_count > 0 {
         info!(
