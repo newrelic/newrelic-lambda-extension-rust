@@ -24,20 +24,16 @@ type UncompressedData = HashMap<String, Value>;
 pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<String>> {
     trace!("Starting trace ID extraction from payload ({} bytes)", payload_bytes.len());
     
-    // Convert to string first
     let payload_str = std::str::from_utf8(payload_bytes)
         .map_err(|e| anyhow!("Invalid UTF-8 in payload: {}", e))?;
     
     debug!("Payload length: {} chars", payload_str.len());
     trace!("Payload content (first 200 chars): {}", &payload_str.chars().take(200).collect::<String>());
     
-    // Step 1: Determine if payload is base64 encoded or raw JSON
     let data_to_process = if payload_str.trim_start().starts_with('[') {
-        // Payload appears to be raw JSON, use directly
         debug!("Payload appears to be raw JSON, using directly");
         payload_bytes.to_vec()
     } else {
-        // Try to base64 decode the payload (matching Go: base64.StdEncoding.DecodeString)
         debug!("Attempting to base64 decode payload");
         match general_purpose::STANDARD.decode(payload_str) {
             Ok(decoded) => {
@@ -46,13 +42,11 @@ pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<Stri
             },
             Err(e) => {
                 debug!("Failed to base64 decode, treating as raw data: {}", e);
-                // If base64 decode fails, treat as raw data
                 payload_bytes.to_vec()
             }
         }
     };
     
-    // Step 2: Check for NR_LAMBDA_MONITORING marker (matching Go: bytes.Contains)
     if !data_to_process.windows(b"NR_LAMBDA_MONITORING".len()).any(|window| window == b"NR_LAMBDA_MONITORING") {
         trace!("Payload does not contain NR_LAMBDA_MONITORING marker, skipping trace extraction");
         return Ok(None);
@@ -60,7 +54,6 @@ pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<Stri
 
     debug!("Found NR_LAMBDA_MONITORING marker in payload, attempting to extract trace ID");
     
-    // Step 3: Parse using parsePayload logic (matching Go implementation exactly)
     let uncompressed_data = match parse_agent_payload(&data_to_process) {
         Ok(data) => {
             debug!("Successfully parsed agent payload, data has {} top-level keys", data.len());
@@ -73,13 +66,11 @@ pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<Stri
         }
     };
 
-    // Step 4: Try analytic_event_data first (matching Go implementation)
     if let Some(trace_id) = extract_trace_id_from_analytics(&uncompressed_data)? {
         debug!("Successfully extracted trace ID from analytic events: {}", trace_id);
         return Ok(Some(trace_id));
     }
 
-    // Step 5: Try span_event_data second (matching Go implementation)  
     if let Some(trace_id) = extract_trace_id_from_spans(&uncompressed_data)? {
         debug!("Successfully extracted trace ID from span events: {}", trace_id);
         return Ok(Some(trace_id));
@@ -95,7 +86,6 @@ fn parse_agent_payload(data: &[u8]) -> Result<UncompressedData> {
     trace!("Parsing agent payload data ({} bytes)", data.len());
     trace!("Raw data (first 100 chars): {}", std::str::from_utf8(data).unwrap_or("invalid utf8").chars().take(100).collect::<String>());
 
-    // Parse as array of JSON values (Go uses [4]json.RawMessage but we need flexible length)
     let arr: Vec<Value> = serde_json::from_slice(data)
         .map_err(|e| anyhow!("unable to unmarshal payload data array: {}", e))?;
 
@@ -105,8 +95,6 @@ fn parse_agent_payload(data: &[u8]) -> Result<UncompressedData> {
         return Err(anyhow!("payload array must have at least 3 elements, got {}", arr.len()));
     }
 
-    // Extract payload version from first element (matching Go implementation)
-    // Handle both string and number formats for version
     let payload_version = match &arr[0] {
         Value::String(s) => s.trim_matches('"').to_string(),
         Value::Number(n) => n.to_string(),
@@ -115,7 +103,6 @@ fn parse_agent_payload(data: &[u8]) -> Result<UncompressedData> {
     
     debug!("Payload version: {}", payload_version);
 
-    // Determine which array element contains the compressed data based on version
     let data_compressed = if payload_version == "2" {
         if arr.len() < 4 {
             return Err(anyhow!("version 2 payload must have 4 elements, got {}", arr.len()));
@@ -134,24 +121,19 @@ fn parse_agent_payload(data: &[u8]) -> Result<UncompressedData> {
     debug!("Compressed data length: {} chars", data_compressed.len());
     trace!("Compressed data (first 50 chars): {}", data_compressed.chars().take(50).collect::<String>());
 
-    // Decode and uncompress the data
     let data_json = decode_uncompress(data_compressed)
         .map_err(|e| anyhow!("unable to uncompress payload: {}", e))?;
 
     debug!("Uncompressed JSON data length: {} bytes", data_json.len());
     trace!("Uncompressed JSON (first 100 chars): {}", std::str::from_utf8(&data_json).unwrap_or("invalid utf8").chars().take(100).collect::<String>());
 
-    // Parse based on payload version (matching Go implementation exactly)
     let uncompressed_data = if payload_version == "2" {
-        // Version 2: direct unmarshal to map[string]json.RawMessage
         serde_json::from_slice::<UncompressedData>(&data_json)
             .map_err(|e| anyhow!("unable to unmarshal uncompressed payload v2: {}", e))?
     } else {
-        // Version 1: unmarshal to map[string]map[string]json.RawMessage and extract "data"
         let v1_data: HashMap<String, UncompressedData> = serde_json::from_slice(&data_json)
             .map_err(|e| anyhow!("unable to unmarshal uncompressed payload v1: {}", e))?;
         
-        // Extract the "data" field for version 1
         v1_data.get("data")
             .ok_or_else(|| anyhow!("data field not found in version 1 payload"))?
             .clone()
@@ -166,16 +148,13 @@ fn decode_uncompress(input: &str) -> Result<Vec<u8>> {
     trace!("Decoding base64 string ({} chars)", input.len());
     trace!("Base64 input (first 50 chars): {}", input.chars().take(50).collect::<String>());
 
-    // Decode base64
     let decoded = general_purpose::STANDARD.decode(input)
         .map_err(|e| anyhow!("base64 decode error: {}", e))?;
 
     debug!("Successfully decoded base64 to {} bytes", decoded.len());
 
-    // Create gzip decoder
     let mut decoder = GzDecoder::new(&decoded[..]);
     
-    // Read uncompressed data
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)
         .map_err(|e| anyhow!("gzip decompression error: {}", e))?;
@@ -202,7 +181,6 @@ fn extract_trace_id_from_analytics(data: &UncompressedData) -> Result<Option<Str
         return Ok(None);
     }
 
-    // The structure is typically [metadata, common_attributes, [[event_data]]]
     let events_array: Vec<Vec<Value>> = serde_json::from_value(parsed_events[2].clone())
         .map_err(|e| anyhow!("failed to parse events array: {}", e))?;
 
@@ -210,7 +188,6 @@ fn extract_trace_id_from_analytics(data: &UncompressedData) -> Result<Option<Str
         return Ok(None);
     }
 
-    // Look for traceId in the first event
     if let Some(event_obj) = events_array[0][0].as_object() {
         if let Some(trace_id_value) = event_obj.get("traceId") {
             if let Some(trace_id) = trace_id_value.as_str() {
@@ -238,7 +215,6 @@ fn extract_trace_id_from_spans(data: &UncompressedData) -> Result<Option<String>
         return Ok(None);
     }
 
-    // The structure is typically [metadata, common_attributes, [[event_data]]]
     let events_array: Vec<Vec<Value>> = serde_json::from_value(parsed_events[2].clone())
         .map_err(|e| anyhow!("failed to parse span events array: {}", e))?;
 
@@ -246,7 +222,6 @@ fn extract_trace_id_from_spans(data: &UncompressedData) -> Result<Option<String>
         return Ok(None);
     }
 
-    // Look for traceId in the first span
     if let Some(span_obj) = events_array[0][0].as_object() {
         if let Some(trace_id_value) = span_obj.get("traceId") {
             if let Some(trace_id) = trace_id_value.as_str() {
@@ -273,25 +248,20 @@ mod tests {
             format!(r#"{{"data": {{"analytic_event_data": [null, null, [[{{"traceId": "{}"}}]]], "span_event_data": [null, null, [[{{"traceId": "{}"}}]]]}}}}"#, trace_id, trace_id)
         };
 
-        // Compress the data
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(test_data.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
         
-        // Base64 encode the compressed data
         let encoded = general_purpose::STANDARD.encode(&compressed);
         
-        // Create payload array based on version (following Go implementation)
         let payload_array = if version == "2" {
             format!(r#"["{}","","","{}"]"#, version, encoded)
         } else {
             format!(r#"["{}","","{}"]"#, version, encoded)
         };
         
-        // Create the JSON array with NR_LAMBDA_MONITORING marker
         let payload_with_marker = format!("{}NR_LAMBDA_MONITORING", payload_array);
         
-        // Base64 encode the entire payload (this is what the agent sends)
         general_purpose::STANDARD.encode(payload_with_marker.as_bytes()).into_bytes()
     }
 
@@ -323,7 +293,6 @@ mod tests {
 
     #[test]
     fn test_extract_trace_id_no_monitoring_marker() {
-        // Create a valid base64 payload but without NR_LAMBDA_MONITORING marker
         let test_data = "regular payload without NR_LAMBDA_MONITORING marker";
         let base64_payload = general_purpose::STANDARD.encode(test_data.as_bytes());
         
@@ -335,13 +304,11 @@ mod tests {
     fn test_decode_uncompress() {
         let test_data = "Hello, World!";
         
-        // Compress and encode
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(test_data.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
         let encoded = general_purpose::STANDARD.encode(&compressed);
         
-        // Test decode_uncompress
         let result = decode_uncompress(&encoded).unwrap();
         assert_eq!(String::from_utf8(result).unwrap(), test_data);
     }
@@ -351,13 +318,10 @@ mod tests {
         use tracing::Level;
         use tracing_subscriber;
         
-        // Initialize tracing for this test
         let _ = tracing_subscriber::fmt()
             .with_max_level(Level::TRACE)
             .try_init();
 
-        // Test with complete version 1 format (from your actual example)
-        // This is the full V1 payload from your message
         let v1_full_payload = "WzEsIk5SX0xBTUJEQV9NT05JVE9SSU5HIiwiSDRzSUFGQi9wR2dDLzlhMjNMYk9CTDlGUmVmRlJKM0VIN0xSWmw0SzlsNEs5bDRLOWx4eFE3TmJxNG9hakpMcnFiNmtKdU0vTlM1YXRJeUhyTjBCMTNzSGY4NnV3OXUxVCtIeXJDOGgxOExBajFERDFSdDNZVUVvd0JSdDA0SDBWZzBWZndweCszUC93KzJJbi9WeGhaTnczUmhGbjVlb3VsVnhVZmdNNS9ITjV6ZjE5VGpLNTBzVDA3N1o4V29KblVuQUVLU2ZNa2J3Il0=";
 
         println!("Testing full V1 payload...");
@@ -369,7 +333,6 @@ mod tests {
             Err(e) => println!("V1 Error: {}", e),
         }
 
-        // Create a simple test payload with trace ID to verify the logic works
         println!("Testing simple V2 with trace ID...");
         let simple_v2_payload = create_test_payload_with_trace_id("2", "test-trace-123");
         let simple_v2_str = String::from_utf8(simple_v2_payload).unwrap();
@@ -381,8 +344,6 @@ mod tests {
             Err(e) => println!("Simple V2 Error: {}", e),
         }
 
-        // These are example payloads, so we don't assert specific results
-        // but we should not get parsing errors
         assert!(result.is_ok());
         assert!(simple_result.is_ok());
     }
