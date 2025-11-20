@@ -57,25 +57,15 @@ pub struct LogProcessor {
    
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
    
-    failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
-   
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
+    failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
 }
 
-/// Failed log entry that stores the original log without invocation-specific metadata
 #[derive(Debug, Clone)]
 struct FailedLogEntry {
-   
     log_message: payload::LogMessage,
-   
     original_request_id: String,
-   
-    original_arn: String,
-   
-    original_timestamp: chrono::DateTime<chrono::Utc>,
-   
     failed_at: chrono::DateTime<chrono::Utc>,
-   
     retry_count: usize,
 }
 
@@ -436,6 +426,54 @@ impl LogProcessor {
    
    
     pub fn process_buffered_logs_with_request_id(&self, request_id: &str) {
+        let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if is_warm_start {
+            let failed_logs = {
+                let mut buffer = self.failed_logs_buffer.lock().unwrap();
+                std::mem::take(&mut *buffer)
+            };
+            
+            if !failed_logs.is_empty() {
+                info!("Retrying {} failed logs from previous invocation", failed_logs.len());
+                
+                let client = Arc::clone(&self.newrelic_client);
+                let config = Arc::clone(&self.config);
+                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
+                
+                tokio::spawn(async move {
+                    let mut still_failed = Vec::new();
+                    
+                    for mut entry in failed_logs {
+                        entry.retry_count += 1;
+                        
+                        if entry.retry_count > MAX_RETRIES {
+                            warn!("Dropping log after {} retries (original request: {})", 
+                                  entry.retry_count, entry.original_request_id);
+                            continue;
+                        }
+                        
+                        let logs_to_send = vec![entry.log_message.clone()];
+                        match client.send_logs(&config, logs_to_send, "retry").await {
+                            Ok(()) => {
+                                debug!("Successfully retried failed log");
+                            }
+                            Err(e) => {
+                                debug!("Failed log retry failed again: {}", e);
+                                still_failed.push(entry);
+                            }
+                        }
+                    }
+                    
+                    if !still_failed.is_empty() {
+                        let mut buffer = failed_buffer.lock().unwrap();
+                        buffer.extend(still_failed);
+                        info!("Re-buffered {} logs that failed retry", buffer.len());
+                    }
+                });
+            }
+        }
+        
         let buffered_logs = {
             let mut buffer = self.request_id_buffer.lock().unwrap();
             std::mem::take(&mut *buffer)
@@ -566,21 +604,17 @@ impl LogProcessor {
             debug!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
-            warn!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
-            {
-                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                let now = chrono::Utc::now();
-
-                for log in failed_logs {
-                    failed_buffer.push(FailedLogEntry {
-                        log_message: log,
-                        original_request_id: context.request_id.clone(),
-                        original_arn: context.invoked_function_arn.clone(),
-                        original_timestamp: now,
-                        failed_at: now,
-                        retry_count: 0,
-                    });
-                }
+            warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
+            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+            let now = chrono::Utc::now();
+            
+            for log in failed_logs {
+                failed_buffer.push(FailedLogEntry {
+                    log_message: log,
+                    original_request_id: context.request_id.clone(),
+                    failed_at: now,
+                    retry_count: 0,
+                });
             }
         }
         
@@ -635,22 +669,18 @@ impl LogProcessor {
                         continue;
                     } else {
                         if use_failed_buffer {
-                            warn!("Max retries exceeded - moving {} logs to failed buffer for retry", chunk.len());
-                            {
-                                let context = self.invocation_context.lock().unwrap().clone();
-                                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                                let now = chrono::Utc::now();
-
-                                for log in chunk {
-                                    failed_buffer.push(FailedLogEntry {
-                                        log_message: log,
-                                        original_request_id: context.request_id.clone(),
-                                        original_arn: context.invoked_function_arn.clone(),
-                                        original_timestamp: now,
-                                        failed_at: now,
-                                        retry_count: 0,
-                                    });
-                                }
+                            warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
+                            let context = self.invocation_context.lock().unwrap().clone();
+                            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                            let now = chrono::Utc::now();
+                            
+                            for log in chunk {
+                                failed_buffer.push(FailedLogEntry {
+                                    log_message: log,
+                                    original_request_id: context.request_id.clone(),
+                                    failed_at: now,
+                                    retry_count: 0,
+                                });
                             }
                         } else {
                             error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
