@@ -11,7 +11,7 @@ use crate::{
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
-    agent::batch::{add_to_batch, should_send_batch, send_batched_payloads},
+    agent::batch::send_batched_payloads,
 };
 
 #[derive(Debug)]

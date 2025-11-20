@@ -65,7 +65,6 @@ pub struct LogProcessor {
 struct FailedLogEntry {
     log_message: payload::LogMessage,
     original_request_id: String,
-    failed_at: chrono::DateTime<chrono::Utc>,
     retry_count: usize,
 }
 
@@ -606,13 +605,11 @@ impl LogProcessor {
         if !failed_logs.is_empty() {
             warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
             let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-            let now = chrono::Utc::now();
             
             for log in failed_logs {
                 failed_buffer.push(FailedLogEntry {
                     log_message: log,
                     original_request_id: context.request_id.clone(),
-                    failed_at: now,
                     retry_count: 0,
                 });
             }
@@ -672,13 +669,11 @@ impl LogProcessor {
                             warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
                             let context = self.invocation_context.lock().unwrap().clone();
                             let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                            let now = chrono::Utc::now();
                             
                             for log in chunk {
                                 failed_buffer.push(FailedLogEntry {
                                     log_message: log,
                                     original_request_id: context.request_id.clone(),
-                                    failed_at: now,
                                     retry_count: 0,
                                 });
                             }
@@ -697,10 +692,6 @@ impl LogProcessor {
 #[async_trait]
 impl Flush for LogProcessor {
     async fn flush(&self) -> std::io::Result<()> {
-        self.send_and_clear_batch_simple().await
-    }
-
-    async fn final_flush(&self) -> std::io::Result<()> {
         self.send_and_clear_batch_simple().await
     }
 }
