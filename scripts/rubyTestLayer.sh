@@ -13,8 +13,9 @@ cd "$ROOT_DIR"
 LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NRTestRubyRustExtension"}
 
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-1"}
-REGIONS_ARM64=${REGIONS_ARM64:-"us-west-1"}
+# Use :- for default only if unset (not if explicitly set to empty string)
+: ${REGIONS_X86_64="us-west-1"}
+: ${REGIONS_ARM64="us-west-1"}
 
 # Ruby configuration
 RUBY_VERSION=${RUBY_VERSION:-"3.3"}
@@ -346,9 +347,13 @@ main() {
   local zip_x86
   zip_x86=$(build_ruby_layer "$target_x86" "x86_64" "$RUBY_VERSION")
   
-  for region in $REGIONS_X86_64; do
-    publish_layer "$zip_x86" "$region" "ruby${RUBY_VERSION}" "x86_64" "${LAYER_NAME_PREFIX}Ruby${RUBY_VERSION//./}X86"
-  done
+  if [ -n "$REGIONS_X86_64" ]; then
+    for region in $REGIONS_X86_64; do
+      publish_layer "$zip_x86" "$region" "ruby${RUBY_VERSION}" "x86_64" "${LAYER_NAME_PREFIX}Ruby${RUBY_VERSION//./}X86"
+    done
+  else
+    echo "Skipping x86_64 publishing (no regions specified)"
+  fi
 
   # --- Build for arm64 ---
   echo ""
@@ -359,9 +364,13 @@ main() {
   local zip_arm
   zip_arm=$(build_ruby_layer "$target_arm" "arm64" "$RUBY_VERSION")
   
-  for region in $REGIONS_ARM64; do
-    publish_layer "$zip_arm" "$region" "ruby${RUBY_VERSION}" "arm64" "${LAYER_NAME_PREFIX}Ruby${RUBY_VERSION//./}ARM64"
-  done
+  if [ -n "$REGIONS_ARM64" ]; then
+    for region in $REGIONS_ARM64; do
+      publish_layer "$zip_arm" "$region" "ruby${RUBY_VERSION}" "arm64" "${LAYER_NAME_PREFIX}Ruby${RUBY_VERSION//./}ARM64"
+    done
+  else
+    echo "Skipping arm64 publishing (no regions specified)"
+  fi
 
   echo ""
   echo "=========================================="
