@@ -1220,7 +1220,7 @@ async fn process_and_send_agent_payload(
             payload_bytes.len()
         );
         match app.process_agent_payload(payload_bytes.to_vec()).await {
-            Ok(_) => {
+            Ok(()) => {
                 info!("APM agent payload processed and sent successfully");
             }
             Err(e) => {
@@ -1244,7 +1244,7 @@ async fn process_and_send_agent_payload(
         )
         .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 info!(
                     "Agent payload processed and sent (size: {} bytes)",
                     payload_bytes.len()
@@ -1361,15 +1361,16 @@ async fn retry_failed_agent_payloads(
         )
         .await
         {
-            Ok(_) => {
+            Ok(()) => {
                 retry_successful_count += 1;
                 debug!(
                     "Successfully retried agent payload for request {}",
                     failed_payload.request_id
                 );
             }
-            Err(_) => {
+            Err(e) => {
                 retry_failed_count += 1;
+                error!("Failed to retry agent payload: {}", e);
 
                 // Put it back in the buffer for next invocation if not too many retries
                 if failed_payload.retry_count <= 5 {

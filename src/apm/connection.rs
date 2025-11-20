@@ -89,8 +89,7 @@ pub async fn preconnect(
     base_host: &str,
 ) -> Result<String> {
     let url = format!(
-        "https://{}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=preconnect&license_key={}",
-        base_host, license_key
+        "https://{base_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=preconnect&license_key={license_key}"
     );
 
     // PreConnect sends an array with one object
@@ -147,8 +146,7 @@ pub async fn connect(
     agent_version: &str,
 ) -> Result<ConnectResponse> {
     let url = format!(
-        "https://{}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={}",
-        collector_host, license_key
+        "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
     );
 
     let connect_req = vec![ConnectRequest {

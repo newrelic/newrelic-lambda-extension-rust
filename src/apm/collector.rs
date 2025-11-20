@@ -25,7 +25,7 @@ const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // User-Agent format matches Go's "NewRelic-Go-Agent/3.35.1"
 fn get_user_agent() -> String {
-    format!("NewRelic-Rust-Lambda-Extension/{}", EXTENSION_VERSION)
+    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
 }
 
 /// APM collector error types
@@ -72,8 +72,7 @@ pub async fn send_error_events(
     ]);
 
     let url = format!(
-        "https://{}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={}&method={}&license_key={}&run_id={}",
-        collector_host, PROTOCOL_VERSION, CMD_ERROR_EVENTS, license_key, run_id
+        "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={PROTOCOL_VERSION}&method={CMD_ERROR_EVENTS}&license_key={license_key}&run_id={run_id}"
     );
 
     // Serialize payload
@@ -153,8 +152,7 @@ pub async fn send_apm_telemetry(
     }
 
     let url = format!(
-        "https://{}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={}&method={}&license_key={}&run_id={}",
-        collector_host, PROTOCOL_VERSION, command, license_key, run_id
+        "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={PROTOCOL_VERSION}&method={command}&license_key={license_key}&run_id={run_id}"
     );
 
     // Serialize payload
