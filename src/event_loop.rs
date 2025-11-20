@@ -1,17 +1,4 @@
-//! Main event processing loops for Lambda extension lifecycle
-//!
-//! This module contains the core event processing logic for both APM and Standard modes:
-//! - execute_apm_mode_event_loop: APM collector mode (immediate sending, no batching)
-//! - execute_standard_mode_event_loop: Serverless ingest API mode (batching optimization)
-//! - execute_noop_event_loop: No-op mode when extension is disabled
-//! - process_apm_request: APM mode request processing
-//! - process_request_concurrently: Standard mode request processing with batching
-//!
-//! Event loop pattern:
-//! 1. GET /next (blocks - Lambda freezes extension)
-//! 2. Receive INVOKE event (Lambda unfreezes)
-//! 3. Process event quickly (< 50ms for warm starts)
-//! 4. Return to step 1 (loops until SHUTDOWN)
+
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,7 +28,6 @@ use crate::{
     IS_WARM_START,
 };
 
-/// Structure holding all extension components for event loop
 #[derive(Debug)]
 pub struct ExtensionComponents {
     pub client: Arc<Client>,
@@ -54,7 +40,6 @@ pub struct ExtensionComponents {
     pub apm_app: crate::apm::SharedApmApp,
 }
 
-/// Failed agent payload structure for retry across invocations
 #[derive(Debug, Clone)]
 pub struct FailedAgentPayload {
     pub payload_bytes: Vec<u8>,
@@ -64,15 +49,13 @@ pub struct FailedAgentPayload {
     pub failed_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Global failed agent payloads buffer for retry across invocations
 pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// Infinite event loop - handles first invoke (cold start) and all subsequent invokes (warm starts)
+/// Event loop: handles cold start (first invoke) and warm starts (subsequent invokes)
 pub async fn run_infinite_event_loop(
     mut extension_components: ExtensionComponents,
 ) -> (u32, tokio::task::JoinHandle<()>) {
-    // Check if this is a no-op mode
     if !extension_components.config.new_relic.extension_enabled
         || extension_components.config.new_relic.license_key.is_none()
     {
@@ -82,22 +65,12 @@ pub async fn run_infinite_event_loop(
         return (0, extension_components.harvester_handle);
     }
 
-    // Execute main telemetry processing loop
     let total_events = execute_main_telemetry_processing_loop(&mut extension_components).await;
     (total_events, extension_components.harvester_handle)
 }
 
-/// INFINITE EVENT LOOP - Core of Lambda Extension Lifecycle
-///
-/// This loop implements the correct Lambda extension pattern:
-/// 1. GET /next (blocks here - Lambda freezes extension)
-/// 2. Receive INVOKE event (Lambda unfreezes extension)
-/// 3. Process event quickly (< 50ms for warm starts)
-/// 4. Return to step 1 (loops forever until SHUTDOWN)
-///
-/// First iteration = Cold Start, subsequent iterations = Warm Starts
-///
-/// Routes to appropriate loop based on APM mode
+/// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
+/// Routes to APM or standard mode based on config
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let is_apm_mode = components.apm_app.read().await.is_some();
 
@@ -110,13 +83,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
     }
 }
 
-/// APM MODE EVENT LOOP - Optimized for APM Collector
-///
-/// Key characteristics:
-/// - Sends agent payloads immediately to APM collector (5 telemetry types)
-/// - No batching or platform.report coordination
-/// - Keeps buffer alive on warm starts to catch late-arriving payloads
-/// - Processes pending payloads from previous invocation on warm starts
+/// APM mode: immediate sending to collector, no batching, keeps buffers alive for late payloads
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
 
@@ -142,20 +109,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             } => {
                 let event_start = std::time::Instant::now();
 
-                // Tag Lambda function on first invocation (with real ARN)
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
                 }
 
-                // Update global context
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                // Process buffered logs
                 components
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
 
-                // Create request state FIRST (before processing pending payloads)
                 let request_state = create_request_processing_state(
                     &request_id,
                     &invoked_function_arn,
@@ -163,10 +126,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 );
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                // WARM START: Process pending payloads in PARALLEL with current request
-                // This prevents blocking the current request while processing old late payloads
                 let pending_task = if !is_cold_start {
-                    // Log buffer state before processing
                     let buffer_count = REQUEST_AGENT_BUFFERS.len();
                     info!(
                         "APM warm start: Found {} request buffer(s) before processing (current: {})",
@@ -186,7 +146,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 &config,
                                 &global_log_processor,
                                 &apm_app,
-                                &current_request_id, // Exclude current request
+                                &current_request_id,
                             )
                             .await;
                         }
@@ -195,7 +155,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     None
                 };
 
-                // Process current request in APM mode (runs in parallel with pending task)
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
                 let processor_factory_clone = components.processor_factory.clone();
@@ -218,7 +177,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                // Wait for both tasks to complete (current request + pending payloads)
                 if let Some(pending) = pending_task {
                     let (current_result, pending_result) = tokio::join!(current_task, pending);
                     if let Err(e) = current_result {
@@ -247,13 +205,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("APM mode: Extension shutting down: {}", shutdown_reason);
-                // Process any final pending payloads (use empty string to process ALL buffers)
                 process_pending_agent_payloads(
                     &components.newrelic_client,
                     &components.config,
                     &components.global_log_processor,
                     &components.apm_app,
-                    "", // Empty string = process all pending buffers
+                    "",
                 )
                 .await;
                 break;
@@ -264,13 +221,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
     event_counter
 }
 
-/// STANDARD MODE EVENT LOOP - Optimized for Serverless Ingest API
-///
-/// Key characteristics:
-/// - Batches agent payloads with platform.report for warm starts
-/// - Sends to serverless ingest API (single wrapped payload)
-/// - Waits for platform.report coordination
-/// - Cleans up immediately after processing
+/// Standard mode: batches payloads with platform.report, sends to serverless API
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
 
@@ -296,29 +247,23 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             } => {
                 let event_start = std::time::Instant::now();
 
-                // Tag Lambda function on first invocation (with real ARN)
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
                 }
 
-                // Update global context
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                // Process buffered logs
                 components
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
 
-                // WARM START: Clean up old buffers from previous request and process any late agent payloads
                 if !is_cold_start {
-                    // Find old request buffers (from previous invocation)
                     let old_requests: Vec<String> = REQUEST_AGENT_BUFFERS
                         .iter()
                         .map(|entry| entry.key().clone())
                         .collect();
 
                     for old_request_id in old_requests {
-                        // Check if there's a late agent payload in the buffer
                         if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
                             if let Ok(buffer_guard) = buffer.lock() {
                                 if !buffer_guard.is_empty() {
@@ -328,7 +273,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                                         old_request_id
                                     );
 
-                                    // Check if there's a matching platform.report in PENDING_REPORTS
                                     let report_line =
                                         PENDING_REPORTS.remove(&old_request_id).map(|(_, report)| {
                                             debug!(
@@ -338,7 +282,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                                             report
                                         });
 
-                                    // Add to batch for sending
                                     for payload_bytes in buffer_guard.iter() {
                                         let context = REQUEST_CONTEXTS
                                             .get(&old_request_id)
@@ -362,14 +305,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                             }
                         }
 
-                        debug!(
-                            "Cleaning up old buffer from previous request: {}",
-                            old_request_id
-                        );
                         cleanup_request_processing_state(&old_request_id);
                     }
 
-                    // Check if batch should be sent now
                     if should_send_batch() {
                         let newrelic_client = components.newrelic_client.clone();
                         let config = components.config.clone();
@@ -379,22 +317,18 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     }
                 }
 
-                // Create request state
                 let request_state = create_request_processing_state(
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
                 );
 
-                // Update global log processor context for this request
                 components
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
-                // Store request processing state
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                // Process request in standard mode
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
                 let processor_factory_clone = components.processor_factory.clone();
@@ -437,7 +371,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("Standard mode: Extension shutting down: {}", shutdown_reason);
 
-                // Wait for all requests to complete and flush batched payloads
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),
                     components.config.clone(),
@@ -451,8 +384,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
     event_counter
 }
 
-/// No-op event loop when extension is disabled
-/// Equivalent to Go's noopLoop function
 pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
     info!("Starting no-op mode, no telemetry will be sent");
 
@@ -473,16 +404,11 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                     request_id
                 );
             }
-            Err(_) => { /* Ignore errors and continue polling */ }
+            Err(_) => {}
         }
     }
 }
 
-// ============================================================================
-// APM MODE REQUEST PROCESSING
-// ============================================================================
-
-/// Process request in APM mode - simplified flow with immediate sending
 pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
@@ -495,14 +421,11 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    // CRITICAL: Set this as the currently active request for agent payload routing
     if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
-    // WARM START: Check for and process any pending late agent payloads from previous invocations
     if !is_cold_start {
-        // Find all buffers that have payloads (excluding current request)
         let pending_buffers: Vec<String> = REQUEST_AGENT_BUFFERS
             .iter()
             .filter_map(|entry| {
@@ -530,7 +453,6 @@ pub async fn process_apm_request(
                     old_request_id
                 );
 
-                // Extract payloads from buffer
                 let late_payloads = if let Some(buffer_ref) =
                     REQUEST_AGENT_BUFFERS.get(&old_request_id)
                 {
@@ -543,7 +465,6 @@ pub async fn process_apm_request(
                     Vec::new()
                 };
 
-                // Send late payloads to APM collector
                 for payload_bytes in late_payloads {
                     debug!(
                         "Sending late agent payload for request: {} ({} bytes)",
@@ -573,17 +494,11 @@ pub async fn process_apm_request(
                     }
                 }
 
-                // Cleanup old request resources after sending late payload
-                debug!(
-                    "Cleaning up resources for old request after late payload: {}",
-                    old_request_id
-                );
                 cleanup_request_processing_state_internal(&old_request_id, false);
             }
         }
     }
 
-    // Get request processing state
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
     let Some(mut state) = state else {
@@ -591,7 +506,6 @@ pub async fn process_apm_request(
         return;
     };
 
-    // Set invocation start time
     let invocation_start_time = chrono::Utc::now();
     global_log_processor.set_invocation_start_time(invocation_start_time);
     global_log_processor.reset_trace_id_state();
@@ -599,9 +513,6 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // COLD START: Wait for platform.runtimeDone
-    // WARM START: Also wait for APM mode (agent sends payload when function completes)
-    // Standard mode can skip for performance since it uses batching
     if is_cold_start {
         if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
             match runtime_done_rx.recv().await {
@@ -616,8 +527,6 @@ pub async fn process_apm_request(
             }
         }
     } else {
-        // APM WARM START: Wait for runtime.done because agent sends payload when function completes
-        debug!("APM warm start: Waiting for runtime.done (agent sends payload at function completion)");
         if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
             match runtime_done_rx.recv().await {
                 Some(_) => debug!(
@@ -632,7 +541,6 @@ pub async fn process_apm_request(
         }
     }
 
-    // Wait up to 200ms for agent payload (early exit on arrival)
     let payload_already_arrived = {
         if let Ok(buffer) = state.agent_buffer.lock() {
             !buffer.is_empty()
@@ -661,7 +569,6 @@ pub async fn process_apm_request(
         );
     }
 
-    // Extract agent payload from buffer
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -670,10 +577,8 @@ pub async fn process_apm_request(
         }
     };
 
-    // Track if we got the payload now or need to wait for late arrival
     let got_payload_now = !agent_payloads.is_empty();
 
-    // Send agent payload immediately to APM collector if available
     let send_agent_task = if got_payload_now {
         info!(
             "APM mode: Sending {} agent payload(s) immediately to APM collector",
@@ -688,7 +593,6 @@ pub async fn process_apm_request(
 
         Some(tokio::spawn(async move {
             for payload_bytes in agent_payloads {
-                // Extract trace ID if enabled
                 extract_and_coordinate_trace_id(
                     &payload_bytes,
                     &config_clone,
@@ -696,7 +600,6 @@ pub async fn process_apm_request(
                 )
                 .await;
 
-                // Send to APM collector
                 if let Err(e) = send_to_apm_collector(
                     &payload_bytes,
                     &request_id_clone,
@@ -719,7 +622,6 @@ pub async fn process_apm_request(
         None
     };
 
-    // Flush logs, platform data, and agent send ALL IN PARALLEL
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
 
@@ -735,7 +637,6 @@ pub async fn process_apm_request(
         }
     );
 
-    // Log any errors
     if let Err(e) = log_result {
         error!("Failed to flush logs for request {}: {}", request_id, e);
     }
@@ -746,9 +647,6 @@ pub async fn process_apm_request(
         error!("Agent send task failed for request {}: {}", request_id, e);
     }
 
-    // APM Mode Cleanup Strategy:
-    // - If we got the payload now and sent it: CLEANUP immediately
-    // - If payload not arrived yet: KEEP buffer alive for late arrival (next invocation will process it)
     if got_payload_now {
         debug!(
             "APM mode: Agent payload sent - cleaning up all resources for request: {}",
@@ -756,20 +654,12 @@ pub async fn process_apm_request(
         );
         cleanup_request_processing_state_internal(&request_id, false);
 
-        // Clear active request ID
         if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
             *active_request = None;
         }
     } else {
-        debug!(
-            "APM mode: No payload yet - keeping buffer alive for late arrival (will process on next invoke)"
-        );
-        // Keep buffer and context alive - cleanup will happen when:
-        // 1. Next invocation arrives and processes pending buffers
-        // 2. Or late payload arrives and gets sent
-        cleanup_request_processing_state_internal(&request_id, true); // skip_buffer_cleanup = true
+        cleanup_request_processing_state_internal(&request_id, true);
 
-        // Keep active request ID so late payloads route correctly
         if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
             *active_request = Some(request_id.clone());
         }
@@ -808,11 +698,6 @@ async fn send_to_apm_collector(
     Ok(())
 }
 
-// ============================================================================
-// STANDARD MODE REQUEST PROCESSING
-// ============================================================================
-
-/// Process request in Standard mode - with batching and platform.report coordination
 pub async fn process_request_concurrently(
     request_id: String,
     invoked_function_arn: String,
@@ -827,12 +712,10 @@ pub async fn process_request_concurrently(
         request_id
     );
 
-    // CRITICAL: Set this as the currently active request for agent payload routing
     if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
-    // Get request processing state
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
     let Some(mut state) = state else {
@@ -840,7 +723,6 @@ pub async fn process_request_concurrently(
         return;
     };
 
-    // Set invocation start time
     let invocation_start_time = chrono::Utc::now();
     global_log_processor.set_invocation_start_time(invocation_start_time);
     global_log_processor.reset_trace_id_state();
@@ -848,11 +730,8 @@ pub async fn process_request_concurrently(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // Check if this is a cold or warm start
     let is_cold_start = !IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
 
-    // COLD START: Wait for platform.runtimeDone event
-    // WARM START: Skip this wait for performance
     if is_cold_start {
         if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
             match runtime_done_rx.recv().await {
@@ -873,7 +752,6 @@ pub async fn process_request_concurrently(
         );
     }
 
-    // Wait for agent payload - Standard mode uses shorter timeout for warm starts
     let agent_wait_timeout_ms = if is_cold_start { 200 } else { 50 };
 
     let payload_already_arrived = {
@@ -904,7 +782,6 @@ pub async fn process_request_concurrently(
         );
     }
 
-    // Extract agent payload from buffer
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -913,7 +790,6 @@ pub async fn process_request_concurrently(
         }
     };
 
-    // Check if platform.report already available in PENDING_REPORTS (non-blocking)
     let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| {
         debug!(
             "Found pending platform.report for request: {}",
@@ -922,12 +798,10 @@ pub async fn process_request_concurrently(
         report
     });
 
-    // STANDARD MODE STRATEGY: Batch payloads on warm starts without platform.report
     let send_agent_task = if agent_payloads.is_empty() {
         info!("Standard mode: No agent payload for request: {}", request_id);
         None
     } else if is_cold_start {
-        // COLD START: Send immediately with or without report
         info!(
             "Standard mode: Cold start - sending agent payload immediately (with report: {})",
             report_line.is_some()
@@ -951,7 +825,6 @@ pub async fn process_request_concurrently(
             .await;
         }))
     } else if report_line.is_some() {
-        // WARM START + REPORT AVAILABLE: Send immediately with report combined
         info!("Standard mode: Warm start - agent+report ready, sending combined");
         let request_id_clone = request_id.clone();
         let invoked_function_arn_clone = invoked_function_arn.clone();
@@ -972,7 +845,6 @@ pub async fn process_request_concurrently(
             .await;
         }))
     } else {
-        // WARM START + NO REPORT: Batch for later (5 min or count threshold)
         info!(
             "Standard mode: Warm start - batching agent payload (no platform.report yet)"
         );
@@ -985,7 +857,6 @@ pub async fn process_request_concurrently(
             );
         }
 
-        // Check if batch threshold reached
         if should_send_batch() {
             debug!("Batch threshold reached - sending batched payloads");
             let newrelic_client_clone = newrelic_client.clone();
@@ -999,7 +870,6 @@ pub async fn process_request_concurrently(
         }
     };
 
-    // Flush logs, platform data, and retry failed payloads ALL IN PARALLEL
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
     let failed_retry = retry_failed_agent_payloads(&newrelic_client, &config);
@@ -1017,7 +887,6 @@ pub async fn process_request_concurrently(
         }
     );
 
-    // Log any errors
     if let Err(e) = log_result {
         error!("Failed to flush logs for request {}: {}", request_id, e);
     }
@@ -1028,12 +897,8 @@ pub async fn process_request_concurrently(
         error!("Agent send task failed for request {}: {}", request_id, e);
     }
 
-    // Standard mode: Keep buffers alive on WARM STARTS to catch late agent payloads
-    // Late payloads are processed at the START of the NEXT request (not via pending payload processing)
-    // Cold starts: cleanup immediately since no late payloads expected
     cleanup_request_processing_state_conditional(&request_id, is_cold_start);
 
-    // CRITICAL: Clear the active request ID now that processing is done
     if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = None;
     }
@@ -1043,10 +908,6 @@ pub async fn process_request_concurrently(
         request_id
     );
 }
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
 
 /// Tag Lambda function once on first invocation
 fn tag_lambda_function_once(invoked_function_arn: String) {
@@ -1068,7 +929,7 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
     if let Ok(mut global_context) = crate::CURRENT_INVOCATION_CONTEXT.lock() {
         global_context.request_id = request_id.to_string();
         global_context.invoked_function_arn = invoked_function_arn.to_string();
-        global_context.trace_id = None; // Reset trace ID for new request
+        global_context.trace_id = None;
     }
 }
 
@@ -1097,9 +958,8 @@ async fn process_pending_agent_payloads(
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
-    current_request_id: &str, // NEW: Exclude this request from processing
+    current_request_id: &str,
 ) {
-    // Get all pending request buffers EXCEPT the current request
     let all_buffers: Vec<(String, usize)> = REQUEST_AGENT_BUFFERS
         .iter()
         .map(|entry| {
@@ -1116,7 +976,7 @@ async fn process_pending_agent_payloads(
 
     let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_AGENT_BUFFERS
         .iter()
-        .filter(|entry| entry.key() != current_request_id) // Exclude current request
+        .filter(|entry| entry.key() != current_request_id)
         .map(|entry| (entry.key().clone(), entry.value().clone()))
         .collect();
 
@@ -1135,7 +995,6 @@ async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
-        // Get the context for this request
         let context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
 
         let invoked_function_arn = if let Some(ctx) = context {
@@ -1148,7 +1007,6 @@ async fn process_pending_agent_payloads(
             "unknown".to_string()
         };
 
-        // Extract payloads from buffer
         let payloads = {
             if let Ok(mut buf) = buffer.lock() {
                 std::mem::take(&mut *buf)
@@ -1181,7 +1039,6 @@ async fn process_pending_agent_payloads(
             }
         }
 
-        // Now cleanup the old request completely
         cleanup_request_processing_state_internal(&request_id, false);
     }
 }
@@ -1196,7 +1053,6 @@ async fn process_and_send_agent_payload(
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract trace ID only if enabled via config
     if config.new_relic.collect_trace_id {
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
             info!("Extracted trace ID: {}, coordinating with logs", trace_id);
@@ -1211,10 +1067,8 @@ async fn process_and_send_agent_payload(
         debug!("Trace ID collection disabled, skipping extraction");
     }
 
-    // Route to APM mode or standard mode
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
-        // APM mode: parse and send to APM collector
         info!(
             "APM mode: Processing agent payload (size: {} bytes)",
             payload_bytes.len()
@@ -1225,7 +1079,6 @@ async fn process_and_send_agent_payload(
             }
             Err(e) => {
                 error!("Failed to send agent payload to APM collector: {}", e);
-                // Buffer for retry
                 buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
                 warn!(
                     "APM agent payload buffered for retry (size: {} bytes)",
@@ -1234,7 +1087,6 @@ async fn process_and_send_agent_payload(
             }
         }
     } else {
-        // Standard mode: send to serverless ingest API
         match send_agent_payload_to_newrelic(
             payload_bytes,
             request_id,
@@ -1256,7 +1108,6 @@ async fn process_and_send_agent_payload(
                     request_id, e
                 );
 
-                // Buffer the failed payload for retry
                 buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
 
                 warn!(
@@ -1304,7 +1155,6 @@ async fn retry_failed_agent_payloads(
     let mut retry_successful_count = 0;
     let mut retry_failed_count = 0;
 
-    // Take all failed payloads for retry (this clears the buffer)
     let failed_payloads = {
         if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
             std::mem::take(&mut *failed_payloads)
@@ -1327,7 +1177,6 @@ async fn retry_failed_agent_payloads(
     for mut failed_payload in failed_payloads {
         failed_payload.retry_count += 1;
 
-        // Skip payloads that are too old (older than 24 hours)
         let age = chrono::Utc::now().signed_duration_since(failed_payload.failed_at);
         if age.num_hours() > 24 {
             warn!(
@@ -1338,7 +1187,6 @@ async fn retry_failed_agent_payloads(
             continue;
         }
 
-        // Skip payloads that have been retried too many times
         if failed_payload.retry_count > 5 {
             warn!(
                 "Dropping agent payload after {} retries for request {}",
@@ -1372,7 +1220,6 @@ async fn retry_failed_agent_payloads(
                 retry_failed_count += 1;
                 error!("Failed to retry agent payload: {}", e);
 
-                // Put it back in the buffer for next invocation if not too many retries
                 if failed_payload.retry_count <= 5 {
                     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
                         failed_payloads.push(failed_payload);
@@ -1398,7 +1245,7 @@ pub fn cleanup_old_failed_payloads() {
 
         failed_payloads.retain(|payload| {
             let age = now.signed_duration_since(payload.failed_at);
-            age.num_hours() <= 24 // Keep payloads newer than 24 hours
+            age.num_hours() <= 24
         });
 
         let removed_count = initial_count - failed_payloads.len();
@@ -1422,7 +1269,6 @@ pub fn start_batch_timeout_task(
         loop {
             interval.tick().await;
 
-            // Check if oldest payload > 5 minutes
             let should_send = {
                 if let Ok(meta) = crate::agent::batch::BATCH_META.lock() {
                     if let Some(oldest) = meta.oldest_timestamp {
@@ -1433,7 +1279,7 @@ pub fn start_batch_timeout_task(
                 } else {
                     false
                 }
-            }; // Lock is released here
+            };
 
             if should_send {
                 info!("Batch timeout reached (5 minutes) - sending buffered payloads");
