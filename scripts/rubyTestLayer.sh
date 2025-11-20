@@ -18,9 +18,9 @@ REGIONS_ARM64=${REGIONS_ARM64:-"us-west-1"}
 
 # Ruby configuration
 RUBY_VERSION=${RUBY_VERSION:-"3.3"}
-RUBY_DIR="ruby"
-BUILD_DIR="$RUBY_DIR"
+RUBY_ASSETS_DIR="$SCRIPT_DIR/ruby"
 WRAPPER_FILE="newrelic_lambda_wrapper.rb"
+GEMFILE="Gemfile"
 
 # Extension configuration
 BIN_NAME="newrelic-lambda-extension"
@@ -72,13 +72,26 @@ ENV['NEW_RELIC_TRUSTED_ACCOUNT_KEY'] = ENV.fetch('NEW_RELIC_ACCOUNT_ID', '')
 
 class NewRelicLambdaWrapper
   HANDLER_VAR = 'NEW_RELIC_LAMBDA_HANDLER'
-  NR_LAYER_GEM_PATH = "/opt/ruby/gems/#{RUBY_VERSION.rpartition('.').first}.0/gems".freeze
+  NR_LAYER_GEM_PATH = "/opt/ruby/gems/#{RUBY_VERSION.rpartition('.').first}.0".freeze
 
   def self.adjust_load_path
     return unless Dir.exist?(NR_LAYER_GEM_PATH)
 
-    Dir.glob(File.join(NR_LAYER_GEM_PATH, '*', 'lib')).each do |gem_lib_dir|
-      $LOAD_PATH.push(gem_lib_dir) unless $LOAD_PATH.include?(gem_lib_dir)
+    # Add the gems directory to load path
+    gem_dirs = Dir.glob(File.join(NR_LAYER_GEM_PATH, 'gems', '*'))
+    gem_dirs.each do |gem_dir|
+      lib_dir = File.join(gem_dir, 'lib')
+      $LOAD_PATH.unshift(lib_dir) if Dir.exist?(lib_dir) && !$LOAD_PATH.include?(lib_dir)
+    end
+    
+    # Also check specifications directory exists
+    specs_dir = File.join(NR_LAYER_GEM_PATH, 'specifications')
+    if Dir.exist?(specs_dir)
+      # Add to GEM_PATH if not already there
+      gem_path = ENV['GEM_PATH'] || ''
+      unless gem_path.split(':').include?(NR_LAYER_GEM_PATH)
+        ENV['GEM_PATH'] = [NR_LAYER_GEM_PATH, gem_path].reject(&:empty?).join(':')
+      end
     end
   end
 
@@ -145,24 +158,18 @@ EOF
 # Bundles Ruby gems
 bundle_ruby_gems() {
   local ruby_version="$1"
-  local temp_bundle_dir="$LAYER_DIR/bundle_temp"
+  local layer_ruby_dir="$2"  # Where to put the final ruby/ directory
   
   echo "Bundling Ruby gems for version $ruby_version" >&2
   
-  # Create temporary bundling directory
-  mkdir -p "$temp_bundle_dir"
-  cd "$temp_bundle_dir"
+  # Create temporary directory for bundling
+  local temp_dir=$(mktemp -d)
+  cd "$temp_dir"
   
-  # Create Gemfile
-  cat > "Gemfile" << 'GEMFILE_EOF'
-# frozen_string_literal: true
-
-source 'https://rubygems.org'
-
-gem 'newrelic_rpm'
-GEMFILE_EOF
+  # Copy Gemfile
+  cp "$RUBY_ASSETS_DIR/$GEMFILE" .
   
-  # Configure bundler
+  # Configure bundler to install in current directory
   bundle config set --local without development >/dev/null 2>&1
   bundle config set --local path . >/dev/null 2>&1
   
@@ -170,28 +177,30 @@ GEMFILE_EOF
   echo "Installing newrelic_rpm gem..." >&2
   bundle install --quiet
   
-  local base_dir="$RUBY_DIR/gems/$ruby_version.0"
-  
-  # Bundler creates ./ruby/<CURRENT_RUBY_VERSION>/gems
-  # AWS wants ./ruby/gems/<TARGET_RUBY_VERSION>
-  mkdir -p "$RUBY_DIR/gems"
-  
-  # Rename to target Ruby version
-  local bundled_version=$(find "$RUBY_DIR" -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | head -n 1 | xargs basename 2>/dev/null)
-  if [ -n "$bundled_version" ]; then
-    mv "$RUBY_DIR/$bundled_version" "$base_dir"
+  # Find the bundled version directory (e.g., ./ruby/3.3.0)
+  local bundled_dir=$(find ruby -maxdepth 1 -type d -name "[0-9]*" 2>/dev/null | head -n 1)
+  if [ -z "$bundled_dir" ]; then
+    echo "Error: Could not find bundled Ruby version directory" >&2
+    cd "$ROOT_DIR"
+    rm -rf "$temp_dir"
+    return 1
   fi
   
+  # Create the target structure: ruby/gems/3.3.0/
+  mkdir -p "$layer_ruby_dir/gems"
+  mv "$bundled_dir" "$layer_ruby_dir/gems/$ruby_version.0"
+  
   # Clean up unnecessary directories
+  local target_dir="$layer_ruby_dir/gems/$ruby_version.0"
   for sub_dir in 'bin' 'build_info' 'cache' 'doc' 'extensions' 'plugins'; do
-    rm -rf "$base_dir/$sub_dir" 2>/dev/null || true
+    rm -rf "$target_dir/$sub_dir" 2>/dev/null || true
   done
   
-  # Extract agent version
-  local agent_dir=$(find "$base_dir/gems" -type d -name "newrelic_rpm-*" 2>/dev/null | head -n 1)
+  # Extract and save agent version
+  local agent_dir=$(find "$target_dir/gems" -type d -name "newrelic_rpm-*" 2>/dev/null | head -n 1)
   if [ -n "$agent_dir" ]; then
     NEWRELIC_RUBY_AGENT_VERSION=$(basename "$agent_dir" | cut -d'-' -f2-)
-    echo "$NEWRELIC_RUBY_AGENT_VERSION" > "$RUBY_DIR/version.txt"
+    echo "$NEWRELIC_RUBY_AGENT_VERSION" > "$layer_ruby_dir/version.txt"
     echo "New Relic Ruby Agent version: $NEWRELIC_RUBY_AGENT_VERSION" >&2
   else
     echo "Warning: Could not determine newrelic_rpm version" >&2
@@ -199,6 +208,7 @@ GEMFILE_EOF
   fi
   
   cd "$ROOT_DIR"
+  rm -rf "$temp_dir"
 }
 
 # Builds a complete Ruby layer with agent + extension
@@ -211,14 +221,14 @@ build_ruby_layer() {
   echo "Building New Relic layer for Ruby $ruby_version ($arch_linux)" >&2
 
   rm -rf "$LAYER_DIR"
-  mkdir -p "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR/ruby"
   
-  # Bundle Ruby gems into LAYER_DIR
-  bundle_ruby_gems "$ruby_version"
+  # Bundle Ruby gems
+  bundle_ruby_gems "$ruby_version" "$LAYER_DIR/ruby"
   
-  # Add wrapper to lib directory
-  mkdir -p "$LAYER_DIR/$RUBY_DIR/lib"
-  create_ruby_wrapper "$LAYER_DIR/$RUBY_DIR/lib/$WRAPPER_FILE"
+  # Copy wrapper to lib directory
+  mkdir -p "$LAYER_DIR/ruby/lib"
+  cp "$RUBY_ASSETS_DIR/$WRAPPER_FILE" "$LAYER_DIR/ruby/lib/"
   
   # Add Rust extension
   mkdir -p "$LAYER_DIR/extensions"
