@@ -369,11 +369,9 @@ impl LogProcessor {
 
    
     fn extract_log_level(&self, message: &str) -> &'static str {
-        // First, try to extract from structured prefixes like "[NR_EXT] TRACE" or "2024-01-01 12:00:00 ERROR"
-        // Look for log level keywords at word boundaries near the start of the message
+        
         let check_str = &message[..message.len().min(100)]; // Check first 100 chars
         
-        // Check for extension format: [NR_EXT] LEVEL
         if let Some(bracket_end) = check_str.find(']') {
             let after_bracket = &check_str[bracket_end+1..].trim_start();
             if after_bracket.starts_with("TRACE") || after_bracket.starts_with("trace") {
@@ -391,7 +389,6 @@ impl LogProcessor {
             }
         }
         
-        // Fallback: check for level keywords anywhere in the first part
         if check_str.contains(" ERROR ") || check_str.contains(" error ") 
            || check_str.contains(" FATAL ") || check_str.contains(" fatal ")
            || check_str.starts_with("ERROR") || check_str.starts_with("error")
@@ -599,22 +596,81 @@ impl LogProcessor {
             return Ok(());
         }
 
-        debug!("Sending {} logs to New Relic", batch.len());
+        let deduplicated_batch = {
+            use std::collections::HashMap;
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            
+            let mut seen = HashMap::new();
+            let mut unique_logs = Vec::new();
+            let mut duplicate_count = 0;
+            
+            for log in batch {
+                let mut hasher = DefaultHasher::new();
+                log.message.hash(&mut hasher);
+                log.timestamp.hash(&mut hasher);
+                
+                if let Some(request_id_value) = log.attributes.get("aws.lambda_request_id") {
+                    if let Some(request_id_str) = request_id_value.as_str() {
+                        request_id_str.hash(&mut hasher);
+                    }
+                }
+                
+                let log_hash = hasher.finish();
+                
+                if seen.insert(log_hash, log.timestamp).is_none() {
+                    unique_logs.push(log);
+                } else {
+                    duplicate_count += 1;
+                }
+            }
+            
+            if duplicate_count > 0 {
+                info!("Deduplicated {} duplicate log(s) before sending", duplicate_count);
+            }
+            
+            unique_logs
+        };
+
+        if deduplicated_batch.is_empty() {
+            debug!("All logs were duplicates, nothing to send");
+            return Ok(());
+        }
+
+        info!("Final flush: sending {} logs to New Relic", deduplicated_batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
         
-        let chunks: Vec<Vec<payload::LogMessage>> = batch
-            .chunks(MAX_BATCH_SIZE)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+        let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut current_size = 0;
         
-        if chunks.len() > 1 {
-            debug!("Chunking {} logs into {} batches", batch.len(), chunks.len());
+        for log in deduplicated_batch {
+            let log_size = 8 + log.message.len() + 
+                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+            
+            if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+            
+            current_chunk.push(log);
+            current_size += log_size;
         }
         
-        let mut failed_logs = Vec::with_capacity(batch.len() / 10);
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+        
+        if chunks.len() > 1 {
+            info!("Chunking {} logs into {} size-based batches (max 1MB each)", 
+                  chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
+        }
+        
+        let mut failed_logs = Vec::new();
         let mut successful_chunks = 0;
         
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
@@ -630,7 +686,7 @@ impl LogProcessor {
         }
         
         if successful_chunks > 0 {
-            debug!("Successfully sent {} log chunks", successful_chunks);
+            info!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
             warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());

@@ -162,6 +162,18 @@ impl Default for ExtensionSettings {
 }
 
 impl ExtensionConfig {
+    /// Validates the log level and returns a valid level or defaults to "info" with a warning
+    fn validate_log_level(raw_level: &str) -> String {
+        let normalized = raw_level.to_lowercase();
+        match normalized.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" | "all" => normalized,
+            _ => {
+                eprintln!("[NR_EXT] WARNING: Invalid log level '{}' provided in NEW_RELIC_EXTENSION_LOG_LEVEL. Defaulting to 'info'. Valid values are: trace, debug, info, warn, error, all", raw_level);
+                "info".to_string()
+            }
+        }
+    }
+
     pub fn from_env() -> Self {
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
@@ -228,7 +240,8 @@ impl ExtensionConfig {
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
 
-        config.extension.log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        config.extension.log_level = Self::validate_log_level(&raw_log_level);
 
         config
     }
@@ -292,7 +305,16 @@ pub fn init_config() -> &'static ExtensionConfig {
                 log_level
             );
 
-            let env_filter = EnvFilter::new(filter_directive);
+            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+            let env_filter = match EnvFilter::try_new(&filter_directive) {
+                Ok(filter) => filter,
+                Err(e) => {
+                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,info";
+                    EnvFilter::try_new(fallback_directive)
+                        .expect("Fallback filter directive should always be valid")
+                }
+            };
 
             let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
