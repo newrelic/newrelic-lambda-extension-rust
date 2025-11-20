@@ -335,9 +335,5 @@ impl Flush for PlatformProcessor {
         
         Ok(())
     }
-    
-    async fn final_flush(&self) -> Result<()> {
-        self.send_and_clear_batch_simple().await
-    }
 }
 
