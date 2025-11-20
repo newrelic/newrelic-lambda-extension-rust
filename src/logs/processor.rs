@@ -369,17 +369,47 @@ impl LogProcessor {
 
    
     fn extract_log_level(&self, message: &str) -> &'static str {
-        if message.contains("ERROR") || message.contains("error")
-           || message.contains("FATAL") || message.contains("fatal") {
+        // First, try to extract from structured prefixes like "[NR_EXT] TRACE" or "2024-01-01 12:00:00 ERROR"
+        // Look for log level keywords at word boundaries near the start of the message
+        let check_str = &message[..message.len().min(100)]; // Check first 100 chars
+        
+        // Check for extension format: [NR_EXT] LEVEL
+        if let Some(bracket_end) = check_str.find(']') {
+            let after_bracket = &check_str[bracket_end+1..].trim_start();
+            if after_bracket.starts_with("TRACE") || after_bracket.starts_with("trace") {
+                return "TRACE";
+            } else if after_bracket.starts_with("DEBUG") || after_bracket.starts_with("debug") {
+                return "DEBUG";
+            } else if after_bracket.starts_with("INFO") || after_bracket.starts_with("info") {
+                return "INFO";
+            } else if after_bracket.starts_with("WARN") || after_bracket.starts_with("warn") 
+                      || after_bracket.starts_with("WARNING") || after_bracket.starts_with("warning") {
+                return "WARN";
+            } else if after_bracket.starts_with("ERROR") || after_bracket.starts_with("error") 
+                      || after_bracket.starts_with("FATAL") || after_bracket.starts_with("fatal") {
+                return "ERROR";
+            }
+        }
+        
+        // Fallback: check for level keywords anywhere in the first part
+        if check_str.contains(" ERROR ") || check_str.contains(" error ") 
+           || check_str.contains(" FATAL ") || check_str.contains(" fatal ")
+           || check_str.starts_with("ERROR") || check_str.starts_with("error")
+           || check_str.starts_with("FATAL") || check_str.starts_with("fatal") {
             "ERROR"
-        } else if message.contains("WARN") || message.contains("warn")
-                  || message.contains("WARNING") || message.contains("warning") {
+        } else if check_str.contains(" WARN ") || check_str.contains(" warn ")
+                  || check_str.contains(" WARNING ") || check_str.contains(" warning ")
+                  || check_str.starts_with("WARN") || check_str.starts_with("warn")
+                  || check_str.starts_with("WARNING") || check_str.starts_with("warning") {
             "WARN"
-        } else if message.contains("DEBUG") || message.contains("debug") {
+        } else if check_str.contains(" DEBUG ") || check_str.contains(" debug ")
+                  || check_str.starts_with("DEBUG") || check_str.starts_with("debug") {
             "DEBUG"
-        } else if message.contains("TRACE") || message.contains("trace") {
+        } else if check_str.contains(" TRACE ") || check_str.contains(" trace ")
+                  || check_str.starts_with("TRACE") || check_str.starts_with("trace") {
             "TRACE"
-        } else if message.contains("INFO") || message.contains("info") {
+        } else if check_str.contains(" INFO ") || check_str.contains(" info ")
+                  || check_str.starts_with("INFO") || check_str.starts_with("info") {
             "INFO"
         } else {
             "INFO"
