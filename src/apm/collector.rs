@@ -10,7 +10,6 @@ use serde_json::Value;
 use std::io::Write;
 use tracing::{debug, info, warn, error};
 
-// APM collector command names
 pub const CMD_METRICS: &str = "metric_data";
 pub const CMD_SPAN_EVENTS: &str = "span_event_data";
 pub const CMD_ERROR_EVENTS: &str = "error_event_data";
@@ -23,7 +22,6 @@ pub const CMD_LOG_EVENTS: &str = "log_event_data";
 const PROTOCOL_VERSION: u8 = 17;
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// User-Agent format matches Go's "NewRelic-Go-Agent/3.35.1"
 fn get_user_agent() -> String {
     format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
 }
@@ -61,7 +59,6 @@ pub async fn send_error_events(
         return Ok(());
     }
 
-    // Wrap error events in APM format: [run_id, {events_seen, reservoir_size}, [events]]
     let wrapped_data = serde_json::json!([
         run_id,
         {
@@ -75,11 +72,9 @@ pub async fn send_error_events(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={PROTOCOL_VERSION}&method={CMD_ERROR_EVENTS}&license_key={license_key}&run_id={run_id}"
     );
 
-    // Serialize payload
     let payload_json = serde_json::to_string(&wrapped_data)?;
     let uncompressed_len = payload_json.len();
 
-    // Gzip compress
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(payload_json.as_bytes())?;
     let compressed = encoder.finish()?;
@@ -91,8 +86,6 @@ pub async fn send_error_events(
         uncompressed_len
     );
 
-    // NOTE: NOT setting Content-Length - let reqwest auto-calculate from body
-    // Go sets Content-Length=uncompressed but this causes issues with strict HTTP servers
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -144,8 +137,6 @@ pub async fn send_apm_telemetry(
     command: &str,
     data: &[Value],
 ) -> Result<()> {
-    // ProcessData: Replace first element with run_id (matching Go implementation)
-    // Go code: if len(data) > 0 { data[0] = runId }
     let mut processed_data = data.to_vec();
     if !processed_data.is_empty() {
         processed_data[0] = serde_json::json!(run_id);
@@ -155,11 +146,9 @@ pub async fn send_apm_telemetry(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version={PROTOCOL_VERSION}&method={command}&license_key={license_key}&run_id={run_id}"
     );
 
-    // Serialize payload
     let payload_json = serde_json::to_string(&processed_data)?;
     let uncompressed_len = payload_json.len();
 
-    // Gzip compress
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(payload_json.as_bytes())?;
     let compressed = encoder.finish()?;
@@ -184,9 +173,6 @@ pub async fn send_apm_telemetry(
         uncompressed_len
     );
 
-    // NOTE: NOT setting Content-Length - let reqwest auto-calculate from body
-    // Go sets Content-Length=uncompressed but this causes issues with strict HTTP servers
-    // Reqwest will either set Content-Length=compressed or use chunked encoding
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -211,14 +197,11 @@ pub async fn send_apm_telemetry(
         
         debug!("Status Code for {} telemetry: {}", command, status_code);
         
-        // Handle special collector status codes
         if status_code == 410 {
-            // Disconnect - fatal error, agent must stop sending
             error!("APM collector disconnected (410) - agent should stop sending telemetry");
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", command)));
         } else if status_code == 401 || status_code == 409 {
-            // Restart exception - should reconnect and get new run_id
             warn!("APM collector restart exception ({}) - reconnection needed", status_code);
             return Err(anyhow::Error::new(CollectorError::RestartException)
                 .context(format!("Collector returned {} for {}", status_code, command)));
@@ -251,7 +234,6 @@ pub async fn send_platform_metrics(
 
     let payload_json = serde_json::to_string(&payload)?;
 
-    // Gzip compress
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(payload_json.as_bytes())?;
     let compressed = encoder.finish()?;
@@ -268,7 +250,7 @@ pub async fn send_platform_metrics(
         .header("Content-Type", "application/json")
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20))  // Match APM collector timeout
+        .timeout(std::time::Duration::from_secs(20)) 
         .send()
         .await?;
 

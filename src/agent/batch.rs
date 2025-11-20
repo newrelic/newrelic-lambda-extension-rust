@@ -68,7 +68,6 @@ pub fn add_to_batch(
         }
     );
 
-    // Update metadata
     if let Ok(mut meta) = BATCH_META.lock() {
         meta.agent_count += 1;
         if meta.oldest_timestamp.is_none() {
@@ -85,13 +84,11 @@ pub fn add_to_batch(
 /// - Oldest payload > 5 minutes
 pub fn should_send_batch() -> bool {
     if let Ok(meta) = BATCH_META.lock() {
-        // Condition 1: 3+ agent payloads
         if meta.agent_count >= 3 {
             debug!("Batch threshold reached: {} agents", meta.agent_count);
             return true;
         }
 
-        // Condition 2: Oldest payload > 5 minutes
         if let Some(oldest) = meta.oldest_timestamp {
             let age = chrono::Utc::now() - oldest;
             if age > chrono::Duration::seconds(300) {
@@ -113,7 +110,6 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
 
     AGENT_BATCH_BUFFER.clear();
 
-    // Reset metadata
     if let Ok(mut meta) = BATCH_META.lock() {
         meta.agent_count = 0;
         meta.oldest_timestamp = None;
@@ -135,26 +131,22 @@ pub async fn send_agent_with_report_immediately(
     let has_report = report_line.is_some();
     debug!("Sending agent payload immediately for {} (with report: {})", request_id, has_report);
 
-    // Check if APM mode is enabled
     let apm_app_guard = apm_app.read().await;
     let is_apm_mode = apm_app_guard.is_some();
 
     for payload_bytes in agent_payloads {
         if let Some(ref app) = *apm_app_guard {
-            // APM MODE: Send agent payload to APM collector
             info!("APM mode: Sending agent payload for request: {}", request_id);
             if let Err(e) = app.process_agent_payload(payload_bytes.clone()).await {
                 error!("Failed to send agent payload to APM collector for {}: {}", request_id, e);
             }
             
-            // Send REPORT log metrics to APM if available
             if let Some(ref report) = report_line {
                 debug!("APM mode: Sending platform REPORT metrics for request: {}", request_id);
                 if let Err(e) = app.send_platform_report_metrics(report).await {
                     error!("Failed to send platform REPORT metrics for {}: {}", request_id, e);
                 }
                 
-                // Check for faults/timeouts in REPORT log and generate error events
                 if report.contains("Task timed out") || report.contains("error") || report.contains("Error") {
                     debug!("APM mode: Detected fault/timeout in REPORT log, generating error event");
                     if let Err(e) = app.send_error_event_from_fault(report, &request_id, &invoked_function_arn).await {
@@ -163,11 +155,8 @@ pub async fn send_agent_with_report_immediately(
                 }
             }
         } else {
-            // STANDARD MODE: Send to serverless ingest API
-            // Build log events array with optional report
             let mut log_events = Vec::new();
 
-            // Add agent payload FIRST (try UTF-8 first to avoid allocation)
             let agent_str = match std::str::from_utf8(&payload_bytes) {
                 Ok(s) => s.to_string(),
                 Err(_) => String::from_utf8_lossy(&payload_bytes).to_string(),
@@ -178,7 +167,6 @@ pub async fn send_agent_with_report_immediately(
                 "timestamp": chrono::Utc::now().timestamp_millis(),
             }));
 
-            // Add report line SECOND (if available)
             if let Some(ref report) = report_line {
                 log_events.push(serde_json::json!({
                     "id": request_id,
@@ -187,7 +175,6 @@ pub async fn send_agent_with_report_immediately(
                 }));
             }
 
-            // Wrap in New Relic format
             let entry = serde_json::json!({
                 "logEvents": log_events,
                 "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
@@ -208,7 +195,6 @@ pub async fn send_agent_with_report_immediately(
 
             let payload_json = payload.to_string();
 
-            // Send to New Relic
             if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
                 error!("Failed to send agent payload for {}: {}", request_id, e);
             }
@@ -234,11 +220,9 @@ pub async fn send_batched_payloads(
 
     debug!("Sending batch of {} agent payloads", batch_items.len());
 
-    // Build log events array from all batched items
     let mut log_events = Vec::new();
 
     for item in &batch_items {
-        // Add agent payload FIRST (try UTF-8 first to avoid allocation)
         let agent_str = match std::str::from_utf8(&item.agent_payload_bytes) {
             Ok(s) => s.to_string(),
             Err(_) => String::from_utf8_lossy(&item.agent_payload_bytes).to_string(),
@@ -249,7 +233,6 @@ pub async fn send_batched_payloads(
             "timestamp": item.timestamp.timestamp_millis(),
         }));
 
-        // Add report line SECOND (if present)
         if let Some(ref report) = item.report_line {
             log_events.push(serde_json::json!({
                 "id": item.request_id,
@@ -259,10 +242,8 @@ pub async fn send_batched_payloads(
         }
     }
 
-    // Use most recent item's ARN for context
     let most_recent = batch_items.last().expect("batch_items should not be empty");
 
-    // Wrap in New Relic format
     let entry = serde_json::json!({
         "logEvents": log_events,
         "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
@@ -283,7 +264,6 @@ pub async fn send_batched_payloads(
 
     let payload_json = payload.to_string();
 
-    // Send to New Relic
     if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
         error!("Failed to send batched payloads: {}", e);
     } else {

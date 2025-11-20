@@ -33,37 +33,29 @@ pub struct LambdaRawData {
 /// Parse agent payload and return telemetry data by type
 /// Returns (data_map, protocol_version)
 pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<Value>>, u8)> {
-    // Convert to string and check if it's JSON array
     let payload_str = std::str::from_utf8(payload_bytes)?;
     
     if payload_str.is_empty() || !payload_str.trim_start().starts_with('[') {
         return Ok((HashMap::new(), 0));
     }
 
-    // Remove square brackets and trim
     let json_data = payload_str.trim().trim_start_matches('[').trim_end_matches(']');
     
-    // Split by comma to get components
     let components: Vec<&str> = json_data.split(',').collect();
     if components.len() < 2 {
         return Err(anyhow!("Insufficient data components"));
     }
 
-    // Extract protocol version (first component)
     let protocol_version = components[0].trim().trim_matches('"');
     
-    // Extract encoded part (last component)
     let encoded_part = components[components.len() - 1].trim().trim_matches('"');
 
     debug!("Parsing agent payload: protocol version = {}", protocol_version);
 
-    // Decode and decompress
     let uncompressed_json = decode_uncompress(encoded_part)?;
 
-    // Parse based on protocol version
     let (data_map, version) = match protocol_version {
         "2" => {
-            // Protocol v2: direct unmarshal to LambdaData
             trace!("Parsing v2 payload: {}", String::from_utf8_lossy(&uncompressed_json));
             let lambda_data: LambdaData = serde_json::from_slice(&uncompressed_json)
                 .map_err(|e| anyhow!("Failed to parse v2 payload: {} - Payload preview: {}", e, 
@@ -71,7 +63,6 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
             (convert_lambda_data_to_map(lambda_data), 2)
         }
         "1" | _ => {
-            // Protocol v1: unmarshal to wrapper with "metadata" and "data" fields
             let wrapper: LambdaRawData = serde_json::from_slice(&uncompressed_json)
                 .map_err(|e| anyhow!("Failed to parse v1 payload: {} - Payload preview: {}", e, 
                     String::from_utf8_lossy(&uncompressed_json).chars().take(500).collect::<String>()))?;
@@ -87,13 +78,11 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
 fn decode_uncompress(input: &str) -> Result<Vec<u8>> {
     trace!("Decoding base64 string ({} chars)", input.len());
 
-    // Decode base64
     let decoded = general_purpose::STANDARD.decode(input)
         .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
 
     debug!("Base64 decoded to {} bytes", decoded.len());
 
-    // Decompress gzip
     let mut decoder = GzDecoder::new(&decoded[..]);
     let mut uncompressed = Vec::new();
     decoder.read_to_end(&mut uncompressed)
@@ -144,7 +133,6 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
     {
         let raw_map: HashMap<String, Value> = HashMap::deserialize(deserializer)?;
         
-        // Helper function to get field with both naming conventions
         fn get_field(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<Value> {
             let value = map.get(snake_case).or_else(|| map.get(camel_case));
             
@@ -181,15 +169,12 @@ mod tests {
             r#"{"data": {"metric_data": [[1, 2, 3]], "span_event_data": [[4, 5, 6]]}}"#
         };
 
-        // Compress
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(test_data.as_bytes()).unwrap();
         let compressed = encoder.finish().unwrap();
 
-        // Base64 encode
         let encoded = general_purpose::STANDARD.encode(&compressed);
 
-        // Create payload array
         let payload = format!(r#"["{}", "NR_LAMBDA_MONITORING", "{}"]"#, version, encoded);
 
         payload.into_bytes()

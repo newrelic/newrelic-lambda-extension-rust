@@ -38,14 +38,12 @@ impl Harvester {
             interval.tick().await;
             flush_cycle_count += 1;
             
-            // Only log every 10th flush cycle to reduce noise
             if flush_cycle_count % 10 == 1 {
                 trace!("Flushing all {} processors + log/platform processors (cycle: {})", self.processors.len(), flush_cycle_count);
             }
             
             let mut error_count = 0;
             
-            // Flush generic processors
             for (index, p) in self.processors.iter().enumerate() {
                 if let Err(e) = p.flush().await {
                     error!("Error flushing processor {}: {}", index, e);
@@ -53,19 +51,16 @@ impl Harvester {
                 }
             }
             
-            // Flush log processor (this will send accumulated logs)
             if let Err(e) = self.log_processor.flush().await {
                 error!("Error flushing log processor: {}", e);
                 error_count += 1;
             }
             
-            // Flush platform processor (this will send accumulated platform events)
             if let Err(e) = self.platform_processor.flush().await {
                 error!("Error flushing platform processor: {}", e);
                 error_count += 1;
             }
             
-            // Only log completion if there were errors or every 10th cycle
             if error_count > 0 {
                 warn!("Completed flush cycle {} with {} errors", flush_cycle_count, error_count);
             } else if flush_cycle_count % 10 == 1 {

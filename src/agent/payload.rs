@@ -74,7 +74,6 @@ fn create_wrapped_agent_payload_json(
         function_name
     );
 
-    // Create New Relic log event format with agent data as message
     create_newrelic_log_format(
         payload_bytes,
         function_name,
@@ -96,18 +95,15 @@ fn create_newrelic_log_format(
     request_id: &str,
     config: &Arc<ExtensionConfig>,
 ) -> String {
-    // Convert agent data to string (should be JSON array like [1,"NR_LAMBDA_MONITORING","compressed_data"])
     let agent_data_str = String::from_utf8_lossy(agent_data);
     debug!("Agent data to wrap in log format: {}", agent_data_str);
 
-    // Generate timestamp in milliseconds
     #[allow(clippy::cast_possible_truncation)]
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Create the log events structure first (for agent payload wrapping)
     let log_events_payload = serde_json::json!({
         "logEvents": [{
             "id": request_id,
@@ -120,10 +116,8 @@ fn create_newrelic_log_format(
         "owner": ""
     });
 
-    // Stringify the log events payload to put in entry field (this is required for agent payload format)
     let log_events_string = log_events_payload.to_string();
 
-    // Create context object with base fields
     let mut context = serde_json::json!({
         "function_name": function_name,
         "invoked_function_arn": invoked_function_arn,
@@ -131,9 +125,7 @@ fn create_newrelic_log_format(
         "log_stream_name": format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
     });
 
-    // Add version detail tags to context if enabled
     if config.new_relic.add_version_detail_tags {
-        // Use cached version info (already detected once during initialization)
         let version_info = version::VersionInfo::get_or_detect();
         let version_tags = version_info.as_tags();
 
@@ -144,16 +136,14 @@ fn create_newrelic_log_format(
             debug!(
                 "Added {} version detail tags to agent payload context",
                 context_obj.len() - 4
-            ); // Subtract the 4 base fields
+            );
         }
     }
 
-    // Create final payload with context and stringified entry
     let final_payload = serde_json::json!({
         "context": context,
         "entry": log_events_string
     });
 
-    // Convert to string and return
     final_payload.to_string()
 }

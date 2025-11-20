@@ -21,21 +21,18 @@ const CHANNEL_BUFFER_SIZE: usize = 100;
 pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
     let path = Path::new(TELEMETRY_NAMED_PIPE_PATH);
 
-    // 1. Remove the pipe if it already exists, ignoring "Not Found" errors.
     match fs::remove_file(path) {
         Ok(_) => {},
         Err(e) if e.kind() == ErrorKind::NotFound => (),
         Err(e) => return Err(e),
     }
 
-    // 2. Create the new named pipe (FIFO) with 0666 permissions.
-    let mode = stat::Mode::from_bits(0o666).unwrap(); // 0o666 is always valid
+    let mode = stat::Mode::from_bits(0o666).unwrap();
     unistd::mkfifo(path, mode)
         .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create FIFO: {}", e)))?;
     debug!("Created new telemetry pipe at {}", TELEMETRY_NAMED_PIPE_PATH);
 
 
-    // 3. Wait for the pipe to be visible in the filesystem to avoid race conditions.
     let mut tries = 0;
     while !path.exists() {
         if tries >= TELEMETRY_NAMED_PIPE_RETRIES {
@@ -45,38 +42,29 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
         tokio::time::sleep(TELEMETRY_NAMED_PIPE_RETRY_DELAY).await;
     }
 
-    // 4. Create an MPSC channel to send data from the pipe listener to the main application.
     let (tx, rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-    // 5. Spawn a background task to poll the pipe.
     tokio::spawn(async move {
         debug!("Starting telemetry pipe listener loop.");
         let mut consecutive_errors = 0;
         let mut bytes_received_count = 0;
         
         loop {
-            // Reading from the pipe is a blocking operation. We offload it to a
-            // blocking-safe thread pool to avoid starving the async executor.
             let bytes_result = poll_for_telemetry().await;
 
             match bytes_result {
                 Ok(bytes) => {
-                    consecutive_errors = 0; // Reset error counter on success
+                    consecutive_errors = 0;
                     
                     if bytes.is_empty() {
-                        // This can happen if the writer closes the pipe immediately.
-                        // We just continue to the next read attempt.
                         continue;
                     }
                     
                     bytes_received_count += 1;
-                    // Only log every 10th successful read to reduce noise
                     if bytes_received_count % 10 == 1 {
                         trace!("Received {} bytes from telemetry pipe (count: {})", bytes.len(), bytes_received_count);
                     }
                     
-                    // Send the received data through the channel. If it fails,
-                    // it means the receiver has been dropped, so we can exit the loop.
                     if tx.send(bytes).await.is_err() {
                         warn!("Telemetry channel closed by receiver. Shutting down listener.");
                         break;
@@ -84,7 +72,6 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
                 }
                 Err(e) => {
                     consecutive_errors += 1;
-                    // Only log errors every 5th occurrence to reduce spam
                     if consecutive_errors % 5 == 1 {
                         error!("Error polling for telemetry: {} (count: {}). Retrying in 1s.", e, consecutive_errors);
                     }
@@ -101,7 +88,6 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
 /// This function will block until a writer opens the other end of the pipe and writes data.
 async fn poll_for_telemetry() -> Result<Vec<u8>> {
     task::spawn_blocking(|| {
-        // This closure runs on a dedicated thread, so blocking is okay.
         let mut pipe = fs::File::open(TELEMETRY_NAMED_PIPE_PATH)?;
         let mut buffer = Vec::new();
         pipe.read_to_end(&mut buffer)?;
@@ -109,7 +95,6 @@ async fn poll_for_telemetry() -> Result<Vec<u8>> {
     })
     .await
     .unwrap_or_else(|join_error| {
-        // The task panicked, which is a critical error.
         Err(Error::new(ErrorKind::Other, join_error.to_string()))
     })
 }

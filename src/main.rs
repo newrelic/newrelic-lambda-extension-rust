@@ -72,7 +72,6 @@ static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // CRITICAL: Set up global panic hook to prevent ANY panic from crashing Lambda
     std::panic::set_hook(Box::new(|panic_info| {
         let location = if let Some(location) = panic_info.location() {
             format!("{}:{}", location.file(), location.line())
@@ -88,31 +87,26 @@ async fn main() -> std::io::Result<()> {
             "unknown panic message"
         };
 
-        // Use eprintln! since logging might not be available during panic
         eprintln!(
             "[NR_EXT] ERROR Extension panic caught (Lambda will continue): {}",
             message
         );
         eprintln!("[NR_EXT] ERROR Panic location: {}", location);
 
-        // Don't re-panic - just log and continue
     }));
 
-    // CRITICAL: Wrap everything in error handling to prevent Lambda crashes
     match run_extension().await {
         Ok(_) => {
             eprintln!("[NR_EXT] INFO Extension completed successfully");
             Ok(())
         }
         Err(e) => {
-            // Log error but don't propagate - this prevents Lambda from crashing
             eprintln!(
                 "[NR_EXT] ERROR Extension failed but continuing gracefully: {}",
                 e
             );
             eprintln!("[NR_EXT] WARN Lambda function will continue without New Relic monitoring");
 
-            // Return Ok to prevent Lambda crash - this is critical!
             Ok(())
         }
     }
@@ -126,8 +120,6 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
         "[NR_EXT] INFO Extension running in NO-OP mode - Lambda function will continue normally"
     );
 
-    // Even in no-op mode, we need to properly register with the Lambda Extensions API
-    // and wait for INVOKE/SHUTDOWN events to follow the correct lifecycle
     let (client, extension_id, _registration) =
         initialize_lambda_runtime_client_and_register().await?;
 
@@ -136,7 +128,6 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
         extension_id
     );
 
-    // Follow proper Extension API lifecycle - wait for events but do nothing with them
     loop {
         match runtime::fetch_next_event(&client, &extension_id).await {
             Ok(runtime::LambdaRuntimeEvent::Invoke {
@@ -147,7 +138,6 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
                     "No-op mode: Received INVOKE event for request {}, doing nothing",
                     request_id
                 );
-                // Do absolutely nothing - no telemetry, no processing, no network calls
             }
             Ok(runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
                 info!(
@@ -177,7 +167,6 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         EXTENSION_VERSION
     );
 
-    // PHASE 1: ONE-TIME COLD START INITIALIZATION (with true no-op fallback)
     let extension_components = match perform_one_time_initialization().await {
         Ok(components) => {
             info!("Extension initialization successful");
@@ -193,9 +182,8 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
                 e
             );
 
-            // Enter true no-op mode - do absolutely nothing
             run_noop_extension().await?;
-            return Ok(()); // This return will never be reached since noop runs forever
+            return Ok(());
         }
     };
 
@@ -207,11 +195,9 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         extension_startup_time.elapsed()
     );
 
-    // PHASE 2: INFINITE EVENT LOOP (handles both first invoke and all warm starts)
     let (total_events_processed, harvester_handle) =
         run_infinite_event_loop(extension_components).await;
 
-    // PHASE 3: CLEANUP ON SHUTDOWN (only happens once per container lifecycle)
     perform_extension_shutdown_cleanup(
         total_events_processed,
         harvester_handle,
@@ -225,19 +211,16 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 /// Perform all one-time initialization - called only once per container
 async fn perform_one_time_initialization(
 ) -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize config first (this sets up logging)
     let config = config::init_config().clone();
     let config = Arc::new(config);
 
-    // --- PHASE 1: PARALLEL CRITICAL OPERATIONS (maximum performance) ---
+   
 
-    // 1. Early exit for disabled extension (no-op mode)
     if !config.new_relic.extension_enabled {
         info!("Extension telemetry processing disabled - entering no-op mode");
         let (client, extension_id, _registration) =
             initialize_lambda_runtime_client_and_register().await?;
 
-        // Create noop processor factory
         let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
         let noop_apm_app = Arc::new(tokio::sync::RwLock::new(None));
         let noop_processor_factory = Arc::new(ProcessorFactory::new(
@@ -246,7 +229,6 @@ async fn perform_one_time_initialization(
             noop_apm_app.clone(),
         ));
 
-        // Create dummy processors for harvester
         let dummy_context = Arc::new(Mutex::new(InvocationContext {
             request_id: "noop".to_string(),
             invoked_function_arn: "noop".to_string(),
@@ -295,7 +277,6 @@ async fn perform_one_time_initialization(
         config.new_relic.add_version_detail_tags
     );
 
-    // Detect versions early if tagging is enabled (using async for AWS API calls)
     if config.new_relic.add_version_detail_tags {
         let version_info = version::VersionInfo::detect_async().await;
         info!("Version detection results:");
@@ -319,9 +300,8 @@ async fn perform_one_time_initialization(
         config.extension.send_function_logs, config.extension.send_extension_logs
     );
 
-    // --- PHASE 2: PARALLEL INITIALIZATION (using already registered extension) ---
+   
 
-    // Update config with registration details first (needed for NewRelic client)
     let mut updated_config = (*config).clone();
     updated_config.aws.update_from_registration(
         registration.function_name,
@@ -330,13 +310,10 @@ async fn perform_one_time_initialization(
     );
     let config = Arc::new(updated_config);
 
-    // Note: Lambda function tagging will happen on first invocation when we have the real ARN
-    // The constructed ARN here may have a placeholder account ID
     if config.new_relic.add_version_detail_tags {
         debug!("Version detail tagging enabled - will tag function on first invocation with actual ARN");
     }
 
-    // 4. MAXIMALLY PARALLEL: Initialize remaining core components simultaneously
     let (agent_telemetry_rx_result, newrelic_client, runtime_done_channels) = tokio::join!(
         initialize_agent_telemetry_ipc_channel(),
         async { Arc::new(NewRelicClient::new(&config)) },
@@ -353,13 +330,10 @@ async fn perform_one_time_initialization(
 
     start_agent_payload_collector_background_task(agent_telemetry_rx);
 
-    // Clean up very old failed payloads (older than 24 hours)
     cleanup_old_failed_payloads();
 
-    // Start batch timeout background task (checks every 30 seconds for 5-minute timeout)
     start_batch_timeout_task(Arc::clone(&newrelic_client), Arc::clone(&config));
 
-    // 9. Initialize APM app if APM mode is enabled (before processor factory)
     let apm_app = if config.new_relic.apm_lambda_mode {
         info!("APM Lambda mode enabled - initializing APM connection");
         let license_key = config
@@ -381,12 +355,10 @@ async fn perform_one_time_initialization(
                     "APM app initialized successfully - Entity GUID: {}",
                     app.get_entity_guid()
                 );
-                // Store in global APM_APP for access by telemetry listener
                 {
                     let mut global_apm = APM_APP.write().await;
                     *global_apm = Some(app);
                 }
-                // Return a clone of the global Arc
                 Arc::clone(&APM_APP)
             }
             Err(e) => {
@@ -402,14 +374,12 @@ async fn perform_one_time_initialization(
         Arc::new(tokio::sync::RwLock::new(None))
     };
 
-    // Create processor factory for request-scoped processors (with apm_app)
     let processor_factory = Arc::new(ProcessorFactory::new(
         Arc::clone(&newrelic_client),
         Arc::clone(&config),
         Arc::clone(&apm_app),
     ));
 
-    // Setup telemetry listener (use global current context that gets updated per request)
     let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
     let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
     let temp_platform_processor = processor_factory.create_platform_processor(global_context);
@@ -451,7 +421,6 @@ async fn handle_no_license_key(
 ) -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
     info!("No license key available after checking all sources. Running in no-op mode.");
 
-    // Update config with registration details even in no-op mode
     let mut updated_config = (*config).clone();
     updated_config.aws.update_from_registration(
         registration.function_name,
@@ -460,7 +429,6 @@ async fn handle_no_license_key(
     );
     let config = Arc::new(updated_config);
 
-    // Return no-op components (extension already registered for SHUTDOWN events)
     let noop_newrelic_client = Arc::new(NewRelicClient::new_noop());
     let noop_apm_app = Arc::new(tokio::sync::RwLock::new(None));
     let noop_processor_factory = Arc::new(ProcessorFactory::new(
@@ -469,7 +437,6 @@ async fn handle_no_license_key(
         noop_apm_app.clone(),
     ));
 
-    // Create dummy processors for harvester
     let dummy_context = Arc::new(Mutex::new(InvocationContext {
         request_id: "noop".to_string(),
         invoked_function_arn: "noop".to_string(),
@@ -493,10 +460,8 @@ async fn handle_no_license_key(
 async fn resolve_license_key_with_aws_fallback(
     config: &Arc<config::ExtensionConfig>,
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    // Fix: Dereference the Arc to get &ExtensionConfig
     let credentials_config = config::Configuration::from(config.as_ref());
 
-    // Check if AWS services are needed for license key resolution
     let aws_services_required = credentials_config.license_key.is_empty()
         && (std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok()
             || std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok()
@@ -532,12 +497,10 @@ async fn resolve_license_key_with_aws_fallback(
 async fn initialize_http_client_with_timeout(
 ) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Client::builder()
-        // Remove global timeout - let individual requests set their own timeouts
-        // Extension event polling needs 5+ minute timeouts, but other requests need shorter ones
-        .connect_timeout(Duration::from_secs(10)) // Connection establishment timeout
-        .pool_idle_timeout(Duration::from_secs(90)) // Keep connections alive longer for Lambda runtime API
-        .pool_max_idle_per_host(10) // Allow more parallel connections for APM telemetry sending
-        .tcp_keepalive(Duration::from_secs(60)) // Enable TCP keepalive
+        .connect_timeout(Duration::from_secs(10))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(Duration::from_secs(60))
         .build()?)
 }
 
@@ -606,7 +569,6 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 );
             }
 
-            // Route payload (will try immediate processing first, store if it fails)
             route_payload_to_request_buffer(payload_bytes).await;
         }
 
@@ -620,7 +582,6 @@ fn start_harvester_background_task(
     harvest_interval: Duration,
     processor_factory: &Arc<ProcessorFactory>,
 ) -> (Arc<Harvester>, tokio::task::JoinHandle<()>) {
-    // Create dummy processors for harvester (will be replaced by per-request processors)
     let dummy_context = Arc::new(Mutex::new(InvocationContext {
         request_id: "harvester".to_string(),
         invoked_function_arn: "harvester".to_string(),
@@ -653,7 +614,6 @@ async fn perform_extension_shutdown_cleanup(
         total_events_processed
     );
 
-    // Stop harvester background task
     harvester_handle.abort();
 
     let shutdown_at = std::time::Instant::now();

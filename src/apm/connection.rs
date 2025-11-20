@@ -92,7 +92,6 @@ pub async fn preconnect(
         "https://{base_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=preconnect&license_key={license_key}"
     );
 
-    // PreConnect sends an array with one object
     let preconnect_req = vec![PreconnectRequest {
         security_policies_token: String::new(),
         high_security: false,
@@ -100,7 +99,6 @@ pub async fn preconnect(
 
     let body = serde_json::to_vec(&preconnect_req)?;
 
-    // Gzip compress the body
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&body)?;
     let compressed_body = encoder.finish()?;
@@ -172,7 +170,6 @@ pub async fn connect(
 
     let body = serde_json::to_vec(&connect_req)?;
 
-    // Gzip compress the body
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&body)?;
     let compressed_body = encoder.finish()?;
@@ -229,7 +226,6 @@ pub fn detect_runtime() -> String {
 pub fn detect_agent_version(runtime: &str) -> String {
     match runtime {
         "node" => {
-            // Try to read package.json from layer paths
             let paths = vec![
                 "/opt/nodejs/node_modules/newrelic/package.json",
                 "/var/task/node_modules/newrelic/package.json",
@@ -317,7 +313,6 @@ fn get_labels(function_arn: &str) -> Vec<Label> {
         },
     ];
 
-    // Add custom tags from NR_TAGS environment variable
     for (key, value) in parse_nr_tags() {
         debug!("Added custom label from NR_TAGS: {}={}", key, value);
         labels.push(Label {

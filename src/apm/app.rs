@@ -34,7 +34,6 @@ impl ApmApp {
     ) -> Result<Self> {
         info!("Initializing APM app connection");
 
-        // Retry connection up to 3 times with backoff
         let backoff_ms = [200, 500, 900];
         let mut last_error = None;
 
@@ -70,14 +69,12 @@ impl ApmApp {
         apm_host: &str,
         client: &Client,
     ) -> Result<ApmApp> {
-        // Step 1: PreConnect to get collector host
         let collector_host = preconnect(client, license_key, apm_host)
             .await
             .context("PreConnect failed")?;
 
         debug!("PreConnect returned collector host: {}", collector_host);
 
-        // Get AWS Lambda function info from environment
         let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
             .unwrap_or_else(|_| "unknown".to_string());
         let function_version = std::env::var("AWS_LAMBDA_FUNCTION_VERSION")
@@ -85,16 +82,13 @@ impl ApmApp {
         let function_arn = std::env::var("AWS_LAMBDA_FUNCTION_ARN")
             .unwrap_or_else(|_| format!("arn:aws:lambda:us-east-1:000000000000:function:{}", function_name));
         
-        // Parse region and account ID from ARN (format: arn:aws:lambda:region:account-id:function:function-name)
         let arn_parts: Vec<&str> = function_arn.split(':').collect();
         let region = if arn_parts.len() > 3 { arn_parts[3].to_string() } else { "us-east-1".to_string() };
         let account_id = if arn_parts.len() > 4 { arn_parts[4].to_string() } else { "000000000000".to_string() };
 
-        // Detect runtime and agent version
         let runtime = super::connection::detect_runtime();
         let agent_version = super::connection::detect_agent_version(&runtime);
 
-        // Step 2: Connect to get run_id and entity_guid
         let connect_resp = connect(
             client, 
             license_key, 
@@ -129,7 +123,6 @@ impl ApmApp {
     pub async fn process_agent_payload(&self, payload: Vec<u8>) -> Result<()> {
         debug!("Processing agent payload ({} bytes)", payload.len());
 
-        // Parse agent payload into telemetry types
         let (telemetry_map, protocol_version) =
             parse_agent_payload(&payload).context("Failed to parse agent payload")?;
 
@@ -139,7 +132,6 @@ impl ApmApp {
             telemetry_map.len()
         );
 
-        // Send all telemetry types in parallel (like Go implementation)
         let mut send_tasks = Vec::new();
 
         for (telemetry_type, data) in telemetry_map {
@@ -153,15 +145,12 @@ impl ApmApp {
                 telemetry_type
             );
 
-            // Clone Arc'd data for parallel sending
             let client = self.client.clone();
             let license_key = self.license_key.clone();
             let collector_host = self.collector_host.clone();
             let run_id = self.run_id.clone();
 
-            // Spawn parallel task for each telemetry type
             let task = tokio::spawn(async move {
-                // Error events need special handling (different payload structure)
                 if telemetry_type == "error_event_data" {
                     if let Err(e) = send_error_events(
                         &client,
@@ -177,7 +166,6 @@ impl ApmApp {
                     return;
                 }
 
-                // All other telemetry types use standard format
                 let command = match telemetry_type.as_str() {
                     "metric_data" => CMD_METRICS,
                     "span_event_data" => CMD_SPAN_EVENTS,
@@ -209,7 +197,6 @@ impl ApmApp {
             send_tasks.push(task);
         }
 
-        // Wait for all sends to complete
         for task in send_tasks {
             let _ = task.await;
         }
@@ -221,7 +208,6 @@ impl ApmApp {
     ///
     /// Based on metric_api.go ParseLambdaReportLog() and ConvertToMetrics()
     pub async fn send_platform_report_metrics(&self, log_line: &str) -> Result<()> {
-        // Parse REPORT log
         let metrics_data = match parse_lambda_report_log(log_line) {
             Some(data) => data,
             None => {
@@ -238,11 +224,9 @@ impl ApmApp {
             metrics_data.max_memory_used
         );
 
-        // Get function name from environment
         let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
             .unwrap_or_else(|_| "unknown".to_string());
 
-        // Convert to APM metrics with entity GUID and function name
         let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
 
         send_platform_metrics(
@@ -262,7 +246,6 @@ impl ApmApp {
     ) -> Result<()> {
         use super::error_event::generate_error_event_from_fault;
         
-        // Generate error event from fault log
         let error_events = match generate_error_event_from_fault(log_line, request_id, function_arn) {
             Some(events) => events,
             None => {
@@ -276,7 +259,6 @@ impl ApmApp {
             request_id
         );
 
-        // Send error event to APM collector using special error event format
         send_error_events(
             &self.client,
             &self.license_key,

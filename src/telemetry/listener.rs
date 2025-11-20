@@ -116,7 +116,6 @@ async fn handle_telemetry_request(
                         log_processor.process_record(record);
                     }
                     "platform.runtimeDone" => {
-                        // Extract request_id from the record
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 runtime_done_request_id = Some(request_id_str.to_string());
@@ -127,13 +126,10 @@ async fn handle_telemetry_request(
                         function_completed = true;
                     }
                     "platform.report" => {
-                        // Extract request_id and match with batched agent or store as pending
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
-                                // Create report line using platform processor
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
                                     
-                                    // APM MODE: Send platform.report metrics to Metric API
                                     {
                                         let apm_app_read = crate::APM_APP.read().await;
                                         if let Some(ref app) = *apm_app_read {
@@ -145,19 +141,15 @@ async fn handle_telemetry_request(
                                         }
                                     }
                                     
-                                    // Strategy 1: Try to match with already batched agent first (most common warm start case)
                                     if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                         batch_item.report_line = Some(report_line);
                                         debug!("Matched platform.report with batched agent for request: {}", request_id_str);
                                     }
-                                    // Strategy 2: Check if agent payload is in buffer (late report scenario)
                                     else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
                                         let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
                                         if has_agent {
-                                            // Agent payload exists in buffer - add both to batch immediately
                                             debug!("Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                             
-                                            // Get context for ARN
                                             let arn = REQUEST_CONTEXTS.get(request_id_str)
                                                 .map(|ctx_ref| {
                                                     ctx_ref.lock()
@@ -167,7 +159,6 @@ async fn handle_telemetry_request(
                                                 })
                                                 .unwrap_or_else(|| "unknown".to_string());
                                             
-                                            // Add each agent payload to batch with report line
                                             if let Ok(buffer_guard) = buffer.lock() {
                                                 for payload_bytes in buffer_guard.iter() {
                                                     add_to_batch(
@@ -179,18 +170,15 @@ async fn handle_telemetry_request(
                                                 }
                                             }
                                             
-                                            // CRITICAL: Clear buffer to prevent event loop from processing it again
-                                            drop(buffer); // Release the reference first
+                                            drop(buffer);
                                             REQUEST_AGENT_BUFFERS.remove(request_id_str);
                                             debug!("Cleared agent buffer for request {} after matching with report", request_id_str);
                                         } else {
-                                            // No agent yet - store in PENDING_REPORTS
                                             PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
                                             debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
                                     else {
-                                        // No batch and no buffer - store in PENDING_REPORTS
                                         PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
                                         debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                     }
@@ -211,7 +199,6 @@ async fn handle_telemetry_request(
                 }
             }
             
-            // Summary logging instead of per-record logging
             if function_count > 0 || extension_count > 0 || platform_count > 0 {
                 let is_cold_start = !crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
                 if is_cold_start && function_count > 0 {
@@ -219,13 +206,10 @@ async fn handle_telemetry_request(
                 }
                
             } else {
-                // Log when no records were processed to help debug
                 debug!("No telemetry records processed in this batch");
             }
             
-            // If runtime is done, signal the per-request channel
             if let Some(request_id) = runtime_done_request_id {
-                // Signal the per-request runtime.done channel
                 if let Some(tx) = RUNTIME_DONE_CHANNELS.get(&request_id) {
                     if let Err(e) = tx.send(()) {
                         warn!("Failed to send runtime.done signal for request {}: {}", request_id, e);
@@ -236,17 +220,13 @@ async fn handle_telemetry_request(
                     warn!("No runtime.done channel found for request: {}", request_id);
                 }
 
-                // Also signal the global channel for backward compatibility (if it exists)
                 if let Some(ref tx) = runtime_done_tx {
                     let _ = tx.send(());
                 }
             }
             
-            // Function completed - logs are accumulated, main loop will handle the final flush
             if function_completed {
                 trace!("Function execution completed - telemetry accumulated for main loop flush");
-                // NOTE: Don't flush here! Let the main loop handle coordinated flush before freeze
-                // This prevents race conditions and ensures proper timing
             }
         }
         Err(e) => {

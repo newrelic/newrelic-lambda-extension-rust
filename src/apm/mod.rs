@@ -11,8 +11,5 @@ pub mod id_generator;
 pub mod metric_converter;
 pub mod payload_parser;
 
-// Re-export main types that are used externally
 pub use app::{ApmApp, SharedApmApp};
 
-// Note: Other types (CollectorError, ConnectResponse, PreconnectResponse, generate_error_event_from_fault)
-// are internal to the APM module and not re-exported to avoid unused warnings

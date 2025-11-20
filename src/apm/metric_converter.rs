@@ -40,7 +40,6 @@ pub struct LambdaMetrics {
 
 /// Parse Lambda REPORT log line
 pub fn parse_lambda_report_log(log_line: &str) -> Option<LambdaMetrics> {
-    // Try parsing as REPORT log first
     if let Some(captures) = REPORT_REGEX.captures(log_line) {
         let request_id = captures.get(1)?.as_str().to_string();
         let duration = captures.get(2)?.as_str().parse::<f64>().ok();
@@ -48,7 +47,6 @@ pub fn parse_lambda_report_log(log_line: &str) -> Option<LambdaMetrics> {
         let memory_size = captures.get(4)?.as_str().parse::<i64>().ok();
         let max_memory_used = captures.get(5)?.as_str().parse::<i64>().ok();
 
-        // Extract optional init duration
         let init_duration = INIT_DURATION_REGEX.captures(log_line)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<f64>().ok());
@@ -67,7 +65,6 @@ pub fn parse_lambda_report_log(log_line: &str) -> Option<LambdaMetrics> {
         });
     }
 
-    // Try parsing as fault log (Status: error)
     if let Some(captures) = FAULT_LOG_REGEX.captures(log_line) {
         let request_id = captures.get(1)?.as_str().to_string();
         let error = captures.get(2)?.as_str().to_string();
@@ -99,7 +96,6 @@ pub fn convert_to_apm_metrics(
 ) -> Vec<Value> {
     let timestamp = chrono::Utc::now().timestamp_millis();
     
-    // Common attributes for all metrics
     let mut common_attrs = serde_json::Map::new();
     common_attrs.insert("aws.requestId".to_string(), json!(metrics.request_id));
     common_attrs.insert("entity.guid".to_string(), json!(entity_guid));
@@ -108,7 +104,6 @@ pub fn convert_to_apm_metrics(
 
     let mut apm_metrics = Vec::new();
 
-    // Add duration metric
     if let Some(duration) = metrics.duration {
         apm_metrics.push(json!({
             "name": "apm.lambda.transaction.duration",
@@ -119,7 +114,6 @@ pub fn convert_to_apm_metrics(
         }));
     }
 
-    // Add billed duration metric
     if let Some(billed_duration) = metrics.billed_duration {
         apm_metrics.push(json!({
             "name": "apm.lambda.transaction.billed_duration",
@@ -130,7 +124,6 @@ pub fn convert_to_apm_metrics(
         }));
     }
 
-    // Add memory size metric
     if let Some(memory_size) = metrics.memory_size {
         apm_metrics.push(json!({
             "name": "apm.lambda.transaction.memory_size",
@@ -141,7 +134,6 @@ pub fn convert_to_apm_metrics(
         }));
     }
 
-    // Add max memory used metric
     if let Some(max_memory) = metrics.max_memory_used {
         apm_metrics.push(json!({
             "name": "apm.lambda.transaction.max_memory_used",
@@ -152,7 +144,6 @@ pub fn convert_to_apm_metrics(
         }));
     }
 
-    // Add init duration metric (cold starts only)
     if let Some(init_duration) = metrics.init_duration {
         apm_metrics.push(json!({
             "name": "apm.lambda.transaction.init_duration",
@@ -163,8 +154,6 @@ pub fn convert_to_apm_metrics(
         }));
     }
 
-    // Add error metric (for faults or errors)
-    // Check if error exists - we don't need to use the value, just check presence
     if metrics.error.is_some() {
         let mut error_attrs = common_attrs.clone();
         if let Some(ref error_type) = metrics.error_type {
@@ -235,10 +224,8 @@ mod tests {
 
         let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid-123", "my-function");
 
-        // Should have 5 metrics (duration, billed, memory, max_memory, init)
         assert_eq!(apm_metrics.len(), 5);
 
-        // Verify first metric structure
         let first_metric = &apm_metrics[0];
         assert_eq!(first_metric["name"], "apm.lambda.transaction.duration");
         assert_eq!(first_metric["type"], "gauge");

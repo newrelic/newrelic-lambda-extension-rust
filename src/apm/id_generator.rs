@@ -46,7 +46,6 @@ impl TraceIDGenerator {
         let mut bytes = vec![0u8; byte_len];
         rng.fill(&mut bytes[..]);
 
-        // Convert to hex string (in-place encoding like Go implementation)
         let mut hex = String::with_capacity(byte_len * 2);
         for byte in bytes {
             hex.push(HEX_TABLE[(byte >> 4) as usize] as char);
@@ -66,7 +65,6 @@ mod tests {
         let gen = TraceIDGenerator::new(1453);
         let trace_id = gen.generate_trace_id();
         assert_eq!(trace_id.len(), 32);
-        // Verify it's all hex characters
         assert!(trace_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -75,7 +73,6 @@ mod tests {
         let gen = TraceIDGenerator::new(1453);
         let span_id = gen.generate_span_id();
         assert_eq!(span_id.len(), 16);
-        // Verify it's all hex characters
         assert!(span_id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
@@ -87,7 +84,6 @@ mod tests {
         let id1 = gen1.generate_trace_id();
         let id2 = gen2.generate_trace_id();
         
-        // Same seed should produce same first ID
         assert_eq!(id1, id2);
     }
 

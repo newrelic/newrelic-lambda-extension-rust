@@ -19,7 +19,6 @@ pub async fn tag_lambda_function_with_versions(
     debug!("Starting Lambda function tagging process...");
     info!("Tagging Lambda function: {}", function_arn);
 
-    // Build tags map
     let mut tags = HashMap::new();
     tags.insert(
         "newrelic.extension.version".to_string(),
@@ -30,8 +29,6 @@ pub async fn tag_lambda_function_with_versions(
         tags.insert("newrelic.agent.version".to_string(), agent_ver);
     }
 
-    // Note: agent_name is not added as a tag since it can be inferred from layer_version
-    // e.g., "NRTestRustExtensionPythonX86:10" clearly indicates Python
 
     if let Some(layer_ver) = layer_version {
         tags.insert("newrelic.layer.version".to_string(), layer_ver);
@@ -42,7 +39,6 @@ pub async fn tag_lambda_function_with_versions(
         debug!("  {}: {}", key, value);
     }
 
-    // Create AWS Lambda client and apply tags
     match apply_tags_to_function(&function_arn, tags).await {
         Ok(_) => {
             info!("Successfully tagged Lambda function with New Relic version information");
@@ -78,10 +74,8 @@ async fn apply_tags_to_function(
             Ok(())
         }
         Err(e) => {
-            // Log detailed error information
             warn!("TagResource API call failed: {:?}", e);
 
-            // Try to extract more specific error details
             let error_msg = format!("{:?}", e);
             if error_msg.contains("AccessDenied") || error_msg.contains("Unauthorized") {
                 warn!("Access denied - check IAM permissions");
