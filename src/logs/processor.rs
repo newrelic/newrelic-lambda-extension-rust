@@ -64,7 +64,6 @@ pub struct LogProcessor {
 
 /// Failed log entry that stores the original log without invocation-specific metadata
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct FailedLogEntry {
     /// Original log message (with original attribution preserved)
     log_message: payload::LogMessage,

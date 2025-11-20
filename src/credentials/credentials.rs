@@ -133,18 +133,6 @@ const DEFAULT_SECRET_ID: &str = "NEW_RELIC_LICENSE_KEY";
 const ENV_LICENSE_KEY_SECRET: &str = "NEW_RELIC_LICENSE_KEY_SECRET";
 const ENV_LICENSE_KEY_SSM_PARAMETER: &str = "NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME";
 
-/// Start AWS client initialization in the background (non-blocking)
-/// This can be called early in the extension startup to begin AWS setup
-/// while other initialization happens in parallel
-#[allow(dead_code)]
-pub fn start_aws_initialization_background() {
-    tokio::spawn(async {
-        if let Err(e) = initialize_aws_clients().await {
-            eprintln!("Background AWS initialization failed: {}", e);
-        }
-    });
-}
-
 /// Initialize AWS clients with maximum performance optimizations
 async fn initialize_aws_clients() -> Result<()> {
     use std::time::Duration;

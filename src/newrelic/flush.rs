@@ -7,7 +7,6 @@ pub trait Flush: Send + Sync {
     /// Flushes any buffered data.
     async fn flush(&self) -> IoResult<()>;
     /// Flushes all data before shutdown.
-    #[allow(dead_code)]
     async fn final_flush(&self) -> IoResult<()>;
 }
 

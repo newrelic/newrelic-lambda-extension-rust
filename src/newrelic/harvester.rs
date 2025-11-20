@@ -1,7 +1,7 @@
 use crate::newrelic::flush::Flush;
 use crate::logs::processor::LogProcessor;
 use crate::platform::processor::PlatformProcessor;
-use std::{io::Result, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tracing::{debug, error, trace, warn};
 
 /// The Harvester is responsible for periodically flushing data from processors.
@@ -72,25 +72,6 @@ impl Harvester {
                 debug!("Completed flush cycle {} successfully (flushed logs and platform events)", flush_cycle_count);
             }
         }
-    }
-
-    /// Performs a final flush of all processors.
-    #[allow(dead_code)]
-    pub async fn final_flush(&self) -> Result<()> {
-        debug!("Performing final flush of all processors");
-        let mut error_count = 0;
-        for p in &self.processors {
-            if let Err(e) = p.final_flush().await {
-                error!("Error in final flush: {}", e);
-                error_count += 1;
-            }
-        }
-        if error_count == 0 {
-            debug!("Final flush completed successfully");
-        } else {
-            warn!("Final flush completed with {} errors", error_count);
-        }
-        Ok(())
     }
 }
 
