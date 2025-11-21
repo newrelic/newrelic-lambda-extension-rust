@@ -278,6 +278,47 @@ impl LogProcessor {
                         });
                     }
                 }
+            } else {
+                // Standard (non-APM) mode: Send errors to telemetry endpoint
+                if record.record_type == "function" && message_str.len() > 0 {
+                    if message_str.contains("Task timed out") ||
+                       message_str.contains("error") || message_str.contains("Error") ||
+                       message_str.contains("Exception") || message_str.contains("exception") ||
+                       message_str.contains("Fatal") || message_str.contains("fatal") {
+                        
+                        let (request_id, function_arn) = {
+                            let context = self.invocation_context.lock().unwrap();
+                            (context.request_id.clone(), context.invoked_function_arn.clone())
+                        };
+                        
+                        // Determine error type
+                        let error_type = if message_str.contains("Task timed out") {
+                            "LambdaTimeout"
+                        } else if message_str.contains("Exception") || message_str.contains("exception") {
+                            "LambdaException"
+                        } else if message_str.contains("Fatal") || message_str.contains("fatal") {
+                            "LambdaFatalError"
+                        } else {
+                            "LambdaError"
+                        };
+                        
+                        let client = Arc::clone(&self.newrelic_client);
+                        let config = Arc::clone(&self.config);
+                        let msg_clone = message_str.to_string();
+                        let error_type_clone = error_type.to_string();
+                        
+                        tokio::spawn(async move {
+                            crate::error_synthesis::send_lambda_error(
+                                &msg_clone,
+                                &request_id,
+                                &function_arn,
+                                &error_type_clone,
+                                &client,
+                                &config,
+                            ).await;
+                        });
+                    }
+                }
             }
     
             let log_message = self.apply_current_invocation_metadata(log_message);
