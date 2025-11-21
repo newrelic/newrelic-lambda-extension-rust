@@ -207,55 +207,140 @@ impl PlatformProcessor {
             return;
         }
         
-        // Extract error information
+        // Extract error information - only if errorType field exists
         let error_type = record.record.get("errorType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
+            .and_then(|v| v.as_str());
         
-        let request_id = self.extract_request_id_from_record(record)
-            .unwrap_or_else(|| {
-                let context = self.invocation_context.lock().unwrap();
-                context.request_id.clone()
-            });
+        // For init errors, requestId might not exist - use instanceId or generate one
+        let request_id = if let Some(rid) = self.extract_request_id_from_record(record) {
+            if !rid.is_empty() {
+                rid
+            } else {
+                // No requestId in event, try instanceId for init events
+                record.record.get("instanceId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| format!("init-{}", &s[..8.min(s.len())]))
+                    .unwrap_or_else(|| {
+                        // Last resort: use context or generate ID
+                        let context = self.invocation_context.lock().unwrap();
+                        if !context.request_id.is_empty() && context.request_id != "temp" {
+                            context.request_id.clone()
+                        } else {
+                            format!("init-{}", chrono::Utc::now().timestamp())
+                        }
+                    })
+            }
+        } else {
+            // No requestId in event, try instanceId for init events
+            record.record.get("instanceId")
+                .and_then(|v| v.as_str())
+                .map(|s| format!("init-{}", &s[..8.min(s.len())]))
+                .unwrap_or_else(|| {
+                    // Last resort: use context or generate ID
+                    let context = self.invocation_context.lock().unwrap();
+                    if !context.request_id.is_empty() && context.request_id != "temp" {
+                        context.request_id.clone()
+                    } else {
+                        format!("init-{}", chrono::Utc::now().timestamp())
+                    }
+                })
+        };
         
         // Build error message based on event type and available information
+        // Format: YYYY-MM-DDTHH:MM:SSZ request-id Message
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ");
+        
         let error_message = match event_type {
             "platform.initReport" | "platform.initRuntimeDone" => {
                 let phase = record.record.get("phase")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                format!(
-                    "RequestId: {} Initialization {} with error type: {} (status: {})",
-                    request_id, phase, error_type, status.unwrap_or("unknown")
-                )
+                let function_name = &self.config.aws.function_name;
+                
+                if let Some(err_type) = error_type {
+                    format!(
+                        "{} {} Function: {} Initialization {} failed: {}",
+                        timestamp, request_id, function_name, phase, err_type
+                    )
+                } else {
+                    format!(
+                        "{} {} Function: {} Initialization {} failed",
+                        timestamp, request_id, function_name, phase
+                    )
+                }
             }
             "platform.runtimeDone" => {
                 let metrics = record.record.get("metrics");
-                let duration_info = if let Some(m) = metrics {
-                    if let Some(duration) = m.get("durationMs").and_then(|v| v.as_f64()) {
-                        format!(" after {:.2}ms", duration)
+                let duration_seconds = if let Some(m) = metrics {
+                    m.get("durationMs").and_then(|v| v.as_f64()).map(|ms| ms / 1000.0)
+                } else {
+                    None
+                };
+                
+                // For timeout status, format like CloudWatch timeout message
+                if status == Some("timeout") {
+                    if let Some(duration) = duration_seconds {
+                        format!(
+                            "{} {} Task timed out after {:.2} seconds",
+                            timestamp, request_id, duration
+                        )
                     } else {
-                        String::new()
+                        format!(
+                            "{} {} Task timed out",
+                            timestamp, request_id
+                        )
+                    }
+                } else if let Some(err_type) = error_type {
+                    if let Some(duration) = duration_seconds {
+                        format!(
+                            "{} {} Function invocation failed after {:.2} seconds: {}",
+                            timestamp, request_id, duration, err_type
+                        )
+                    } else {
+                        format!(
+                            "{} {} Function invocation failed: {}",
+                            timestamp, request_id, err_type
+                        )
                     }
                 } else {
-                    String::new()
-                };
-                format!(
-                    "RequestId: {} Function invocation failed{} with error type: {} (status: {})",
-                    request_id, duration_info, error_type, status.unwrap_or("unknown")
-                )
+                    if let Some(duration) = duration_seconds {
+                        format!(
+                            "{} {} Function invocation failed after {:.2} seconds",
+                            timestamp, request_id, duration
+                        )
+                    } else {
+                        format!(
+                            "{} {} Function invocation failed",
+                            timestamp, request_id
+                        )
+                    }
+                }
             }
             "platform.restoreRuntimeDone" | "platform.restoreReport" => {
-                format!(
-                    "RequestId: {} Runtime restore failed with error type: {} (status: {})",
-                    request_id, error_type, status.unwrap_or("unknown")
-                )
+                if let Some(err_type) = error_type {
+                    format!(
+                        "{} {} Runtime restore failed: {}",
+                        timestamp, request_id, err_type
+                    )
+                } else {
+                    format!(
+                        "{} {} Runtime restore failed",
+                        timestamp, request_id
+                    )
+                }
             }
             _ => {
-                format!(
-                    "RequestId: {} Platform event {} failed with error type: {} (status: {})",
-                    request_id, event_type, error_type, status.unwrap_or("unknown")
-                )
+                if let Some(err_type) = error_type {
+                    format!(
+                        "{} {} Platform error ({}): {}",
+                        timestamp, request_id, event_type, err_type
+                    )
+                } else {
+                    format!(
+                        "{} {} Platform error ({})",
+                        timestamp, request_id, event_type
+                    )
+                }
             }
         };
         
@@ -293,7 +378,11 @@ impl PlatformProcessor {
             .await;
         });
         
-        debug!("Detected platform error in {}: {} - will send to telemetry endpoint", event_type, error_type);
+        debug!(
+            "Detected platform error in {}: {} - will send to telemetry endpoint", 
+            event_type, 
+            error_type.unwrap_or("no errorType field")
+        );
     }
     
    

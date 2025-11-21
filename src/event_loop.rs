@@ -114,10 +114,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             } => {
                 let event_start = std::time::Instant::now();
                 
-                // Track this request for potential error synthesis on shutdown
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
+                
+                error_synthesis::clear_sent_errors_for_request(&request_id);
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
@@ -216,39 +217,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("APM mode: Extension shutting down: {}", shutdown_reason);
                 
-                // Synthesize and send error if shutdown is due to timeout or failure
-                if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
-                    if shutdown_reason.to_lowercase().contains("timeout") {
-                        error_synthesis::send_timeout_error(
-                            &last_request_id,
-                            &last_arn,
-                            None,
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
-                    } else if shutdown_reason.to_lowercase().contains("failure") || shutdown_reason.to_lowercase().contains("fault") {
-                        error_synthesis::send_platform_fault_error(
-                            &last_request_id,
-                            &last_arn,
-                            &shutdown_reason,
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
-                    } else if !shutdown_reason.to_lowercase().contains("spindown") {
-                        // Any other unexpected shutdown reason
-                        error_synthesis::send_lambda_error(
-                            &format!("Lambda shutdown with reason: {}", shutdown_reason),
-                            &last_request_id,
-                            &last_arn,
-                            "LambdaShutdown",
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
-                    }
-                }
                 
                 process_pending_agent_payloads(
                     &components.newrelic_client,
@@ -296,6 +264,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
+                
+                // Clear error tracking for this new invocation
+                error_synthesis::clear_sent_errors_for_request(&request_id);
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());

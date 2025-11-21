@@ -26,6 +26,23 @@ pub struct PlatformMetrics {
 pub static LAST_PLATFORM_METRICS: Lazy<Arc<Mutex<Option<PlatformMetrics>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 
+/// Track sent errors to avoid duplicates (request_id, error_type)
+/// Using error_type instead of full message to prevent duplicate errors from different sources
+pub static SENT_ERRORS: Lazy<Arc<Mutex<std::collections::HashSet<(String, String)>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
+
+/// Clear all sent errors (call when starting new invocation)
+/// This ensures each new invocation starts with a clean slate and prevents memory leaks
+pub fn clear_sent_errors_for_request(request_id: &str) {
+    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+        let prev_count = sent_errors.len();
+        sent_errors.clear();
+        if prev_count > 0 {
+            debug!("Cleared {} sent error(s) for new invocation (request: {})", prev_count, request_id);
+        }
+    }
+}
+
 /// Store platform metrics from platform.report event
 pub fn store_platform_metrics(
     request_id: String,
@@ -70,6 +87,7 @@ pub async fn send_timeout_error(
         None
     };
 
+    // Compose the error message using actual_duration or timeout_seconds
     let timeout_msg = if let Some(actual_secs) = actual_duration {
         // Use actual duration from platform.report
         format!(
@@ -95,6 +113,15 @@ pub async fn send_timeout_error(
         )
     };
 
+    // Check if we already sent a timeout error for this request (by error type, not exact message)
+    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+        let key = (request_id.to_string(), "LambdaTimeout".to_string());
+        if sent_errors.contains(&key) {
+            debug!("Already sent timeout error for request {} (type dedup), skipping duplicate", request_id);
+            return;
+        }
+        sent_errors.insert(key);
+    }
     info!("Synthesizing timeout error for request {}: {}", request_id, timeout_msg);
 
     send_error_to_telemetry(
@@ -137,12 +164,23 @@ pub async fn send_platform_fault_error(
         String::new()
     };
 
+    // Compose the fault message with memory info
     let fault_msg = format!(
         "RequestId: {} AWS Lambda platform fault caused a shutdown (reason: {}){}",
         request_id,
         shutdown_reason,
         memory_info
     );
+
+    // Check if we already sent a platform fault error for this request (by error type, not exact message)
+    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+        let key = (request_id.to_string(), "LambdaPlatformFault".to_string());
+        if sent_errors.contains(&key) {
+            debug!("Already sent platform fault error for request {} (type dedup), skipping duplicate", request_id);
+            return;
+        }
+        sent_errors.insert(key);
+    }
 
     info!("Synthesizing platform fault error for request {}: {}", request_id, fault_msg);
 
@@ -158,6 +196,7 @@ pub async fn send_platform_fault_error(
 }
 
 /// Synthesize and send generic Lambda error to telemetry endpoint
+/// Note: error_message should already be in CloudWatch format (timestamp request-id message)
 pub async fn send_lambda_error(
     error_message: &str,
     request_id: &str,
@@ -166,6 +205,16 @@ pub async fn send_lambda_error(
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
 ) {
+    // Check if we already sent this error type for this request (by error type, not exact message)
+    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+        let key = (request_id.to_string(), error_type.to_string());
+        if sent_errors.contains(&key) {
+            debug!("Already sent {} error for request {} (type dedup), skipping duplicate", error_type, request_id);
+            return;
+        }
+        sent_errors.insert(key);
+    }
+    
     info!("Synthesizing Lambda error for request {}: {} - {}", request_id, error_type, error_message);
 
     send_error_to_telemetry(
