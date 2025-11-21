@@ -3,7 +3,8 @@
 //! This module synthesizes error messages for Lambda errors (timeout, platform faults, etc.)
 //! and sends them to the New Relic telemetry endpoint (Vortex) similar to the Go extension.
 
-use std::sync::Arc;
+use once_cell::sync::Lazy;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info};
 use crate::{
     config::ExtensionConfig,
@@ -11,7 +12,42 @@ use crate::{
     EXTENSION_VERSION,
 };
 
+/// Store platform metrics for error synthesis (from platform.report events)
+#[derive(Debug, Clone)]
+pub struct PlatformMetrics {
+    pub request_id: String,
+    pub duration_ms: Option<f64>,
+    pub memory_size_mb: Option<u64>,
+    pub max_memory_used_mb: Option<u64>,
+    pub billed_duration_ms: Option<u64>,
+}
+
+/// Global storage for last platform metrics (for timeout error synthesis)
+pub static LAST_PLATFORM_METRICS: Lazy<Arc<Mutex<Option<PlatformMetrics>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+
+/// Store platform metrics from platform.report event
+pub fn store_platform_metrics(
+    request_id: String,
+    duration_ms: Option<f64>,
+    memory_size_mb: Option<u64>,
+    max_memory_used_mb: Option<u64>,
+    billed_duration_ms: Option<u64>,
+) {
+    if let Ok(mut guard) = LAST_PLATFORM_METRICS.lock() {
+        *guard = Some(PlatformMetrics {
+            request_id,
+            duration_ms,
+            memory_size_mb,
+            max_memory_used_mb,
+            billed_duration_ms,
+        });
+        debug!("Stored platform metrics for error synthesis");
+    }
+}
+
 /// Synthesize and send timeout error to telemetry endpoint
+/// Uses platform metrics if available, otherwise calculates from timeout_seconds
 pub async fn send_timeout_error(
     request_id: &str,
     invoked_function_arn: &str,
@@ -19,7 +55,31 @@ pub async fn send_timeout_error(
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
 ) {
-    let timeout_msg = if let Some(secs) = timeout_seconds {
+    // Try to get actual duration from platform metrics first
+    let actual_duration = if let Ok(guard) = LAST_PLATFORM_METRICS.lock() {
+        if let Some(ref metrics) = *guard {
+            if metrics.request_id == request_id {
+                metrics.duration_ms.map(|ms| ms / 1000.0) // Convert ms to seconds
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let timeout_msg = if let Some(actual_secs) = actual_duration {
+        // Use actual duration from platform.report
+        format!(
+            "{} {} Task timed out after {:.2} seconds",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+            request_id,
+            actual_secs
+        )
+    } else if let Some(secs) = timeout_seconds {
+        // Use provided timeout value
         format!(
             "{} {} Task timed out after {:.2} seconds",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
@@ -27,6 +87,7 @@ pub async fn send_timeout_error(
             secs
         )
     } else {
+        // No timing information available
         format!(
             "{} {} Task timed out",
             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
@@ -48,6 +109,7 @@ pub async fn send_timeout_error(
 }
 
 /// Synthesize and send platform fault error to telemetry endpoint
+/// Includes memory information if available from platform metrics
 pub async fn send_platform_fault_error(
     request_id: &str,
     invoked_function_arn: &str,
@@ -55,10 +117,31 @@ pub async fn send_platform_fault_error(
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
 ) {
+    // Try to get memory info from platform metrics (useful for OOM faults)
+    let memory_info = if let Ok(guard) = LAST_PLATFORM_METRICS.lock() {
+        if let Some(ref metrics) = *guard {
+            if metrics.request_id == request_id {
+                match (metrics.max_memory_used_mb, metrics.memory_size_mb) {
+                    (Some(used), Some(size)) => {
+                        format!(" (Memory: {} MB used / {} MB limit)", used, size)
+                    }
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
     let fault_msg = format!(
-        "RequestId: {} AWS Lambda platform fault caused a shutdown (reason: {})",
+        "RequestId: {} AWS Lambda platform fault caused a shutdown (reason: {}){}",
         request_id,
-        shutdown_reason
+        shutdown_reason,
+        memory_info
     );
 
     info!("Synthesizing platform fault error for request {}: {}", request_id, fault_msg);

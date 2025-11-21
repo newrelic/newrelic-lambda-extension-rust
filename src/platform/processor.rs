@@ -39,6 +39,31 @@ impl PlatformProcessor {
     pub fn process_record(&self, record: TelemetryRecord) {
         let (message, level) = self.create_platform_log_message(&record);
         
+        // Store platform metrics for error synthesis (timeout/fault detection)
+        if record.record_type == "platform.report" {
+            if let Some(request_id) = record.record.get("requestId").and_then(|v| v.as_str()) {
+                if let Some(metrics) = record.record.get("metrics") {
+                    let duration_ms = metrics.get("durationMs").and_then(|v| v.as_f64());
+                    let memory_size_mb = metrics.get("memorySizeMB").and_then(|v| v.as_u64());
+                    let max_memory_used_mb = metrics.get("maxMemoryUsedMB").and_then(|v| v.as_u64());
+                    let billed_duration_ms = metrics.get("billedDurationMs").and_then(|v| v.as_u64());
+                    
+                    crate::error_synthesis::store_platform_metrics(
+                        request_id.to_string(),
+                        duration_ms,
+                        memory_size_mb,
+                        max_memory_used_mb,
+                        billed_duration_ms,
+                    );
+                }
+            }
+        }
+        
+        // Check for platform errors (from platform events with error/failure/timeout status)
+        // These events have errorType field: platform.initReport, platform.initRuntimeDone,
+        // platform.runtimeDone, platform.restoreRuntimeDone, platform.restoreReport
+        self.check_and_send_platform_errors(&record);
+        
         let log_event = serde_json::json!({
             "timestamp": record.time,
             "message": message,
@@ -156,6 +181,119 @@ impl PlatformProcessor {
    
     fn extract_request_id_from_record(&self, record: &TelemetryRecord) -> Option<String> {
         record.record.get("requestId")?.as_str().map(String::from)
+    }
+    
+    /// Check platform events for errors and send to telemetry endpoint
+    /// Platform events that can have errors: platform.initReport, platform.initRuntimeDone,
+    /// platform.runtimeDone, platform.restoreRuntimeDone, platform.restoreReport
+    fn check_and_send_platform_errors(&self, record: &TelemetryRecord) {
+        // Check if this event type can have errors
+        let event_type = record.record_type.as_str();
+        let can_have_errors = matches!(
+            event_type,
+            "platform.initReport" | "platform.initRuntimeDone" | "platform.runtimeDone" |
+            "platform.restoreRuntimeDone" | "platform.restoreReport"
+        );
+        
+        if !can_have_errors {
+            return;
+        }
+        
+        // Check status field - should be error, failure, or timeout
+        let status = record.record.get("status").and_then(|v| v.as_str());
+        let has_error = matches!(status, Some("error") | Some("failure") | Some("timeout"));
+        
+        if !has_error {
+            return;
+        }
+        
+        // Extract error information
+        let error_type = record.record.get("errorType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+        
+        let request_id = self.extract_request_id_from_record(record)
+            .unwrap_or_else(|| {
+                let context = self.invocation_context.lock().unwrap();
+                context.request_id.clone()
+            });
+        
+        // Build error message based on event type and available information
+        let error_message = match event_type {
+            "platform.initReport" | "platform.initRuntimeDone" => {
+                let phase = record.record.get("phase")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                format!(
+                    "RequestId: {} Initialization {} with error type: {} (status: {})",
+                    request_id, phase, error_type, status.unwrap_or("unknown")
+                )
+            }
+            "platform.runtimeDone" => {
+                let metrics = record.record.get("metrics");
+                let duration_info = if let Some(m) = metrics {
+                    if let Some(duration) = m.get("durationMs").and_then(|v| v.as_f64()) {
+                        format!(" after {:.2}ms", duration)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                format!(
+                    "RequestId: {} Function invocation failed{} with error type: {} (status: {})",
+                    request_id, duration_info, error_type, status.unwrap_or("unknown")
+                )
+            }
+            "platform.restoreRuntimeDone" | "platform.restoreReport" => {
+                format!(
+                    "RequestId: {} Runtime restore failed with error type: {} (status: {})",
+                    request_id, error_type, status.unwrap_or("unknown")
+                )
+            }
+            _ => {
+                format!(
+                    "RequestId: {} Platform event {} failed with error type: {} (status: {})",
+                    request_id, event_type, error_type, status.unwrap_or("unknown")
+                )
+            }
+        };
+        
+        // Get invoked function ARN from context
+        let invoked_function_arn = {
+            let context = self.invocation_context.lock().unwrap();
+            context.invoked_function_arn.clone()
+        };
+        
+        // Map platform error to appropriate Lambda error type
+        let lambda_error_type = match status {
+            Some("timeout") => "LambdaTimeout",
+            Some("failure") => "LambdaFatalError",
+            Some("error") => "LambdaError",
+            _ => "LambdaError",
+        };
+        
+        // Send error to telemetry endpoint asynchronously
+        let client = Arc::clone(&self.newrelic_client);
+        let config = Arc::clone(&self.config);
+        let error_msg = error_message.clone();
+        let req_id = request_id.clone();
+        let func_arn = invoked_function_arn.clone();
+        let err_type = lambda_error_type.to_string();
+        
+        tokio::spawn(async move {
+            crate::error_synthesis::send_lambda_error(
+                &error_msg,
+                &req_id,
+                &func_arn,
+                &err_type,
+                &client,
+                &config,
+            )
+            .await;
+        });
+        
+        debug!("Detected platform error in {}: {} - will send to telemetry endpoint", event_type, error_type);
     }
     
    
