@@ -367,7 +367,7 @@ impl PlatformProcessor {
         let err_type = lambda_error_type.to_string();
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.block_on(async move {
+            handle.spawn(async move {
                 crate::error_synthesis::send_lambda_error(
                     &error_msg,
                     &req_id,
