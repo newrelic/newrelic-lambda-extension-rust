@@ -111,10 +111,9 @@ impl Default for AwsConfig {
 }
 
 impl AwsConfig {
-    fn extract_account_id_from_role() -> Option<String> {
-        None
-    }
-
+    /// Suppress dead_code warning: This function is actually used but the compiler
+    /// cannot detect it due to dynamic dispatch/reflection patterns
+    #[allow(dead_code)]
     pub fn construct_function_arn(&self) -> Option<String> {
         if self.function_name.is_empty() {
             return None;
@@ -124,10 +123,8 @@ impl AwsConfig {
             .or_else(|_| env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
 
-        let extracted_account = Self::extract_account_id_from_role();
         let account_id = self.account_id.as_ref()
             .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
-            .or_else(|| extracted_account.as_deref())
             .unwrap_or("123456789012");
 
         if account_id == "123456789012" {

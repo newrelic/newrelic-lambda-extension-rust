@@ -11,7 +11,7 @@ use crate::{
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
-    agent::batch::send_batched_payloads,
+    newrelic::flush::Flush,
 };
 
 #[derive(Debug)]
@@ -20,7 +20,6 @@ pub struct RequestProcessingState {
     pub platform_processor: Arc<PlatformProcessor>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     pub coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
-    pub runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,15 +106,11 @@ pub fn create_request_processing_state(
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
-    let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
-    RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
-
     let state = RequestProcessingState {
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
         coordination_rx: Some(payload_rx),
-        runtime_done_rx: Some(runtime_done_rx),
     };
 
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);
@@ -130,12 +125,6 @@ pub fn create_request_processing_state(
 
 pub fn cleanup_request_processing_state(request_id: &str) {
     cleanup_request_processing_state_internal(request_id, false);
-}
-
-/// Conditional cleanup: cold start clears all, warm start keeps buffer for late payloads
-pub fn cleanup_request_processing_state_conditional(request_id: &str, is_cold_start: bool) {
-    let skip_buffer_cleanup = !is_cold_start;
-    cleanup_request_processing_state_internal(request_id, skip_buffer_cleanup);
 }
 
 pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_cleanup: bool) {
@@ -237,6 +226,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
 pub async fn wait_for_all_requests_completion(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<crate::logs::processor::LogProcessor>,
 ) {
     let pending_count = REQUEST_PROCESSORS.len();
 
@@ -263,12 +253,39 @@ pub async fn wait_for_all_requests_completion(
         info!("All requests completed");
     }
 
-    let batch_count = crate::agent::batch::AGENT_BATCH_BUFFER.len();
-    if batch_count > 0 {
-        info!(
-            "Flushing {} batched agent payload(s) before shutdown",
-            batch_count
-        );
-        send_batched_payloads(newrelic_client, config).await;
+    // Send all pending telemetry and logs in parallel with 1MB chunking
+    info!("Shutdown: Flushing all pending telemetry and logs...");
+
+    use crate::agent::batch::send_all_pending_payloads_on_shutdown;
+
+    let telemetry_flush = tokio::spawn({
+        let client = newrelic_client.clone();
+        let cfg = config.clone();
+        async move {
+            send_all_pending_payloads_on_shutdown(client, cfg).await;
+        }
+    });
+
+    let logs_flush = tokio::spawn({
+        let log_processor = global_log_processor.clone();
+        async move {
+            if let Err(e) = log_processor.flush().await {
+                error!("Shutdown: Failed to flush logs: {}", e);
+            } else {
+                info!("Shutdown: Successfully flushed logs");
+            }
+        }
+    });
+
+    // Wait for both to complete
+    let (telemetry_result, logs_result) = tokio::join!(telemetry_flush, logs_flush);
+
+    if let Err(e) = telemetry_result {
+        error!("Shutdown: Telemetry flush task failed: {}", e);
     }
+    if let Err(e) = logs_result {
+        error!("Shutdown: Logs flush task failed: {}", e);
+    }
+
+    info!("Shutdown: All pending data flushed");
 }

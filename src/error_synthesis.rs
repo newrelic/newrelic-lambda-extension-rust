@@ -19,7 +19,6 @@ pub struct PlatformMetrics {
     pub duration_ms: Option<f64>,
     pub memory_size_mb: Option<u64>,
     pub max_memory_used_mb: Option<u64>,
-    pub billed_duration_ms: Option<u64>,
 }
 
 /// Global storage for last platform metrics (for timeout error synthesis)
@@ -146,7 +145,6 @@ pub fn store_platform_metrics(
     duration_ms: Option<f64>,
     memory_size_mb: Option<u64>,
     max_memory_used_mb: Option<u64>,
-    billed_duration_ms: Option<u64>,
 ) {
     if let Ok(mut guard) = LAST_PLATFORM_METRICS.lock() {
         *guard = Some(PlatformMetrics {
@@ -154,7 +152,6 @@ pub fn store_platform_metrics(
             duration_ms,
             memory_size_mb,
             max_memory_used_mb,
-            billed_duration_ms,
         });
         debug!("Stored platform metrics for error synthesis");
     }

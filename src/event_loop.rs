@@ -15,13 +15,12 @@ use crate::{
         ProcessorFactory,
         create_request_processing_state,
         cleanup_request_processing_state,
-        cleanup_request_processing_state_conditional,
         cleanup_request_processing_state_internal,
         wait_for_all_requests_completion,
         REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
         CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
     },
-    agent::batch::{add_to_batch, should_send_batch, send_batched_payloads, send_agent_with_report_immediately},
+    agent::batch::{add_to_batch, should_send_batch_by_threshold, send_batched_payloads_with_reports_only},
     agent::payload::send_agent_payload_to_newrelic,
     error_synthesis,
     trace,
@@ -118,10 +117,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
 
-                // Clear sent errors for new invocation
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                // Retry any failed errors from previous invocation
                 error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
@@ -141,34 +138,32 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 );
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                let pending_task = if !is_cold_start {
-                    let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                if buffer_count > 0 {
                     info!(
-                        "APM warm start: Found {} request buffer(s) before processing (current: {})",
+                        "APM mode: Found {} request buffer(s) before processing (current: {})",
                         buffer_count, request_id
                     );
+                }
 
-                    Some(tokio::spawn({
-                        let newrelic_client = components.newrelic_client.clone();
-                        let config = components.config.clone();
-                        let global_log_processor = components.global_log_processor.clone();
-                        let apm_app = components.apm_app.clone();
-                        let current_request_id = request_id.clone();
+                let pending_task = Some(tokio::spawn({
+                    let newrelic_client = components.newrelic_client.clone();
+                    let config = components.config.clone();
+                    let global_log_processor = components.global_log_processor.clone();
+                    let apm_app = components.apm_app.clone();
+                    let current_request_id = request_id.clone();
 
-                        async move {
-                            process_pending_agent_payloads(
-                                &newrelic_client,
-                                &config,
-                                &global_log_processor,
-                                &apm_app,
-                                &current_request_id,
-                            )
-                            .await;
-                        }
-                    }))
-                } else {
-                    None
-                };
+                    async move {
+                        process_pending_agent_payloads(
+                            &newrelic_client,
+                            &config,
+                            &global_log_processor,
+                            &apm_app,
+                            &current_request_id,
+                        )
+                        .await;
+                    }
+                }));
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
@@ -192,16 +187,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                if let Some(pending) = pending_task {
-                    let (current_result, pending_result) = tokio::join!(current_task, pending);
-                    if let Err(e) = current_result {
-                        error!("Error in APM request processing: {}", e);
-                    }
-                    if let Err(e) = pending_result {
-                        error!("Error in pending payload processing: {}", e);
-                    }
-                } else if let Err(e) = current_task.await {
+                let (current_result, pending_result) = tokio::join!(current_task, pending_task.unwrap());
+                if let Err(e) = current_result {
                     error!("Error in APM request processing: {}", e);
+                }
+                if let Err(e) = pending_result {
+                    error!("Error in pending payload processing: {}", e);
                 }
 
                 let event_time = event_start.elapsed();
@@ -269,10 +260,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
 
-                // Clear error tracking for this new invocation
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                // Retry any failed errors from previous invocation
                 error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
@@ -285,30 +274,37 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
 
-                if !is_cold_start {
-                    let old_requests: Vec<String> = REQUEST_AGENT_BUFFERS
-                        .iter()
-                        .map(|entry| entry.key().clone())
-                        .collect();
+                let old_requests: Vec<String> = REQUEST_AGENT_BUFFERS
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
 
-                    for old_request_id in old_requests {
-                        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
-                            if let Ok(buffer_guard) = buffer.lock() {
-                                if !buffer_guard.is_empty() {
+                for old_request_id in old_requests {
+                    if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
+                        if let Ok(buffer_guard) = buffer.lock() {
+                            if !buffer_guard.is_empty() {
+                                info!(
+                                    "Found {} late agent payload(s) for previous request: {}",
+                                    buffer_guard.len(),
+                                    old_request_id
+                                );
+
+                                // Check if report line is available
+                                let report_line =
+                                    PENDING_REPORTS.remove(&old_request_id).map(|(_, report)| {
+                                        debug!(
+                                            "Found matching platform.report for late agent payload: {}",
+                                            old_request_id
+                                        );
+                                        report
+                                    });
+
+                                // Only send if we have the report line (complete data)
+                                if let Some(ref report) = report_line {
                                     info!(
-                                        "Found {} late agent payload(s) for previous request: {}",
-                                        buffer_guard.len(),
+                                        "Late payload for {} has report - adding to batch for sending",
                                         old_request_id
                                     );
-
-                                    let report_line =
-                                        PENDING_REPORTS.remove(&old_request_id).map(|(_, report)| {
-                                            debug!(
-                                                "Found matching platform.report for late agent payload: {}",
-                                                old_request_id
-                                            );
-                                            report
-                                        });
 
                                     for payload_bytes in buffer_guard.iter() {
                                         let context = REQUEST_CONTEXTS
@@ -325,24 +321,39 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                                         add_to_batch(
                                             old_request_id.clone(),
                                             payload_bytes.clone(),
-                                            report_line.clone(),
+                                            Some(report.clone()),
                                             context,
                                         );
                                     }
+
+                                    // Clean up since we're sending this data
+                                    cleanup_request_processing_state(&old_request_id);
+                                } else {
+                                    debug!(
+                                        "Late payload for {} has NO report yet - keeping in buffer for next invocation",
+                                        old_request_id
+                                    );
+                                    // Don't cleanup - keep buffer alive for next invocation
                                 }
+                            } else {
+                                // Empty buffer, clean up
+                                cleanup_request_processing_state(&old_request_id);
                             }
                         }
-
+                    } else {
+                        // No buffer, clean up
                         cleanup_request_processing_state(&old_request_id);
                     }
+                }
 
-                    if should_send_batch() {
-                        let newrelic_client = components.newrelic_client.clone();
-                        let config = components.config.clone();
-                        tokio::spawn(async move {
-                            send_batched_payloads(newrelic_client, config).await;
-                        });
-                    }
+                // Send batch if threshold is reached after processing late payloads (only with report lines)
+                if should_send_batch_by_threshold() {
+                    info!("Batch threshold reached - sending payloads with report lines only");
+                    let newrelic_client = components.newrelic_client.clone();
+                    let config = components.config.clone();
+                    tokio::spawn(async move {
+                        send_batched_payloads_with_reports_only(newrelic_client, config).await;
+                    });
                 }
 
                 let request_state = create_request_processing_state(
@@ -436,6 +447,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),
                     components.config.clone(),
+                    components.global_log_processor.clone(),
                 )
                 .await;
                 break;
@@ -575,33 +587,12 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    if is_cold_start {
-        if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
-            match runtime_done_rx.recv().await {
-                Some(_) => info!(
-                    "Runtime.done received for request: {} (COLD START)",
-                    request_id
-                ),
-                None => warn!(
-                    "Runtime.done channel closed for request: {} - proceeding anyway",
-                    request_id
-                ),
-            }
-        }
-    } else {
-        if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
-            match runtime_done_rx.recv().await {
-                Some(_) => debug!(
-                    "Runtime.done received for APM warm start request: {}",
-                    request_id
-                ),
-                None => warn!(
-                    "Runtime.done channel closed for request: {} - proceeding anyway",
-                    request_id
-                ),
-            }
-        }
-    }
+    // Unified approach: Skip runtime.done wait for all invocations (APM mode)
+    // Late payloads will be processed in next invocation
+    debug!(
+        "APM mode: Skipping runtime.done wait for request: {} (unified batching approach)",
+        request_id
+    );
 
     let payload_already_arrived = {
         if let Ok(buffer) = state.agent_buffer.lock() {
@@ -611,17 +602,18 @@ pub async fn process_apm_request(
         }
     };
 
+    // Unified wait timeout for all invocations (APM mode)
     if !payload_already_arrived {
         debug!(
-            "APM mode: Waiting up to 200ms for agent payload for request: {}",
+            "APM mode: Waiting up to 100ms for agent payload for request: {}",
             request_id
         );
         tokio::select! {
             _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
                 debug!("Agent payload received early for request: {} (saved wait time)", request_id);
             }
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                debug!("Agent payload wait timeout (200ms) for request: {} - may arrive late", request_id);
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                debug!("Agent payload wait timeout (100ms) for request: {} - may arrive late", request_id);
             }
         }
     } else {
@@ -792,29 +784,15 @@ pub async fn process_request_concurrently(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    let is_cold_start = !IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+    // Skip runtime.done wait for all invocations (performance optimization)
+    // Late payloads will be processed in next invocation
+    debug!(
+        "Skipping runtime.done wait for request: {} (unified batching approach)",
+        request_id
+    );
 
-    if is_cold_start {
-        if let Some(ref mut runtime_done_rx) = state.runtime_done_rx {
-            match runtime_done_rx.recv().await {
-                Some(_) => info!(
-                    "Runtime.done received for request: {} (COLD START)",
-                    request_id
-                ),
-                None => warn!(
-                    "Runtime.done channel closed for request: {} - proceeding anyway",
-                    request_id
-                ),
-            }
-        }
-    } else {
-        debug!(
-            "Skipping runtime.done wait for WARM START request: {} (performance optimization)",
-            request_id
-        );
-    }
-
-    let agent_wait_timeout_ms = if is_cold_start { 200 } else { 50 };
+    // Unified wait timeout for all invocations
+    let agent_wait_timeout_ms = 100;
 
     let payload_already_arrived = {
         if let Ok(buffer) = state.agent_buffer.lock() {
@@ -860,76 +838,56 @@ pub async fn process_request_concurrently(
         report
     });
 
+    // Smart batching: Only send complete payloads (with report)
     let send_agent_task = if agent_payloads.is_empty() {
         info!("Standard mode: No agent payload for request: {}", request_id);
         None
-    } else if is_cold_start {
+    } else if let Some(ref report) = report_line {
+        // Both payload and report available - send now (complete data)
         info!(
-            "Standard mode: Cold start - sending agent payload immediately (with report: {})",
-            report_line.is_some()
+            "Standard mode: Payload + report both ready for {} - adding to batch",
+            request_id
         );
-        let request_id_clone = request_id.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-        let newrelic_client_clone = newrelic_client.clone();
-        let config_clone = config.clone();
-        let apm_app_clone = _apm_app.clone();
 
-        Some(tokio::spawn(async move {
-            send_agent_with_report_immediately(
-                request_id_clone,
-                invoked_function_arn_clone,
-                agent_payloads,
-                report_line,
-                newrelic_client_clone,
-                config_clone,
-                apm_app_clone,
-            )
-            .await;
-        }))
-    } else if report_line.is_some() {
-        info!("Standard mode: Warm start - agent+report ready, sending combined");
-        let request_id_clone = request_id.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-        let newrelic_client_clone = newrelic_client.clone();
-        let config_clone = config.clone();
-        let apm_app_clone = _apm_app.clone();
-
-        Some(tokio::spawn(async move {
-            send_agent_with_report_immediately(
-                request_id_clone,
-                invoked_function_arn_clone,
-                agent_payloads,
-                report_line,
-                newrelic_client_clone,
-                config_clone,
-                apm_app_clone,
-            )
-            .await;
-        }))
-    } else {
-        info!(
-            "Standard mode: Warm start - batching agent payload (no platform.report yet)"
-        );
         for payload_bytes in agent_payloads {
             add_to_batch(
                 request_id.clone(),
                 payload_bytes,
-                None,
+                Some(report.clone()),
                 invoked_function_arn.clone(),
             );
         }
 
-        if should_send_batch() {
-            debug!("Batch threshold reached - sending batched payloads");
+        // Check if batch threshold is met and send if needed (only payloads with report lines)
+        if should_send_batch_by_threshold() {
+            info!("Batch threshold reached - sending payloads with report lines only");
             let newrelic_client_clone = newrelic_client.clone();
             let config_clone = config.clone();
 
             Some(tokio::spawn(async move {
-                send_batched_payloads(newrelic_client_clone, config_clone).await;
+                send_batched_payloads_with_reports_only(newrelic_client_clone, config_clone).await;
             }))
         } else {
             None
         }
+    } else {
+        // Only payload, no report yet - put back in buffer for next invocation
+        info!(
+            "Standard mode: Payload ready but NO report yet for {} - keeping in buffer",
+            request_id
+        );
+        debug!(
+            "Payload will be sent in next invocation when platform.report arrives"
+        );
+
+        // Put payloads back in buffer (they were taken out with mem::take)
+        if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+            if let Ok(mut buffer) = buffer_ref.lock() {
+                buffer.extend(agent_payloads);
+            }
+        }
+
+        None
     };
 
     let log_flushing = global_log_processor.flush();
@@ -959,7 +917,8 @@ pub async fn process_request_concurrently(
         error!("Agent send task failed for request {}: {}", request_id, e);
     }
 
-    cleanup_request_processing_state_conditional(&request_id, is_cold_start);
+    // Unified cleanup: Always preserve buffers for late payload handling
+    cleanup_request_processing_state_internal(&request_id, true);
 
     if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = None;
@@ -1321,32 +1280,3 @@ pub fn cleanup_old_failed_payloads() {
     }
 }
 
-/// Start batch timeout background task (checks every 30 seconds for 5-minute timeout)
-pub fn start_batch_timeout_task(
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<ExtensionConfig>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-
-            let should_send = {
-                if let Ok(meta) = crate::agent::batch::BATCH_META.lock() {
-                    if let Some(oldest) = meta.oldest_timestamp {
-                        chrono::Utc::now() - oldest > chrono::Duration::seconds(300)
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-
-            if should_send {
-                info!("Batch timeout reached (5 minutes) - sending buffered payloads");
-                send_batched_payloads(newrelic_client.clone(), config.clone()).await;
-            }
-        }
-    });
-}

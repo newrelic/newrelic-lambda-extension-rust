@@ -77,25 +77,17 @@ pub fn add_to_batch(
     }
 }
 
-/// Check if batch should be sent based on thresholds
-///
-/// Thresholds:
-/// - 3+ agent payloads
-/// - Oldest payload > 5 minutes
-pub fn should_send_batch() -> bool {
-    if let Ok(meta) = BATCH_META.lock() {
-        if meta.agent_count >= 3 {
-            debug!("Batch threshold reached: {} agents", meta.agent_count);
-            return true;
-        }
+/// Check if batch threshold is reached (3+ payloads WITH report lines)
+/// Only sends payloads with report lines when threshold is hit
+pub fn should_send_batch_by_threshold() -> bool {
+    let count_with_reports = AGENT_BATCH_BUFFER
+        .iter()
+        .filter(|entry| entry.value().report_line.is_some())
+        .count();
 
-        if let Some(oldest) = meta.oldest_timestamp {
-            let age = chrono::Utc::now() - oldest;
-            if age > chrono::Duration::seconds(300) {
-                debug!("Batch timeout reached: oldest payload is {:?} old", age);
-                return true;
-            }
-        }
+    if count_with_reports >= 3 {
+        info!("Batch threshold reached: {} agent payloads with report lines", count_with_reports);
+        return true;
     }
 
     false
@@ -118,107 +110,62 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
     items
 }
 
-/// Send agent payload with optional report immediately (for cold start or when both ready)
-pub async fn send_agent_with_report_immediately(
-    request_id: String,
-    invoked_function_arn: String,
-    agent_payloads: Vec<Vec<u8>>,
-    report_line: Option<String>,
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<ExtensionConfig>,
-    apm_app: crate::apm::SharedApmApp,
-) {
-    let has_report = report_line.is_some();
-    debug!("Sending agent payload immediately for {} (with report: {})", request_id, has_report);
+/// Get only batched payloads WITH report lines and remove them from buffer
+/// Payloads without report lines remain in buffer for timeout/shutdown sending
+pub fn get_and_clear_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
+    let items_with_reports: Vec<BatchedAgentPayload> = AGENT_BATCH_BUFFER
+        .iter()
+        .filter(|entry| entry.value().report_line.is_some())
+        .map(|entry| entry.value().clone())
+        .collect();
 
-    let apm_app_guard = apm_app.read().await;
-    let is_apm_mode = apm_app_guard.is_some();
+    // Remove only items with report lines from buffer
+    for item in &items_with_reports {
+        AGENT_BATCH_BUFFER.remove(&item.request_id);
+    }
 
-    for payload_bytes in agent_payloads {
-        if let Some(ref app) = *apm_app_guard {
-            info!("APM mode: Sending agent payload for request: {}", request_id);
-            if let Err(e) = app.process_agent_payload(payload_bytes.clone()).await {
-                error!("Failed to send agent payload to APM collector for {}: {}", request_id, e);
-            }
-            
-            if let Some(ref report) = report_line {
-                debug!("APM mode: Sending platform REPORT metrics for request: {}", request_id);
-                if let Err(e) = app.send_platform_report_metrics(report).await {
-                    error!("Failed to send platform REPORT metrics for {}: {}", request_id, e);
-                }
-                
-                if report.contains("Task timed out") || report.contains("error") || report.contains("Error") {
-                    debug!("APM mode: Detected fault/timeout in REPORT log, generating error event");
-                    if let Err(e) = app.send_error_event_from_fault(report, &request_id, &invoked_function_arn).await {
-                        error!("Failed to send error event for fault in {}: {}", request_id, e);
-                    }
-                }
-            }
+    // Update metadata to reflect remaining items
+    if let Ok(mut meta) = BATCH_META.lock() {
+        let remaining_count = AGENT_BATCH_BUFFER.len();
+        meta.agent_count = remaining_count;
+
+        // Update oldest timestamp to the oldest remaining item
+        if remaining_count == 0 {
+            meta.oldest_timestamp = None;
         } else {
-            let mut log_events = Vec::new();
-
-            let agent_str = match std::str::from_utf8(&payload_bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => String::from_utf8_lossy(&payload_bytes).to_string(),
-            };
-            log_events.push(serde_json::json!({
-                "id": request_id,
-                "message": agent_str,
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-            }));
-
-            if let Some(ref report) = report_line {
-                log_events.push(serde_json::json!({
-                    "id": request_id,
-                    "message": report,
-                    "timestamp": chrono::Utc::now().timestamp_millis(),
-                }));
-            }
-
-            let entry = serde_json::json!({
-                "logEvents": log_events,
-                "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
-                "logStream": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
-                "messageType": "",
-                "owner": "",
-            });
-
-            let payload = serde_json::json!({
-                "context": {
-                    "function_name": config.aws.function_name,
-                    "invoked_function_arn": invoked_function_arn,
-                    "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
-                    "log_stream_name": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
-                },
-                "entry": entry.to_string(),
-            });
-
-            let payload_json = payload.to_string();
-
-            if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
-                error!("Failed to send agent payload for {}: {}", request_id, e);
-            }
+            meta.oldest_timestamp = AGENT_BATCH_BUFFER
+                .iter()
+                .map(|entry| entry.value().timestamp)
+                .min();
         }
+
+        info!(
+            "Removed {} payloads with report lines from batch (remaining in buffer: {})",
+            items_with_reports.len(),
+            remaining_count
+        );
     }
-    
-    if is_apm_mode {
-        info!("APM mode: Agent payload and platform metrics sent for request: {}", request_id);
-    }
+
+    items_with_reports
 }
 
-/// Send batched agent payloads (3+ payloads or timeout reached)
-pub async fn send_batched_payloads(
+/// Send only batched agent payloads WITH report lines (when threshold is hit)
+/// Payloads without report lines remain in buffer for timeout/shutdown sending
+pub async fn send_batched_payloads_with_reports_only(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    let batch_items = get_and_clear_batch();
+    let batch_items = get_and_clear_batch_with_reports_only();
 
     if batch_items.is_empty() {
-        debug!("No batched payloads to send");
+        debug!("No batched payloads with report lines to send");
         return;
     }
 
-    debug!("Sending batch of {} agent payloads", batch_items.len());
+    info!(
+        "Threshold reached: Sending batch of {} agent payloads WITH report lines (payloads without reports kept in buffer)",
+        batch_items.len()
+    );
 
     let mut log_events = Vec::new();
 
@@ -233,6 +180,7 @@ pub async fn send_batched_payloads(
             "timestamp": item.timestamp.timestamp_millis(),
         }));
 
+        // All items in this batch have report lines (filtered)
         if let Some(ref report) = item.report_line {
             log_events.push(serde_json::json!({
                 "id": item.request_id,
@@ -265,8 +213,211 @@ pub async fn send_batched_payloads(
     let payload_json = payload.to_string();
 
     if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
-        error!("Failed to send batched payloads: {}", e);
+        error!("Failed to send batched payloads with reports: {}", e);
     } else {
-        info!("Successfully sent batch of {} payloads", batch_items.len());
+        info!("Successfully sent batch of {} payloads with report lines", batch_items.len());
     }
+}
+
+/// Send all pending payloads on shutdown with 1MB chunking
+/// Collects from: AGENT_BATCH_BUFFER, REQUEST_AGENT_BUFFERS, and matches with PENDING_REPORTS
+/// Splits into 1MB chunks while keeping each payload + report together
+pub async fn send_all_pending_payloads_on_shutdown(
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) {
+    use crate::request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS};
+
+    info!("Shutdown: Collecting all pending telemetry payloads");
+
+    let mut all_payloads: Vec<BatchedAgentPayload> = Vec::new();
+
+    // 1. Collect from AGENT_BATCH_BUFFER (already batched payloads)
+    let batched_items = get_and_clear_batch();
+    info!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
+    all_payloads.extend(batched_items);
+
+    // 2. Collect from REQUEST_AGENT_BUFFERS (late/unbatched payloads)
+    let all_buffer_requests: Vec<String> = REQUEST_AGENT_BUFFERS
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    for request_id in all_buffer_requests {
+        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+            let payloads = if let Ok(mut buf) = buffer.lock() {
+                std::mem::take(&mut *buf)
+            } else {
+                Vec::new()
+            };
+
+            if !payloads.is_empty() {
+                info!("Shutdown: Found {} unbatched payload(s) for request: {}", payloads.len(), request_id);
+
+                // Get report line if available
+                let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| report);
+
+                // Get context
+                let arn = REQUEST_CONTEXTS
+                    .get(&request_id)
+                    .map(|ctx_entry| {
+                        ctx_entry
+                            .lock()
+                            .ok()
+                            .map(|ctx| ctx.invoked_function_arn.clone())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    })
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                for payload_bytes in payloads {
+                    all_payloads.push(BatchedAgentPayload {
+                        request_id: request_id.clone(),
+                        agent_payload_bytes: Arc::new(payload_bytes),
+                        report_line: report_line.clone(),
+                        invoked_function_arn: arn.clone(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+            }
+        }
+    }
+
+    if all_payloads.is_empty() {
+        info!("Shutdown: No pending payloads to send");
+        return;
+    }
+
+    info!("Shutdown: Total {} payload(s) to send", all_payloads.len());
+
+    // 3. Split into 1MB chunks while keeping each payload + report together
+    const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB
+
+    let chunks = split_into_chunks(all_payloads, MAX_CHUNK_SIZE, &config);
+
+    info!("Shutdown: Sending {} chunk(s)", chunks.len());
+
+    // 4. Send each chunk
+    for (idx, chunk_items) in chunks.iter().enumerate() {
+        debug!("Shutdown: Sending chunk {} with {} payload(s)", idx + 1, chunk_items.len());
+
+        let mut log_events = Vec::new();
+
+        for item in chunk_items {
+            let agent_str = match std::str::from_utf8(&item.agent_payload_bytes) {
+                Ok(s) => s.to_string(),
+                Err(_) => String::from_utf8_lossy(&item.agent_payload_bytes).to_string(),
+            };
+            log_events.push(serde_json::json!({
+                "id": item.request_id,
+                "message": agent_str,
+                "timestamp": item.timestamp.timestamp_millis(),
+            }));
+
+            if let Some(ref report) = item.report_line {
+                log_events.push(serde_json::json!({
+                    "id": item.request_id,
+                    "message": report,
+                    "timestamp": item.timestamp.timestamp_millis(),
+                }));
+            }
+        }
+
+        let most_recent = chunk_items.last().expect("chunk should not be empty");
+
+        let entry = serde_json::json!({
+            "logEvents": log_events,
+            "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
+            "logStream": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
+            "messageType": "",
+            "owner": "",
+        });
+
+        let payload = serde_json::json!({
+            "context": {
+                "function_name": config.aws.function_name,
+                "invoked_function_arn": most_recent.invoked_function_arn,
+                "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
+                "log_stream_name": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
+            },
+            "entry": entry.to_string(),
+        });
+
+        let payload_json = payload.to_string();
+
+        if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
+            error!("Shutdown: Failed to send chunk {}: {}", idx + 1, e);
+        } else {
+            info!("Shutdown: Successfully sent chunk {} with {} payload(s)", idx + 1, chunk_items.len());
+        }
+    }
+
+    info!("Shutdown: Completed sending all pending payloads");
+}
+
+/// Split payloads into chunks of max_size, keeping each payload + report together
+fn split_into_chunks(
+    payloads: Vec<BatchedAgentPayload>,
+    max_size: usize,
+    config: &Arc<ExtensionConfig>,
+) -> Vec<Vec<BatchedAgentPayload>> {
+    let mut chunks: Vec<Vec<BatchedAgentPayload>> = Vec::new();
+    let mut current_chunk: Vec<BatchedAgentPayload> = Vec::new();
+    let mut current_size: usize = 0;
+
+    // Base overhead for the JSON structure (approximate)
+    let base_overhead = estimate_base_overhead(config);
+
+    for payload_item in payloads {
+        // Estimate size of this item (agent payload + optional report + JSON overhead)
+        let item_size = estimate_item_size(&payload_item);
+
+        // Check if adding this item would exceed max_size
+        if current_size + item_size + base_overhead > max_size && !current_chunk.is_empty() {
+            // Start a new chunk
+            debug!("Splitting chunk at {} bytes with {} items", current_size, current_chunk.len());
+            chunks.push(current_chunk);
+            current_chunk = Vec::new();
+            current_size = 0;
+        }
+
+        // Add item to current chunk
+        current_chunk.push(payload_item);
+        current_size += item_size;
+    }
+
+    // Add the last chunk if not empty
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
+/// Estimate the size of a single batched payload item
+fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
+    let mut size = 0;
+
+    // Agent payload size
+    size += item.agent_payload_bytes.len();
+
+    // Report line size (if present)
+    if let Some(ref report) = item.report_line {
+        size += report.len();
+    }
+
+    // JSON overhead per log event (~150 bytes per event for structure + metadata)
+    size += 150;
+    if item.report_line.is_some() {
+        size += 150; // Second log event for report
+    }
+
+    size
+}
+
+/// Estimate the base overhead of the JSON structure
+fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
+    // Rough estimate: context object + entry wrapper + logEvents array
+    let function_name_len = config.aws.function_name.len();
+    let base = 500 + (function_name_len * 3); // Function name appears in multiple places
+    base
 }

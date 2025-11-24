@@ -46,7 +46,7 @@ use crate::{
     request::{route_payload_to_request_buffer, ProcessorFactory},
     event_loop::{
         run_infinite_event_loop, ExtensionComponents,
-        cleanup_old_failed_payloads, start_batch_timeout_task,
+        cleanup_old_failed_payloads,
     },
 };
 
@@ -332,8 +332,6 @@ async fn perform_one_time_initialization(
     start_agent_payload_collector_background_task(agent_telemetry_rx);
 
     cleanup_old_failed_payloads();
-
-    start_batch_timeout_task(Arc::clone(&newrelic_client), Arc::clone(&config));
 
     let apm_app = if config.new_relic.apm_lambda_mode {
         info!("APM Lambda mode enabled - initializing APM connection");

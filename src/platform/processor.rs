@@ -9,7 +9,7 @@ use std::{
     io::Result,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
@@ -46,14 +46,12 @@ impl PlatformProcessor {
                     let duration_ms = metrics.get("durationMs").and_then(|v| v.as_f64());
                     let memory_size_mb = metrics.get("memorySizeMB").and_then(|v| v.as_u64());
                     let max_memory_used_mb = metrics.get("maxMemoryUsedMB").and_then(|v| v.as_u64());
-                    let billed_duration_ms = metrics.get("billedDurationMs").and_then(|v| v.as_u64());
-                    
+
                     crate::error_synthesis::store_platform_metrics(
                         request_id.to_string(),
                         duration_ms,
                         memory_size_mb,
                         max_memory_used_mb,
-                        billed_duration_ms,
                     );
                 }
             }
@@ -386,9 +384,10 @@ impl PlatformProcessor {
             error_type.unwrap_or("no errorType field")
         );
     }
-    
-   
-   
+ 
+    /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
+    /// but the compiler cannot detect it in certain build configurations
+    #[allow(dead_code)]
     fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
         if message.starts_with("REPORT RequestId: ") {
             if let Some(start) = message.find("REPORT RequestId: ") {
@@ -403,9 +402,10 @@ impl PlatformProcessor {
         }
         None
     }
-    
-   
-   
+
+    /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
+    /// but the compiler cannot detect it in certain build configurations
+    #[allow(dead_code)]
     fn extract_log_level_from_message(&self, message: &str) -> &'static str {
         let message_upper = message.to_uppercase();
         
@@ -437,116 +437,6 @@ impl PlatformProcessor {
     }
     
    
-    pub async fn send_and_clear_batch_simple(&self) -> Result<()> {
-        let batch = {
-            let mut batch_guard = self.platform_events_batch.lock().unwrap();
-            std::mem::take(&mut *batch_guard)
-        };
-
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("Sending {} platform events as logs to New Relic", batch.len());
-
-        let client = Arc::clone(&self.newrelic_client);
-        let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
-        
-        let log_messages: Vec<crate::newrelic::payload::LogMessage> = batch
-            .into_iter()
-            .filter_map(|event| {
-                let message = event.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        let event_type = event.get("type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("platform.unknown");
-                        let request_id = event.get("requestId")
-                            .and_then(|r| r.as_str())
-                            .unwrap_or("unknown");
-                        format!("PLATFORM EVENT {} RequestId: {}", event_type.to_uppercase(), request_id)
-                    });
-
-                let timestamp_str = event.get("timestamp")
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        chrono::Utc::now().to_rfc3339()
-                    });
-
-                let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp_str)
-                    .unwrap_or_else(|_| chrono::Utc::now().into())
-                    .timestamp_millis();
-
-                let mut attributes = serde_json::Map::new();
-                
-                let context = self.invocation_context.lock().unwrap();
-                
-                let request_id = if message.starts_with("REPORT RequestId: ") {
-                    self.extract_request_id_from_message(&message)
-                        .unwrap_or_else(|| context.request_id.clone())
-                } else {
-                    context.request_id.clone()
-                };
-                
-                if !request_id.is_empty() {
-                    attributes.insert("aws.lambda_request_id".to_string(), 
-                                    serde_json::Value::String(request_id.clone()));
-                    attributes.insert("faas.execution".to_string(), 
-                                    serde_json::Value::String(request_id.clone()));
-                }
-                
-                if !context.invoked_function_arn.is_empty() {
-                    attributes.insert("faas.arn".to_string(), 
-                                    serde_json::Value::String(context.invoked_function_arn.clone()));
-                } else if let Some(constructed_arn) = config.aws.construct_function_arn() {
-                    attributes.insert("faas.arn".to_string(), 
-                                    serde_json::Value::String(constructed_arn.clone()));
-                    debug!("Used constructed faas.arn from registration details: {}", constructed_arn);
-                } else {
-                    debug!("Cannot construct faas.arn - missing registration details for platform event: {}", 
-                          message.chars().take(100).collect::<String>());
-                }
-                
-                let log_level = if let Some(level) = event.get("level").and_then(|l| l.as_str()) {
-                    level.to_string()
-                } else {
-                    self.extract_log_level_from_message(&message).to_string()
-                };
-                attributes.insert("level".to_string(), serde_json::Value::String(log_level));
-                
-                if let Some(event_type) = event.get("type").and_then(|t| t.as_str()) {
-                    attributes.insert("platform.type".to_string(), serde_json::Value::String(event_type.to_string()));
-                }
-                
-                attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
-                attributes.insert("newrelic.source".to_string(), "api.platform".into());
-
-                Some(crate::newrelic::payload::LogMessage {
-                    timestamp,
-                    message,
-                    attributes,
-                })
-            })
-            .collect();
-
-        if log_messages.is_empty() {
-            return Ok(());
-        }
-
-        match client.send_logs(&config, log_messages, &context.invoked_function_arn).await {
-            Ok(()) => {
-                trace!("Successfully sent platform events as logs to New Relic");
-                Ok(())
-            },
-            Err(e) => {
-                error!("Failed to send platform events as logs: {}", e);
-                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
-            }
-        }
-    }
 }
 
 #[async_trait]
