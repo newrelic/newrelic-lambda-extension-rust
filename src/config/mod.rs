@@ -324,7 +324,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            info!("New Relic Lambda Extension started");
+            info!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
             GLOBAL_CONFIG = Some(config);
         });
