@@ -170,7 +170,7 @@ impl LogProcessor {
     }
 
    
-    pub fn process_record(&self, record: TelemetryRecord) {
+    pub async fn process_record(&self, record: TelemetryRecord) {
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
@@ -269,17 +269,32 @@ impl LogProcessor {
                         let apm_clone = Arc::clone(apm_app_arc);
                         let msg_clone = message_str.to_string();
 
-                        // Send error synchronously to ensure it's sent during the current invoke
-                        // This prevents accumulation across invocations
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            handle.block_on(async move {
-                                let apm_guard = apm_clone.read().await;
-                                if let Some(ref app) = *apm_guard {
-                                    if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
-                                        debug!("Failed to send error event from function log fault: {}", e);
-                                    }
-                                }
+                        // Store error details for potential platform fault correlation
+                        let error_type = if message_str.contains("Task timed out") {
+                            "Timeout"
+                        } else if message_str.contains("Exception") || message_str.contains("exception") {
+                            "Exception"
+                        } else if message_str.contains("Fatal") || message_str.contains("fatal") {
+                            "Fatal"
+                        } else {
+                            "Error"
+                        };
+
+                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                            *last_error = Some(crate::error_synthesis::LastDetectedError {
+                                request_id: request_id.clone(),
+                                error_message: msg_clone.clone(),
+                                error_type: error_type.to_string(),
                             });
+                        }
+
+                        // Send error asynchronously during the current invoke
+                        // This prevents accumulation across invocations
+                        let apm_guard = apm_clone.read().await;
+                        if let Some(ref app) = *apm_guard {
+                            if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
+                                debug!("Failed to send error event from function log fault: {}", e);
+                            }
                         }
                     }
                 }
@@ -312,20 +327,25 @@ impl LogProcessor {
                         let msg_clone = message_str.to_string();
                         let error_type_clone = error_type.to_string();
 
-                        // Send error synchronously to ensure it's sent during the current invoke
-                        // This prevents accumulation across invocations
-                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            handle.block_on(async {
-                                crate::error_synthesis::send_lambda_error(
-                                    &msg_clone,
-                                    &request_id,
-                                    &function_arn,
-                                    &error_type_clone,
-                                    &client,
-                                    &config,
-                                ).await;
+                        // Store error details for potential platform fault correlation
+                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                            *last_error = Some(crate::error_synthesis::LastDetectedError {
+                                request_id: request_id.clone(),
+                                error_message: msg_clone.clone(),
+                                error_type: error_type_clone.clone(),
                             });
                         }
+
+                        // Send error asynchronously during the current invoke
+                        // This prevents accumulation across invocations
+                        crate::error_synthesis::send_lambda_error(
+                            &msg_clone,
+                            &request_id,
+                            &function_arn,
+                            &error_type_clone,
+                            &client,
+                            &config,
+                        ).await;
                     }
                 }
             }

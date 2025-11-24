@@ -91,8 +91,8 @@ pub async fn subscribe_to_telemetry(
         "types": ["platform", "function", "extension"],
         "buffering": {
             "maxBytes": 262144,
-            "maxItems": 10000,
-            "timeoutMs": 100
+            "maxItems": 1000,
+            "timeoutMs": 25  // Minimum value to ensure platform.report events are delivered in current invocation
         },
         "destination": {
             "protocol": "HTTP",

@@ -109,11 +109,11 @@ async fn handle_telemetry_request(
                 match record.record_type.as_str() {
                     "function" => {
                         function_count += 1;
-                        log_processor.process_record(record);
+                        log_processor.process_record(record).await;
                     }
                     "extension" => {
                         extension_count += 1;
-                        log_processor.process_record(record);
+                        log_processor.process_record(record).await;
                     }
                     "platform.runtimeDone" => {
                         if let Some(request_id_value) = record.record.get("requestId") {

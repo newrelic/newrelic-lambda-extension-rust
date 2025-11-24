@@ -45,6 +45,17 @@ pub struct FailedError {
 pub static FAILED_ERRORS: Lazy<Arc<Mutex<Vec<FailedError>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
+/// Store the last detected error from function logs for more detailed platform fault messages
+#[derive(Debug, Clone)]
+pub struct LastDetectedError {
+    pub request_id: String,
+    pub error_message: String,
+    pub error_type: String,
+}
+
+pub static LAST_DETECTED_ERROR: Lazy<Arc<Mutex<Option<LastDetectedError>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
+
 /// Retry any failed errors from previous invocation before starting new one
 /// Returns true if any retries were attempted
 pub async fn retry_failed_errors(
@@ -117,6 +128,14 @@ pub fn clear_sent_errors_for_request(request_id: &str) {
         sent_errors.clear();
         if prev_count > 0 {
             debug!("Cleared {} sent error(s) for new invocation (request: {})", prev_count, request_id);
+        }
+    }
+
+    // Also clear the last detected error for new invocation
+    if let Ok(mut last_error) = LAST_DETECTED_ERROR.lock() {
+        if last_error.is_some() {
+            debug!("Cleared last detected error for new invocation (request: {})", request_id);
+            *last_error = None;
         }
     }
 }
@@ -263,11 +282,27 @@ pub async fn send_platform_fault_error(
         String::new()
     };
 
-    // Compose the fault message with memory info
+    // Try to get detailed error info from previously detected errors in function logs
+    let detailed_reason = if let Ok(guard) = LAST_DETECTED_ERROR.lock() {
+        if let Some(ref error) = *guard {
+            if error.request_id == request_id {
+                // Use the actual error message instead of generic shutdown reason
+                format!("{} (type: {})", error.error_message, error.error_type)
+            } else {
+                shutdown_reason.to_string()
+            }
+        } else {
+            shutdown_reason.to_string()
+        }
+    } else {
+        shutdown_reason.to_string()
+    };
+
+    // Compose the fault message with detailed error info and memory info
     let fault_msg = format!(
         "RequestId: {} AWS Lambda platform fault caused a shutdown (reason: {}){}",
         request_id,
-        shutdown_reason,
+        detailed_reason,
         memory_info
     );
 
