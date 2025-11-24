@@ -31,6 +31,84 @@ pub static LAST_PLATFORM_METRICS: Lazy<Arc<Mutex<Option<PlatformMetrics>>>> =
 pub static SENT_ERRORS: Lazy<Arc<Mutex<std::collections::HashSet<(String, String)>>>> =
     Lazy::new(|| Arc::new(Mutex::new(std::collections::HashSet::new())));
 
+/// Store failed error sends for retry on next invoke
+/// Structure: (request_id, error_type, error_message, function_arn, error_class)
+#[derive(Debug, Clone)]
+pub struct FailedError {
+    pub request_id: String,
+    pub error_type: String,
+    pub error_message: String,
+    pub invoked_function_arn: String,
+    pub error_class: String,
+}
+
+pub static FAILED_ERRORS: Lazy<Arc<Mutex<Vec<FailedError>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+/// Retry any failed errors from previous invocation before starting new one
+/// Returns true if any retries were attempted
+pub async fn retry_failed_errors(
+    newrelic_client: &Arc<NewRelicClient>,
+    config: &Arc<ExtensionConfig>,
+) -> bool {
+    let failed_errors = if let Ok(mut guard) = FAILED_ERRORS.lock() {
+        if guard.is_empty() {
+            return false;
+        }
+        let errors = guard.clone();
+        guard.clear(); // Clear immediately to avoid duplicate retries
+        errors
+    } else {
+        return false;
+    };
+
+    if failed_errors.is_empty() {
+        return false;
+    }
+
+    info!("Retrying {} failed error(s) from previous invocation(s)", failed_errors.len());
+
+    for failed_error in failed_errors {
+        debug!(
+            "Retrying error send: {} for request {}",
+            failed_error.error_class, failed_error.request_id
+        );
+
+        // Don't check SENT_ERRORS here - these are retries
+        // Send directly to telemetry
+        match send_error_to_telemetry_internal(
+            &failed_error.error_message,
+            &failed_error.request_id,
+            &failed_error.invoked_function_arn,
+            &failed_error.error_class,
+            newrelic_client,
+            config,
+        )
+        .await
+        {
+            Ok(()) => {
+                debug!(
+                    "Successfully retried error {} for request {}",
+                    failed_error.error_class, failed_error.request_id
+                );
+                // Mark as sent on success
+                if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+                    sent_errors.insert((failed_error.request_id.clone(), failed_error.error_type.clone()));
+                }
+            }
+            Err(e) => {
+                error!(
+                    "Retry failed for error {} (request {}): {} - will not retry again",
+                    failed_error.error_class, failed_error.request_id, e
+                );
+                // Don't retry again - drop the error after one retry attempt
+            }
+        }
+    }
+
+    true
+}
+
 /// Clear all sent errors (call when starting new invocation)
 /// This ensures each new invocation starts with a clean slate and prevents memory leaks
 pub fn clear_sent_errors_for_request(request_id: &str) {
@@ -114,17 +192,17 @@ pub async fn send_timeout_error(
     };
 
     // Check if we already sent a timeout error for this request (by error type, not exact message)
-    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+    if let Ok(sent_errors) = SENT_ERRORS.lock() {
         let key = (request_id.to_string(), "LambdaTimeout".to_string());
         if sent_errors.contains(&key) {
             debug!("Already sent timeout error for request {} (type dedup), skipping duplicate", request_id);
             return;
         }
-        sent_errors.insert(key);
     }
     info!("Synthesizing timeout error for request {}: {}", request_id, timeout_msg);
 
-    send_error_to_telemetry(
+    // Attempt to send - only mark as sent on success
+    match send_error_to_telemetry_internal(
         &timeout_msg,
         request_id,
         invoked_function_arn,
@@ -132,7 +210,28 @@ pub async fn send_timeout_error(
         newrelic_client,
         config,
     )
-    .await;
+    .await
+    {
+        Ok(()) => {
+            // Mark as successfully sent
+            if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+                sent_errors.insert((request_id.to_string(), "LambdaTimeout".to_string()));
+            }
+        }
+        Err(e) => {
+            error!("Failed to send timeout error for {}: {} - will retry on next invoke", request_id, e);
+            // Store for retry on next invocation
+            if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                failed_errors.push(FailedError {
+                    request_id: request_id.to_string(),
+                    error_type: "LambdaTimeout".to_string(),
+                    error_message: timeout_msg,
+                    invoked_function_arn: invoked_function_arn.to_string(),
+                    error_class: "LambdaTimeout".to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Synthesize and send platform fault error to telemetry endpoint
@@ -173,18 +272,18 @@ pub async fn send_platform_fault_error(
     );
 
     // Check if we already sent a platform fault error for this request (by error type, not exact message)
-    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+    if let Ok(sent_errors) = SENT_ERRORS.lock() {
         let key = (request_id.to_string(), "LambdaPlatformFault".to_string());
         if sent_errors.contains(&key) {
             debug!("Already sent platform fault error for request {} (type dedup), skipping duplicate", request_id);
             return;
         }
-        sent_errors.insert(key);
     }
 
     info!("Synthesizing platform fault error for request {}: {}", request_id, fault_msg);
 
-    send_error_to_telemetry(
+    // Attempt to send - only mark as sent on success
+    match send_error_to_telemetry_internal(
         &fault_msg,
         request_id,
         invoked_function_arn,
@@ -192,7 +291,28 @@ pub async fn send_platform_fault_error(
         newrelic_client,
         config,
     )
-    .await;
+    .await
+    {
+        Ok(()) => {
+            // Mark as successfully sent
+            if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+                sent_errors.insert((request_id.to_string(), "LambdaPlatformFault".to_string()));
+            }
+        }
+        Err(e) => {
+            error!("Failed to send platform fault error for {}: {} - will retry on next invoke", request_id, e);
+            // Store for retry on next invocation
+            if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                failed_errors.push(FailedError {
+                    request_id: request_id.to_string(),
+                    error_type: "LambdaPlatformFault".to_string(),
+                    error_message: fault_msg,
+                    invoked_function_arn: invoked_function_arn.to_string(),
+                    error_class: "LambdaPlatformFault".to_string(),
+                });
+            }
+        }
+    }
 }
 
 /// Synthesize and send generic Lambda error to telemetry endpoint
@@ -206,18 +326,18 @@ pub async fn send_lambda_error(
     config: &Arc<ExtensionConfig>,
 ) {
     // Check if we already sent this error type for this request (by error type, not exact message)
-    if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+    if let Ok(sent_errors) = SENT_ERRORS.lock() {
         let key = (request_id.to_string(), error_type.to_string());
         if sent_errors.contains(&key) {
             debug!("Already sent {} error for request {} (type dedup), skipping duplicate", error_type, request_id);
             return;
         }
-        sent_errors.insert(key);
     }
-    
+
     info!("Synthesizing Lambda error for request {}: {} - {}", request_id, error_type, error_message);
 
-    send_error_to_telemetry(
+    // Attempt to send - only mark as sent on success
+    match send_error_to_telemetry_internal(
         error_message,
         request_id,
         invoked_function_arn,
@@ -225,18 +345,40 @@ pub async fn send_lambda_error(
         newrelic_client,
         config,
     )
-    .await;
+    .await
+    {
+        Ok(()) => {
+            // Mark as successfully sent
+            if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
+                sent_errors.insert((request_id.to_string(), error_type.to_string()));
+            }
+        }
+        Err(e) => {
+            error!("Failed to send Lambda error for {}: {} - will retry on next invoke", request_id, e);
+            // Store for retry on next invocation
+            if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                failed_errors.push(FailedError {
+                    request_id: request_id.to_string(),
+                    error_type: error_type.to_string(),
+                    error_message: error_message.to_string(),
+                    invoked_function_arn: invoked_function_arn.to_string(),
+                    error_class: error_type.to_string(),
+                });
+            }
+        }
+    }
 }
 
-/// Core function to send error message to telemetry endpoint (Vortex/cloud-collector)
-async fn send_error_to_telemetry(
+/// Internal function to send error message to telemetry endpoint (Vortex/cloud-collector)
+/// Returns Result to allow caller to handle success/failure
+async fn send_error_to_telemetry_internal(
     error_message: &str,
     request_id: &str,
     invoked_function_arn: &str,
     error_class: &str,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
-) {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     let log_event = serde_json::json!({
@@ -267,12 +409,8 @@ async fn send_error_to_telemetry(
 
     info!("Sending synthesized error ({}) to telemetry endpoint for request {}", error_class, request_id);
 
-    match newrelic_client.send_agent_payload(config, &payload_json).await {
-        Ok(()) => {
-            debug!("Successfully sent synthesized error to telemetry endpoint for request: {}", request_id);
-        }
-        Err(e) => {
-            error!("Failed to send synthesized error to telemetry endpoint for {}: {}", request_id, e);
-        }
-    }
+    newrelic_client.send_agent_payload(config, &payload_json).await?;
+
+    debug!("Successfully sent synthesized error to telemetry endpoint for request: {}", request_id);
+    Ok(())
 }

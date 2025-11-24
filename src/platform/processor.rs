@@ -358,25 +358,27 @@ impl PlatformProcessor {
             _ => "LambdaError",
         };
         
-        // Send error to telemetry endpoint asynchronously
+        // Send error to telemetry endpoint synchronously to ensure it's sent during the current invoke
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let error_msg = error_message.clone();
         let req_id = request_id.clone();
         let func_arn = invoked_function_arn.clone();
         let err_type = lambda_error_type.to_string();
-        
-        tokio::spawn(async move {
-            crate::error_synthesis::send_lambda_error(
-                &error_msg,
-                &req_id,
-                &func_arn,
-                &err_type,
-                &client,
-                &config,
-            )
-            .await;
-        });
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.block_on(async move {
+                crate::error_synthesis::send_lambda_error(
+                    &error_msg,
+                    &req_id,
+                    &func_arn,
+                    &err_type,
+                    &client,
+                    &config,
+                )
+                .await;
+            });
+        }
         
         debug!(
             "Detected platform error in {}: {} - will send to telemetry endpoint", 

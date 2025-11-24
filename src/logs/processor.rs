@@ -268,14 +268,19 @@ impl LogProcessor {
                         
                         let apm_clone = Arc::clone(apm_app_arc);
                         let msg_clone = message_str.to_string();
-                        tokio::spawn(async move {
-                            let apm_guard = apm_clone.read().await;
-                            if let Some(ref app) = *apm_guard {
-                                if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
-                                    debug!("Failed to send error event from function log fault: {}", e);
+
+                        // Send error synchronously to ensure it's sent during the current invoke
+                        // This prevents accumulation across invocations
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.block_on(async move {
+                                let apm_guard = apm_clone.read().await;
+                                if let Some(ref app) = *apm_guard {
+                                    if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
+                                        debug!("Failed to send error event from function log fault: {}", e);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                     }
                 }
             } else {
@@ -306,17 +311,21 @@ impl LogProcessor {
                         let config = Arc::clone(&self.config);
                         let msg_clone = message_str.to_string();
                         let error_type_clone = error_type.to_string();
-                        
-                        tokio::spawn(async move {
-                            crate::error_synthesis::send_lambda_error(
-                                &msg_clone,
-                                &request_id,
-                                &function_arn,
-                                &error_type_clone,
-                                &client,
-                                &config,
-                            ).await;
-                        });
+
+                        // Send error synchronously to ensure it's sent during the current invoke
+                        // This prevents accumulation across invocations
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            handle.block_on(async {
+                                crate::error_synthesis::send_lambda_error(
+                                    &msg_clone,
+                                    &request_id,
+                                    &function_arn,
+                                    &error_type_clone,
+                                    &client,
+                                    &config,
+                                ).await;
+                            });
+                        }
                     }
                 }
             }

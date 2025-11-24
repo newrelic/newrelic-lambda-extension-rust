@@ -117,8 +117,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
-                
+
+                // Clear sent errors for new invocation
                 error_synthesis::clear_sent_errors_for_request(&request_id);
+
+                // Retry any failed errors from previous invocation
+                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
@@ -264,9 +268,12 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
-                
+
                 // Clear error tracking for this new invocation
                 error_synthesis::clear_sent_errors_for_request(&request_id);
+
+                // Retry any failed errors from previous invocation
+                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
