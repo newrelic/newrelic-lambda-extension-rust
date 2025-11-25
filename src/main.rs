@@ -361,11 +361,15 @@ async fn perform_one_time_initialization(
                 Arc::clone(&APM_APP)
             }
             Err(e) => {
-                info!(
-                    "Failed to initialize APM app: {} - continuing without APM mode",
-                    e
-                );
-                Arc::new(tokio::sync::RwLock::new(None))
+                error!("Failed to initialize APM app: {}", e);
+                error!("APM mode was explicitly enabled (NEW_RELIC_APM_LAMBDA_MODE=true) but initialization failed");
+                error!("Extension will run in NO-OP mode to prevent incorrect data collection");
+                error!("Lambda function will continue normally but without New Relic monitoring");
+
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("APM initialization failed when APM mode was explicitly enabled: {}", e)
+                )));
             }
         }
     } else {
