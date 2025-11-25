@@ -112,7 +112,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 invoked_function_arn,
             } => {
                 let event_start = std::time::Instant::now();
-                
+
+                if is_cold_start {
+                    let mut updated_config = (*components.config).clone();
+                    updated_config.aws.extract_and_update_account_id_from_arn(&invoked_function_arn);
+                    components.config = Arc::new(updated_config);
+                }
+
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
                 }
@@ -212,49 +218,60 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
 
-                // Synthesize and send error based on shutdown reason
+                // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
-                    match shutdown_reason {
-                        runtime::ShutdownReason::Timeout => {
-                            // Lambda timeout - send timeout error with reason
-                            info!("Shutdown due to timeout - synthesizing timeout error for request: {}", last_request_id);
-                            error_synthesis::send_timeout_error(
-                                &last_request_id,
-                                &last_arn,
-                                None,
-                                &components.newrelic_client,
-                                &components.config,
-                            )
-                            .await;
+                    let apm_app_guard = components.apm_app.read().await;
+                    if let Some(ref app) = *apm_app_guard {
+                        match shutdown_reason {
+                            runtime::ShutdownReason::Timeout => {
+                                // Lambda timeout - send timeout error event to APM collector
+                                info!("Shutdown due to timeout - sending error event to APM for request: {}", last_request_id);
+                                if let Err(e) = app.send_shutdown_error_event(
+                                    "LambdaTimeout",
+                                    "Task timed out",
+                                    &last_request_id,
+                                    &last_arn,
+                                )
+                                .await
+                                {
+                                    error!("Failed to send timeout error event to APM: {}", e);
+                                }
+                            }
+                            runtime::ShutdownReason::Failure => {
+                                // Lambda failure/fault - send platform fault error event to APM collector
+                                info!("Shutdown due to failure - sending error event to APM for request: {}", last_request_id);
+                                if let Err(e) = app.send_shutdown_error_event(
+                                    "LambdaPlatformFault",
+                                    "AWS Lambda platform fault caused a shutdown",
+                                    &last_request_id,
+                                    &last_arn,
+                                )
+                                .await
+                                {
+                                    error!("Failed to send platform fault error event to APM: {}", e);
+                                }
+                            }
+                            runtime::ShutdownReason::Spindown => {
+                                // Normal shutdown - no error needed
+                                debug!("Normal spindown shutdown - no error event needed");
+                            }
+                            runtime::ShutdownReason::Unknown => {
+                                // Unknown/unexpected shutdown reason - send generic error event
+                                warn!("Unknown shutdown reason - sending error event to APM for request: {}", last_request_id);
+                                if let Err(e) = app.send_shutdown_error_event(
+                                    "LambdaShutdown",
+                                    "Lambda shutdown with unknown reason",
+                                    &last_request_id,
+                                    &last_arn,
+                                )
+                                .await
+                                {
+                                    error!("Failed to send shutdown error event to APM: {}", e);
+                                }
+                            }
                         }
-                        runtime::ShutdownReason::Failure => {
-                            // Lambda failure/fault - send platform fault error
-                            info!("Shutdown due to failure - synthesizing fault error for request: {}", last_request_id);
-                            error_synthesis::send_platform_fault_error(
-                                &last_request_id,
-                                &last_arn,
-                                &components.newrelic_client,
-                                &components.config,
-                            )
-                            .await;
-                        }
-                        runtime::ShutdownReason::Spindown => {
-                            // Normal shutdown - no error needed
-                            debug!("Normal spindown shutdown - no error synthesis needed");
-                        }
-                        runtime::ShutdownReason::Unknown => {
-                            // Unknown/unexpected shutdown reason - send generic error
-                            warn!("Unknown shutdown reason - synthesizing generic error for request: {}", last_request_id);
-                            error_synthesis::send_lambda_error(
-                                &format!("Lambda shutdown with unknown reason"),
-                                &last_request_id,
-                                &last_arn,
-                                "LambdaShutdown",
-                                &components.newrelic_client,
-                                &components.config,
-                            )
-                            .await;
-                        }
+                    } else {
+                        warn!("APM app not initialized - cannot send shutdown error event");
                     }
                 }
 
@@ -300,7 +317,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 invoked_function_arn,
             } => {
                 let event_start = std::time::Instant::now();
-                
+
+                // Extract real account ID from ARN on first invocation (if not already set)
+                if is_cold_start {
+                    let mut updated_config = (*components.config).clone();
+                    updated_config.aws.extract_and_update_account_id_from_arn(&invoked_function_arn);
+                    components.config = Arc::new(updated_config);
+                }
+
                 // Track this request for potential error synthesis on shutdown
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
                     *guard = Some((request_id.clone(), invoked_function_arn.clone()));
@@ -691,6 +715,22 @@ pub async fn process_apm_request(
 
     let got_payload_now = !agent_payloads.is_empty();
 
+    // Check if there was a detected error but no agent payload (APM mode)
+    // This can happen when the function code has errors but doesn't send telemetry
+    if !got_payload_now {
+        if let Ok(guard) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+            if let Some(ref detected_error) = *guard {
+                if detected_error.request_id == request_id {
+                    info!(
+                        "APM mode: No agent payload for request {} but error detected: {} - error event was already sent by log processor",
+                        request_id, detected_error.error_type
+                    );
+                    // Error event was already sent by log processor via send_error_event_from_fault
+                }
+            }
+        }
+    }
+
     let send_agent_task = if got_payload_now {
         info!(
             "APM mode: Sending {} agent payload(s) immediately to APM collector",
@@ -895,6 +935,22 @@ pub async fn process_request_concurrently(
         );
         report
     });
+
+    // Check if there was a detected error but no agent payload
+    // This can happen when the function code has errors but doesn't send telemetry
+    if agent_payloads.is_empty() {
+        if let Ok(guard) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+            if let Some(ref detected_error) = *guard {
+                if detected_error.request_id == request_id {
+                    info!(
+                        "Standard mode: No agent payload for request {} but error detected: {} - sending to telemetry",
+                        request_id, detected_error.error_type
+                    );
+                    // Error was already sent by log processor, just log this for visibility
+                }
+            }
+        }
+    }
 
     // Smart batching: Only send complete payloads (with report)
     let send_agent_task = if agent_payloads.is_empty() {

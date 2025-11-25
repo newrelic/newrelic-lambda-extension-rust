@@ -269,6 +269,38 @@ impl ApmApp {
         .await
     }
 
+    /// Send error event for shutdown events (timeout, failure)
+    /// Used when Lambda shuts down due to timeout or platform fault
+    pub async fn send_shutdown_error_event(
+        &self,
+        error_class: &str,
+        error_message: &str,
+        request_id: &str,
+        function_arn: &str,
+    ) -> Result<()> {
+        use super::error_event::generate_error_event;
+
+        let error_events = generate_error_event(error_class, error_message, request_id, function_arn);
+
+        if error_events.is_empty() {
+            return Ok(());
+        }
+
+        info!(
+            "Sending shutdown error event ({}) for request: {}",
+            error_class, request_id
+        );
+
+        send_error_events(
+            &self.client,
+            &self.license_key,
+            &self.collector_host,
+            &self.run_id,
+            &error_events,
+        )
+        .await
+    }
+
     /// Get entity GUID for log correlation
     pub fn get_entity_guid(&self) -> &str {
         &self.entity_guid

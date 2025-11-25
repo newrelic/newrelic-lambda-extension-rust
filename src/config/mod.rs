@@ -141,9 +141,27 @@ impl AwsConfig {
         self.function_name = function_name;
         self.function_version = Some(function_version);
         self.account_id = account_id;
-        
+
         if self.region.is_none() {
             self.region = env::var("AWS_REGION").ok();
+        }
+    }
+
+    pub fn extract_and_update_account_id_from_arn(&mut self, invoked_function_arn: &str) {
+        if self.account_id.is_none() || self.account_id.as_ref().map_or(true, |id| id.is_empty() || id == "123456789012") {
+            if let Some(extracted_account_id) = Self::extract_account_id_from_arn(invoked_function_arn) {
+                info!("Extracted account ID from ARN: {}", extracted_account_id);
+                self.account_id = Some(extracted_account_id);
+            }
+        }
+    }
+
+    fn extract_account_id_from_arn(arn: &str) -> Option<String> {
+        let parts: Vec<&str> = arn.split(':').collect();
+        if parts.len() >= 5 && parts[0] == "arn" && parts[2] == "lambda" {
+            Some(parts[4].to_string())
+        } else {
+            None
         }
     }
 }

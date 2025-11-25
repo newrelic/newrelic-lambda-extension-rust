@@ -260,12 +260,16 @@ impl LogProcessor {
                        message_str.contains("error") || message_str.contains("Error") ||
                        message_str.contains("Exception") || message_str.contains("exception") ||
                        message_str.contains("Fatal") || message_str.contains("fatal") {
-                        
+
+                        info!("APM mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
                             (context.request_id.clone(), context.invoked_function_arn.clone())
                         };
-                        
+
+                        info!("APM mode: Sending error event for request_id: {}", request_id);
+
                         let apm_clone = Arc::clone(apm_app_arc);
                         let msg_clone = message_str.to_string();
 
@@ -305,11 +309,15 @@ impl LogProcessor {
                        message_str.contains("error") || message_str.contains("Error") ||
                        message_str.contains("Exception") || message_str.contains("exception") ||
                        message_str.contains("Fatal") || message_str.contains("fatal") {
-                        
+
+                        info!("Standard mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
                             (context.request_id.clone(), context.invoked_function_arn.clone())
                         };
+
+                        info!("Standard mode: Sending error for request_id: {}", request_id);
                         
                         // Determine error type
                         let error_type = if message_str.contains("Task timed out") {

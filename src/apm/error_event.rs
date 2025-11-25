@@ -14,8 +14,8 @@ pub fn generate_error_event_from_fault(
     function_arn: &str,
 ) -> Option<Vec<Value>> {
     let is_timeout = log_line.contains("Task timed out");
-    let is_fault = log_line.contains("error") 
-        || log_line.contains("ERROR") 
+    let is_fault = log_line.contains("error")
+        || log_line.contains("ERROR")
         || log_line.contains("Error")
         || log_line.contains("exception")
         || log_line.contains("Exception");
@@ -36,6 +36,28 @@ pub fn generate_error_event_from_fault(
         "LambdaError"
     };
 
+    generate_error_event_internal(error_class, &error_message, request_id, function_arn)
+}
+
+/// Generate error event directly from error class and message
+/// Used for shutdown events (timeout, failure) where we don't parse from log lines
+pub fn generate_error_event(
+    error_class: &str,
+    error_message: &str,
+    request_id: &str,
+    function_arn: &str,
+) -> Vec<Value> {
+    generate_error_event_internal(error_class, error_message, request_id, function_arn)
+        .unwrap_or_else(Vec::new)
+}
+
+/// Internal function to generate error event structure
+fn generate_error_event_internal(
+    error_class: &str,
+    error_message: &str,
+    request_id: &str,
+    function_arn: &str,
+) -> Option<Vec<Value>> {
     debug!(
         "Generating error event for request {}: {} - {}",
         request_id, error_class, error_message
@@ -48,12 +70,12 @@ pub fn generate_error_event_from_fault(
     let priority = trace_gen.float32() as f64 * 2.0;
 
     let timestamp_ms = chrono::Utc::now().timestamp_millis();
-    
+
     let function_name = extract_function_name(function_arn);
     let transaction_name = format!("OtherTransaction/Function/{}", function_name);
-    
+
     let function_version = extract_function_version(function_arn);
-    
+
     let event_detail = json!({
         "duration": 0.1,
         "error.class": error_class,
