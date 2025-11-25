@@ -48,7 +48,6 @@ pub static FAILED_ERRORS: Lazy<Arc<Mutex<Vec<FailedError>>>> =
 #[derive(Debug, Clone)]
 pub struct LastDetectedError {
     pub request_id: String,
-    pub error_message: String,
     pub error_type: String,
 }
 

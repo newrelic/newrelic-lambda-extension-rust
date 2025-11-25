@@ -1,5 +1,5 @@
 use std::{env, time::Duration};
-use tracing::{info, Event, Subscriber};
+use tracing::{info, debug, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
@@ -150,7 +150,7 @@ impl AwsConfig {
     pub fn extract_and_update_account_id_from_arn(&mut self, invoked_function_arn: &str) {
         if self.account_id.is_none() || self.account_id.as_ref().map_or(true, |id| id.is_empty() || id == "123456789012") {
             if let Some(extracted_account_id) = Self::extract_account_id_from_arn(invoked_function_arn) {
-                info!("Extracted account ID from ARN: {}", extracted_account_id);
+                debug!("Extracted account ID from ARN: {}", extracted_account_id);
                 self.account_id = Some(extracted_account_id);
             }
         }

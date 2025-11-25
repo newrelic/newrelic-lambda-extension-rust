@@ -254,14 +254,22 @@ impl LogProcessor {
                 return;
             }
             
-            if let Some(ref apm_app_arc) = self.apm_app {
-                if record.record_type == "function" && message_str.len() > 0 {
-                    if message_str.contains("Task timed out") ||
-                       message_str.contains("error") || message_str.contains("Error") ||
-                       message_str.contains("Exception") || message_str.contains("exception") ||
-                       message_str.contains("Fatal") || message_str.contains("fatal") {
+            // Check if we're actually in APM mode (both outer and inner Option must be Some)
+            let is_apm_mode = self.apm_app.as_ref().and_then(|apm_arc| {
+                apm_arc.try_read().ok().and_then(|guard| {
+                    if guard.is_some() { Some(()) } else { None }
+                })
+            }).is_some();
 
-                        info!("APM mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+            if is_apm_mode {
+                if let Some(ref apm_app_arc) = self.apm_app {
+                    if record.record_type == "function" && message_str.len() > 0 {
+                        if message_str.contains("Task timed out") ||
+                           message_str.contains("error") || message_str.contains("Error") ||
+                           message_str.contains("Exception") || message_str.contains("exception") ||
+                           message_str.contains("Fatal") || message_str.contains("fatal") {
+
+                            info!("APM mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
 
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
@@ -287,7 +295,6 @@ impl LogProcessor {
                         if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
                             *last_error = Some(crate::error_synthesis::LastDetectedError {
                                 request_id: request_id.clone(),
-                                error_message: msg_clone.clone(),
                                 error_type: error_type.to_string(),
                             });
                         }
@@ -301,6 +308,7 @@ impl LogProcessor {
                             }
                         }
                     }
+                }
                 }
             } else {
                 // Standard (non-APM) mode: Send errors to telemetry endpoint
@@ -318,28 +326,35 @@ impl LogProcessor {
                         };
 
                         info!("Standard mode: Sending error for request_id: {}", request_id);
-                        
-                        // Determine error type
+
+                        // Determine error type - use consistent LambdaError for all function errors
+                        // (except timeout which should match platform timeout)
                         let error_type = if message_str.contains("Task timed out") {
-                            "LambdaTimeout"
-                        } else if message_str.contains("Exception") || message_str.contains("exception") {
-                            "LambdaException"
-                        } else if message_str.contains("Fatal") || message_str.contains("fatal") {
-                            "LambdaFatalError"
+                            "LambdaTimeout"  // Match platform timeout error class
                         } else {
-                            "LambdaError"
+                            "LambdaError"    // Use single consistent error class
                         };
-                        
+
                         let client = Arc::clone(&self.newrelic_client);
                         let config = Arc::clone(&self.config);
                         let msg_clone = message_str.to_string();
                         let error_type_clone = error_type.to_string();
 
+                        // Format error message like timeout/platform errors for Error Inbox recognition
+                        // Format: "{ISO_TIMESTAMP} {REQUEST_ID} {ERROR_CLASS} {original_error_message}"
+                        // Keep the original error message with [ERROR] prefix intact
+                        let formatted_error_msg = format!(
+                            "{} {} {} {}",
+                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                            request_id,
+                            error_type,  // LambdaError or LambdaTimeout
+                            msg_clone    // Keep original message with [ERROR] prefix
+                        );
+
                         // Store error details for potential platform fault correlation
                         if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
                             *last_error = Some(crate::error_synthesis::LastDetectedError {
                                 request_id: request_id.clone(),
-                                error_message: msg_clone.clone(),
                                 error_type: error_type_clone.clone(),
                             });
                         }
@@ -347,7 +362,7 @@ impl LogProcessor {
                         // Send error asynchronously during the current invoke
                         // This prevents accumulation across invocations
                         crate::error_synthesis::send_lambda_error(
-                            &msg_clone,
+                            &formatted_error_msg,  // Send formatted message, not raw log
                             &request_id,
                             &function_arn,
                             &error_type_clone,
@@ -445,9 +460,8 @@ impl LogProcessor {
         })
     }
 
-   
     fn extract_log_level(&self, message: &str) -> &'static str {
-        
+
         let check_str = &message[..message.len().min(100)]; // Check first 100 chars
         
         if let Some(bracket_end) = check_str.find(']') {

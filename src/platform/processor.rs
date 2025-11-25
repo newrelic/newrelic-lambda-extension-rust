@@ -362,7 +362,6 @@ impl PlatformProcessor {
             if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
                 *last_error = Some(crate::error_synthesis::LastDetectedError {
                     request_id: request_id.clone(),
-                    error_message: error_message.clone(),
                     error_type: err_type.to_string(),
                 });
                 debug!("Stored platform error type for correlation: {}", err_type);
