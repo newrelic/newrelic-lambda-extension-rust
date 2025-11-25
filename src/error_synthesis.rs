@@ -255,7 +255,6 @@ pub async fn send_timeout_error(
 pub async fn send_platform_fault_error(
     request_id: &str,
     invoked_function_arn: &str,
-    shutdown_reason: &str,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
 ) {
@@ -279,27 +278,10 @@ pub async fn send_platform_fault_error(
         String::new()
     };
 
-    // Try to get detailed error info from previously detected errors in function logs
-    let detailed_reason = if let Ok(guard) = LAST_DETECTED_ERROR.lock() {
-        if let Some(ref error) = *guard {
-            if error.request_id == request_id {
-                // Use the actual error message instead of generic shutdown reason
-                format!("{} (type: {})", error.error_message, error.error_type)
-            } else {
-                shutdown_reason.to_string()
-            }
-        } else {
-            shutdown_reason.to_string()
-        }
-    } else {
-        shutdown_reason.to_string()
-    };
-
-    // Compose the fault message with detailed error info and memory info
+    // Compose the fault message with memory info
     let fault_msg = format!(
-        "RequestId: {} AWS Lambda platform fault caused a shutdown (reason: {}){}",
+        "RequestId: {} AWS Lambda platform fault caused a shutdown{}",
         request_id,
-        detailed_reason,
         memory_info
     );
 

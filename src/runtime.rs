@@ -19,6 +19,35 @@ pub struct ExtensionRegistrationResponse {
     pub account_id: Option<String>,
 }
 
+/// Shutdown reasons from AWS Lambda (matching Go extension implementation)
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShutdownReason {
+    Spindown,  // Normal shutdown
+    Timeout,   // Lambda timeout
+    Failure,   // Lambda failure/fault
+    #[serde(other)]
+    Unknown,   // Any other reason
+}
+
+impl ShutdownReason {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &str {
+        match self {
+            ShutdownReason::Spindown => "spindown",
+            ShutdownReason::Timeout => "timeout",
+            ShutdownReason::Failure => "failure",
+            ShutdownReason::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for ShutdownReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "eventType")]
 pub enum LambdaRuntimeEvent {
@@ -32,7 +61,7 @@ pub enum LambdaRuntimeEvent {
     #[serde(rename(deserialize = "SHUTDOWN"))]
     Shutdown {
         #[serde(rename(deserialize = "shutdownReason"))]
-        shutdown_reason: String,
+        shutdown_reason: ShutdownReason,
     },
 }
 

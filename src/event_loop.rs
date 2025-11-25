@@ -210,9 +210,55 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                info!("APM mode: Extension shutting down: {}", shutdown_reason);
-                
-                
+                info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
+
+                // Synthesize and send error based on shutdown reason
+                if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
+                    match shutdown_reason {
+                        runtime::ShutdownReason::Timeout => {
+                            // Lambda timeout - send timeout error with reason
+                            info!("Shutdown due to timeout - synthesizing timeout error for request: {}", last_request_id);
+                            error_synthesis::send_timeout_error(
+                                &last_request_id,
+                                &last_arn,
+                                None,
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
+                        runtime::ShutdownReason::Failure => {
+                            // Lambda failure/fault - send platform fault error
+                            info!("Shutdown due to failure - synthesizing fault error for request: {}", last_request_id);
+                            error_synthesis::send_platform_fault_error(
+                                &last_request_id,
+                                &last_arn,
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
+                        runtime::ShutdownReason::Spindown => {
+                            // Normal shutdown - no error needed
+                            debug!("Normal spindown shutdown - no error synthesis needed");
+                        }
+                        runtime::ShutdownReason::Unknown => {
+                            // Unknown/unexpected shutdown reason - send generic error
+                            warn!("Unknown shutdown reason - synthesizing generic error for request: {}", last_request_id);
+                            error_synthesis::send_lambda_error(
+                                &format!("Lambda shutdown with unknown reason"),
+                                &last_request_id,
+                                &last_arn,
+                                "LambdaShutdown",
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                // Process any remaining pending agent payloads
                 process_pending_agent_payloads(
                     &components.newrelic_client,
                     &components.config,
@@ -408,39 +454,51 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                info!("Standard mode: Extension shutting down: {}", shutdown_reason);
-                
-                // Synthesize and send error if shutdown is due to timeout or failure
+                info!("Standard mode: Extension shutting down with reason: {}", shutdown_reason);
+
+                // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
-                    if shutdown_reason.to_lowercase().contains("timeout") {
-                        error_synthesis::send_timeout_error(
-                            &last_request_id,
-                            &last_arn,
-                            None,
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
-                    } else if shutdown_reason.to_lowercase().contains("failure") || shutdown_reason.to_lowercase().contains("fault") {
-                        error_synthesis::send_platform_fault_error(
-                            &last_request_id,
-                            &last_arn,
-                            &shutdown_reason,
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
-                    } else if !shutdown_reason.to_lowercase().contains("spindown") {
-                        // Any other unexpected shutdown reason
-                        error_synthesis::send_lambda_error(
-                            &format!("Lambda shutdown with reason: {}", shutdown_reason),
-                            &last_request_id,
-                            &last_arn,
-                            "LambdaShutdown",
-                            &components.newrelic_client,
-                            &components.config,
-                        )
-                        .await;
+                    match shutdown_reason {
+                        runtime::ShutdownReason::Timeout => {
+                            // Lambda timeout - send timeout error with reason
+                            info!("Shutdown due to timeout - synthesizing timeout error for request: {}", last_request_id);
+                            error_synthesis::send_timeout_error(
+                                &last_request_id,
+                                &last_arn,
+                                None,
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
+                        runtime::ShutdownReason::Failure => {
+                            // Lambda failure/fault - send platform fault error
+                            info!("Shutdown due to failure - synthesizing fault error for request: {}", last_request_id);
+                            error_synthesis::send_platform_fault_error(
+                                &last_request_id,
+                                &last_arn,
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
+                        runtime::ShutdownReason::Spindown => {
+                            // Normal shutdown - no error needed
+                            debug!("Normal spindown shutdown - no error synthesis needed");
+                        }
+                        runtime::ShutdownReason::Unknown => {
+                            // Unknown/unexpected shutdown reason - send generic error
+                            warn!("Unknown shutdown reason - synthesizing generic error for request: {}", last_request_id);
+                            error_synthesis::send_lambda_error(
+                                &format!("Lambda shutdown with unknown reason"),
+                                &last_request_id,
+                                &last_arn,
+                                "LambdaShutdown",
+                                &components.newrelic_client,
+                                &components.config,
+                            )
+                            .await;
+                        }
                     }
                 }
 

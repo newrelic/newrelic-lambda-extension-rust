@@ -355,7 +355,20 @@ impl PlatformProcessor {
             Some("error") => "LambdaError",
             _ => "LambdaError",
         };
-        
+
+        // Store detailed error information for potential use in shutdown error synthesis
+        // Platform events have more accurate error types than function logs
+        if let Some(err_type) = error_type {
+            if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                *last_error = Some(crate::error_synthesis::LastDetectedError {
+                    request_id: request_id.clone(),
+                    error_message: error_message.clone(),
+                    error_type: err_type.to_string(),
+                });
+                debug!("Stored platform error type for correlation: {}", err_type);
+            }
+        }
+
         // Send error to telemetry endpoint synchronously to ensure it's sent during the current invoke
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
