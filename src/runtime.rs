@@ -81,6 +81,7 @@ pub async fn register_extension(
     let response = client
         .post(&url)
         .header(EXTENSION_NAME_HEADER, extension_name)
+        .header("Lambda-Extension-Accept-Feature", "accountId")
         .json(&payload)
         .timeout(Duration::from_secs(30))
         .send()

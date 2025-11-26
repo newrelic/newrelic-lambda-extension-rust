@@ -31,6 +31,10 @@ impl ApmApp {
         apm_host: String,
         _metric_endpoint: String,
         client: Client,
+        function_name: String,
+        function_version: String,
+        account_id: Option<String>,
+        region: Option<String>,
     ) -> Result<Self> {
         info!("Initializing APM app connection");
 
@@ -40,7 +44,17 @@ impl ApmApp {
         for (attempt, delay) in backoff_ms.iter().enumerate() {
             debug!("APM connection attempt {} of {}", attempt + 1, 3);
 
-            match Self::try_connect(&license_key, &apm_host, &client).await {
+            match Self::try_connect(
+                &license_key,
+                &apm_host,
+                &client,
+                &function_name,
+                &function_version,
+                &account_id,
+                &region,
+            )
+            .await
+            {
                 Ok(app) => {
                     info!(
                         "APM connection successful: run_id={}, entity_guid={}",
@@ -68,6 +82,10 @@ impl ApmApp {
         license_key: &str,
         apm_host: &str,
         client: &Client,
+        function_name: &str,
+        function_version: &str,
+        account_id_opt: &Option<String>,
+        region_opt: &Option<String>,
     ) -> Result<ApmApp> {
         let collector_host = preconnect(client, license_key, apm_host)
             .await
@@ -75,16 +93,30 @@ impl ApmApp {
 
         debug!("PreConnect returned collector host: {}", collector_host);
 
-        let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or_else(|_| "unknown".to_string());
-        let function_version = std::env::var("AWS_LAMBDA_FUNCTION_VERSION")
-            .unwrap_or_else(|_| "$LATEST".to_string());
-        let function_arn = std::env::var("AWS_LAMBDA_FUNCTION_ARN")
-            .unwrap_or_else(|_| format!("arn:aws:lambda:us-east-1:000000000000:function:{}", function_name));
-        
-        let arn_parts: Vec<&str> = function_arn.split(':').collect();
-        let region = if arn_parts.len() > 3 { arn_parts[3].to_string() } else { "us-east-1".to_string() };
-        let account_id = if arn_parts.len() > 4 { arn_parts[4].to_string() } else { "000000000000".to_string() };
+        // Use provided config data instead of environment variables
+        // Environment variables like AWS_LAMBDA_FUNCTION_ARN are not available during INIT
+        let region = region_opt
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .unwrap_or_else(|| "us-east-1".to_string());
+
+        let account_id = account_id_opt
+            .clone()
+            .unwrap_or_else(|| {
+                warn!("Account ID not available from registration, using placeholder. Transactions may not appear in APM.");
+                "000000000000".to_string()
+            });
+
+        // Construct ARN using the correct account_id from registration
+        let function_arn = format!(
+            "arn:aws:lambda:{}:{}:function:{}",
+            region, account_id, function_name
+        );
+
+        debug!(
+            "Connecting to APM with function_name={}, account_id={}, region={}",
+            function_name, account_id, region
+        );
 
         let runtime = super::connection::detect_runtime();
         let agent_version = super::connection::detect_agent_version(&runtime);

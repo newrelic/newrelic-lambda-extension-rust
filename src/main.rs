@@ -346,6 +346,10 @@ async fn perform_one_time_initialization(
             config.new_relic.apm_host.clone(),
             config.new_relic.metric_endpoint.clone(),
             (*client).clone(),
+            config.aws.function_name.clone(),
+            config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
+            config.aws.account_id.clone(),
+            config.aws.region.clone(),
         )
         .await
         {
