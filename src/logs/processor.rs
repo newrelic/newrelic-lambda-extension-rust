@@ -48,17 +48,20 @@ pub struct LogProcessor {
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     invocation_context: Arc<Mutex<InvocationContext>>,
-   
+
     buffered_logs: Option<Arc<Mutex<Vec<payload::LogMessage>>>>,
-   
+
     trace_extraction_state: Option<Arc<Mutex<TraceIdExtractionState>>>,
-   
+
     request_id_buffer: Arc<Mutex<Vec<payload::LogMessage>>>,
-   
+
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
-   
+
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
+
+    /// Track pending auto-flush tasks to ensure they complete before function ends
+    pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +112,7 @@ impl LogProcessor {
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
             apm_app,
+            pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -395,32 +399,33 @@ impl LogProcessor {
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
-            
-            let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
-            
-           
-           
-            let flush_threshold = if is_warm_start { 25 } else { 10 };
-            let should_flush = batch_size >= flush_threshold;
-            
+
+            // Auto-flush threshold: 25 logs for faster delivery
+            // End-of-request flush ensures completeness of remaining logs
+            const FLUSH_THRESHOLD: usize = 25;
+            let should_flush = batch_size >= FLUSH_THRESHOLD;
+
             if should_flush {
                 let logs_to_send = std::mem::take(&mut *batch);
                 drop(batch);
-                
-                debug!("Flushing batch of {} logs (warm_start={}, threshold={})", 
-                       logs_to_send.len(), is_warm_start, flush_threshold);
-                
+
+                debug!("Auto-flushing batch of {} logs (threshold={})",
+                       logs_to_send.len(), FLUSH_THRESHOLD);
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
-                
-                tokio::spawn(async move {
-                    if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
-                        error!("Failed to send log batch: {}", e);
-                    } else {
-                        debug!("Successfully sent log batch");
-                    }
+
+                // Spawn background task with proper 1MB chunking
+                // Store handle to ensure it completes before function ends
+                let handle = tokio::spawn(async move {
+                    Self::send_logs_with_chunking(&client, &config, logs_to_send, &context.invoked_function_arn).await;
                 });
+
+                // Track this handle so end-of-request flush can await it
+                if let Ok(mut handles) = self.pending_flush_handles.lock() {
+                    handles.push(handle);
+                }
             }
         } else {
             warn!("Failed to convert telemetry record to log message");
@@ -678,6 +683,21 @@ impl LogProcessor {
 
    
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        // First, await all pending auto-flush tasks to ensure they complete
+        // before we do the final flush (prevents logs from being cancelled)
+        let pending_handles = {
+            let mut handles = self.pending_flush_handles.lock().unwrap();
+            std::mem::take(&mut *handles)
+        };
+
+        if !pending_handles.is_empty() {
+            debug!("Waiting for {} pending auto-flush tasks to complete", pending_handles.len());
+            for handle in pending_handles {
+                let _ = handle.await; // Ignore JoinErrors, just ensure task completes
+            }
+            debug!("All pending auto-flush tasks completed");
+        }
+
         let batch = {
             let mut batch_guard = self.log_batch.lock().unwrap();
             std::mem::take(&mut *batch_guard)
@@ -861,6 +881,51 @@ impl LogProcessor {
                         return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
                     }
                 }
+            }
+        }
+    }
+
+    /// Helper method to send logs with proper 1MB chunking
+    /// Used by both auto-flush (25 logs) and end-of-request flush
+    async fn send_logs_with_chunking(
+        client: &Arc<NewRelicClient>,
+        config: &Arc<ExtensionConfig>,
+        logs: Vec<payload::LogMessage>,
+        function_arn: &str,
+    ) {
+        if logs.is_empty() {
+            return;
+        }
+
+        const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+        let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut current_size = 0;
+
+        for log in logs {
+            let log_size = 8 + log.message.len() +
+                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+
+            if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+
+            current_chunk.push(log);
+            current_size += log_size;
+        }
+
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        if chunks.len() > 1 {
+            debug!("Chunking logs into {} batches (max 1MB each)", chunks.len());
+        }
+
+        for chunk in chunks {
+            if let Err(e) = client.send_logs(config, chunk, function_arn).await {
+                error!("Failed to send log chunk: {}", e);
             }
         }
     }

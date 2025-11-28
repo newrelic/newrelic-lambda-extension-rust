@@ -47,17 +47,19 @@ pub struct VersionInfo {
 
 impl VersionInfo {
     /// Create version info with detected versions
+    /// Uses fast synchronous detection (env vars, filesystem) - no AWS API calls
     pub fn detect() -> Self {
-        debug!("=== Starting version detection ===");
+        debug!("=== Starting version detection (sync) ===");
         let (agent_version, agent_name) = detect_agent_version();
         let extension_version = EXTENSION_VERSION.to_string();
 
-        let layer_version = None;
+        // Detect layer version from environment variables (fast, no AWS API calls)
+        let layer_version = detect_layer_version_sync();
 
-        debug!("Version detection complete (sync phase):");
+        debug!("Version detection complete (sync):");
         debug!("  Extension version: {}", extension_version);
         debug!("  Agent version: {:?} ({})", agent_version, agent_name.as_deref().unwrap_or("none"));
-        debug!("  Layer version: (async detection pending)");
+        debug!("  Layer version: {:?}", layer_version);
 
         Self {
             agent_version,
@@ -379,15 +381,18 @@ fn read_dotnet_version(base_path: &str) -> Option<String> {
     None
 }
 
-/// Async layer version detection using AWS Lambda API
-async fn detect_layer_version_async() -> Option<String> {
-    debug!("Detecting layer version (async)...");
+/// Synchronous layer version detection (no AWS API calls)
+/// Only checks environment variables and filesystem - fast enough for first invocation
+fn detect_layer_version_sync() -> Option<String> {
+    debug!("Detecting layer version (sync - no AWS API calls)...");
 
+    // Check env var first (instant)
     if let Ok(layer_version) = std::env::var("NEW_RELIC_LAYER_VERSION") {
         debug!("Layer version from NEW_RELIC_LAYER_VERSION: {}", layer_version);
         return Some(layer_version);
     }
 
+    // Check AWS_LAMBDA_LAYERS env var (instant, set by Lambda runtime)
     match std::env::var("AWS_LAMBDA_LAYERS") {
         Ok(layers) => {
             debug!("AWS_LAMBDA_LAYERS found: {}", layers);
@@ -396,23 +401,38 @@ async fn detect_layer_version_async() -> Option<String> {
             }
         }
         Err(_) => {
-            debug!("AWS_LAMBDA_LAYERS environment variable not set (this is normal)");
+            debug!("AWS_LAMBDA_LAYERS environment variable not set (will try filesystem)");
         }
     }
 
-    debug!("Attempting to fetch layer info from AWS Lambda API...");
+    // Fall back to filesystem detection (also fast, no network)
+    debug!("Checking filesystem for layer markers...");
+    detect_layer_from_filesystem()
+}
+
+/// Async layer version detection using AWS Lambda API
+/// This makes AWS API calls - used as fallback when env vars don't have layer info
+/// Public so tagging background task can use it as fallback
+pub async fn detect_layer_version_async() -> Option<String> {
+    debug!("Detecting layer version (async - includes AWS API calls)...");
+
+    // First try the fast sync methods
+    if let Some(layer_version) = detect_layer_version_sync() {
+        return Some(layer_version);
+    }
+
+    // Only if sync detection failed, make AWS API call
+    debug!("Sync detection failed, attempting to fetch layer info from AWS Lambda API...");
     match aws_layer::fetch_layer_info_from_aws().await {
         Some(layer_info) => {
             debug!("✓ Successfully fetched layer info from AWS: {}", layer_info);
-            return Some(layer_info);
+            Some(layer_info)
         }
         None => {
             debug!("✗ Failed to fetch layer info from AWS Lambda API");
+            None
         }
     }
-
-    debug!("Falling back to filesystem detection...");
-    detect_layer_from_filesystem()
 }
 
 /// Detect layer from filesystem when environment variable is not available

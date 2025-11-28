@@ -273,27 +273,10 @@ async fn perform_one_time_initialization(
         "NEW_RELIC_COLLECT_TRACE_ID setting: {}",
         config.new_relic.collect_trace_id
     );
-    info!(
-        "NEW_RELIC_ADD_VERSION_DETAIL_TAGS setting: {}",
-        config.new_relic.add_version_detail_tags
-    );
-
     if config.new_relic.add_version_detail_tags {
-        let version_info = version::VersionInfo::detect_async().await;
-        info!("Version detection results:");
-        info!("  Extension version: {}", version_info.extension_version);
-        if let Some(ref agent_name) = version_info.agent_name {
-            if let Some(ref agent_version) = version_info.agent_version {
-                info!("  Agent: {} version {}", agent_name, agent_version);
-            }
-        } else {
-            info!("  Agent: Not detected");
-        }
-        if let Some(ref layer_version) = version_info.layer_version {
-            info!("  Layer: {}", layer_version);
-        } else {
-            info!("  Layer: Not detected (AWS API call may have failed)");
-        }
+        info!("Version detail tagging enabled - will tag function on first invocation");
+        info!("  Extension version: {}", EXTENSION_VERSION);
+        debug!("Version detection and tagging will happen lazily on first invocation to avoid AWS SDK initialization during INIT");
     }
 
     info!(
@@ -310,10 +293,6 @@ async fn perform_one_time_initialization(
         registration.account_id,
     );
     let config = Arc::new(updated_config);
-
-    if config.new_relic.add_version_detail_tags {
-        debug!("Version detail tagging enabled - will tag function on first invocation with actual ARN");
-    }
 
     let (agent_telemetry_rx_result, newrelic_client, runtime_done_channels) = tokio::join!(
         initialize_agent_telemetry_ipc_channel(),
@@ -333,79 +312,144 @@ async fn perform_one_time_initialization(
 
     cleanup_old_failed_payloads();
 
-    let apm_app = if config.new_relic.apm_lambda_mode {
-        info!("APM Lambda mode enabled - initializing APM connection");
-        let license_key = config
-            .new_relic
-            .license_key
-            .clone()
-            .expect("License key must be available for APM mode");
+    // Smart conditional parallelization: only use tokio::join! when APM enabled
+    // This avoids async overhead for standard mode (most common case)
+    let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
+        if config.new_relic.apm_lambda_mode {
+            info!("APM Lambda mode enabled - using parallel initialization");
 
-        match apm::ApmApp::new(
-            license_key,
-            config.new_relic.apm_host.clone(),
-            config.new_relic.metric_endpoint.clone(),
-            (*client).clone(),
-            config.aws.function_name.clone(),
-            config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
-            config.aws.account_id.clone(),
-            config.aws.region.clone(),
-        )
-        .await
-        {
-            Ok(app) => {
-                info!(
-                    "APM app initialized successfully - Entity GUID: {}",
-                    app.get_entity_guid()
-                );
-                {
-                    let mut global_apm = APM_APP.write().await;
-                    *global_apm = Some(app);
+            // Parallel path: APM init + telemetry setup run concurrently
+            let license_key = config
+                .new_relic
+                .license_key
+                .clone()
+                .expect("License key must be available for APM mode");
+
+            let apm_future = {
+                let license_key = license_key.clone();
+                let apm_host = config.new_relic.apm_host.clone();
+                let metric_endpoint = config.new_relic.metric_endpoint.clone();
+                let client_clone = (*client).clone();
+                let function_name = config.aws.function_name.clone();
+                let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
+                let account_id = config.aws.account_id.clone();
+                let region = config.aws.region.clone();
+
+                async move {
+                    match apm::ApmApp::new(
+                        license_key,
+                        apm_host,
+                        metric_endpoint,
+                        client_clone,
+                        function_name,
+                        function_version,
+                        account_id,
+                        region,
+                    )
+                    .await
+                    {
+                        Ok(app) => {
+                            info!(
+                                "APM app initialized successfully - Entity GUID: {}",
+                                app.get_entity_guid()
+                            );
+                            {
+                                let mut global_apm = APM_APP.write().await;
+                                *global_apm = Some(app);
+                            }
+                            Ok(Arc::clone(&APM_APP))
+                        }
+                        Err(e) => {
+                            error!("Failed to initialize APM app: {}", e);
+                            error!("APM mode was explicitly enabled (NEW_RELIC_APM_LAMBDA_MODE=true) but initialization failed");
+                            error!("Extension will run in NO-OP mode to prevent incorrect data collection");
+                            error!("Lambda function will continue normally but without New Relic monitoring");
+                            Err(e)
+                        }
+                    }
                 }
-                Arc::clone(&APM_APP)
-            }
-            Err(e) => {
-                error!("Failed to initialize APM app: {}", e);
-                error!("APM mode was explicitly enabled (NEW_RELIC_APM_LAMBDA_MODE=true) but initialization failed");
-                error!("Extension will run in NO-OP mode to prevent incorrect data collection");
-                error!("Lambda function will continue normally but without New Relic monitoring");
+            };
 
-                return Err(Box::new(std::io::Error::new(
+            let telemetry_future = {
+                let newrelic_client = Arc::clone(&newrelic_client);
+                let config_clone = Arc::clone(&config);
+                async move {
+                    // Create empty APM app for processor factory (will be updated after APM init)
+                    let temp_apm_app = Arc::new(tokio::sync::RwLock::new(None));
+
+                    let processor_factory = Arc::new(ProcessorFactory::new(
+                        Arc::clone(&newrelic_client),
+                        Arc::clone(&config_clone),
+                        Arc::clone(&temp_apm_app),
+                    ));
+
+                    let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
+                    let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
+                    let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+
+                    let telemetry_listener_address = setup_telemetry_listener(
+                        temp_log_processor.clone(),
+                        temp_platform_processor,
+                        Some(runtime_done_tx),
+                    )
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((processor_factory, temp_log_processor, telemetry_listener_address))
+                }
+            };
+
+            // Run both futures in parallel
+            let (apm_result, telemetry_result) = tokio::join!(apm_future, telemetry_future);
+
+            // Handle APM result
+            let apm_app = apm_result.map_err(|e| {
+                Box::new(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("APM initialization failed when APM mode was explicitly enabled: {}", e)
-                )));
-            }
-        }
-    } else {
-        debug!("APM Lambda mode disabled");
-        Arc::new(tokio::sync::RwLock::new(None))
-    };
+                )) as Box<dyn std::error::Error + Send + Sync>
+            })?;
 
-    let processor_factory = Arc::new(ProcessorFactory::new(
-        Arc::clone(&newrelic_client),
-        Arc::clone(&config),
-        Arc::clone(&apm_app),
-    ));
+            // Handle telemetry result
+            let (processor_factory, temp_log_processor, telemetry_listener_address) =
+                telemetry_result?;
 
-    let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
-    let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-    let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+            (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
+        } else {
+            debug!("APM Lambda mode disabled - using sequential initialization");
 
-    let telemetry_listener_address = setup_telemetry_listener(
-        temp_log_processor.clone(),
-        temp_platform_processor,
-        Some(runtime_done_tx),
-    )
-    .await?;
+            // Sequential path: simple flow with no async overhead
+            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+
+            let processor_factory = Arc::new(ProcessorFactory::new(
+                Arc::clone(&newrelic_client),
+                Arc::clone(&config),
+                Arc::clone(&apm_app),
+            ));
+
+            let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
+            let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
+            let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+
+            let telemetry_listener_address = setup_telemetry_listener(
+                temp_log_processor.clone(),
+                temp_platform_processor,
+                Some(runtime_done_tx),
+            )
+            .await?;
+
+            (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
+        };
 
     runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
         .await?;
 
-    let (_harvester, harvester_handle) = start_harvester_background_task(
-        vec![],
-        config.new_relic.harvest_interval,
-        &processor_factory,
-    );
+    // Harvester disabled - using end-of-request flush only to prevent connection pool exhaustion
+    // and flush storms. All logs are batched per-request and sent with proper 1MB chunking.
+    info!("Using end-of-request flush strategy (harvester disabled)");
+    let harvester_handle = tokio::spawn(async {
+        // No-op task - flushing happens at end of each request instead
+    });
 
     Ok(ExtensionComponents {
         client,
@@ -469,16 +513,21 @@ async fn resolve_license_key_with_aws_fallback(
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let credentials_config = config::Configuration::from(config.as_ref());
 
-    let aws_services_required = credentials_config.license_key.is_empty()
-        && (std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok()
-            || std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok()
-            || !credentials_config.license_key_secret_id.is_empty()
-            || !credentials_config.license_key_ssm_parameter_name.is_empty()
-            || std::env::var("AWS_LAMBDA_RUNTIME_API").is_ok());
-
+    // Early return if license key is already in environment variable
     if !credentials_config.license_key.is_empty() {
-        Ok(Some(credentials_config.license_key.clone()))
-    } else if aws_services_required {
+        debug!("License key found in environment variable - skipping AWS SDK initialization for credentials");
+        return Ok(Some(credentials_config.license_key.clone()));
+    }
+
+    // Only initialize AWS SDK if we actually need to fetch from Secrets Manager or SSM
+    let aws_services_required =
+        std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok()
+        || std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok()
+        || !credentials_config.license_key_secret_id.is_empty()
+        || !credentials_config.license_key_ssm_parameter_name.is_empty();
+
+    if aws_services_required {
+        debug!("License key not in env var, fetching from AWS Secrets Manager or SSM Parameter Store");
         match get_new_relic_license_key(&credentials_config).await {
             Ok(key) => {
                 debug!("Successfully obtained New Relic license key from AWS");
@@ -494,7 +543,7 @@ async fn resolve_license_key_with_aws_fallback(
         }
     } else {
         info!(
-            "No license key available and not in AWS Lambda environment. Extension will run in no-op mode."
+            "No license key available and no AWS sources configured. Extension will run in no-op mode."
         );
         Ok(None)
     }
@@ -512,6 +561,8 @@ async fn initialize_http_client_with_timeout(
 }
 
 /// Initialize Lambda runtime client and register extension
+/// Creates a dedicated HTTP client for Lambda Runtime API with NO global request timeout
+/// This ensures /next polling is never affected by other HTTP operations
 async fn initialize_lambda_runtime_client_and_register(
 ) -> Result<
     (
@@ -521,9 +572,18 @@ async fn initialize_lambda_runtime_client_and_register(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let client = Arc::new(initialize_http_client_with_timeout().await?);
-    let (registration, extension_id) = runtime::register_extension(&client, EXTENSION_NAME).await?;
-    Ok((client, extension_id, registration))
+    // Create dedicated Lambda Runtime API client (critical path, no global timeout)
+    // Only connect_timeout for TCP setup, NO timeout() for HTTP requests
+    // This allows /next to block indefinitely waiting for INVOKE/SHUTDOWN events
+    let lambda_runtime_client = Arc::new(Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_idle_timeout(Duration::from_secs(300))  // Keep connections alive 5 min
+        .pool_max_idle_per_host(10)
+        .build()?);
+
+    let (registration, extension_id) = runtime::register_extension(&lambda_runtime_client, EXTENSION_NAME).await?;
+    Ok((lambda_runtime_client, extension_id, registration))
 }
 
 /// Initialize agent telemetry IPC channel

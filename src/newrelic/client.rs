@@ -46,7 +46,7 @@ impl NewRelicClient {
 
         let client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_millis(2400))
+            .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout - safe with separate Lambda Runtime client
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
             .tcp_keepalive(std::time::Duration::from_secs(30))
@@ -140,7 +140,7 @@ impl NewRelicClient {
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload_json.to_string())
-                .timeout(std::time::Duration::from_millis(2400))
+                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 
@@ -221,7 +221,7 @@ impl NewRelicClient {
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
-                .timeout(std::time::Duration::from_millis(2400))
+                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 

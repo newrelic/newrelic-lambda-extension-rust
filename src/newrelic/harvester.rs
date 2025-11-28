@@ -31,6 +31,7 @@ impl Harvester {
     /// Runs the harvester loop, periodically flushing all processors.
     pub async fn run(&self) {
         let mut interval = tokio::time::interval(self.interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         debug!("Starting harvester with interval: {:?}", self.interval);
         let mut flush_cycle_count = 0;
         
