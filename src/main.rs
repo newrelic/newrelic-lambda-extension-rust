@@ -71,7 +71,7 @@ static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));
 
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> std::io::Result<()> {
     std::panic::set_hook(Box::new(|panic_info| {
         let location = if let Some(location) = panic_info.location() {

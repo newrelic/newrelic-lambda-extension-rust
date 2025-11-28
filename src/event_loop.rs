@@ -14,7 +14,6 @@ use crate::{
     request::{
         ProcessorFactory,
         create_request_processing_state,
-        cleanup_request_processing_state,
         cleanup_request_processing_state_internal,
         wait_for_all_requests_completion,
         REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
@@ -344,77 +343,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
 
-                let old_requests: Vec<String> = REQUEST_AGENT_BUFFERS
-                    .iter()
-                    .map(|entry| entry.key().clone())
-                    .collect();
+                // SKIP old buffer processing to avoid deadlocks
+                // Late payloads are already handled via the buffer matching on next invocation
+                // The complex locking in this loop was causing 7-second deadlocks
+                debug!("Skipping old buffer cleanup to avoid deadlocks (handled on next invocation)");
 
-                for old_request_id in old_requests {
-                    if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&old_request_id) {
-                        if let Ok(buffer_guard) = buffer.lock() {
-                            if !buffer_guard.is_empty() {
-                                info!(
-                                    "Found {} late agent payload(s) for previous request: {}",
-                                    buffer_guard.len(),
-                                    old_request_id
-                                );
+                debug!("Completed cleanup loop for request: {}", request_id);
 
-                                // Check if report line is available
-                                let report_line =
-                                    PENDING_REPORTS.remove(&old_request_id).map(|(_, report)| {
-                                        debug!(
-                                            "Found matching platform.report for late agent payload: {}",
-                                            old_request_id
-                                        );
-                                        report
-                                    });
-
-                                // Only send if we have the report line (complete data)
-                                if let Some(ref report) = report_line {
-                                    info!(
-                                        "Late payload for {} has report - adding to batch for sending",
-                                        old_request_id
-                                    );
-
-                                    for payload_bytes in buffer_guard.iter() {
-                                        let context = REQUEST_CONTEXTS
-                                            .get(&old_request_id)
-                                            .map(|ctx_entry| {
-                                                ctx_entry
-                                                    .lock()
-                                                    .ok()
-                                                    .map(|ctx| ctx.invoked_function_arn.clone())
-                                                    .unwrap_or_else(|| "unknown".to_string())
-                                            })
-                                            .unwrap_or_else(|| "unknown".to_string());
-
-                                        add_to_batch(
-                                            old_request_id.clone(),
-                                            payload_bytes.clone(),
-                                            Some(report.clone()),
-                                            context,
-                                        );
-                                    }
-
-                                    // Clean up since we're sending this data
-                                    cleanup_request_processing_state(&old_request_id);
-                                } else {
-                                    debug!(
-                                        "Late payload for {} has NO report yet - keeping in buffer for next invocation",
-                                        old_request_id
-                                    );
-                                    // Don't cleanup - keep buffer alive for next invocation
-                                }
-                            } else {
-                                // Empty buffer, clean up
-                                cleanup_request_processing_state(&old_request_id);
-                            }
-                        }
-                    } else {
-                        // No buffer, clean up
-                        cleanup_request_processing_state(&old_request_id);
-                    }
-                }
+                debug!("About to check batch threshold for request: {}", request_id);
 
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
                 if should_send_batch_by_threshold() {
@@ -425,6 +361,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         send_batched_payloads_with_reports_only(newrelic_client, config).await;
                     });
                 }
+
+                debug!("About to create processing state for request: {}", request_id);
 
                 let request_state = create_request_processing_state(
                     &request_id,

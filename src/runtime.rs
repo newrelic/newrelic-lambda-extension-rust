@@ -4,7 +4,7 @@
 use std::{env, time::Duration};
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
@@ -161,28 +161,41 @@ pub async fn fetch_next_event(
     let mut retry_count = 0;
 
     loop {
+        debug!("About to call /next API (attempt {}/{})", retry_count + 1, MAX_RETRIES);
+        let call_start = std::time::Instant::now();
+
         let response = client
             .get(&url)
             .header(EXTENSION_ID_HEADER, ext_id)
-            .timeout(Duration::from_secs(300))
             .send()
             .await;
 
+        let call_duration = call_start.elapsed();
+
         match response {
             Ok(resp) => {
+                debug!("/next response received after {:?}", call_duration);
+
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-                    error!("Next event request failed with status: {}, body: {}", status, body);
+                    error!("/next request failed with status: {}, body: {}", status, body);
                     return Err(format!("Next event request failed with status: {}", status).into());
                 }
 
+                debug!("Parsing /next response JSON...");
                 let event: LambdaRuntimeEvent = resp.json().await?;
+                let event_type_str = match &event {
+                    LambdaRuntimeEvent::Invoke { .. } => "INVOKE",
+                    LambdaRuntimeEvent::Shutdown { .. } => "SHUTDOWN",
+                };
+                debug!("/next event parsed successfully: eventType={}", event_type_str);
                 return Ok(event);
             },
             Err(e) => {
+                error!("/next call failed after {:?}: {}", call_duration, e);
                 retry_count += 1;
-                
+
                 if e.is_timeout() {
                     warn!("Event polling timeout (attempt {}/{})", retry_count, MAX_RETRIES);
                 } else if e.is_connect() {
