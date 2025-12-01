@@ -57,11 +57,13 @@ impl ProcessorFactory {
     pub fn create_platform_processor(
         &self,
         request_context: Arc<Mutex<InvocationContext>>,
+        log_processor: Arc<crate::logs::processor::LogProcessor>,
     ) -> Arc<PlatformProcessor> {
         Arc::new(PlatformProcessor::new(
             Arc::clone(&self.newrelic_client),
             Arc::clone(&self.config),
             request_context,
+            log_processor,
         ))
     }
 }
@@ -103,7 +105,8 @@ pub fn create_request_processing_state(
         trace_id: None,
     }));
 
-    let platform_processor = processor_factory.create_platform_processor(context.clone());
+    let log_processor = processor_factory.create_log_processor(context.clone());
+    let platform_processor = processor_factory.create_platform_processor(context.clone(), log_processor.clone());
 
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
 

@@ -237,7 +237,7 @@ async fn perform_one_time_initialization(
         }));
         let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
         let _noop_platform_processor =
-            noop_processor_factory.create_platform_processor(dummy_context);
+            noop_processor_factory.create_platform_processor(dummy_context, noop_log_processor.clone());
 
         return Ok(ExtensionComponents {
             client,
@@ -385,7 +385,7 @@ async fn perform_one_time_initialization(
 
                     let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
                     let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-                    let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+                    let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
 
                     let telemetry_listener_address = setup_telemetry_listener(
                         temp_log_processor.clone(),
@@ -429,7 +429,7 @@ async fn perform_one_time_initialization(
 
             let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
             let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-            let temp_platform_processor = processor_factory.create_platform_processor(global_context);
+            let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
 
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
@@ -444,12 +444,26 @@ async fn perform_one_time_initialization(
     runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
         .await?;
 
-    // Harvester disabled - using end-of-request flush only to prevent connection pool exhaustion
-    // and flush storms. All logs are batched per-request and sent with proper 1MB chunking.
-    info!("Using end-of-request flush strategy (harvester disabled)");
-    let harvester_handle = tokio::spawn(async {
-        // No-op task - flushing happens at end of each request instead
-    });
+    // Harvester enabled for periodic log flushing to reduce memory usage
+    // Flushes function logs (if NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=true),
+    // extension logs (if NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS=true),
+    // and platform logs (always, formatted as log lines except REPORT)
+    let harvest_interval_secs = std::env::var("NEW_RELIC_HARVEST_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(5); // Default: 5 seconds for frequent log flushing
+    
+    info!("Starting log harvester with {}s interval (function_logs={}, extension_logs={})",
+        harvest_interval_secs,
+        config.extension.send_function_logs,
+        config.extension.send_extension_logs
+    );
+    
+    let (_harvester, harvester_handle) = start_harvester_background_task(
+        vec![], // No processors - only log/platform flushing
+        Duration::from_secs(harvest_interval_secs),
+        &processor_factory,
+    );
 
     Ok(ExtensionComponents {
         client,
@@ -494,7 +508,7 @@ async fn handle_no_license_key(
         trace_id: None,
     }));
     let noop_log_processor = noop_processor_factory.create_log_processor(dummy_context.clone());
-    let _noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context);
+    let _noop_platform_processor = noop_processor_factory.create_platform_processor(dummy_context, noop_log_processor.clone());
 
     Ok(ExtensionComponents {
         client,
@@ -655,7 +669,7 @@ fn start_harvester_background_task(
         trace_id: None,
     }));
     let dummy_log_processor = processor_factory.create_log_processor(dummy_context.clone());
-    let dummy_platform_processor = processor_factory.create_platform_processor(dummy_context);
+    let dummy_platform_processor = processor_factory.create_platform_processor(dummy_context, dummy_log_processor.clone());
 
     let harvester = Arc::new(Harvester::new(
         processors,

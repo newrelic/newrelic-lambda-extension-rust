@@ -28,11 +28,13 @@ impl Harvester {
         }
     }
 
-    /// Runs the harvester loop, periodically flushing all processors.
+    /// Runs the harvester loop, periodically flushing ONLY logs (function, extension, platform).
+    /// This optimized harvester reduces memory by flushing logs frequently without touching
+    /// other processors (agent telemetry is handled per-request in serverless mode).
     pub async fn run(&self) {
         let mut interval = tokio::time::interval(self.interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        debug!("Starting harvester with interval: {:?}", self.interval);
+        debug!("Starting log-only harvester with interval: {:?}", self.interval);
         let mut flush_cycle_count = 0;
         
         loop {
@@ -40,32 +42,27 @@ impl Harvester {
             flush_cycle_count += 1;
             
             if flush_cycle_count % 10 == 1 {
-                trace!("Flushing all {} processors + log/platform processors (cycle: {})", self.processors.len(), flush_cycle_count);
+                trace!("Log harvester cycle {} - flushing function, extension, and platform logs", flush_cycle_count);
             }
             
             let mut error_count = 0;
             
-            for (index, p) in self.processors.iter().enumerate() {
-                if let Err(e) = p.flush().await {
-                    error!("Error flushing processor {}: {}", index, e);
-                    error_count += 1;
-                }
-            }
-            
+            // Flush function and extension logs (controlled by ENV variables)
             if let Err(e) = self.log_processor.flush().await {
-                error!("Error flushing log processor: {}", e);
+                error!("Error flushing function/extension logs: {}", e);
                 error_count += 1;
             }
             
+            // Flush platform logs (always enabled, formatted as log lines)
             if let Err(e) = self.platform_processor.flush().await {
-                error!("Error flushing platform processor: {}", e);
+                error!("Error flushing platform logs: {}", e);
                 error_count += 1;
             }
             
             if error_count > 0 {
-                warn!("Completed flush cycle {} with {} errors", flush_cycle_count, error_count);
+                warn!("Log harvester cycle {} completed with {} errors", flush_cycle_count, error_count);
             } else if flush_cycle_count % 10 == 1 {
-                debug!("Completed flush cycle {} successfully (flushed logs and platform events)", flush_cycle_count);
+                debug!("Log harvester cycle {} completed - logs flushed to reduce memory", flush_cycle_count);
             }
         }
     }

@@ -153,15 +153,6 @@ fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
     }
 }
 
-/// Get only batched payloads WITH report lines and remove them from buffer
-/// Payloads without report lines remain in buffer for timeout/shutdown sending
-/// DEPRECATED: Use get_batch_with_reports_only() + clear_batch_with_reports() instead
-pub fn get_and_clear_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
-    let items_with_reports = get_batch_with_reports_only();
-    clear_batch_with_reports(&items_with_reports);
-    items_with_reports
-}
-
 /// Send only batched agent payloads WITH report lines (when threshold is hit)
 /// Payloads without report lines remain in buffer for timeout/shutdown sending
 /// DATA LOSS PREVENTION: Only removes payloads from buffer AFTER successful send

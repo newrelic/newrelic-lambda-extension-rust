@@ -9,12 +9,12 @@ use std::{
     io::Result,
     sync::{Arc, Mutex},
 };
-use tracing::{debug, trace};
+use tracing::debug;
 
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
 pub struct PlatformProcessor {
-    platform_events_batch: Mutex<Vec<serde_json::Value>>,
+    log_processor: Arc<crate::logs::processor::LogProcessor>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     invocation_context: Arc<Mutex<InvocationContext>>,
@@ -26,9 +26,10 @@ impl PlatformProcessor {
         newrelic_client: Arc<NewRelicClient>,
         config: Arc<ExtensionConfig>,
         invocation_context: Arc<Mutex<InvocationContext>>,
+        log_processor: Arc<crate::logs::processor::LogProcessor>,
     ) -> Self {
         Self {
-            platform_events_batch: Mutex::new(Vec::new()),
+            log_processor,
             newrelic_client,
             config,
             invocation_context,
@@ -62,20 +63,26 @@ impl PlatformProcessor {
         // platform.runtimeDone, platform.restoreRuntimeDone, platform.restoreReport
         self.check_and_send_platform_errors(&record);
         
-        let log_event = serde_json::json!({
-            "timestamp": record.time,
-            "message": message,
-            "level": level,
-            "type": record.record_type,
-            "requestId": self.extract_request_id_from_record(&record)
-        });
+        // Create log message from platform event and add to log batch
+        let timestamp = record.time.timestamp_millis();
         
-        let mut batch = self.platform_events_batch.lock().unwrap();
-        batch.push(log_event);
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("plugin".to_string(), serde_json::json!({
+            "type": "lambda-extension",
+            "version": crate::EXTENSION_VERSION.to_string()
+        }));
+        attributes.insert("log_type".to_string(), serde_json::json!("platform"));
+        attributes.insert("level".to_string(), serde_json::json!(level));
+        attributes.insert("platform_event_type".to_string(), serde_json::json!(record.record_type));
         
-        if batch.len() % 10 == 1 {
-            trace!("Added platform event to batch. Current batch size: {}", batch.len());
-        }
+        let log_message = crate::newrelic::payload::LogMessage {
+            timestamp,
+            message,
+            attributes,
+        };
+        
+        // Add to existing log batch for unified flushing
+        self.log_processor.add_log_to_batch(log_message);
     }
 
    
@@ -447,23 +454,13 @@ impl PlatformProcessor {
         context.request_id = request_id.to_string();
         context.invoked_function_arn = invoked_function_arn.to_string();
     }
-    
-   
 }
-
+    
 #[async_trait]
 impl Flush for PlatformProcessor {
     async fn flush(&self) -> Result<()> {
-        let batch_size = {
-            if let Ok(batch) = self.platform_events_batch.lock() {
-                batch.len()
-            } else { 0 }
-        };
-        
-        if batch_size > 0 {
-            trace!("Harvester flush: {} platform events accumulated (will be sent by coordinated flush)", batch_size);
-        }
-        
+        // Platform logs are added directly to log batch, so they flush with regular logs
+        // No separate flushing needed
         Ok(())
     }
 }

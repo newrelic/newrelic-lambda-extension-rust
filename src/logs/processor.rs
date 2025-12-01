@@ -117,6 +117,14 @@ impl LogProcessor {
     }
 
    
+    /// Add a log message directly to the batch (used by platform processor)
+    pub fn add_log_to_batch(&self, log_message: payload::LogMessage) {
+        if let Ok(mut batch) = self.log_batch.lock() {
+            batch.push(log_message);
+        }
+    }
+
+   
     pub fn update_invocation_context(&self, new_context: Arc<Mutex<InvocationContext>>) {
         if let (Some(mut current), Some(new)) = (self.invocation_context.safe_lock(), new_context.safe_lock()) {
             current.request_id = new.request_id.clone();
