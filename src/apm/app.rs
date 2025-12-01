@@ -12,6 +12,7 @@ use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -155,7 +156,7 @@ impl ApmApp {
     pub async fn process_agent_payload(&self, payload: Vec<u8>) -> Result<()> {
         debug!("Processing agent payload ({} bytes)", payload.len());
 
-        let (telemetry_map, protocol_version) =
+        let (mut telemetry_map, protocol_version) =
             parse_agent_payload(&payload).context("Failed to parse agent payload")?;
 
         debug!(
@@ -163,6 +164,42 @@ impl ApmApp {
             protocol_version,
             telemetry_map.len()
         );
+
+        // Normalize transaction names for Ruby v2 payloads only
+        // Ruby agent sends transaction names without proper "OtherTransaction/Ruby/" prefix
+        if protocol_version == 2 {
+            let runtime = super::connection::detect_runtime();
+            if runtime == "ruby" {
+                debug!("Ruby v2 payload detected - normalizing transaction names");
+                
+                if let Some(data) = telemetry_map.get_mut("analytic_event_data") {
+                    normalize_analytic_event_data(data);
+                }
+                
+                if let Some(data) = telemetry_map.get_mut("span_event_data") {
+                    normalize_span_event_data(data);
+                }
+                
+                if let Some(data) = telemetry_map.get_mut("metric_data") {
+                    normalize_metric_data(data);
+                }
+                
+                // Normalize error events - they may contain transaction names
+                if let Some(data) = telemetry_map.get_mut("error_event_data") {
+                    normalize_error_event_data(data);
+                }
+                
+                // Normalize custom events - they may contain transaction names
+                if let Some(data) = telemetry_map.get_mut("custom_event_data") {
+                    normalize_custom_event_data(data);
+                }
+                
+                // Normalize transaction samples - they contain transaction names
+                if let Some(data) = telemetry_map.get_mut("transaction_sample_data") {
+                    normalize_transaction_sample_data(data);
+                }
+            }
+        }
 
         let mut send_tasks = Vec::new();
 
@@ -336,6 +373,291 @@ impl ApmApp {
     /// Get entity GUID for log correlation
     pub fn get_entity_guid(&self) -> &str {
         &self.entity_guid
+    }
+}
+
+/// Check if transaction name needs normalization (doesn't contain '/')
+fn needs_normalization(name: &str) -> bool {
+    !name.contains('/')
+}
+
+/// Normalize transaction name by prepending "OtherTransaction/Ruby/"
+fn normalize_transaction_name(original: &str) -> String {
+    format!("OtherTransaction/Ruby/{}", original)
+}
+
+/// Normalize transaction names in analytic_event_data
+/// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
+fn normalize_analytic_event_data(data: &mut Vec<Value>) {
+    if data.len() < 3 {
+        return;
+    }
+    
+    let events_array = match data[2].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    for event_tuple in events_array.iter_mut() {
+        let event_array = match event_tuple.as_array_mut() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+        
+        let event_obj = match event_array[0].as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        let is_transaction = event_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|t| t == "Transaction")
+            .unwrap_or(false);
+        
+        if !is_transaction {
+            continue;
+        }
+        
+        // Check and normalize the transaction name
+        if let Some(name_value) = event_obj.get("name") {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing transaction name: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    debug!("Normalized analytic_event name: '{}' -> '{}'", name, normalized);
+                    event_obj.insert("name".to_string(), Value::String(normalized));
+                }
+            }
+        }
+    }
+}
+
+/// Normalize transaction names in span_event_data
+/// Structure: [run_id, {metadata}, [[[span_obj, {}, {}]], ...]]
+fn normalize_span_event_data(data: &mut Vec<Value>) {
+    // Check we have the expected structure: data[2] should be the spans array
+    if data.len() < 3 {
+        return;
+    }
+    
+    let spans_array = match data[2].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    // Iterate through all spans
+    for span_tuple in spans_array.iter_mut() {
+        let span_array = match span_tuple.as_array_mut() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+        
+        let span_obj = match span_array[0].as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        let is_span = span_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|t| t == "Span")
+            .unwrap_or(false);
+        
+        if !is_span {
+            continue;
+        }
+        
+        // Normalize the span name if needed
+        if let Some(name_value) = span_obj.get("name") {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing span name: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    debug!("Normalized span name: '{}' -> '{}'", name, normalized);
+                    span_obj.insert("name".to_string(), Value::String(normalized.clone()));
+                    
+                    // Also update transaction.name field if it exists
+                    if span_obj.contains_key("transaction.name") {
+                        span_obj.insert("transaction.name".to_string(), Value::String(normalized));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Normalize transaction names in metric_data
+/// Structure: [run_id, timestamp_start, timestamp_end, [[[{name: "..."}, [values]]], ...]]
+fn normalize_metric_data(data: &mut Vec<Value>) {
+    // Check we have the expected structure: data[3] should be the metrics array
+    if data.len() < 4 {
+        return;
+    }
+    
+    let metrics_array = match data[3].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    // Iterate through all metrics
+    for metric_tuple in metrics_array.iter_mut() {
+        let metric_array = match metric_tuple.as_array_mut() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+        
+        let metric_obj = match metric_array[0].as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        // Get the metric name
+        let name = match metric_obj.get("name").and_then(|v| v.as_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        
+        // Only normalize metrics that reference transaction names
+        // These typically start with "OtherTransaction" or similar prefixes
+        if name.starts_with("OtherTransaction") {
+            // Check if the last segment needs normalization
+            // Example: "OtherTransactionTotalTime/ruby-hw" should become
+            //          "OtherTransactionTotalTime/Ruby/ruby-hw"
+            if let Some(last_slash_pos) = name.rfind('/') {
+                let prefix = &name[..last_slash_pos];
+                let suffix = &name[last_slash_pos + 1..];
+                
+                // If suffix has no '/', it needs normalization
+                if needs_normalization(suffix) {
+                    debug!("Normalizing metric name: '{}'", name);
+                    let normalized = format!("{}/Ruby/{}", prefix, suffix);
+                    debug!("Normalized metric name: '{}' -> '{}'", name, normalized);
+                    metric_obj.insert("name".to_string(), Value::String(normalized));
+                }
+            }
+        } else if needs_normalization(name) {
+            // Handle standalone metrics that are just the function name
+            // Example: "ruby-hw-x86-hw" should become "OtherTransaction/Ruby/ruby-hw-x86-hw"
+            debug!("Normalizing standalone metric name: '{}'", name);
+            let normalized = normalize_transaction_name(name);
+            metric_obj.insert("name".to_string(), Value::String(normalized));
+        }
+    }
+}
+
+/// Normalize transaction names in error_event_data
+/// Structure: [run_id, {metadata}, [[[error_obj, {}, {}]], ...]]
+fn normalize_error_event_data(data: &mut Vec<Value>) {
+    if data.len() < 3 {
+        return;
+    }
+    
+    let events_array = match data[2].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    for event_tuple in events_array.iter_mut() {
+        let event_array = match event_tuple.as_array_mut() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+        
+        let event_obj = match event_array[0].as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        // Error events may have transaction.name field
+        if let Some(name_value) = event_obj.get("transaction.name") {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing error event transaction.name: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    event_obj.insert("transaction.name".to_string(), Value::String(normalized));
+                }
+            }
+        }
+        
+        // Error events may also have transactionName field (alternative naming)
+        if let Some(name_value) = event_obj.get("transactionName") {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing error event transactionName: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    event_obj.insert("transactionName".to_string(), Value::String(normalized));
+                }
+            }
+        }
+    }
+}
+
+/// Normalize transaction names in custom_event_data
+/// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
+fn normalize_custom_event_data(data: &mut Vec<Value>) {
+    if data.len() < 3 {
+        return;
+    }
+    
+    let events_array = match data[2].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    for event_tuple in events_array.iter_mut() {
+        let event_array = match event_tuple.as_array_mut() {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => continue,
+        };
+        
+        let event_obj = match event_array[0].as_object_mut() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        
+        // Custom events may have transaction.name field
+        if let Some(name_value) = event_obj.get("transaction.name") {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing custom event transaction.name: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    event_obj.insert("transaction.name".to_string(), Value::String(normalized));
+                }
+            }
+        }
+    }
+}
+
+/// Normalize transaction names in transaction_sample_data
+/// Structure: [run_id, [[transaction_id, timestamp, name, duration, encoded_data], ...]]
+fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
+    if data.len() < 2 {
+        return;
+    }
+    
+    let samples_array = match data[1].as_array_mut() {
+        Some(arr) => arr,
+        None => return,
+    };
+    
+    for sample in samples_array.iter_mut() {
+        let sample_array = match sample.as_array_mut() {
+            Some(arr) if arr.len() >= 3 => arr,
+            _ => continue,
+        };
+        
+        // Transaction sample format: [transaction_id, timestamp, name, duration, encoded_data]
+        // Index 2 is the transaction name
+        if let Some(name_value) = sample_array.get(2) {
+            if let Some(name) = name_value.as_str() {
+                if needs_normalization(name) {
+                    debug!("Normalizing transaction sample name: '{}'", name);
+                    let normalized = normalize_transaction_name(name);
+                    sample_array[2] = Value::String(normalized);
+                }
+            }
+        }
     }
 }
 
