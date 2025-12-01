@@ -89,6 +89,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 /// APM mode: immediate sending to collector, no batching, keeps buffers alive for late payloads
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
+    let mut cleanup_counter = 0; // Track when to run periodic cleanup
 
     loop {
         debug!("APM mode: waiting for next lambda invocation event...");
@@ -213,6 +214,20 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         event_counter, event_time, request_id
                     );
                 }
+
+                // Periodic cleanup: Run every 10 invocations to prevent memory leaks
+                cleanup_counter += 1;
+                if cleanup_counter >= 10 {
+                    cleanup_counter = 0;
+                    let newrelic_client = components.newrelic_client.clone();
+                    let config = components.config.clone();
+                    tokio::spawn(async move {
+                        use crate::agent::batch::cleanup_old_batch_entries;
+                        use crate::request::cleanup_old_request_buffers;
+                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        cleanup_old_request_buffers(newrelic_client, config).await;
+                    });
+                }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
@@ -294,6 +309,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 /// Standard mode: batches payloads with platform.report, sends to serverless API
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
+    let mut cleanup_counter = 0; // Track when to run periodic cleanup
 
     loop {
         debug!("Standard mode: waiting for next lambda invocation event...");
@@ -346,23 +362,16 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // SKIP old buffer processing to avoid deadlocks
                 // Late payloads are already handled via the buffer matching on next invocation
                 // The complex locking in this loop was causing 7-second deadlocks
-                debug!("Skipping old buffer cleanup to avoid deadlocks (handled on next invocation)");
-
-                debug!("Completed cleanup loop for request: {}", request_id);
-
-                debug!("About to check batch threshold for request: {}", request_id);
 
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
+                // CRITICAL: Must await to prevent Lambda from freezing network mid-request
                 if should_send_batch_by_threshold() {
                     info!("Batch threshold reached - sending payloads with report lines only");
-                    let newrelic_client = components.newrelic_client.clone();
-                    let config = components.config.clone();
-                    tokio::spawn(async move {
-                        send_batched_payloads_with_reports_only(newrelic_client, config).await;
-                    });
+                    send_batched_payloads_with_reports_only(
+                        components.newrelic_client.clone(),
+                        components.config.clone()
+                    ).await;
                 }
-
-                debug!("About to create processing state for request: {}", request_id);
 
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -413,6 +422,20 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         "WARM START: Event {} processed in {:?} (request_id: {})",
                         event_counter, event_time, request_id
                     );
+                }
+
+                // Periodic cleanup: Run every 10 invocations to prevent memory leaks
+                cleanup_counter += 1;
+                if cleanup_counter >= 10 {
+                    cleanup_counter = 0;
+                    let newrelic_client = components.newrelic_client.clone();
+                    let config = components.config.clone();
+                    tokio::spawn(async move {
+                        use crate::agent::batch::cleanup_old_batch_entries;
+                        use crate::request::cleanup_old_request_buffers;
+                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        cleanup_old_request_buffers(newrelic_client, config).await;
+                    });
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {

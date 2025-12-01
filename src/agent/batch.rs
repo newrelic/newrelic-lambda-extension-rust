@@ -110,17 +110,23 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
     items
 }
 
-/// Get only batched payloads WITH report lines and remove them from buffer
-/// Payloads without report lines remain in buffer for timeout/shutdown sending
-pub fn get_and_clear_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
+/// Get only batched payloads WITH report lines WITHOUT removing them from buffer
+/// Used before sending to prevent data loss if send fails
+pub fn get_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
     let items_with_reports: Vec<BatchedAgentPayload> = AGENT_BATCH_BUFFER
         .iter()
         .filter(|entry| entry.value().report_line.is_some())
         .map(|entry| entry.value().clone())
         .collect();
 
+    items_with_reports
+}
+
+/// Remove successfully sent payloads from buffer and update metadata
+/// Only call this after successful send to prevent data loss
+fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
     // Remove only items with report lines from buffer
-    for item in &items_with_reports {
+    for item in items {
         AGENT_BATCH_BUFFER.remove(&item.request_id);
     }
 
@@ -141,21 +147,30 @@ pub fn get_and_clear_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
 
         info!(
             "Removed {} payloads with report lines from batch (remaining in buffer: {})",
-            items_with_reports.len(),
+            items.len(),
             remaining_count
         );
     }
+}
 
+/// Get only batched payloads WITH report lines and remove them from buffer
+/// Payloads without report lines remain in buffer for timeout/shutdown sending
+/// DEPRECATED: Use get_batch_with_reports_only() + clear_batch_with_reports() instead
+pub fn get_and_clear_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
+    let items_with_reports = get_batch_with_reports_only();
+    clear_batch_with_reports(&items_with_reports);
     items_with_reports
 }
 
 /// Send only batched agent payloads WITH report lines (when threshold is hit)
 /// Payloads without report lines remain in buffer for timeout/shutdown sending
+/// DATA LOSS PREVENTION: Only removes payloads from buffer AFTER successful send
 pub async fn send_batched_payloads_with_reports_only(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    let batch_items = get_and_clear_batch_with_reports_only();
+    // Get items WITHOUT removing them from buffer (prevent data loss on send failure)
+    let batch_items = get_batch_with_reports_only();
 
     if batch_items.is_empty() {
         debug!("No batched payloads with report lines to send");
@@ -167,16 +182,15 @@ pub async fn send_batched_payloads_with_reports_only(
         batch_items.len()
     );
 
-    let mut log_events = Vec::new();
+    // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
+    let mut log_events = Vec::with_capacity(batch_items.len() * 2);
 
     for item in &batch_items {
-        let agent_str = match std::str::from_utf8(&item.agent_payload_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(&item.agent_payload_bytes).to_string(),
-        };
+        // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
+        let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
         log_events.push(serde_json::json!({
-            "id": item.request_id,
-            "message": agent_str,
+            "id": &item.request_id,
+            "message": &*agent_str,
             "timestamp": item.timestamp.timestamp_millis(),
         }));
 
@@ -212,10 +226,21 @@ pub async fn send_batched_payloads_with_reports_only(
 
     let payload_json = payload.to_string();
 
-    if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
-        error!("Failed to send batched payloads with reports: {}", e);
-    } else {
-        info!("Successfully sent batch of {} payloads with report lines", batch_items.len());
+    // Send to New Relic with retries
+    match newrelic_client.send_agent_payload(&config, &payload_json).await {
+        Ok(_) => {
+            info!("Successfully sent batch of {} payloads with report lines", batch_items.len());
+            // Only remove from buffer AFTER successful send (prevent data loss)
+            clear_batch_with_reports(&batch_items);
+        }
+        Err(e) => {
+            error!(
+                "Failed to send batched payloads with reports after all retries: {} - Keeping {} payloads in buffer for next attempt",
+                e,
+                batch_items.len()
+            );
+            // Items remain in buffer - will be retried on next batch send or at shutdown
+        }
     }
 }
 
@@ -300,16 +325,15 @@ pub async fn send_all_pending_payloads_on_shutdown(
     for (idx, chunk_items) in chunks.iter().enumerate() {
         debug!("Shutdown: Sending chunk {} with {} payload(s)", idx + 1, chunk_items.len());
 
-        let mut log_events = Vec::new();
+        // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
+        let mut log_events = Vec::with_capacity(chunk_items.len() * 2);
 
         for item in chunk_items {
-            let agent_str = match std::str::from_utf8(&item.agent_payload_bytes) {
-                Ok(s) => s.to_string(),
-                Err(_) => String::from_utf8_lossy(&item.agent_payload_bytes).to_string(),
-            };
+            // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
+            let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
             log_events.push(serde_json::json!({
-                "id": item.request_id,
-                "message": agent_str,
+                "id": &item.request_id,
+                "message": &*agent_str,
                 "timestamp": item.timestamp.timestamp_millis(),
             }));
 
@@ -420,4 +444,96 @@ fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
     let function_name_len = config.aws.function_name.len();
     let base = 500 + (function_name_len * 3); // Function name appears in multiple places
     base
+}
+
+/// Cleanup old entries from AGENT_BATCH_BUFFER by sending them to New Relic first
+/// Finds entries older than 5 minutes, sends them (even without report lines), then removes them
+pub async fn cleanup_old_batch_entries(
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) {
+    let now = chrono::Utc::now();
+    let threshold = chrono::Duration::minutes(5);
+
+    // Collect old entries that need to be sent
+    let old_entries: Vec<BatchedAgentPayload> = AGENT_BATCH_BUFFER
+        .iter()
+        .filter(|entry| now.signed_duration_since(entry.value().timestamp) >= threshold)
+        .map(|entry| entry.value().clone())
+        .collect();
+
+    if old_entries.is_empty() {
+        return;
+    }
+
+    info!("Periodic cleanup: Found {} old batch entries to send and remove", old_entries.len());
+
+    // Send the old entries to New Relic (even without report lines - don't lose telemetry!)
+    // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
+    let mut log_events = Vec::with_capacity(old_entries.len() * 2);
+
+    for item in &old_entries {
+        // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
+        let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
+        log_events.push(serde_json::json!({
+            "id": &item.request_id,
+            "message": &*agent_str,
+            "timestamp": item.timestamp.timestamp_millis(),
+        }));
+
+        // Include report line if available
+        if let Some(ref report) = item.report_line {
+            log_events.push(serde_json::json!({
+                "id": item.request_id,
+                "message": report,
+                "timestamp": item.timestamp.timestamp_millis(),
+            }));
+        }
+    }
+
+    let most_recent = old_entries.last().expect("old_entries should not be empty");
+
+    let entry = serde_json::json!({
+        "logEvents": log_events,
+        "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
+        "logStream": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
+        "messageType": "",
+        "owner": "",
+    });
+
+    let payload = serde_json::json!({
+        "context": {
+            "function_name": config.aws.function_name,
+            "invoked_function_arn": most_recent.invoked_function_arn,
+            "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
+            "log_stream_name": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
+        },
+        "entry": entry.to_string(),
+    });
+
+    let payload_json = payload.to_string();
+
+    // Send to New Relic before removing
+    if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
+        error!("Periodic cleanup: Failed to send old batch entries: {}", e);
+    } else {
+        info!("Periodic cleanup: Successfully sent {} old batch entries", old_entries.len());
+    }
+
+    // Now remove the old entries from buffer
+    for item in &old_entries {
+        AGENT_BATCH_BUFFER.remove(&item.request_id);
+    }
+
+    // Update metadata
+    if let Ok(mut meta) = BATCH_META.lock() {
+        let final_count = AGENT_BATCH_BUFFER.len();
+        meta.agent_count = final_count;
+        meta.oldest_timestamp = if final_count == 0 {
+            None
+        } else {
+            AGENT_BATCH_BUFFER.iter().map(|entry| entry.value().timestamp).min()
+        };
+        info!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), final_count);
+    }
 }
