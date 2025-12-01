@@ -98,6 +98,24 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
         {
             Ok(event) => event,
             Err(e) => {
+                let error_msg = e.to_string();
+                // Check if this is a fatal 403 state transition error (AWS shutting down without sending SHUTDOWN event)
+                if error_msg.contains("403") || error_msg.contains("State transition") {
+                    error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
+                    info!("Performing emergency shutdown cleanup...");
+                    
+                    process_pending_agent_payloads(
+                        &components.newrelic_client,
+                        &components.config,
+                        &components.global_log_processor,
+                        &components.apm_app,
+                        "",
+                    )
+                    .await;
+                    
+                    info!("Emergency shutdown cleanup completed. Extension exiting.");
+                    break;
+                }
                 error!("Error receiving next event: {:?}. Continuing.", e);
                 continue;
             }
@@ -318,6 +336,22 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             match runtime::fetch_next_event(&components.client, &components.extension_id).await {
                 Ok(event) => event,
                 Err(e) => {
+                    let error_msg = e.to_string();
+                    if error_msg.contains("403") || error_msg.contains("State transition") {
+                        error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
+                        info!("Performing emergency shutdown cleanup...");
+                        
+                        send_batched_payloads_with_reports_only(
+                            components.newrelic_client.clone(),
+                            components.config.clone(),
+                        )
+                        .await;
+                        
+                        let _ = components.global_log_processor.flush().await;
+                        
+                        info!("Emergency shutdown cleanup completed. Extension exiting.");
+                        break;
+                    }
                     error!("Error receiving next event: {:?}. Continuing.", e);
                     continue;
                 }
@@ -521,7 +555,15 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                     request_id
                 );
             }
-            Err(_) => {}
+            Err(e) => {
+                let error_msg = e.to_string();
+                if error_msg.contains("403") || error_msg.contains("State transition") {
+                    error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
+                    info!("No-op mode exiting due to Lambda shutdown");
+                    break;
+                }
+                error!("Error in no-op event loop: {:?}. Continuing.", e);
+            }
         }
     }
 }
