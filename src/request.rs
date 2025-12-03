@@ -94,6 +94,10 @@ pub static REQUEST_BUFFER_TIMESTAMPS: Lazy<Arc<DashMap<String, chrono::DateTime<
 pub static CURRENT_ACTIVE_REQUEST_ID: Lazy<Arc<Mutex<Option<String>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 
+/// Buffer for orphaned agent payloads that arrive before any request is created
+pub static ORPHANED_PAYLOADS: Lazy<Arc<Mutex<Vec<Vec<u8>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
@@ -121,8 +125,22 @@ pub fn create_request_processing_state(
     };
 
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);
-    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer);
+    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer.clone());
     REQUEST_BUFFER_TIMESTAMPS.insert(request_id.to_string(), chrono::Utc::now());
+
+    // Move any orphaned payloads to this request buffer
+    if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+        if !orphaned.is_empty() {
+            if let Ok(mut buffer) = agent_buffer.lock() {
+                let count = orphaned.len();
+                buffer.extend(orphaned.drain(..));
+                info!(
+                    "Moved {} orphaned agent payload(s) to request buffer for {}",
+                    count, request_id
+                );
+            }
+        }
+    }
 
     debug!(
         "Created per-request processing state for {} (using global log processor)",
@@ -228,7 +246,16 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                 }
             }
         } else {
-            warn!("No active requests found - agent payload lost!");
+            // No requests exist yet - store in orphaned buffer
+            if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+                orphaned.push(payload_bytes);
+                info!(
+                    "No active requests - stored agent payload in orphaned buffer (total orphaned: {})",
+                    orphaned.len()
+                );
+            } else {
+                warn!("Failed to lock orphaned buffer - agent payload lost!");
+            }
         }
     }
 }

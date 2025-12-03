@@ -197,6 +197,14 @@ pub async fn send_batched_payloads_with_reports_only(
 
     let most_recent = batch_items.last().expect("batch_items should not be empty");
 
+    let entry = serde_json::json!({
+        "logEvents": log_events,
+        "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
+        "logStream": "",
+        "messageType": "",
+        "owner": "",
+    });
+
     let payload = serde_json::json!({
         "context": {
             "function_name": config.aws.function_name,
@@ -204,13 +212,7 @@ pub async fn send_batched_payloads_with_reports_only(
             "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
             "log_stream_name": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
         },
-        "entry": {
-            "logEvents": log_events,
-            "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
-            "logStream": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
-            "messageType": "",
-            "owner": "",
-        },
+        "entry": entry.to_string(),
     });
 
     // Use to_string() for final serialization (send_agent_payload expects &str)
