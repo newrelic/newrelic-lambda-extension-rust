@@ -281,7 +281,10 @@ impl LogProcessor {
                            message_str.contains("Exception") || message_str.contains("exception") ||
                            message_str.contains("Fatal") || message_str.contains("fatal") {
 
-                            info!("APM mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+                            // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+                            let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
+                                .replace('\n', "\\n").replace('\r', "\\r");
+                            info!("APM mode: Error detected in function log: {}", sanitized_msg);
 
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
@@ -330,7 +333,10 @@ impl LogProcessor {
                        message_str.contains("Exception") || message_str.contains("exception") ||
                        message_str.contains("Fatal") || message_str.contains("fatal") {
 
-                        info!("Standard mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+                        // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+                        let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
+                            .replace('\n', "\\n").replace('\r', "\\r");
+                        info!("Standard mode: Error detected in function log: {}", sanitized_msg);
 
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();

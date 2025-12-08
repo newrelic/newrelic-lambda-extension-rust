@@ -56,16 +56,34 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
 
     let (data_map, version) = match protocol_version {
         "2" => {
-            trace!("Parsing v2 payload: {}", String::from_utf8_lossy(&uncompressed_json));
+            // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+            let sanitized_payload = String::from_utf8_lossy(&uncompressed_json)
+                .replace('\n', "\\n")
+                .replace('\r', "\\r");
+            trace!("Parsing v2 payload: {}", sanitized_payload);
             let lambda_data: LambdaData = serde_json::from_slice(&uncompressed_json)
-                .map_err(|e| anyhow!("Failed to parse v2 payload: {} - Payload preview: {}", e, 
-                    String::from_utf8_lossy(&uncompressed_json).chars().take(500).collect::<String>()))?;
+                .map_err(|e| {
+                    let preview: String = String::from_utf8_lossy(&uncompressed_json)
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r");
+                    anyhow!("Failed to parse v2 payload: {} - Payload preview: {}", e, preview)
+                })?;
             (convert_lambda_data_to_map(lambda_data), 2)
         }
         "1" | _ => {
             let wrapper: LambdaRawData = serde_json::from_slice(&uncompressed_json)
-                .map_err(|e| anyhow!("Failed to parse v1 payload: {} - Payload preview: {}", e, 
-                    String::from_utf8_lossy(&uncompressed_json).chars().take(500).collect::<String>()))?;
+                .map_err(|e| {
+                    let preview: String = String::from_utf8_lossy(&uncompressed_json)
+                        .chars()
+                        .take(500)
+                        .collect::<String>()
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r");
+                    anyhow!("Failed to parse v1 payload: {} - Payload preview: {}", e, preview)
+                })?;
             (convert_lambda_data_to_map(wrapper.data), 1)
         }
     };

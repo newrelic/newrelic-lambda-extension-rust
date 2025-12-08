@@ -7,8 +7,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::Write;
+use std::time::Duration;
 use tracing::{debug, error, info};
 use once_cell::sync::Lazy;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+/// Connection timeouts - MORE AGGRESSIVE than Go for Lambda cold start
+const PRECONNECT_TIMEOUT_SECS: u64 = 20;
+const CONNECT_TIMEOUT_SECS: u64 = 20;
 
 /// OPTIMIZATION: Cache runtime detection (runs once per container lifetime)
 static CACHED_RUNTIME: Lazy<String> = Lazy::new(|| detect_runtime_internal());
@@ -18,6 +25,13 @@ static CACHED_AGENT_VERSION: Lazy<String> = Lazy::new(|| {
     let runtime = CACHED_RUNTIME.as_str();
     detect_agent_version_internal(runtime)
 });
+
+/// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
+fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(data)?;
+    encoder.finish().map_err(|e| anyhow!("Compression failed: {}", e))
+}
 
 /// PreConnect request payload
 #[derive(Debug, Serialize)]
@@ -109,18 +123,12 @@ pub async fn preconnect(
 
     let body = serde_json::to_vec(&preconnect_req)?;
 
-    // OPTIMIZATION: Use spawn_blocking for CPU-intensive compression
-    let compressed_body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(&body)?;
-        encoder.finish().map_err(|e| anyhow::anyhow!("Compression failed: {}", e))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Compression task failed: {}", e))??;
+    // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
+    let compressed_body = compress_inline(&body)?;
 
-    debug!("PreConnect request to: {}", url);
+    debug!("PreConnect request to: {} (timeout: {}s)", url, PRECONNECT_TIMEOUT_SECS);
 
-    // OPTIMIZATION: 8s timeout balances cold start performance with reliability
+    // OPTIMIZATION: 30s timeout for Lambda cold start (network can be slow)
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -128,15 +136,28 @@ pub async fn preconnect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(Duration::from_secs(PRECONNECT_TIMEOUT_SECS))
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            error!("PreConnect HTTP request failed: {:?}", e);
+            if e.is_timeout() {
+                error!("PreConnect TIMEOUT after {}s - Lambda cold start network may be slow", PRECONNECT_TIMEOUT_SECS);
+            } else if e.is_connect() {
+                error!("PreConnect CONNECTION ERROR - Cannot reach collector at {}", base_host);
+            } else if e.is_request() {
+                error!("PreConnect REQUEST ERROR - Invalid request format or parameters");
+            }
+            e
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
-        error!("PreConnect failed - Status: {}, Response: {}", status, error_body);
-        return Err(anyhow!("PreConnect failed with status: {} - {}", status, error_body));
+        error!("PreConnect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
+        error!("PreConnect URL was: {}", url);
+        error!("This usually means: 1) Invalid license key, 2) Network connectivity issue, 3) Collector endpoint unreachable");
+        return Err(anyhow!("PreConnect failed with HTTP {} - {}", status, error_body));
     }
 
     let preconnect_resp: PreconnectResponse = response.json().await?;
@@ -186,18 +207,12 @@ pub async fn connect(
 
     let body = serde_json::to_vec(&connect_req)?;
 
-    // OPTIMIZATION: Use spawn_blocking for CPU-intensive compression
-    let compressed_body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        encoder.write_all(&body)?;
-        encoder.finish().map_err(|e| anyhow::anyhow!("Compression failed: {}", e))
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Compression task failed: {}", e))??;
+    // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
+    let compressed_body = compress_inline(&body)?;
 
-    debug!("Connect request to: {}", url);
+    debug!("Connect request to: {} (timeout: {}s)", url, CONNECT_TIMEOUT_SECS);
 
-    // OPTIMIZATION: 8s timeout balances cold start performance with reliability
+    // OPTIMIZATION: 30s timeout for Lambda cold start
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -205,15 +220,25 @@ pub async fn connect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            error!("Connect HTTP request failed: {:?}", e);
+            if e.is_timeout() {
+                error!("Connect TIMEOUT after {}s", CONNECT_TIMEOUT_SECS);
+            } else if e.is_connect() {
+                error!("Connect CONNECTION ERROR - Cannot reach collector at {}", collector_host);
+            }
+            e
+        })?;
 
     let status = response.status();
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
-        error!("Connect failed - Status: {}, Response: {}", status, error_body);
-        return Err(anyhow!("Connect failed with status: {} - {}", status, error_body));
+        error!("Connect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
+        error!("Connect URL was: {}", url);
+        return Err(anyhow!("Connect failed with HTTP {} - {}", status, error_body));
     }
 
     let connect_resp: ConnectResponse = response.json().await?;
