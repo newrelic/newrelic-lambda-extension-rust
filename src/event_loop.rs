@@ -75,9 +75,22 @@ pub async fn run_infinite_event_loop(
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
 /// Routes to APM or standard mode based on config
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let is_apm_mode = components.apm_app.read().await.is_some();
+    let apm_app_initialized = components.apm_app.read().await.is_some();
+    let apm_mode_enabled = components.config.new_relic.apm_lambda_mode;
 
-    if is_apm_mode {
+    // Determine mode:
+    // - APM enabled + connected → APM mode
+    // - APM enabled + NOT connected → NO-OP mode (failed to connect)
+    // - APM disabled → standard mode
+    if apm_mode_enabled && !apm_app_initialized {
+        error!("APM mode was explicitly enabled but connection failed - entering NO-OP mode");
+        warn!("No telemetry will be processed. Check APM connection logs above.");
+        info!("Running in no-op mode");
+        execute_noop_event_loop(&components.client, &components.extension_id).await;
+        return 0;
+    }
+
+    if apm_app_initialized {
         info!("Starting APM mode event loop");
         execute_apm_mode_event_loop(components).await
     } else {
@@ -307,7 +320,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 }
 
-                // Process any remaining pending agent payloads
+                // CRITICAL: Process ALL remaining pending agent payloads before shutdown
+                info!("APM mode shutdown: Processing all remaining agent payloads");
+                let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                if buffer_count > 0 {
+                    info!("APM mode shutdown: Found {} pending buffer(s) to process", buffer_count);
+                }
+                
                 process_pending_agent_payloads(
                     &components.newrelic_client,
                     &components.config,
@@ -316,6 +335,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     "",
                 )
                 .await;
+                
+                // Final flush of logs
+                if let Err(e) = components.global_log_processor.flush().await {
+                    error!("APM mode shutdown: Failed to flush logs: {}", e);
+                }
+                
+                info!("APM mode shutdown: All data processed and sent");
                 break;
             }
         }
@@ -521,12 +547,22 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     }
                 }
 
+                // CRITICAL: Send all remaining batched data before shutdown
+                info!("Standard mode shutdown: Sending all remaining batched data");
+                send_batched_payloads_with_reports_only(
+                    components.newrelic_client.clone(),
+                    components.config.clone(),
+                )
+                .await;
+                
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),
                     components.config.clone(),
                     components.global_log_processor.clone(),
                 )
                 .await;
+                
+                info!("Standard mode shutdown: All data processed and sent");
                 break;
             }
         }
@@ -687,23 +723,17 @@ pub async fn process_apm_request(
         }
     };
 
-    // Unified wait timeout for all invocations (APM mode)
+    // APM mode: No timeout wait - we immediately process if payload exists,
+    // otherwise buffer stays alive for late arrival (processed in next invocation)
     if !payload_already_arrived {
         debug!(
-            "APM mode: Waiting up to 100ms for agent payload for request: {}",
+            "APM mode: No agent payload yet for request: {} - buffer will stay alive for late arrival",
             request_id
         );
-        tokio::select! {
-            _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
-                debug!("Agent payload received early for request: {} (saved wait time)", request_id);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                debug!("Agent payload wait timeout (100ms) for request: {} - may arrive late", request_id);
-            }
-        }
+        // Don't wait - just continue. Late payloads will be processed in next invocation
     } else {
         debug!(
-            "Agent payload already in buffer for request: {} - no wait needed",
+            "APM mode: Agent payload already in buffer for request: {} - will send immediately",
             request_id
         );
     }
@@ -803,8 +833,8 @@ pub async fn process_apm_request(
     }
 
     if got_payload_now {
-        debug!(
-            "APM mode: Agent payload sent - cleaning up all resources for request: {}",
+        info!(
+            "APM mode: Agent payload sent successfully - cleaning up resources for request: {}",
             request_id
         );
         cleanup_request_processing_state_internal(&request_id, false);
@@ -813,6 +843,10 @@ pub async fn process_apm_request(
             *active_request = None;
         }
     } else {
+        info!(
+            "APM mode: No agent payload for {} - buffer kept alive for late arrival (will process in next invocation)",
+            request_id
+        );
         cleanup_request_processing_state_internal(&request_id, true);
 
         if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {

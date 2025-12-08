@@ -31,7 +31,7 @@ use std::{
 use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use reqwest::Client;
 
 use crate::{
@@ -316,17 +316,20 @@ async fn perform_one_time_initialization(
     // This avoids async overhead for standard mode (most common case)
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            info!("APM Lambda mode enabled - using parallel initialization");
+            info!("APM Lambda mode enabled - using async parallel initialization");
 
-            // Parallel path: APM init + telemetry setup run concurrently
+            // OPTIMIZATION: APM connection with parallel setup
+            // Connect to APM while setting up telemetry listener in parallel
+            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+            
             let license_key = config
                 .new_relic
                 .license_key
                 .clone()
                 .expect("License key must be available for APM mode");
 
-            let apm_future = {
-                let license_key = license_key.clone();
+            let apm_connection_future = {
+                let license_key_clone = license_key.clone();
                 let apm_host = config.new_relic.apm_host.clone();
                 let metric_endpoint = config.new_relic.metric_endpoint.clone();
                 let client_clone = (*client).clone();
@@ -334,10 +337,11 @@ async fn perform_one_time_initialization(
                 let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
                 let account_id = config.aws.account_id.clone();
                 let region = config.aws.region.clone();
+                let apm_app_clone = Arc::clone(&apm_app);
 
                 async move {
                     match apm::ApmApp::new(
-                        license_key,
+                        license_key_clone,
                         apm_host,
                         metric_endpoint,
                         client_clone,
@@ -353,34 +357,31 @@ async fn perform_one_time_initialization(
                                 "APM app initialized successfully - Entity GUID: {}",
                                 app.get_entity_guid()
                             );
-                            {
-                                let mut global_apm = APM_APP.write().await;
-                                *global_apm = Some(app);
-                            }
-                            Ok(Arc::clone(&APM_APP))
+                            let mut global_apm = apm_app_clone.write().await;
+                            *global_apm = Some(app);
+                            Ok(())
                         }
                         Err(e) => {
-                            error!("Failed to initialize APM app: {}", e);
-                            error!("APM mode was explicitly enabled (NEW_RELIC_APM_LAMBDA_MODE=true) but initialization failed");
-                            error!("Extension will run in NO-OP mode to prevent incorrect data collection");
-                            error!("Lambda function will continue normally but without New Relic monitoring");
+                            error!("CRITICAL: Failed to initialize APM app: {}", e);
+                            error!("APM mode was explicitly enabled but connection failed");
+                            error!("Extension will enter NO-OP mode - no telemetry will be processed");
+                            warn!("Lambda function will continue but without New Relic monitoring");
                             Err(e)
                         }
                     }
                 }
             };
 
-            let telemetry_future = {
-                let newrelic_client = Arc::clone(&newrelic_client);
+            // Set up telemetry listener in parallel with APM connection
+            let telemetry_setup_future = {
+                let newrelic_client_clone = Arc::clone(&newrelic_client);
                 let config_clone = Arc::clone(&config);
+                let apm_app_clone = Arc::clone(&apm_app);
                 async move {
-                    // Create empty APM app for processor factory (will be updated after APM init)
-                    let temp_apm_app = Arc::new(tokio::sync::RwLock::new(None));
-
                     let processor_factory = Arc::new(ProcessorFactory::new(
-                        Arc::clone(&newrelic_client),
-                        Arc::clone(&config_clone),
-                        Arc::clone(&temp_apm_app),
+                        newrelic_client_clone,
+                        config_clone,
+                        apm_app_clone,
                     ));
 
                     let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
@@ -392,27 +393,22 @@ async fn perform_one_time_initialization(
                         temp_platform_processor,
                         Some(runtime_done_tx),
                     )
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                    .await?;
 
                     Ok::<_, Box<dyn std::error::Error + Send + Sync>>((processor_factory, temp_log_processor, telemetry_listener_address))
                 }
             };
 
-            // Run both futures in parallel
-            let (apm_result, telemetry_result) = tokio::join!(apm_future, telemetry_future);
+            // Run APM connection and telemetry setup in parallel, wait for both
+            let (apm_result, telemetry_result) = tokio::join!(apm_connection_future, telemetry_setup_future);
 
-            // Handle APM result
-            let apm_app = apm_result.map_err(|e| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("APM initialization failed when APM mode was explicitly enabled: {}", e)
-                )) as Box<dyn std::error::Error + Send + Sync>
-            })?;
+            // Check APM result - if failed, we'll enter NO-OP mode in event loop
+            if let Err(_e) = apm_result {
+                // Error already logged in the future, just continue
+                // apm_app remains None, event loop will detect and enter NO-OP mode
+            }
 
-            // Handle telemetry result
-            let (processor_factory, temp_log_processor, telemetry_listener_address) =
-                telemetry_result?;
+            let (processor_factory, temp_log_processor, telemetry_listener_address) = telemetry_result?;
 
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         } else {

@@ -8,6 +8,16 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::io::Write;
 use tracing::{debug, error, info};
+use once_cell::sync::Lazy;
+
+/// OPTIMIZATION: Cache runtime detection (runs once per container lifetime)
+static CACHED_RUNTIME: Lazy<String> = Lazy::new(|| detect_runtime_internal());
+
+/// OPTIMIZATION: Cache agent version detection (runs once per container lifetime)
+static CACHED_AGENT_VERSION: Lazy<String> = Lazy::new(|| {
+    let runtime = CACHED_RUNTIME.as_str();
+    detect_agent_version_internal(runtime)
+});
 
 /// PreConnect request payload
 #[derive(Debug, Serialize)]
@@ -99,12 +109,18 @@ pub async fn preconnect(
 
     let body = serde_json::to_vec(&preconnect_req)?;
 
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&body)?;
-    let compressed_body = encoder.finish()?;
+    // OPTIMIZATION: Use spawn_blocking for CPU-intensive compression
+    let compressed_body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&body)?;
+        encoder.finish().map_err(|e| anyhow::anyhow!("Compression failed: {}", e))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Compression task failed: {}", e))??;
 
     debug!("PreConnect request to: {}", url);
 
+    // OPTIMIZATION: 8s timeout balances cold start performance with reliability
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -112,7 +128,7 @@ pub async fn preconnect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(8))
         .send()
         .await?;
 
@@ -170,12 +186,18 @@ pub async fn connect(
 
     let body = serde_json::to_vec(&connect_req)?;
 
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&body)?;
-    let compressed_body = encoder.finish()?;
+    // OPTIMIZATION: Use spawn_blocking for CPU-intensive compression
+    let compressed_body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&body)?;
+        encoder.finish().map_err(|e| anyhow::anyhow!("Compression failed: {}", e))
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Compression task failed: {}", e))??;
 
     debug!("Connect request to: {}", url);
 
+    // OPTIMIZATION: 8s timeout balances cold start performance with reliability
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -183,7 +205,7 @@ pub async fn connect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(8))
         .send()
         .await?;
 
@@ -205,25 +227,41 @@ pub async fn connect(
     Ok(connect_resp)
 }
 
-/// Detect Lambda runtime from /var/lang/bin
-pub fn detect_runtime() -> String {
-    const RUNTIME_LOOKUP_PATH: &str = "/var/lang/bin";
-    const RUNTIMES: &[&str] = &["node", "python", "dotnet", "ruby"];
+/// Get cached runtime (detected once per container)
+/// OPTIMIZATION: Returns cached value - detection happens only once
+pub fn detect_runtime() -> &'static str {
+    CACHED_RUNTIME.as_str()
+}
 
-    for runtime in RUNTIMES {
-        let path = format!("{}/{}", RUNTIME_LOOKUP_PATH, runtime);
-        if std::path::Path::new(&path).exists() {
-            debug!("Detected runtime: {}", runtime);
-            return runtime.to_string();
-        }
+/// Detect Lambda runtime from /var/lang/bin (internal, called once)
+fn detect_runtime_internal() -> String {
+    // OPTIMIZATION: Check most common runtimes first (Node, Python)
+    // Using direct path construction without heap allocation
+    if std::path::Path::new("/var/lang/bin/node").exists() {
+        return "node".to_string();
+    }
+    if std::path::Path::new("/var/lang/bin/python").exists() {
+        return "python".to_string();
+    }
+    if std::path::Path::new("/var/lang/bin/ruby").exists() {
+        return "ruby".to_string();
+    }
+    if std::path::Path::new("/var/lang/bin/dotnet").exists() {
+        return "dotnet".to_string();
     }
 
     debug!("No specific runtime detected, defaulting to go");
     "go".to_string()
 }
 
-/// Get agent version from layer paths
-pub fn detect_agent_version(runtime: &str) -> String {
+/// Get cached agent version (detected once per container)
+/// OPTIMIZATION: Returns cached value - detection happens only once
+pub fn detect_agent_version(_runtime: &str) -> &'static str {
+    CACHED_AGENT_VERSION.as_str()
+}
+
+/// Get agent version from layer paths (internal, called once)
+fn detect_agent_version_internal(runtime: &str) -> String {
     match runtime {
         "node" => {
             let paths = vec![
