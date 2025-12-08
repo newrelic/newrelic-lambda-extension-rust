@@ -1315,7 +1315,7 @@ async fn process_and_send_agent_payload(
     request_id: &str,
     invoked_function_arn: &str,
     log_processor: &Arc<LogProcessor>,
-    newrelic_client: &Arc<NewRelicClient>,
+    _newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1336,52 +1336,31 @@ async fn process_and_send_agent_payload(
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
         info!(
-            "APM mode: Processing agent payload (size: {} bytes)",
+            "APM mode: Processing agent payload for request: {} (size: {} bytes)",
+            request_id,
             payload_bytes.len()
         );
         match app.process_agent_payload(payload_bytes.to_vec()).await {
             Ok(()) => {
-                info!("APM agent payload processed and sent successfully");
+                info!("APM mode: Agent payload sent successfully for request: {}", request_id);
             }
             Err(e) => {
-                error!("Failed to send agent payload to APM collector: {}", e);
+                error!("APM mode: Failed to send agent payload to APM collector: {}", e);
                 buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
                 warn!(
-                    "APM agent payload buffered for retry (size: {} bytes)",
+                    "APM mode: Agent payload buffered for retry (size: {} bytes)",
                     payload_bytes.len()
                 );
             }
         }
     } else {
-        match send_agent_payload_to_newrelic(
-            payload_bytes,
+        // APM connection not ready - buffer the payload, do NOT send to telemetry endpoint
+        warn!(
+            "APM connection not established - buffering agent payload for request: {} (size: {} bytes)",
             request_id,
-            invoked_function_arn,
-            newrelic_client,
-            config,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(
-                    "Agent payload processed and sent (size: {} bytes)",
-                    payload_bytes.len()
-                );
-            }
-            Err(e) => {
-                error!(
-                    "Failed to send agent payload for request {}: {}",
-                    request_id, e
-                );
-
-                buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
-
-                warn!(
-                    "Agent payload buffered for retry (size: {} bytes)",
-                    payload_bytes.len()
-                );
-            }
-        }
+            payload_bytes.len()
+        );
+        buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
     }
 
     Ok(())

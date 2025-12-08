@@ -263,7 +263,7 @@ fn detect_runtime_internal() -> String {
     // OPTIMIZATION: Check most common runtimes first (Node, Python)
     // Using direct path construction without heap allocation
     if std::path::Path::new("/var/lang/bin/node").exists() {
-        return "node".to_string();
+        return "nodejs".to_string(); // BUGFIX: Collector expects "nodejs", not "node"
     }
     if std::path::Path::new("/var/lang/bin/python").exists() {
         return "python".to_string();
@@ -288,7 +288,7 @@ pub fn detect_agent_version(_runtime: &str) -> &'static str {
 /// Get agent version from layer paths (internal, called once)
 fn detect_agent_version_internal(runtime: &str) -> String {
     match runtime {
-        "node" => {
+        "nodejs" => { // BUGFIX: Changed from "node" to match runtime string
             let paths = vec![
                 "/opt/nodejs/node_modules/newrelic/package.json",
                 "/var/task/node_modules/newrelic/package.json",
