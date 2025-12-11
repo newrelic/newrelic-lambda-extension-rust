@@ -26,7 +26,6 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
 const LAYER_AGENT_PATH_DOTNET: &[&str] = &["/opt/lib/newrelic-dotnet-agent"];
-const LAYER_AGENT_PATH_RUBY: &[&str] = &["/opt/ruby"];
 const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
     "/opt/ruby/gems/3.2.0/gems/newrelic_rpm",
     "/opt/ruby/gems/3.3.0/gems/newrelic_rpm",
@@ -36,9 +35,6 @@ const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
 const VENDOR_AGENT_PATH_NODE: &str = "/var/task/node_modules/newrelic";
 const VENDOR_AGENT_PATH_PYTHON: &str = "/var/task/newrelic";
 const VENDOR_AGENT_PATH_RUBY: &str = "/var/task/vendor/bundle/ruby/3.3.0/gems/newrelic_rpm";
-
-/// Runtime lookup path
-const RUNTIME_LOOKUP_PATH: &str = "/var/lang/bin";
 
 /// Version information structure
 #[derive(Debug, Clone)]
@@ -51,18 +47,19 @@ pub struct VersionInfo {
 
 impl VersionInfo {
     /// Create version info with detected versions
+    /// Uses fast synchronous detection (env vars, filesystem) - no AWS API calls
     pub fn detect() -> Self {
-        debug!("=== Starting version detection ===");
+        debug!("=== Starting version detection (sync) ===");
         let (agent_version, agent_name) = detect_agent_version();
         let extension_version = EXTENSION_VERSION.to_string();
 
-        // Layer version detection needs to be async, so we'll handle it separately
-        let layer_version = None; // Will be populated by detect_async
+        // Detect layer version from environment variables (fast, no AWS API calls)
+        let layer_version = detect_layer_version_sync();
 
-        debug!("Version detection complete (sync phase):");
+        debug!("Version detection complete (sync):");
         debug!("  Extension version: {}", extension_version);
         debug!("  Agent version: {:?} ({})", agent_version, agent_name.as_deref().unwrap_or("none"));
-        debug!("  Layer version: (async detection pending)");
+        debug!("  Layer version: {:?}", layer_version);
 
         Self {
             agent_version,
@@ -91,7 +88,6 @@ impl VersionInfo {
             layer_version,
         };
 
-        // Cache the version info globally for reuse
         let _ = VERSION_INFO_CACHE.set(Arc::new(info.clone()));
 
         info
@@ -111,13 +107,11 @@ impl VersionInfo {
     pub fn as_tags(&self) -> Vec<(String, String)> {
         let mut tags = Vec::new();
 
-        // Add extension version
         tags.push((
             "nr.extensionVersion".to_string(),
             self.extension_version.clone(),
         ));
 
-        // Add agent version with name if available
         if let (Some(name), Some(version)) = (&self.agent_name, &self.agent_version) {
             tags.push((
                 format!("nr.{}AgentVersion", name),
@@ -125,7 +119,6 @@ impl VersionInfo {
             ));
         }
 
-        // Add layer version if available
         if let Some(layer_version) = &self.layer_version {
             tags.push((
                 "nr.layerVersion".to_string(),
@@ -141,7 +134,6 @@ impl VersionInfo {
 fn detect_agent_version() -> (Option<String>, Option<String>) {
     debug!("Starting agent version detection...");
 
-    // Try Node.js agent (layer)
     for path in LAYER_AGENT_PATH_NODE {
         debug!("Checking Node.js layer path: {}", path);
         if let Some(version) = read_nodejs_version(path) {
@@ -150,14 +142,12 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         }
     }
 
-    // Try Node.js agent (vendor)
     debug!("Checking Node.js vendor path: {}", VENDOR_AGENT_PATH_NODE);
     if let Some(version) = read_nodejs_version(VENDOR_AGENT_PATH_NODE) {
         debug!("✓ Detected Node.js agent version: {} from {}", version, VENDOR_AGENT_PATH_NODE);
         return (Some(version), Some("Node".to_string()));
     }
 
-    // Try Python agent (layer)
     for path in LAYER_AGENT_PATHS_PYTHON {
         debug!("Checking Python layer path: {}", path);
         if let Some(version) = read_python_version(path) {
@@ -166,14 +156,12 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         }
     }
 
-    // Try Python agent (vendor)
     debug!("Checking Python vendor path: {}", VENDOR_AGENT_PATH_PYTHON);
     if let Some(version) = read_python_version(VENDOR_AGENT_PATH_PYTHON) {
         debug!("✓ Detected Python agent version: {} from {}", version, VENDOR_AGENT_PATH_PYTHON);
         return (Some(version), Some("Python".to_string()));
     }
 
-    // Try Ruby agent (layer)
     for path in LAYER_AGENT_PATHS_RUBY {
         debug!("Checking Ruby layer path: {}", path);
         if let Some(version) = read_ruby_version(path) {
@@ -182,14 +170,12 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         }
     }
 
-    // Try Ruby agent (vendor)
     debug!("Checking Ruby vendor path: {}", VENDOR_AGENT_PATH_RUBY);
     if let Some(version) = read_ruby_version(VENDOR_AGENT_PATH_RUBY) {
         debug!("✓ Detected Ruby agent version: {} from {}", version, VENDOR_AGENT_PATH_RUBY);
         return (Some(version), Some("Ruby".to_string()));
     }
 
-    // Try .NET agent (layer)
     for path in LAYER_AGENT_PATH_DOTNET {
         debug!("Checking .NET layer path: {}", path);
         if let Some(version) = read_dotnet_version(path) {
@@ -211,7 +197,6 @@ fn read_nodejs_version(base_path: &str) -> Option<String> {
 
     match fs::read_to_string(&package_json_path) {
         Ok(content) => {
-            // Parse JSON to extract version
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
                 if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
                     return Some(version.to_string());
@@ -234,7 +219,6 @@ fn read_python_version(base_path: &str) -> Option<String> {
         return None;
     }
 
-    // Try version.py first
     let version_py_path = format!("{}/version.py", base_path);
     debug!("  Trying version.py: {}", version_py_path);
     if Path::new(&version_py_path).exists() {
@@ -245,7 +229,6 @@ fn read_python_version(base_path: &str) -> Option<String> {
         }
     }
 
-    // Try __init__.py
     let init_py_path = format!("{}/__init__.py", base_path);
     debug!("  Trying __init__.py: {}", init_py_path);
     if Path::new(&init_py_path).exists() {
@@ -256,16 +239,13 @@ fn read_python_version(base_path: &str) -> Option<String> {
         }
     }
 
-    // Try METADATA file (common in pip installed packages)
     let metadata_path = format!("{}-*.dist-info/METADATA", base_path);
     debug!("  Trying METADATA pattern: {}", metadata_path);
 
-    // Also check parent directory for dist-info
     if let Some(parent) = Path::new(base_path).parent() {
         let dist_info_pattern = format!("{}/newrelic-*.dist-info/METADATA", parent.display());
         debug!("  Trying dist-info METADATA: {}", dist_info_pattern);
 
-        // Try to find .dist-info directories
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -291,14 +271,10 @@ fn read_python_version(base_path: &str) -> Option<String> {
 fn extract_python_version_from_file(file_path: &str) -> Option<String> {
     match fs::read_to_string(file_path) {
         Ok(content) => {
-            // Look for version patterns like:
-            // __version__ = '1.2.3'
-            // version = "1.2.3"
-            // VERSION = (1, 2, 3)
+           
             for line in content.lines() {
                 let line = line.trim();
 
-                // Match __version__ = '1.2.3' or version = "1.2.3"
                 if (line.starts_with("__version__") || line.starts_with("version"))
                     && line.contains('=') {
                     if let Some(version_part) = line.split('=').nth(1) {
@@ -324,7 +300,6 @@ fn extract_python_version_from_file(file_path: &str) -> Option<String> {
 fn extract_python_version_from_metadata(metadata_path: &std::path::Path) -> Option<String> {
     match fs::read_to_string(metadata_path) {
         Ok(content) => {
-            // Look for "Version: 1.2.3" line in METADATA
             for line in content.lines() {
                 let line = line.trim();
                 if line.starts_with("Version:") {
@@ -347,18 +322,14 @@ fn extract_python_version_from_metadata(metadata_path: &std::path::Path) -> Opti
 
 /// Read Ruby agent version
 fn read_ruby_version(base_path: &str) -> Option<String> {
-    // Ruby gem version is often in the directory name itself
-    // e.g., /opt/ruby/gems/3.3.0/gems/newrelic_rpm-9.5.0
     if let Some(dir_name) = Path::new(base_path).file_name() {
         if let Some(name) = dir_name.to_str() {
-            // Extract version from directory name like "newrelic_rpm-9.5.0"
             if let Some(version_part) = name.split('-').nth(1) {
                 return Some(version_part.to_string());
             }
         }
     }
 
-    // Also try reading from version.rb
     let version_rb_path = format!("{}/lib/new_relic/version.rb", base_path);
     if Path::new(&version_rb_path).exists() {
         if let Some(version) = extract_ruby_version_from_file(&version_rb_path) {
@@ -373,7 +344,6 @@ fn read_ruby_version(base_path: &str) -> Option<String> {
 fn extract_ruby_version_from_file(file_path: &str) -> Option<String> {
     match fs::read_to_string(file_path) {
         Ok(content) => {
-            // Look for VERSION = '1.2.3' pattern
             for line in content.lines() {
                 let line = line.trim();
                 if line.starts_with("VERSION") && line.contains('=') {
@@ -398,7 +368,6 @@ fn extract_ruby_version_from_file(file_path: &str) -> Option<String> {
 
 /// Read .NET agent version
 fn read_dotnet_version(base_path: &str) -> Option<String> {
-    // Try reading version from newrelic.config or VERSION file
     let version_file = format!("{}/VERSION", base_path);
     if Path::new(&version_file).exists() {
         if let Ok(content) = fs::read_to_string(&version_file) {
@@ -412,17 +381,18 @@ fn read_dotnet_version(base_path: &str) -> Option<String> {
     None
 }
 
-/// Async layer version detection using AWS Lambda API
-async fn detect_layer_version_async() -> Option<String> {
-    debug!("Detecting layer version (async)...");
+/// Synchronous layer version detection (no AWS API calls)
+/// Only checks environment variables and filesystem - fast enough for first invocation
+fn detect_layer_version_sync() -> Option<String> {
+    debug!("Detecting layer version (sync - no AWS API calls)...");
 
-    // Option 1: Check for user-provided layer version (fastest, recommended)
+    // Check env var first (instant)
     if let Ok(layer_version) = std::env::var("NEW_RELIC_LAYER_VERSION") {
         debug!("Layer version from NEW_RELIC_LAYER_VERSION: {}", layer_version);
         return Some(layer_version);
     }
 
-    // Option 2: Try AWS_LAMBDA_LAYERS environment variable (rarely available)
+    // Check AWS_LAMBDA_LAYERS env var (instant, set by Lambda runtime)
     match std::env::var("AWS_LAMBDA_LAYERS") {
         Ok(layers) => {
             debug!("AWS_LAMBDA_LAYERS found: {}", layers);
@@ -431,32 +401,44 @@ async fn detect_layer_version_async() -> Option<String> {
             }
         }
         Err(_) => {
-            debug!("AWS_LAMBDA_LAYERS environment variable not set (this is normal)");
+            debug!("AWS_LAMBDA_LAYERS environment variable not set (will try filesystem)");
         }
     }
 
-    // Option 3: Fetch from AWS Lambda API
-    debug!("Attempting to fetch layer info from AWS Lambda API...");
+    // Fall back to filesystem detection (also fast, no network)
+    debug!("Checking filesystem for layer markers...");
+    detect_layer_from_filesystem()
+}
+
+/// Async layer version detection using AWS Lambda API
+/// This makes AWS API calls - used as fallback when env vars don't have layer info
+/// Public so tagging background task can use it as fallback
+pub async fn detect_layer_version_async() -> Option<String> {
+    debug!("Detecting layer version (async - includes AWS API calls)...");
+
+    // First try the fast sync methods
+    if let Some(layer_version) = detect_layer_version_sync() {
+        return Some(layer_version);
+    }
+
+    // Only if sync detection failed, make AWS API call
+    debug!("Sync detection failed, attempting to fetch layer info from AWS Lambda API...");
     match aws_layer::fetch_layer_info_from_aws().await {
         Some(layer_info) => {
             debug!("✓ Successfully fetched layer info from AWS: {}", layer_info);
-            return Some(layer_info);
+            Some(layer_info)
         }
         None => {
             debug!("✗ Failed to fetch layer info from AWS Lambda API");
+            None
         }
     }
-
-    // Option 4: Try filesystem detection
-    debug!("Falling back to filesystem detection...");
-    detect_layer_from_filesystem()
 }
 
 /// Detect layer from filesystem when environment variable is not available
 fn detect_layer_from_filesystem() -> Option<String> {
     debug!("Attempting to detect layer from filesystem...");
 
-    // Check for New Relic layer marker files
     let layer_markers = vec![
         "/opt/newrelic-layer-version",
         "/opt/extensions/newrelic-lambda-extension",
@@ -468,9 +450,7 @@ fn detect_layer_from_filesystem() -> Option<String> {
         }
     }
 
-    // Try to read AWS Lambda execution environment info
     if let Ok(env_file) = std::fs::read_to_string("/proc/self/environ") {
-        // Parse null-separated environment variables
         for env_var in env_file.split('\0') {
             if env_var.starts_with("AWS_LAMBDA") || env_var.contains("layer") {
                 debug!("Found in environ: {}", env_var);
@@ -484,17 +464,13 @@ fn detect_layer_from_filesystem() -> Option<String> {
 
 /// Parse layer version from AWS_LAMBDA_LAYERS environment variable
 fn parse_layer_version_from_env(layers_str: &str) -> Option<String> {
-    // Lambda layers env var format: comma-separated list of layer ARNs
-    // Example: arn:aws:lambda:us-east-1:123456789012:layer:NewRelicPython313X86:93
     for layer in layers_str.split(',') {
         let layer = layer.trim();
         if layer.contains("newrelic") || layer.contains("NewRelic") {
-            // Extract layer name and version
             let parts: Vec<&str> = layer.split(':').collect();
             if parts.len() >= 8 {
                 let layer_name = parts[6];
                 let layer_version = parts[7];
-                // Format: NRTestRustExtensionPython313X86:93
                 return Some(format!("{}:{}", layer_name, layer_version));
             }
         }
@@ -517,7 +493,7 @@ mod tests {
         };
 
         let tags = version_info.as_tags();
-        assert!(tags.len() >= 2); // At least extension and layer version
+        assert!(tags.len() >= 2);
     }
 
     #[test]

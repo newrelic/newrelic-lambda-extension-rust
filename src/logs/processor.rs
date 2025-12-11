@@ -12,9 +12,11 @@ use std::{
     time::Duration,
 };
 
+use crate::apm::app::ApmApp;
+
 /// Safe mutex operations that won't panic and allow graceful degradation
 trait SafeMutexOps<T> {
-    /// Safely lock a mutex, returning None if poisoned (instead of panicking)
+   
     fn safe_lock(&self) -> Option<std::sync::MutexGuard<T>>;
 }
 
@@ -33,12 +35,10 @@ impl<T> SafeMutexOps<T> for Mutex<T> {
 /// State of trace ID extraction for the current invocation
 #[derive(Debug, Clone, PartialEq)]
 enum TraceIdExtractionState {
-    /// Waiting to attempt trace ID extraction
+   
     Waiting,
-    /// Successfully extracted a trace ID
+   
     Extracted,
-    /// Attempted extraction but failed (error or no trace ID found)
-    Failed,
 }
 
 /// The LogProcessor is responsible for handling and transforming function and extension logs.
@@ -48,42 +48,33 @@ pub struct LogProcessor {
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     invocation_context: Arc<Mutex<InvocationContext>>,
-    /// Buffered logs waiting for trace ID extraction (only allocated if collection is enabled)
+
     buffered_logs: Option<Arc<Mutex<Vec<payload::LogMessage>>>>,
-    /// Current state of trace ID extraction (only allocated if collection is enabled)
+
     trace_extraction_state: Option<Arc<Mutex<TraceIdExtractionState>>>,
-    /// Buffered logs waiting for request_id from NextEvent (always allocated)
+
     request_id_buffer: Arc<Mutex<Vec<payload::LogMessage>>>,
-    /// Timestamp when current invocation started (for filtering late telemetry)
+
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
-    /// Failed logs buffer - logs that failed to send after all retries (with metadata stripped)
+
+    apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
+
+    /// Track pending auto-flush tasks to ensure they complete before function ends
+    pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
-/// Failed log entry that stores the original log without invocation-specific metadata
 #[derive(Debug, Clone)]
 struct FailedLogEntry {
-    /// Original log message (with original attribution preserved)
     log_message: payload::LogMessage,
-    /// Original request ID where this log was generated
     original_request_id: String,
-    /// Original function ARN where this log was generated
-    original_arn: String,
-    /// When the log was originally generated
-    original_timestamp: chrono::DateTime<chrono::Utc>,
-    /// When this log failed (for cleanup of very old logs)
-    failed_at: chrono::DateTime<chrono::Utc>,
-    /// Number of retry attempts for this specific log
     retry_count: usize,
 }
 
 /// Configuration constants for batching and retry logic
-const MAX_BATCH_SIZE: usize = 100; // Maximum logs per batch to avoid 413 errors
-const MAX_RETRIES: usize = 3; // Maximum retry attempts for failed sends
-const MAX_FAILED_LOG_AGE_HOURS: i64 = 24; // Drop failed logs older than 24 hours
-const MAX_FAILED_LOGS_BUFFER_SIZE: usize = 1000; // Limit failed buffer size
+const MAX_BATCH_SIZE: usize = 100;
+const MAX_RETRIES: usize = 3;
 
-// Standardized backoff delays: 200ms, 400ms, 900ms
 fn get_backoff_delay(retry_attempt: usize) -> Duration {
     match retry_attempt {
         1 => Duration::from_millis(200),
@@ -94,13 +85,13 @@ fn get_backoff_delay(retry_attempt: usize) -> Duration {
 
 impl LogProcessor {
     
-    /// Creates a new LogProcessor.
+   
     pub fn new(
         newrelic_client: Arc<NewRelicClient>,
         config: Arc<ExtensionConfig>,
         invocation_context: Arc<Mutex<InvocationContext>>,
+        apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     ) -> Self {
-        // Only allocate trace ID structures if collection is enabled
         let (buffered_logs, trace_extraction_state) = if config.new_relic.collect_trace_id {
             (
                 Some(Arc::new(Mutex::new(Vec::new()))),
@@ -120,37 +111,21 @@ impl LogProcessor {
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+            apm_app,
+            pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Creates a no-op LogProcessor for disabled mode.
-    pub fn new_noop() -> Self {
-        use crate::config::ExtensionConfig;
-        use crate::context::InvocationContext;
-        
-        let noop_config = Arc::new(ExtensionConfig::default());
-        let noop_invocation_context = Arc::new(Mutex::new(InvocationContext::default()));
-        let noop_client = Arc::new(NewRelicClient::new_noop());
-        
-        Self {
-            log_batch: Arc::new(Mutex::new(Vec::new())),
-            newrelic_client: noop_client,
-            config: noop_config,
-            invocation_context: noop_invocation_context,
-            buffered_logs: None,
-            trace_extraction_state: None,
-            request_id_buffer: Arc::new(Mutex::new(Vec::new())),
-            invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
-            failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+   
+    /// Add a log message directly to the batch (used by platform processor)
+    pub fn add_log_to_batch(&self, log_message: payload::LogMessage) {
+        if let Ok(mut batch) = self.log_batch.lock() {
+            batch.push(log_message);
         }
     }
-    pub fn get_invocation_context(&self) -> Arc<Mutex<InvocationContext>> {
-        Arc::clone(&self.invocation_context)
-    }
 
-    /// Update the invocation context for a new request (used by global log processor)
+   
     pub fn update_invocation_context(&self, new_context: Arc<Mutex<InvocationContext>>) {
-        // Copy the new context data to the existing context to maintain the same Arc reference
         if let (Some(mut current), Some(new)) = (self.invocation_context.safe_lock(), new_context.safe_lock()) {
             current.request_id = new.request_id.clone();
             current.invoked_function_arn = new.invoked_function_arn.clone();
@@ -159,7 +134,7 @@ impl LogProcessor {
             warn!("Failed to update invocation context - mutex poisoned, extension continuing in degraded mode");
         }
     }
-    /// Updates the invocation start time (called when new invocation begins)
+   
     pub fn set_invocation_start_time(&self, start_time: chrono::DateTime<chrono::Utc>) {
         if let Some(mut guard) = self.invocation_start_time.safe_lock() {
             *guard = start_time;
@@ -168,10 +143,9 @@ impl LogProcessor {
         }
     }
 
-    /// Applies current invocation metadata to a log message
+   
     fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
-            // Apply current request_id if available and valid
             if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
                 log_message.attributes.insert("aws.lambda_request_id".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
@@ -179,13 +153,11 @@ impl LogProcessor {
                     serde_json::Value::String(context.request_id.clone()));
             }
 
-            // Apply current invoked_function_arn if available and valid
             if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
                 log_message.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(context.invoked_function_arn.clone()));
             }
 
-            // Apply current trace_id if available
             if let Some(ref trace_id) = context.trace_id {
                 log_message.attributes.insert("trace.id".to_string(),
                     serde_json::Value::String(trace_id.clone()));
@@ -193,166 +165,24 @@ impl LogProcessor {
         } else {
             warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
         }
-
-        log_message
-    }
-
-    /// Adds dual attribution metadata to a failed log being retried
-    /// Preserves original request_id while adding retry context
-    fn add_retry_metadata(
-        &self,
-        mut log_message: payload::LogMessage,
-        original_request_id: &str,
-        retry_attempt: usize,
-        original_timestamp: chrono::DateTime<chrono::Utc>,
-    ) -> payload::LogMessage {
-        // Get current invocation context for retry metadata
-        if let Some(context) = self.invocation_context.safe_lock() {
-            // Add retry metadata while keeping original attribution
-            log_message.attributes.insert(
-                "retry_request_id".to_string(),
-                serde_json::Value::String(context.request_id.clone())
-            );
-            log_message.attributes.insert(
-                "retry_attempt".to_string(),
-                serde_json::Value::Number(retry_attempt.into())
-            );
-            log_message.attributes.insert(
-                "original_request_id".to_string(),
-                serde_json::Value::String(original_request_id.to_string())
-            );
-            log_message.attributes.insert(
-                "original_timestamp".to_string(),
-                serde_json::Value::Number(original_timestamp.timestamp_millis().into())
-            );
-            log_message.attributes.insert(
-                "retry_timestamp".to_string(),
-                serde_json::Value::Number(chrono::Utc::now().timestamp_millis().into())
-            );
-        } else {
-            warn!("Cannot add retry metadata - context mutex poisoned, log will be sent without retry info");
-        }
-
-        log_message
-    }
-
-    /// Cleans up old failed logs and limits buffer size
-    fn cleanup_failed_logs_buffer(&self) {
-        if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-            let now = chrono::Utc::now();
-            
-            // Remove logs older than MAX_FAILED_LOG_AGE_HOURS
-            let initial_count = failed_buffer.len();
-            failed_buffer.retain(|entry| {
-                let age_hours = (now - entry.failed_at).num_hours();
-                age_hours < MAX_FAILED_LOG_AGE_HOURS
-            });
-            
-            let after_age_cleanup = failed_buffer.len();
-            if after_age_cleanup < initial_count {
-                info!("Cleaned up {} old failed logs (older than {} hours)", 
-                      initial_count - after_age_cleanup, MAX_FAILED_LOG_AGE_HOURS);
-            }
-            
-            // If still too many, remove oldest logs to stay within limit
-            if failed_buffer.len() > MAX_FAILED_LOGS_BUFFER_SIZE {
-                let excess = failed_buffer.len() - MAX_FAILED_LOGS_BUFFER_SIZE;
-                failed_buffer.drain(0..excess);
-                warn!("Failed logs buffer exceeded limit, dropped {} oldest entries", excess);
-            }
-        } else {
-            warn!("Cannot cleanup failed logs buffer - mutex poisoned, skipping cleanup");
-        }
-    }
-
-    /// Retry failed logs from previous invocations at the start of a new invocation
-    pub async fn retry_failed_logs_before_invocation(&self) -> std::io::Result<()> {
-        // First, cleanup old logs and limit buffer size
-        self.cleanup_failed_logs_buffer();
         
-        let failed_entries = {
-            if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-                std::mem::take(&mut *failed_buffer)
-            } else {
-                warn!("Cannot retry failed logs - buffer mutex poisoned, skipping retry");
-                return Ok(());
-            }
-        };
-
-        if failed_entries.is_empty() {
-            return Ok(());
-        }
-
-        let total_failed = failed_entries.len();
-        let high_retry_logs = failed_entries.iter().filter(|e| e.retry_count >= MAX_RETRIES - 1).count();
-        
-        if high_retry_logs > 0 {
-            warn!("Retrying {} failed logs (including {} near max retry limit) from previous invocations", 
-                  total_failed, high_retry_logs);
-        } else {
-            info!("Retrying {} failed logs from previous invocations with current context", total_failed);
-        }
-
-        // Convert failed entries back to log messages with current invocation metadata
-        let mut logs_to_retry = Vec::with_capacity(failed_entries.len());
-        let mut logs_to_drop = Vec::with_capacity(failed_entries.len() / 10); // Estimate 10% might be dropped
-
-        for mut entry in failed_entries {
-            // Check if this log has exceeded max retries
-            if entry.retry_count >= MAX_RETRIES {
-                logs_to_drop.push(entry);
-            } else {
-                // Add dual attribution (original + retry metadata)
-                entry.log_message = self.add_retry_metadata(
-                    entry.log_message,
-                    &entry.original_request_id,
-                    entry.retry_count + 1,
-                    entry.original_timestamp,
-                );
-                entry.retry_count += 1;
-                logs_to_retry.push(entry);
-            }
-        }
-
-        if !logs_to_drop.is_empty() {
-            warn!("Dropping {} failed logs that exceeded max retry attempts", logs_to_drop.len());
-        }
-
-        if logs_to_retry.is_empty() {
-            return Ok(());
-        }
-
-        // Extract just the log messages for sending
-        let log_messages: Vec<payload::LogMessage> = logs_to_retry
-            .iter()
-            .map(|entry| entry.log_message.clone())
-            .collect();
-
-        // Try to send the logs with current context
-        match self.send_buffered_logs_with_retry(log_messages).await {
-            Ok(()) => {
-                info!("Successfully sent {} previously failed logs", logs_to_retry.len());
-            }
-            Err(e) => {
-                error!("Failed to send previously failed logs: {}", e);
-                
-                // Put back the failed entries (with incremented retry count, keeping original attribution)
-                {
-                    let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                    for mut entry in logs_to_retry {
-                        entry.failed_at = chrono::Utc::now();
-                        failed_buffer.push(entry);
+        if let Some(ref apm_app_arc) = self.apm_app {
+            if let Ok(apm_guard) = apm_app_arc.try_read() {
+                if let Some(ref app) = *apm_guard {
+                    let entity_guid = app.get_entity_guid();
+                    if !entity_guid.is_empty() {
+                        log_message.attributes.insert("entity.guid".to_string(),
+                            serde_json::Value::String(entity_guid.to_string()));
                     }
                 }
             }
         }
 
-        Ok(())
+        log_message
     }
 
-    /// Processes a single log telemetry record, adding it to the batch if valid.
-    pub fn process_record(&self, record: TelemetryRecord) {
-        // Check if this log type should be sent based on configuration
+   
+    pub async fn process_record(&self, record: TelemetryRecord) {
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
@@ -367,30 +197,24 @@ impl LogProcessor {
                 }
             }
             _ => {
-                // Unknown log type - process it
                 trace!("Processing unknown log type: {}", record.record_type);
             }
         }
         
-        // Extract message for recursive filtering - handle both string and object records
         let message_str = match &record.record {
             serde_json::Value::String(s) => s.as_str(),
             serde_json::Value::Object(obj) => {
                 if let Some(message_value) = obj.get("message") {
                     message_value.as_str().unwrap_or("")
                 } else {
-                    // If no message field, convert the entire object to string for filtering
                     &serde_json::to_string(&record.record).unwrap_or_default()
                 }
             }
             _ => {
-                // For other types, convert to string for filtering
                 &serde_json::to_string(&record.record).unwrap_or_default()
             }
         };
         
-        // CRITICAL: Prevent infinite recursion by filtering ALL extension-related log messages
-        // This must be comprehensive to prevent feedback loops
         if 
            message_str.contains("Processing log record") ||
            message_str.contains("Added log to batch") ||
@@ -423,12 +247,10 @@ impl LogProcessor {
            message_str.contains("LogProcessor received record type") ||
            message_str.contains("Processing unknown log type") ||
            message_str.contains("Added log to batch for coordinated flush") {
-            // Silently drop these messages to prevent infinite recursion
             return;
         }
     
-        if let Some(log_message) = self.to_log_message(record) {
-            // CRITICAL FIX: Always check if we have valid invocation context before processing
+        if let Some(log_message) = self.to_log_message(record.clone()) {
             let has_valid_context = {
                 let context = self.invocation_context.lock().unwrap();
                 !context.request_id.is_empty() && 
@@ -437,18 +259,134 @@ impl LogProcessor {
                 context.invoked_function_arn != "temp"
             };
     
-            // If we don't have valid invocation context, buffer the log
             if !has_valid_context {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
                 request_buffer.push(log_message);
                
                 return;
             }
+            
+            // Check if we're actually in APM mode (both outer and inner Option must be Some)
+            let is_apm_mode = self.apm_app.as_ref().and_then(|apm_arc| {
+                apm_arc.try_read().ok().and_then(|guard| {
+                    if guard.is_some() { Some(()) } else { None }
+                })
+            }).is_some();
+
+            if is_apm_mode {
+                if let Some(ref apm_app_arc) = self.apm_app {
+                    if record.record_type == "function" && message_str.len() > 0 {
+                        if message_str.contains("Task timed out") ||
+                           message_str.contains("error") || message_str.contains("Error") ||
+                           message_str.contains("Exception") || message_str.contains("exception") ||
+                           message_str.contains("Fatal") || message_str.contains("fatal") {
+
+                            info!("APM mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+
+                        let (request_id, function_arn) = {
+                            let context = self.invocation_context.lock().unwrap();
+                            (context.request_id.clone(), context.invoked_function_arn.clone())
+                        };
+
+                        info!("APM mode: Sending error event for request_id: {}", request_id);
+
+                        let apm_clone = Arc::clone(apm_app_arc);
+                        let msg_clone = message_str.to_string();
+
+                        // Store error details for potential platform fault correlation
+                        let error_type = if message_str.contains("Task timed out") {
+                            "Timeout"
+                        } else if message_str.contains("Exception") || message_str.contains("exception") {
+                            "Exception"
+                        } else if message_str.contains("Fatal") || message_str.contains("fatal") {
+                            "Fatal"
+                        } else {
+                            "Error"
+                        };
+
+                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                            *last_error = Some(crate::error_synthesis::LastDetectedError {
+                                request_id: request_id.clone(),
+                                error_type: error_type.to_string(),
+                            });
+                        }
+
+                        // Send error asynchronously during the current invoke
+                        // This prevents accumulation across invocations
+                        let apm_guard = apm_clone.read().await;
+                        if let Some(ref app) = *apm_guard {
+                            if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
+                                debug!("Failed to send error event from function log fault: {}", e);
+                            }
+                        }
+                    }
+                }
+                }
+            } else {
+                // Standard (non-APM) mode: Send errors to telemetry endpoint
+                if record.record_type == "function" && message_str.len() > 0 {
+                    if message_str.contains("Task timed out") ||
+                       message_str.contains("error") || message_str.contains("Error") ||
+                       message_str.contains("Exception") || message_str.contains("exception") ||
+                       message_str.contains("Fatal") || message_str.contains("fatal") {
+
+                        info!("Standard mode: Error detected in function log: {}", message_str.chars().take(100).collect::<String>());
+
+                        let (request_id, function_arn) = {
+                            let context = self.invocation_context.lock().unwrap();
+                            (context.request_id.clone(), context.invoked_function_arn.clone())
+                        };
+
+                        info!("Standard mode: Sending error for request_id: {}", request_id);
+
+                        // Determine error type - use consistent LambdaError for all function errors
+                        // (except timeout which should match platform timeout)
+                        let error_type = if message_str.contains("Task timed out") {
+                            "LambdaTimeout"  // Match platform timeout error class
+                        } else {
+                            "LambdaError"    // Use single consistent error class
+                        };
+
+                        let client = Arc::clone(&self.newrelic_client);
+                        let config = Arc::clone(&self.config);
+                        let msg_clone = message_str.to_string();
+                        let error_type_clone = error_type.to_string();
+
+                        // Format error message like timeout/platform errors for Error Inbox recognition
+                        // Format: "{ISO_TIMESTAMP} {REQUEST_ID} {ERROR_CLASS} {original_error_message}"
+                        // Keep the original error message with [ERROR] prefix intact
+                        let formatted_error_msg = format!(
+                            "{} {} {} {}",
+                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                            request_id,
+                            error_type,  // LambdaError or LambdaTimeout
+                            msg_clone    // Keep original message with [ERROR] prefix
+                        );
+
+                        // Store error details for potential platform fault correlation
+                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                            *last_error = Some(crate::error_synthesis::LastDetectedError {
+                                request_id: request_id.clone(),
+                                error_type: error_type_clone.clone(),
+                            });
+                        }
+
+                        // Send error asynchronously during the current invoke
+                        // This prevents accumulation across invocations
+                        crate::error_synthesis::send_lambda_error(
+                            &formatted_error_msg,  // Send formatted message, not raw log
+                            &request_id,
+                            &function_arn,
+                            &error_type_clone,
+                            &client,
+                            &config,
+                        ).await;
+                    }
+                }
+            }
     
-            // Apply current invocation metadata (this will now have valid values)
             let log_message = self.apply_current_invocation_metadata(log_message);
     
-            // Check if trace ID collection is enabled and we should buffer for trace ID
             if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
                 (&self.trace_extraction_state, &self.buffered_logs) {
                 
@@ -458,67 +396,60 @@ impl LogProcessor {
                     context.trace_id.is_some()
                 };
                 
-                // Buffer logs only if we're still waiting for trace ID extraction attempt
                 if *state == TraceIdExtractionState::Waiting && !has_trace_id {
-                    drop(state); // Release lock before modifying buffer
+                    drop(state);
                     let mut buffered = buffered_logs.lock().unwrap();
                     buffered.push(log_message);
                     return;
                 }
             }
             
-            // Add to main batch for sending
             let mut batch = self.log_batch.lock().unwrap();
             batch.push(log_message);
             let batch_size = batch.len();
-            
-            // Check if this is a warm start for performance optimization
-            let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
-            
-            // Improved batching strategy:
-            // - Cold starts: Send smaller batches immediately for visibility
-            // - Warm starts: Use larger batches but still send during execution to avoid loss
-            let flush_threshold = if is_warm_start { 25 } else { 10 };
-            let should_flush = batch_size >= flush_threshold;
-            
+
+            // Auto-flush threshold: 25 logs for faster delivery
+            // End-of-request flush ensures completeness of remaining logs
+            const FLUSH_THRESHOLD: usize = 25;
+            let should_flush = batch_size >= FLUSH_THRESHOLD;
+
             if should_flush {
                 let logs_to_send = std::mem::take(&mut *batch);
-                drop(batch); // Release lock
-                
-                debug!("Flushing batch of {} logs (warm_start={}, threshold={})", 
-                       logs_to_send.len(), is_warm_start, flush_threshold);
-                
+                drop(batch);
+
+                debug!("Auto-flushing batch of {} logs (threshold={})",
+                       logs_to_send.len(), FLUSH_THRESHOLD);
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
-                
-                // Send async to not block other processing
-                tokio::spawn(async move {
-                    if let Err(e) = client.send_logs(&config, logs_to_send, &context.invoked_function_arn).await {
-                        error!("Failed to send log batch: {}", e);
-                    } else {
-                        debug!("Successfully sent log batch");
-                    }
+
+                // Spawn background task with proper 1MB chunking
+                // Store handle to ensure it completes before function ends
+                let handle = tokio::spawn(async move {
+                    Self::send_logs_with_chunking(&client, &config, logs_to_send, &context.invoked_function_arn).await;
                 });
+
+                // Track this handle so end-of-request flush can await it
+                if let Ok(mut handles) = self.pending_flush_handles.lock() {
+                    handles.push(handle);
+                }
             }
         } else {
             warn!("Failed to convert telemetry record to log message");
         }
     }
 
-    /// Converts a TelemetryRecord into a LogMessage, if applicable.
+   
     fn to_log_message(&self, record: TelemetryRecord) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
         
-        // Try multiple ways to extract the message from the telemetry record
         let message = if let Some(message_value) = record.record.get("message") {
-            // Standard case: message field exists
             match message_value {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string()
             }
         } else {
-            // Fallback: use the entire record as the message
             match &record.record {
                 serde_json::Value::String(s) => s.clone(),
                 other => other.to_string()
@@ -527,18 +458,13 @@ impl LogProcessor {
         
         let mut attributes = serde_json::Map::new();
         
-        // Add log level - extract from message content for proper filtering in New Relic UI
         let log_level = self.extract_log_level(&message);
         attributes.insert("level".to_string(), log_level.into());
         
-        // Add newrelic.logPattern
         attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
         
-        // Add newrelic.source
         attributes.insert("newrelic.source".to_string(), "api.logs".into());
     
-        // NOTE: Do NOT add AWS Lambda attributes here - they will be added later
-        // when we have valid invocation context via apply_current_invocation_metadata()
     
         Some(payload::LogMessage {
             timestamp,
@@ -547,68 +473,60 @@ impl LogProcessor {
         })
     }
 
-    /// Extract log level from log message content - optimized case-insensitive check
     fn extract_log_level(&self, message: &str) -> &'static str {
-        // Check for common log level patterns (case insensitive) without allocating
-        if message.contains("ERROR") || message.contains("error")
-           || message.contains("FATAL") || message.contains("fatal") {
+
+        let check_str = &message[..message.len().min(100)]; // Check first 100 chars
+        
+        if let Some(bracket_end) = check_str.find(']') {
+            let after_bracket = &check_str[bracket_end+1..].trim_start();
+            if after_bracket.starts_with("TRACE") || after_bracket.starts_with("trace") {
+                return "TRACE";
+            } else if after_bracket.starts_with("DEBUG") || after_bracket.starts_with("debug") {
+                return "DEBUG";
+            } else if after_bracket.starts_with("INFO") || after_bracket.starts_with("info") {
+                return "INFO";
+            } else if after_bracket.starts_with("WARN") || after_bracket.starts_with("warn") 
+                      || after_bracket.starts_with("WARNING") || after_bracket.starts_with("warning") {
+                return "WARN";
+            } else if after_bracket.starts_with("ERROR") || after_bracket.starts_with("error") 
+                      || after_bracket.starts_with("FATAL") || after_bracket.starts_with("fatal") {
+                return "ERROR";
+            }
+        }
+        
+        if check_str.contains(" ERROR ") || check_str.contains(" error ") 
+           || check_str.contains(" FATAL ") || check_str.contains(" fatal ")
+           || check_str.starts_with("ERROR") || check_str.starts_with("error")
+           || check_str.starts_with("FATAL") || check_str.starts_with("fatal") {
             "ERROR"
-        } else if message.contains("WARN") || message.contains("warn")
-                  || message.contains("WARNING") || message.contains("warning") {
+        } else if check_str.contains(" WARN ") || check_str.contains(" warn ")
+                  || check_str.contains(" WARNING ") || check_str.contains(" warning ")
+                  || check_str.starts_with("WARN") || check_str.starts_with("warn")
+                  || check_str.starts_with("WARNING") || check_str.starts_with("warning") {
             "WARN"
-        } else if message.contains("DEBUG") || message.contains("debug") {
+        } else if check_str.contains(" DEBUG ") || check_str.contains(" debug ")
+                  || check_str.starts_with("DEBUG") || check_str.starts_with("debug") {
             "DEBUG"
-        } else if message.contains("TRACE") || message.contains("trace") {
+        } else if check_str.contains(" TRACE ") || check_str.contains(" trace ")
+                  || check_str.starts_with("TRACE") || check_str.starts_with("trace") {
             "TRACE"
-        } else if message.contains("INFO") || message.contains("info") {
+        } else if check_str.contains(" INFO ") || check_str.contains(" info ")
+                  || check_str.starts_with("INFO") || check_str.starts_with("info") {
             "INFO"
         } else {
-            // Default to INFO if no level detected
             "INFO"
         }
     }
 
-    /// Called when a trace ID is extracted - updates all buffered logs and moves them to main batch for coordinated sending
-    pub fn on_trace_id_extracted_to_batch(&self, trace_id: &str) {
-        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) else {
-            return; // Nothing to do if trace ID collection is disabled
-        };
-
-        // Mark that we've successfully extracted the trace ID
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
-        
-        // Get all buffered logs
-        let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-        
-        if buffered_logs.is_empty() {
-            return;
-        }
-        
-        debug!("Moving {} trace-buffered logs to main batch with trace ID: {}", buffered_logs.len(), trace_id);
-        
-        // Update all buffered logs with the trace ID and move to main batch
-        let mut batch = self.log_batch.lock().unwrap();
-        for mut log in buffered_logs {
-            log.attributes.insert("trace.id".to_string(), trace_id.into());
-            batch.push(log);
-        }
-    }
-
-    /// Called when a trace ID is extracted - updates all buffered logs and sends them immediately
+   
     pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
             (&self.trace_extraction_state, &self.buffered_logs) else {
-            return Ok(()); // Nothing to do if trace ID collection is disabled
+            return Ok(());
         };
 
-        // Mark that we've successfully extracted the trace ID
         *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
         
-        // Get all buffered logs
         let mut buffered_logs = {
             let mut buffered = buffered_logs_arc.lock().unwrap();
             std::mem::take(&mut *buffered)
@@ -620,42 +538,14 @@ impl LogProcessor {
         
         debug!("Applied trace ID to {} buffered logs", buffered_logs.len());
         
-        // Update all buffered logs with the trace ID
         for log in &mut buffered_logs {
             log.attributes.insert("trace.id".to_string(), trace_id.into());
         }
         
-        // Send buffered logs immediately with chunking and retry logic
         self.send_buffered_logs_with_retry(buffered_logs).await
     }
 
-    /// Called when trace ID extraction fails - sends all buffered logs without trace ID
-    pub async fn on_trace_id_extraction_failed(&self) -> std::io::Result<()> {
-        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) else {
-            return Ok(()); // Nothing to do if trace ID collection is disabled
-        };
-
-        // Mark that we've attempted extraction but failed
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Failed;
-        
-        // Get all buffered logs
-        let buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-        
-        if buffered_logs.is_empty() {
-            return Ok(());
-        }
-        
-        warn!("Trace ID extraction failed - sending {} buffered logs without trace ID", buffered_logs.len());
-        
-        // Send buffered logs immediately with chunking and retry logic (without trace ID)
-        self.send_buffered_logs_with_retry(buffered_logs).await
-    }
-
-    /// Reset the trace ID collection state for a new invocation
+   
     pub fn reset_trace_id_state(&self) {
         if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
             (&self.trace_extraction_state, &self.buffered_logs) {
@@ -664,75 +554,57 @@ impl LogProcessor {
         }
     }
 
-
-
-    /// Flush all buffers with the previous invocation's context before starting new invocation
-    /// This ensures logs from previous invocation get the correct request_id and trace_id
-    pub async fn flush_with_previous_context(
-        &self, 
-        previous_request_id: &str, 
-        previous_trace_id: Option<&str>
-    ) -> std::io::Result<()> {
-        // Flush request_id buffer with previous context
-        let mut request_buffered_logs = {
-            let mut buffered = self.request_id_buffer.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-
-        // Update request_id buffered logs with previous context
-        for log_message in &mut request_buffered_logs {
-            log_message.attributes.insert("aws.lambda_request_id".to_string(), 
-                            serde_json::Value::String(previous_request_id.to_string()));
-            log_message.attributes.insert("faas.execution".to_string(), 
-                            serde_json::Value::String(previous_request_id.to_string()));
-            if let Some(trace_id) = previous_trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
-                                serde_json::Value::String(trace_id.to_string()));
-            }
-        }
-
-        // Flush trace_id buffer with previous context if enabled
-        let mut trace_buffered_logs = if let Some(ref buffered_logs_arc) = self.buffered_logs {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        } else {
-            Vec::new()
-        };
-
-        // Update trace_id buffered logs with previous context
-        for log_message in &mut trace_buffered_logs {
-            if let Some(trace_id) = previous_trace_id {
-                log_message.attributes.insert("trace.id".to_string(), 
-                                serde_json::Value::String(trace_id.to_string()));
-            }
-        }
-
-        // Combine all logs and send them
-        let mut all_logs = request_buffered_logs;
-        all_logs.extend(trace_buffered_logs);
-
-        // Also flush current batch
-        let current_batch = {
-            let mut batch_guard = self.log_batch.lock().unwrap();
-            std::mem::take(&mut *batch_guard)
-        };
-        all_logs.extend(current_batch);
-
-        if !all_logs.is_empty() {
-            info!("Flushing {} logs with previous invocation context (request_id: {})", 
-                  all_logs.len(), previous_request_id);
-            self.send_buffered_logs_with_retry(all_logs).await?;
-        }
-
-        // Reset trace ID state for new invocation
-        self.reset_trace_id_state();
-
-        Ok(())
-    }
-
-    /// Process buffered logs when request_id becomes available
-    /// This moves logs from request_id_buffer to the main processing flow
+   
+   
     pub fn process_buffered_logs_with_request_id(&self, request_id: &str) {
+        let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
+        
+        if is_warm_start {
+            let failed_logs = {
+                let mut buffer = self.failed_logs_buffer.lock().unwrap();
+                std::mem::take(&mut *buffer)
+            };
+            
+            if !failed_logs.is_empty() {
+                info!("Retrying {} failed logs from previous invocation", failed_logs.len());
+                
+                let client = Arc::clone(&self.newrelic_client);
+                let config = Arc::clone(&self.config);
+                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
+                
+                tokio::spawn(async move {
+                    let mut still_failed = Vec::new();
+                    
+                    for mut entry in failed_logs {
+                        entry.retry_count += 1;
+                        
+                        if entry.retry_count > MAX_RETRIES {
+                            warn!("Dropping log after {} retries (original request: {})", 
+                                  entry.retry_count, entry.original_request_id);
+                            continue;
+                        }
+                        
+                        let logs_to_send = vec![entry.log_message.clone()];
+                        match client.send_logs(&config, logs_to_send, "retry").await {
+                            Ok(()) => {
+                                debug!("Successfully retried failed log");
+                            }
+                            Err(e) => {
+                                debug!("Failed log retry failed again: {}", e);
+                                still_failed.push(entry);
+                            }
+                        }
+                    }
+                    
+                    if !still_failed.is_empty() {
+                        let mut buffer = failed_buffer.lock().unwrap();
+                        buffer.extend(still_failed);
+                        info!("Re-buffered {} logs that failed retry", buffer.len());
+                    }
+                });
+            }
+        }
+        
         let buffered_logs = {
             let mut buffer = self.request_id_buffer.lock().unwrap();
             std::mem::take(&mut *buffer)
@@ -742,14 +614,11 @@ impl LogProcessor {
             info!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
             
             for mut log_message in buffered_logs {
-                // Add the request_id to the log message
                 log_message.attributes.insert("aws.lambda_request_id".to_string(), 
                                 serde_json::Value::String(request_id.to_string()));
                 log_message.attributes.insert("faas.execution".to_string(), 
                                 serde_json::Value::String(request_id.to_string()));
                 
-                // Now process the log through the normal flow (check trace ID, etc.)
-                // Add to appropriate buffer based on trace ID collection state
                 if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
                     (&self.trace_extraction_state, &self.buffered_logs) {
                     
@@ -759,7 +628,6 @@ impl LogProcessor {
                         context.trace_id.is_some()
                     };
                     
-                    // Buffer logs only if we're still waiting for trace ID extraction attempt
                     if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                         drop(state);
                         let mut buffered = buffered_logs_arc.lock().unwrap();
@@ -768,35 +636,16 @@ impl LogProcessor {
                     }
                 }
                 
-                // Add to main batch for sending
                 let mut batch = self.log_batch.lock().unwrap();
                 batch.push(log_message);
             }
         }
     }
 
-    /// Clear the request_id when the invocation is complete
-    /// This ensures logs are buffered again for the next invocation until new request_id arrives
-    /// Note: We keep invoked_function_arn since it doesn't change between invocations
-    pub fn clear_request_id(&self) {
-        let mut context = self.invocation_context.lock().unwrap();
-        context.request_id = String::new(); // Use empty string instead of "unknown"
-        // Keep invoked_function_arn - it's the same for all invocations of this function
-        // context.invoked_function_arn = String::new(); // DON'T clear this
-        context.trace_id = None;
-        // Clear all buffers to prevent cross-invocation pollution
-        self.request_id_buffer.lock().unwrap().clear();
-        self.log_batch.lock().unwrap().clear();
-        self.failed_logs_buffer.lock().unwrap().clear();
-        if let Some(ref buffered_logs) = self.buffered_logs {
-            buffered_logs.lock().unwrap().clear();
-        }
-    }
 
 
-
-    /// Send buffered logs directly with chunking and retry logic
-    /// This bypasses the regular batch to ensure immediate sending with proper context
+   
+   
     async fn send_buffered_logs_with_retry(&self, logs: Vec<payload::LogMessage>) -> std::io::Result<()> {
         if logs.is_empty() {
             return Ok(());
@@ -806,7 +655,6 @@ impl LogProcessor {
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
         
-        // Split large batches into smaller chunks to avoid 413 errors
         let chunks: Vec<Vec<payload::LogMessage>> = logs
             .chunks(MAX_BATCH_SIZE)
             .map(|chunk| chunk.to_vec())
@@ -820,7 +668,6 @@ impl LogProcessor {
         let mut successful_chunks = 0;
         
         for (_chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            // Don't use failed buffer for trace ID buffered logs to prevent metadata pollution
             match self.send_chunk_with_retry_internal(&client, &config, chunk.clone(), &context.invoked_function_arn, false).await {
                 Ok(()) => {
                     successful_chunks += 1;
@@ -828,7 +675,6 @@ impl LogProcessor {
                 Err(e) => {
                     error!("Buffered logs send failed: {}", e);
                     failed_count += chunk.len();
-                    // These failed logs are dropped to prevent cross-invocation issues
                 }
             }
         }
@@ -843,8 +689,23 @@ impl LogProcessor {
         Ok(())
     }
 
-    /// Robust send method with chunking, retry logic, and proper error handling
+   
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        // First, await all pending auto-flush tasks to ensure they complete
+        // before we do the final flush (prevents logs from being cancelled)
+        let pending_handles = {
+            let mut handles = self.pending_flush_handles.lock().unwrap();
+            std::mem::take(&mut *handles)
+        };
+
+        if !pending_handles.is_empty() {
+            debug!("Waiting for {} pending auto-flush tasks to complete", pending_handles.len());
+            for handle in pending_handles {
+                let _ = handle.await; // Ignore JoinErrors, just ensure task completes
+            }
+            debug!("All pending auto-flush tasks completed");
+        }
+
         let batch = {
             let mut batch_guard = self.log_batch.lock().unwrap();
             std::mem::take(&mut *batch_guard)
@@ -855,23 +716,81 @@ impl LogProcessor {
             return Ok(());
         }
 
-        debug!("Sending {} logs to New Relic", batch.len());
+        let deduplicated_batch = {
+            use std::collections::HashMap;
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            
+            let mut seen = HashMap::new();
+            let mut unique_logs = Vec::new();
+            let mut duplicate_count = 0;
+            
+            for log in batch {
+                let mut hasher = DefaultHasher::new();
+                log.message.hash(&mut hasher);
+                log.timestamp.hash(&mut hasher);
+                
+                if let Some(request_id_value) = log.attributes.get("aws.lambda_request_id") {
+                    if let Some(request_id_str) = request_id_value.as_str() {
+                        request_id_str.hash(&mut hasher);
+                    }
+                }
+                
+                let log_hash = hasher.finish();
+                
+                if seen.insert(log_hash, log.timestamp).is_none() {
+                    unique_logs.push(log);
+                } else {
+                    duplicate_count += 1;
+                }
+            }
+            
+            if duplicate_count > 0 {
+                info!("Deduplicated {} duplicate log(s) before sending", duplicate_count);
+            }
+            
+            unique_logs
+        };
+
+        if deduplicated_batch.is_empty() {
+            debug!("All logs were duplicates, nothing to send");
+            return Ok(());
+        }
+
+        info!("Final flush: sending {} logs to New Relic", deduplicated_batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
         
-        // Split large batches into smaller chunks to avoid 413 errors
-        let chunks: Vec<Vec<payload::LogMessage>> = batch
-            .chunks(MAX_BATCH_SIZE)
-            .map(|chunk| chunk.to_vec())
-            .collect();
+        const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+        let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut current_size = 0;
         
-        if chunks.len() > 1 {
-            debug!("Chunking {} logs into {} batches", batch.len(), chunks.len());
+        for log in deduplicated_batch {
+            let log_size = 8 + log.message.len() + 
+                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+            
+            if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+            
+            current_chunk.push(log);
+            current_size += log_size;
         }
         
-        let mut failed_logs = Vec::with_capacity(batch.len() / 10); // Estimate 10% might fail
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+        
+        if chunks.len() > 1 {
+            info!("Chunking {} logs into {} size-based batches (max 1MB each)", 
+                  chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
+        }
+        
+        let mut failed_logs = Vec::new();
         let mut successful_chunks = 0;
         
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
@@ -881,40 +800,31 @@ impl LogProcessor {
                 },
                 Err(e) => {
                     error!("Log batch send failed: {}", e);
-                    // Store failed logs for potential retry in current invocation only
-                    // DO NOT carry over to next invocation to avoid request_id/trace_id pollution
                     failed_logs.extend(chunk);
                 }
             }
         }
         
         if successful_chunks > 0 {
-            debug!("Successfully sent {} log chunks", successful_chunks);
+            info!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
-            warn!("Buffering {} failed logs for retry in next invocation", failed_logs.len());
-            // Store failed logs with original attribution for accurate retry
-            {
-                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                let now = chrono::Utc::now();
-
-                for log in failed_logs {
-                    failed_buffer.push(FailedLogEntry {
-                        log_message: log,
-                        original_request_id: context.request_id.clone(),
-                        original_arn: context.invoked_function_arn.clone(),
-                        original_timestamp: now,
-                        failed_at: now,
-                        retry_count: 0, // This is the first failure
-                    });
-                }
+            warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
+            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+            
+            for log in failed_logs {
+                failed_buffer.push(FailedLogEntry {
+                    log_message: log,
+                    original_request_id: context.request_id.clone(),
+                    retry_count: 0,
+                });
             }
         }
         
         Ok(())
     }
     
-    /// Send a single chunk with retry logic
+   
     async fn send_chunk_with_retry(
         &self,
         client: &NewRelicClient,
@@ -926,14 +836,14 @@ impl LogProcessor {
         self.send_chunk_with_retry_internal(client, config, chunk, function_arn, true).await
     }
 
-    /// Send a single chunk with retry logic - internal method with buffer control
+   
     async fn send_chunk_with_retry_internal(
         &self,
         client: &NewRelicClient,
         config: &ExtensionConfig,
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
-        use_failed_buffer: bool, // If false, don't add to failed buffer (for retrying failed logs)
+        use_failed_buffer: bool,
     ) -> std::io::Result<()> {
         let mut retries = 0;
         
@@ -947,7 +857,6 @@ impl LogProcessor {
                         warn!("Log send failed: {}", e);
                     }
                     
-                    // Check if this is a 413 (Payload Too Large) error
                     if e.to_string().contains("413") || e.to_string().contains("Payload Too Large") {
                         error!("Payload too large even after chunking - dropping {} logs", chunk.len());
                         return Err(std::io::Error::new(
@@ -963,26 +872,18 @@ impl LogProcessor {
                         continue;
                     } else {
                         if use_failed_buffer {
-                            // Move failed logs to failed buffer for retry later
-                            warn!("Max retries exceeded - moving {} logs to failed buffer for retry", chunk.len());
-                            {
-                                let context = self.invocation_context.lock().unwrap().clone();
-                                let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                                let now = chrono::Utc::now();
-
-                                for log in chunk {
-                                    failed_buffer.push(FailedLogEntry {
-                                        log_message: log,
-                                        original_request_id: context.request_id.clone(),
-                                        original_arn: context.invoked_function_arn.clone(),
-                                        original_timestamp: now,
-                                        failed_at: now,
-                                        retry_count: 0,
-                                    });
-                                }
+                            warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
+                            let context = self.invocation_context.lock().unwrap().clone();
+                            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                            
+                            for log in chunk {
+                                failed_buffer.push(FailedLogEntry {
+                                    log_message: log,
+                                    original_request_id: context.request_id.clone(),
+                                    retry_count: 0,
+                                });
                             }
                         } else {
-                            // For failed log retries, don't buffer again to avoid infinite loops
                             error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
                         }
                         return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
@@ -992,17 +893,56 @@ impl LogProcessor {
         }
     }
 
+    /// Helper method to send logs with proper 1MB chunking
+    /// Used by both auto-flush (25 logs) and end-of-request flush
+    async fn send_logs_with_chunking(
+        client: &Arc<NewRelicClient>,
+        config: &Arc<ExtensionConfig>,
+        logs: Vec<payload::LogMessage>,
+        function_arn: &str,
+    ) {
+        if logs.is_empty() {
+            return;
+        }
+
+        const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+        let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+        let mut current_chunk = Vec::new();
+        let mut current_size = 0;
+
+        for log in logs {
+            let log_size = 8 + log.message.len() +
+                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+
+            if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+
+            current_chunk.push(log);
+            current_size += log_size;
+        }
+
+        if !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+        }
+
+        if chunks.len() > 1 {
+            debug!("Chunking logs into {} batches (max 1MB each)", chunks.len());
+        }
+
+        for chunk in chunks {
+            if let Err(e) = client.send_logs(config, chunk, function_arn).await {
+                error!("Failed to send log chunk: {}", e);
+            }
+        }
+    }
+
 }
 
 #[async_trait]
 impl Flush for LogProcessor {
     async fn flush(&self) -> std::io::Result<()> {
-        // Send logs when explicitly flushed (called by main loop or harvester)
-        self.send_and_clear_batch_simple().await
-    }
-
-    async fn final_flush(&self) -> std::io::Result<()> {
-        // Final flush during shutdown
         self.send_and_clear_batch_simple().await
     }
 }

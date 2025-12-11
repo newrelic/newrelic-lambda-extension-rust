@@ -3,16 +3,13 @@ use reqwest::{header, Client, Error};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
-// Extension name and version from Cargo.toml
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Helper function to get extension name with version
 fn get_extension_name_with_version() -> String {
     format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
 }
 
-// Standardized backoff delays: 200ms, 400ms, 900ms
 fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
     match retry_attempt {
         1 => std::time::Duration::from_millis(200),
@@ -21,8 +18,6 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
     }
 }
 
-// Note: Version detection is done during initialization in main.rs
-// We detect on each call here (fast, filesystem-based detection only)
 
 #[derive(Debug)]
 pub struct NewRelicClient {
@@ -51,10 +46,10 @@ impl NewRelicClient {
 
         let client = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_millis(2400)) // 2.4s timeout for New Relic requests
-            .pool_idle_timeout(std::time::Duration::from_secs(90)) // Keep connections alive longer for Lambda warm starts
-            .pool_max_idle_per_host(10) // Allow more connections for  batching
-            .tcp_keepalive(std::time::Duration::from_secs(30)) // TCP keepalive for better connection reuse
+            .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout - safe with separate Lambda Runtime client
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build().unwrap();
 
         Self {
@@ -66,7 +61,7 @@ impl NewRelicClient {
     /// Creates a no-op New Relic client for disabled mode.
     pub fn new_noop() -> Self {
         let client = Client::builder()
-            .timeout(std::time::Duration::from_millis(100)) // Very short timeout for no-op
+            .timeout(std::time::Duration::from_millis(100))
             .build().unwrap();
 
         Self {
@@ -87,7 +82,6 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        // Validate license key
         if config.new_relic.license_key.is_none() {
             warn!("New Relic license key is not set, skipping log send");
             return Ok(());
@@ -100,7 +94,6 @@ impl NewRelicClient {
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
 
-        // Add version detail tags if enabled (cached for performance)
         if config.new_relic.add_version_detail_tags {
             let version_attrs = self.cached_version_attrs.get_or_init(|| {
                 let version_info = VersionInfo::get_or_detect();
@@ -147,7 +140,7 @@ impl NewRelicClient {
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload_json.to_string())
-                .timeout(std::time::Duration::from_millis(2400)) // 2.4s per-request timeout
+                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 
@@ -182,7 +175,6 @@ impl NewRelicClient {
                 }
                 Err(e) => {
                     if retries == 0 {
-                        // Classify common network errors for better debugging
                         let error_msg = e.to_string();
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("[agentsend] Connection issue (will retry): {}", e);
@@ -220,7 +212,6 @@ impl NewRelicClient {
         let payload_size = body.len();
         debug!("Sending payload to NR endpoint: {} bytes", payload_size);
 
-        // Retry logic with exponential backoff
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
         
@@ -230,7 +221,7 @@ impl NewRelicClient {
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
-                .timeout(std::time::Duration::from_millis(2400)) // 2.4s per-request timeout
+                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 
@@ -252,13 +243,11 @@ impl NewRelicClient {
                             warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
                         }
                         
-                        // Don't retry on client errors (4xx)
                         if status.is_client_error() {
                             warn!("Client error (4xx), not retrying");
                             return Ok(());
                         }
                         
-                        // Retry on server errors (5xx) or other issues
                         if retries < MAX_RETRIES {
                             retries += 1;
                             let delay = get_backoff_delay(retries);
@@ -272,7 +261,6 @@ impl NewRelicClient {
                 }
                 Err(e) => {
                     if retries == 0 {
-                        // Classify common network errors for better debugging
                         let error_msg = e.to_string();
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("Connection issue (will retry): {}", e);

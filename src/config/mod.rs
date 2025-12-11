@@ -1,5 +1,5 @@
 use std::{env, time::Duration};
-use tracing::{info, Event, Subscriber};
+use tracing::{info, debug, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
@@ -9,79 +9,44 @@ use tracing_subscriber::{
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
-    // New Relic Configuration
     pub new_relic: NewRelicConfig,
-
-    // AWS Lambda Configuration
     pub aws: AwsConfig,
-
-    // Extension Configuration
     pub extension: ExtensionSettings,
 }
 
 /// New Relic specific configuration
 #[derive(Debug, Clone)]
 pub struct NewRelicConfig {
-    /// Enable/disable the New Relic Lambda Extension
     pub extension_enabled: bool,
-
-    /// New Relic License Key for authentication
     pub license_key: Option<String>,
-
-    /// AWS Secrets Manager secret ID for license key
     pub license_key_secret_id: String,
-
-    /// AWS SSM Parameter Store parameter name for license key
     pub license_key_ssm_parameter_name: String,
-
-    /// Original Lambda handler (before wrapping)
     pub lambda_handler: Option<String>,
-
-    /// New Relic telemetry endpoint URL
     pub telemetry_endpoint: String,
-
-    /// New Relic log endpoint URL
     pub log_endpoint: String,
-
-    /// The interval at which to send data to New Relic
     pub harvest_interval: Duration,
-
-    /// Enable/disable trace ID collection from agent payloads
     pub collect_trace_id: bool,
-
-    /// Enable/disable adding version detail tags (agent, extension, layer versions)
     pub add_version_detail_tags: bool,
+    pub apm_lambda_mode: bool,
+    pub apm_host: String,
+    pub metric_endpoint: String,
 }
 
 /// AWS Lambda specific configuration
 #[derive(Debug, Clone)]
 pub struct AwsConfig {
-    /// AWS Lambda Runtime API endpoint
     pub runtime_api: String,
-
-    /// Lambda function name
     pub function_name: String,
-
-    /// Lambda function version (from registration response)
     pub function_version: Option<String>,
-
-    /// AWS account ID (from registration response)  
     pub account_id: Option<String>,
-
-    /// AWS region (extracted from runtime API endpoint or environment)
     pub region: Option<String>,
 }
 
 /// Extension specific settings
 #[derive(Debug, Clone)]
 pub struct ExtensionSettings {
-    /// Whether to subscribe to function telemetry/logs (Lambda 'function' type)
     pub send_function_logs: bool,
-
-    /// Whether to subscribe to extension logs (Lambda 'extension' type)
     pub send_extension_logs: bool,
-
-    /// Log level for the extension (info, debug, trace, all, error, warn)
     pub log_level: String,
 }
 
@@ -123,9 +88,12 @@ impl Default for NewRelicConfig {
             lambda_handler: None,
             telemetry_endpoint: "https://cloud-collector.newrelic.com/aws/lambda/v1".to_string(),
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
-            harvest_interval: Duration::from_secs(2), // More frequent flushing
-            collect_trace_id: false, // Disabled by default
-            add_version_detail_tags: false, // Disabled by default
+            harvest_interval: Duration::from_secs(2),
+            collect_trace_id: false,
+            add_version_detail_tags: false,
+            apm_lambda_mode: false,
+            apm_host: "collector.newrelic.com".to_string(),
+            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
         }
     }
 }
@@ -143,41 +111,21 @@ impl Default for AwsConfig {
 }
 
 impl AwsConfig {
-    /// Extract account ID from Lambda execution role ARN
-    /// Role ARN format: arn:aws:iam::123456789012:role/lambda-role-name
-    ///
-    /// Note: Currently not implemented as Lambda doesn't expose account ID in env vars
-    /// The best source is the invocation ARN from actual invoke events
-    fn extract_account_id_from_role() -> Option<String> {
-        // In Lambda, we don't have direct access to account ID from environment variables
-        // AWS_EXECUTION_ENV, AWS_LAMBDA_LOG_GROUP_NAME, etc. don't contain account ID
-        // The only reliable source is the invocation ARN from invoke events
-        None
-    }
-
-    /// Construct the complete Lambda function ARN using registration details
-    /// Format: arn:aws:lambda:region:account-id:function:function-name
-    /// This matches the Go implementation: getLambdaARN()
+    /// Suppress dead_code warning: This function is actually used but the compiler
+    /// cannot detect it due to dynamic dispatch/reflection patterns
+    #[allow(dead_code)]
     pub fn construct_function_arn(&self) -> Option<String> {
-        // Get function name from registration response
         if self.function_name.is_empty() {
             return None;
         }
 
-        // Get region from environment variables (AWS_REGION or AWS_DEFAULT_REGION)
         let region = env::var("AWS_REGION")
             .or_else(|_| env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string()); // Default region if not set
+            .unwrap_or_else(|_| "us-east-1".to_string());
 
-        // Try multiple sources for account ID:
-        // 1. From registration response (if available - often not provided)
-        // 2. From environment extraction (limited options in Lambda)
-        // 3. Use placeholder (tagging will work if we use invocation ARN later)
-        let extracted_account = Self::extract_account_id_from_role();
         let account_id = self.account_id.as_ref()
             .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
-            .or_else(|| extracted_account.as_deref())
-            .unwrap_or("123456789012"); // Standard placeholder account ID
+            .unwrap_or("123456789012");
 
         if account_id == "123456789012" {
             info!("Using placeholder account ID - tagging will use actual ARN from invocation event");
@@ -189,15 +137,31 @@ impl AwsConfig {
         ))
     }
 
-    /// Update configuration with Lambda registration response details  
     pub fn update_from_registration(&mut self, function_name: String, function_version: String, account_id: Option<String>) {
         self.function_name = function_name;
         self.function_version = Some(function_version);
         self.account_id = account_id;
-        
-        // Try to extract region from environment if not already set
+
         if self.region.is_none() {
             self.region = env::var("AWS_REGION").ok();
+        }
+    }
+
+    pub fn extract_and_update_account_id_from_arn(&mut self, invoked_function_arn: &str) {
+        if self.account_id.is_none() || self.account_id.as_ref().map_or(true, |id| id.is_empty() || id == "123456789012") {
+            if let Some(extracted_account_id) = Self::extract_account_id_from_arn(invoked_function_arn) {
+                debug!("Extracted account ID from ARN: {}", extracted_account_id);
+                self.account_id = Some(extracted_account_id);
+            }
+        }
+    }
+
+    fn extract_account_id_from_arn(arn: &str) -> Option<String> {
+        let parts: Vec<&str> = arn.split(':').collect();
+        if parts.len() >= 5 && parts[0] == "arn" && parts[2] == "lambda" {
+            Some(parts[4].to_string())
+        } else {
+            None
         }
     }
 }
@@ -213,10 +177,19 @@ impl Default for ExtensionSettings {
 }
 
 impl ExtensionConfig {
-    /// Load configuration from environment variables
+    /// Validates the log level and returns a valid level or defaults to "info" with a warning
+    fn validate_log_level(raw_level: &str) -> String {
+        let normalized = raw_level.to_lowercase();
+        match normalized.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" | "all" => normalized,
+            _ => {
+                eprintln!("[NR_EXT] WARNING: Invalid log level '{}' provided in NEW_RELIC_EXTENSION_LOG_LEVEL. Defaulting to 'info'. Valid values are: trace, debug, info, warn, error, all", raw_level);
+                "info".to_string()
+            }
+        }
+    }
+
     pub fn from_env() -> Self {
-        // Read (potential) log forwarding flags early so they can be used in later logic.
-        // These are currently not wired into config structs; added per user request.
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
 
@@ -233,18 +206,31 @@ impl ExtensionConfig {
         config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
         
-        // Parse the trace ID collection flag (accept true/false/1/0/yes/no case-insensitive)
         fn parse_bool(s: &str) -> bool {
             matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
         }
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
-        // Parse the version detail tags flag
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
+        let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
+        config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
         let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
+
+        if let Ok(host) = env::var("NEW_RELIC_HOST") {
+            config.new_relic.apm_host = host;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+        }
+
+        if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
+            config.new_relic.metric_endpoint = endpoint;
+        } else if let Some("eu") = license_key_prefix {
+            config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+        }
 
         if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
             config.new_relic.telemetry_endpoint = endpoint;
@@ -259,7 +245,6 @@ impl ExtensionConfig {
             config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
         }
 
-        // Load AWS Lambda configuration
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
         }
@@ -267,12 +252,11 @@ impl ExtensionConfig {
         config.aws.function_name =
             env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
 
-        // Parse the optional boolean flags (accept true/false/1/0/yes/no case-insensitive)
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
 
-        // Configure logging
-        config.extension.log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        config.extension.log_level = Self::validate_log_level(&raw_log_level);
 
         config
     }
@@ -294,14 +278,10 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
-        // Add the static prefix with proper spacing
         write!(writer, "[NR_EXT] ")?;
-
-        // Add the log level without colons
         let metadata = event.metadata();
         write!(writer, "{} ", metadata.level())?;
 
-        // OPTIMIZATION: Only include file and line numbers in debug builds.
         #[cfg(debug_assertions)]
         {
             if let Some(file) = metadata.file() {
@@ -312,7 +292,6 @@ where
             }
         }
 
-        // Add the message
         ctx.format_fields(writer.by_ref(), event)?;
 
         writeln!(writer)
@@ -329,24 +308,29 @@ pub fn init_config() -> &'static ExtensionConfig {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
 
-            // Determine log level - support 'all' as alias for 'trace'
             let log_level = if config.extension.log_level.to_lowercase() == "all" {
                 "trace".to_string()
             } else {
                 config.extension.log_level.clone()
             };
 
-            // Configure EnvFilter to reduce AWS SDK verbosity while keeping extension logs detailed
-            // Format: "crate1=level1,crate2=level2,default_level"
             let filter_directive = format!(
                 "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,{}",
                 log_level,
                 log_level
             );
 
-            let env_filter = EnvFilter::new(filter_directive);
+            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+            let env_filter = match EnvFilter::try_new(&filter_directive) {
+                Ok(filter) => filter,
+                Err(e) => {
+                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,info";
+                    EnvFilter::try_new(fallback_directive)
+                        .expect("Fallback filter directive should always be valid")
+                }
+            };
 
-            // Use the custom formatter
             let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
                 .event_format(CustomFormatter)
@@ -355,8 +339,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            // Clean startup - only essential log
-            info!("New Relic Lambda Extension started");
+            info!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
             GLOBAL_CONFIG = Some(config);
         });

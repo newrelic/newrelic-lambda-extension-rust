@@ -6,7 +6,6 @@ use tracing::{debug, warn};
 pub async fn fetch_layer_info_from_aws() -> Option<String> {
     debug!("Attempting to fetch layer info from AWS Lambda API...");
 
-    // Get function name from environment
     let function_name = match std::env::var("AWS_LAMBDA_FUNCTION_NAME") {
         Ok(name) => {
             debug!("Function name: {}", name);
@@ -18,7 +17,6 @@ pub async fn fetch_layer_info_from_aws() -> Option<String> {
         }
     };
 
-    // Try to get AWS configuration
     let config = match aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await {
         config => {
             debug!("AWS config loaded successfully");
@@ -26,11 +24,9 @@ pub async fn fetch_layer_info_from_aws() -> Option<String> {
         }
     };
 
-    // Create Lambda client
     let lambda_client = aws_sdk_lambda::Client::new(&config);
     debug!("Lambda client created");
 
-    // Get function configuration
     debug!("Sending GetFunctionConfiguration request to AWS Lambda API...");
     match lambda_client
         .get_function_configuration()
@@ -41,22 +37,17 @@ pub async fn fetch_layer_info_from_aws() -> Option<String> {
         Ok(response) => {
             debug!("✓ Successfully retrieved function configuration from AWS");
 
-            // Extract layer information
             let layers = response.layers();
             debug!("Response contains {} layer(s)", layers.len());
 
             if !layers.is_empty() {
                 debug!("Found {} layers attached to function", layers.len());
 
-                // Look for New Relic layer
                 for layer in layers {
                     if let Some(arn) = layer.arn() {
                         debug!("Layer ARN: {}", arn);
 
-                        // Check if it's a New Relic layer
                         if arn.to_lowercase().contains("newrelic") {
-                            // Parse layer name and version from ARN
-                            // Format: arn:aws:lambda:region:account:layer:layer-name:version
                             if let Some(layer_info) = parse_layer_arn(arn) {
                                 debug!("Detected New Relic layer: {}", layer_info);
                                 return Some(layer_info);
@@ -65,7 +56,6 @@ pub async fn fetch_layer_info_from_aws() -> Option<String> {
                     }
                 }
 
-                // If no New Relic layer found, return the first layer
                 if let Some(first_layer) = layers.first() {
                     if let Some(arn) = first_layer.arn() {
                         if let Some(layer_info) = parse_layer_arn(arn) {

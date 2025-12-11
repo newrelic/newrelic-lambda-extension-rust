@@ -4,32 +4,6 @@
 //! - Environment variables (NEW_RELIC_LICENSE_KEY)
 //! - AWS Secrets Manager (via NEW_RELIC_LICENSE_KEY_SECRET env var or configuration)
 //! - AWS Systems Manager Parameter Store (via NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME env var or configuration)
-//! 
-//! ## Environment Variables
-//! 
-//! ### NEW_RELIC_LICENSE_KEY_SECRET
-//! - **Type**: Secret Name or ARN
-//! - **Description**: Specify the name or ARN of the secret from AWS Secrets Manager that contains your New Relic license key.
-//! - **Notes**:
-//!   - This is only used if NEW_RELIC_LICENSE_KEY is not set.
-//!   - The secret must be in the same AWS region as your Lambda function.
-//!   - Your Lambda function's execution role needs the `secretsmanager:GetSecretValue` permission for this secret.
-//! 
-//! ### NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME
-//! - **Type**: Parameter Name or ARN
-//! - **Description**: Specify the name or ARN of the parameter from the AWS Systems Manager Parameter Store that contains your New Relic license key.
-//! - **Notes**:
-//!   - This is only used if NEW_RELIC_LICENSE_KEY is not set.
-//!   - The SSM parameter must be in the same AWS region as your Lambda function.
-//!   - Your Lambda function's execution role needs the `ssm:GetParameter` permission for this parameter.
-//! 
-//! ## Lookup Order
-//! 1. NEW_RELIC_LICENSE_KEY environment variable (direct license key)
-//! 2. NEW_RELIC_LICENSE_KEY_SECRET environment variable (AWS Secrets Manager)
-//! 3. NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME environment variable (AWS SSM Parameter Store)
-//! 4. Configuration file settings for AWS sources
-//! 5. Default AWS sources with name "NEW_RELIC_LICENSE_KEY"
-//! 
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -133,47 +107,28 @@ const DEFAULT_SECRET_ID: &str = "NEW_RELIC_LICENSE_KEY";
 const ENV_LICENSE_KEY_SECRET: &str = "NEW_RELIC_LICENSE_KEY_SECRET";
 const ENV_LICENSE_KEY_SSM_PARAMETER: &str = "NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME";
 
-/// Start AWS client initialization in the background (non-blocking)
-/// This can be called early in the extension startup to begin AWS setup
-/// while other initialization happens in parallel
-#[allow(dead_code)]
-pub fn start_aws_initialization_background() {
-    tokio::spawn(async {
-        if let Err(e) = initialize_aws_clients().await {
-            eprintln!("Background AWS initialization failed: {}", e);
-        }
-    });
-}
-
 /// Initialize AWS clients with maximum performance optimizations
 async fn initialize_aws_clients() -> Result<()> {
     use std::time::Duration;
     
-    // Skip AWS initialization entirely if we're clearly not in AWS Lambda
     if std::env::var("AWS_LAMBDA_RUNTIME_API").is_err() {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
     
-    // Ultra-fast AWS configuration with minimal overhead
     let config_future = tokio::spawn(async {
-        // Use the most minimal AWS config possible
         aws_config::defaults(BehaviorVersion::latest())
-            // Use fastest possible retry config
             .retry_config(aws_config::retry::RetryConfig::disabled())
-            // Skip unnecessary credential provider chain steps
             .load()
             .await
     });
     
-    // Very short timeout to fail fast if AWS isn't available
     let config = tokio::time::timeout(
-        Duration::from_millis(1000), // Only 1 second timeout
+        Duration::from_millis(1000),
         config_future
     ).await
     .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?
     .map_err(|e| anyhow!("AWS config failed: {}", e))?;
     
-    // Create clients in parallel with minimal overhead
     let (secrets_result, ssm_result) = tokio::join!(
         tokio::spawn({
             let config = config.clone();
@@ -200,12 +155,10 @@ async fn initialize_aws_clients() -> Result<()> {
 
 /// Get the AWS clients (will initialize if needed)
 async fn get_aws_clients() -> Result<&'static AwsClients> {
-    // If we already have clients, return them immediately
     if let Some(clients) = AWS_CLIENTS.get() {
         return Ok(clients);
     }
     
-    // Initialize clients if not already done
     initialize_aws_clients().await?;
     AWS_CLIENTS.get().ok_or_else(|| anyhow!("AWS clients not initialized"))
 }
@@ -251,24 +204,13 @@ async fn try_license_key_from_ssm_parameter(parameter_name: &str) -> Result<Stri
     Ok(parameter_value)
 }
 
-/// Get New Relic license key from AWS sources only
-/// 
-/// This function is called only when environment variables are not available.
-/// It tries to get the license key from:
-/// 1. NEW_RELIC_LICENSE_KEY_SECRET environment variable (Secrets Manager)
-/// 2. NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME environment variable (SSM Parameter Store)
-/// 3. Configured AWS Secrets Manager secret ID from configuration
-/// 4. Configured AWS SSM parameter name from configuration
-/// 5. Default AWS Secrets Manager secret (NEW_RELIC_LICENSE_KEY)
-/// 6. Default AWS SSM parameter (NEW_RELIC_LICENSE_KEY)
+/// Get New Relic license key from AWS sources only This function is called only when environment variables are not available.
 pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
-    // Initialize AWS clients only when we need them (lazy initialization)
     if let Err(e) = initialize_aws_clients().await {
         warn!("Failed to initialize AWS clients: {}. Skipping AWS credential sources.", e);
         return Err(anyhow!("Failed to initialize AWS clients"));
     }
     
-    // 1. Try environment variable for Secrets Manager secret name/ARN first
     if let Ok(secret_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SECRET) {
         if !secret_name_or_arn.is_empty() {
 
@@ -276,7 +218,6 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
         }
     }
     
-    // 2. Try environment variable for SSM parameter name/ARN
     if let Ok(parameter_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SSM_PARAMETER) {
         if !parameter_name_or_arn.is_empty() {
 
@@ -284,14 +225,12 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
         }
     }
     
-    // 3. Try configured secret ID from configuration
     let secret_id = &conf.license_key_secret_id;
     if !secret_id.is_empty() {
 
         return try_license_key_from_secret(secret_id).await;
     }
     
-    // 4. Try configured SSM parameter name from configuration
     let parameter_name = &conf.license_key_ssm_parameter_name;
     if !parameter_name.is_empty() {
 
@@ -300,12 +239,10 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     
 
     
-    // 5. Try default secret ID
     if let Ok(license_key) = try_license_key_from_secret(DEFAULT_SECRET_ID).await {
         return Ok(license_key);
     }
     
-    // 6. Try default SSM parameter name
     if let Ok(license_key) = try_license_key_from_ssm_parameter(DEFAULT_SECRET_ID).await {
         return Ok(license_key);
     }
