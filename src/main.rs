@@ -509,33 +509,20 @@ async fn resolve_license_key_with_aws_fallback(
         return Ok(Some(credentials_config.license_key.clone()));
     }
 
-    // Only initialize AWS SDK if we actually need to fetch from Secrets Manager or SSM
-    let aws_services_required =
-        std::env::var("NEW_RELIC_LICENSE_KEY_SECRET").is_ok()
-        || std::env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").is_ok()
-        || !credentials_config.license_key_secret_id.is_empty()
-        || !credentials_config.license_key_ssm_parameter_name.is_empty();
-
-    if aws_services_required {
-        debug!("License key not in env var, fetching from AWS Secrets Manager or SSM Parameter Store");
-        match get_new_relic_license_key(&credentials_config).await {
-            Ok(key) => {
-                debug!("Successfully obtained New Relic license key from AWS");
-                Ok(Some(key))
-            }
-            Err(e) => {
-                info!(
-                    "No license key found from AWS sources: {}. Extension will run in no-op mode.",
-                    e
-                );
-                Ok(None)
-            }
+    // Always attempt to fetch from AWS sources (Secrets Manager, SSM, or fallback to default names)
+    debug!("License key not in env var, attempting to fetch from AWS Secrets Manager or SSM Parameter Store");
+    match get_new_relic_license_key(&credentials_config).await {
+        Ok(key) => {
+            debug!("Successfully obtained New Relic license key from AWS");
+            Ok(Some(key))
         }
-    } else {
-        info!(
-            "No license key available and no AWS sources configured. Extension will run in no-op mode."
-        );
-        Ok(None)
+        Err(e) => {
+            info!(
+                "No license key found from AWS sources: {}. Extension will run in no-op mode.",
+                e
+            );
+            Ok(None)
+        }
     }
 }
 
