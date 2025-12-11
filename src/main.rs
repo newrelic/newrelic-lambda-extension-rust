@@ -31,7 +31,7 @@ use std::{
 use tokio::sync::mpsc;
 use once_cell::sync::Lazy;
 
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use reqwest::Client;
 
 use crate::{
@@ -316,17 +316,19 @@ async fn perform_one_time_initialization(
     // This avoids async overhead for standard mode (most common case)
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            info!("APM Lambda mode enabled - using parallel initialization");
+            info!("APM Lambda mode enabled - non-blocking connection strategy");
 
-            // Parallel path: APM init + telemetry setup run concurrently
+            // Spawn APM connection as background task - event loop starts immediately
+            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+            
             let license_key = config
                 .new_relic
                 .license_key
                 .clone()
                 .expect("License key must be available for APM mode");
 
-            let apm_future = {
-                let license_key = license_key.clone();
+            tokio::spawn({
+                let license_key_clone = license_key.clone();
                 let apm_host = config.new_relic.apm_host.clone();
                 let metric_endpoint = config.new_relic.metric_endpoint.clone();
                 let client_clone = (*client).clone();
@@ -334,10 +336,12 @@ async fn perform_one_time_initialization(
                 let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
                 let account_id = config.aws.account_id.clone();
                 let region = config.aws.region.clone();
+                let apm_app_clone = Arc::clone(&apm_app);
 
                 async move {
+                    info!("Background APM connection started...");
                     match apm::ApmApp::new(
-                        license_key,
+                        license_key_clone,
                         apm_host,
                         metric_endpoint,
                         client_clone,
@@ -353,66 +357,37 @@ async fn perform_one_time_initialization(
                                 "APM app initialized successfully - Entity GUID: {}",
                                 app.get_entity_guid()
                             );
-                            {
-                                let mut global_apm = APM_APP.write().await;
-                                *global_apm = Some(app);
-                            }
-                            Ok(Arc::clone(&APM_APP))
+                            let mut global_apm = apm_app_clone.write().await;
+                            *global_apm = Some(app);
+                            info!("APM connection complete - ready for agent payloads");
                         }
                         Err(e) => {
-                            error!("Failed to initialize APM app: {}", e);
-                            error!("APM mode was explicitly enabled (NEW_RELIC_APM_LAMBDA_MODE=true) but initialization failed");
-                            error!("Extension will run in NO-OP mode to prevent incorrect data collection");
-                            error!("Lambda function will continue normally but without New Relic monitoring");
-                            Err(e)
+                            error!("CRITICAL: Failed to initialize APM app: {}", e);
+                            error!("APM mode was explicitly enabled but connection failed");
+                            error!("Extension will enter NO-OP mode - no telemetry will be processed");
+                            warn!("Lambda function will continue but without New Relic monitoring");
                         }
                     }
                 }
-            };
+            });
 
-            let telemetry_future = {
-                let newrelic_client = Arc::clone(&newrelic_client);
-                let config_clone = Arc::clone(&config);
-                async move {
-                    // Create empty APM app for processor factory (will be updated after APM init)
-                    let temp_apm_app = Arc::new(tokio::sync::RwLock::new(None));
+            let processor_factory = Arc::new(ProcessorFactory::new(
+                Arc::clone(&newrelic_client),
+                Arc::clone(&config),
+                Arc::clone(&apm_app),
+            ));
 
-                    let processor_factory = Arc::new(ProcessorFactory::new(
-                        Arc::clone(&newrelic_client),
-                        Arc::clone(&config_clone),
-                        Arc::clone(&temp_apm_app),
-                    ));
+            let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
+            let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
+            let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
 
-                    let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
-                    let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-                    let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
-
-                    let telemetry_listener_address = setup_telemetry_listener(
-                        temp_log_processor.clone(),
-                        temp_platform_processor,
-                        Some(runtime_done_tx),
-                    )
-                    .await
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((processor_factory, temp_log_processor, telemetry_listener_address))
-                }
-            };
-
-            // Run both futures in parallel
-            let (apm_result, telemetry_result) = tokio::join!(apm_future, telemetry_future);
-
-            // Handle APM result
-            let apm_app = apm_result.map_err(|e| {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("APM initialization failed when APM mode was explicitly enabled: {}", e)
-                )) as Box<dyn std::error::Error + Send + Sync>
-            })?;
-
-            // Handle telemetry result
-            let (processor_factory, temp_log_processor, telemetry_listener_address) =
-                telemetry_result?;
+            let telemetry_listener_address = setup_telemetry_listener(
+                temp_log_processor.clone(),
+                temp_platform_processor,
+                Some(runtime_done_tx),
+                config.new_relic.apm_lambda_mode,
+            )
+            .await?;
 
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         } else {
@@ -435,6 +410,7 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 Some(runtime_done_tx),
+                config.new_relic.apm_lambda_mode,
             )
             .await?;
 
@@ -575,7 +551,6 @@ async fn initialize_http_client_with_timeout(
 }
 
 /// Initialize Lambda runtime client and register extension
-/// Creates a dedicated HTTP client for Lambda Runtime API with NO global request timeout
 /// This ensures /next polling is never affected by other HTTP operations
 async fn initialize_lambda_runtime_client_and_register(
 ) -> Result<
@@ -586,7 +561,6 @@ async fn initialize_lambda_runtime_client_and_register(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    // Create dedicated Lambda Runtime API client (critical path, no global timeout)
     // Only connect_timeout for TCP setup, NO timeout() for HTTP requests
     // This allows /next to block indefinitely waiting for INVOKE/SHUTDOWN events
     let lambda_runtime_client = Arc::new(Client::builder()
@@ -642,12 +616,10 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
             );
 
             if payload_count <= 5 {
-                debug!(
-                    "Agent Payload preview: {:?}",
-                    String::from_utf8_lossy(
-                        &payload_bytes[..std::cmp::min(100, payload_bytes.len())]
-                    )
-                );
+                // Print complete payload with escaped newlines to prevent log corruption
+                let full_payload = String::from_utf8_lossy(&payload_bytes);
+                let sanitized = full_payload.replace('\n', "\\n").replace('\r', "\\r");
+                debug!("Agent Payload (complete): {}", sanitized);
             }
 
             route_payload_to_request_buffer(payload_bytes).await;

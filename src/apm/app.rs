@@ -88,6 +88,12 @@ impl ApmApp {
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
     ) -> Result<ApmApp> {
+        // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
+        // No need for spawn_blocking or parallelization - instant access
+        let runtime = super::connection::detect_runtime();
+        let agent_version = super::connection::detect_agent_version(runtime);
+
+        // Run preconnect while we have the cached values
         let collector_host = preconnect(client, license_key, apm_host)
             .await
             .context("PreConnect failed")?;
@@ -118,9 +124,6 @@ impl ApmApp {
             "Connecting to APM with function_name={}, account_id={}, region={}",
             function_name, account_id, region
         );
-
-        let runtime = super::connection::detect_runtime();
-        let agent_version = super::connection::detect_agent_version(&runtime);
 
         let connect_resp = connect(
             client, 

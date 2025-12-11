@@ -19,7 +19,11 @@ use crate::{
         REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
         CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
     },
-    agent::batch::{add_to_batch, should_send_batch_by_threshold, send_batched_payloads_with_reports_only},
+    agent::batch::{
+        add_to_batch, should_send_batch_by_threshold, 
+        send_batched_payloads_with_reports_only,
+        send_all_pending_payloads_on_shutdown,
+    },
     agent::payload::send_agent_payload_to_newrelic,
     error_synthesis,
     trace,
@@ -75,10 +79,9 @@ pub async fn run_infinite_event_loop(
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
 /// Routes to APM or standard mode based on config
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let is_apm_mode = components.apm_app.read().await.is_some();
-
-    if is_apm_mode {
-        info!("Starting APM mode event loop");
+    let apm_mode_enabled = components.config.new_relic.apm_lambda_mode;
+    if apm_mode_enabled {
+        info!("Starting APM mode event loop (connection may still be in progress)");
         execute_apm_mode_event_loop(components).await
     } else {
         info!("Starting standard mode event loop");
@@ -307,15 +310,71 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 }
 
-                // Process any remaining pending agent payloads
-                process_pending_agent_payloads(
-                    &components.newrelic_client,
-                    &components.config,
-                    &components.global_log_processor,
-                    &components.apm_app,
-                    "",
-                )
-                .await;
+                // CRITICAL: Process ALL remaining pending agent payloads before shutdown
+                info!("APM mode shutdown: Processing all remaining agent payloads");
+                
+                // Check all request buffers for unsent payloads
+                let all_request_ids: Vec<String> = REQUEST_AGENT_BUFFERS
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
+                
+                if !all_request_ids.is_empty() {
+                    info!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
+                    
+                    for request_id in all_request_ids {
+                        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+                            let payloads = {
+                                if let Ok(mut buf) = buffer.lock() {
+                                    std::mem::take(&mut *buf)
+                                } else {
+                                    Vec::new()
+                                }
+                            };
+                            
+                            if !payloads.is_empty() {
+                                info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
+                                
+                                let invoked_function_arn = REQUEST_CONTEXTS
+                                    .get(&request_id)
+                                    .map(|ctx_ref| {
+                                        ctx_ref.lock()
+                                            .ok()
+                                            .map(|ctx| ctx.invoked_function_arn.clone())
+                                            .unwrap_or_else(|| "unknown".to_string())
+                                    })
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                
+                                for payload_bytes in payloads {
+                                    if let Err(e) = process_and_send_agent_payload(
+                                        &payload_bytes,
+                                        &request_id,
+                                        &invoked_function_arn,
+                                        &components.global_log_processor,
+                                        &components.newrelic_client,
+                                        &components.config,
+                                        &components.apm_app,
+                                    )
+                                    .await
+                                    {
+                                        warn!("APM mode shutdown: Failed to send payload for {}: {}", request_id, e);
+                                    } else {
+                                        info!("APM mode shutdown: Successfully sent payload for request: {}", request_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!("APM mode shutdown: No pending agent payloads to process");
+                }
+                
+                // Final flush of logs
+                if let Err(e) = components.global_log_processor.flush().await {
+                    error!("APM mode shutdown: Failed to flush logs: {}", e);
+                }
+                
+                info!("APM mode shutdown: All data processed and sent");
                 break;
             }
         }
@@ -521,12 +580,22 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     }
                 }
 
+                // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
+                info!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
+                send_all_pending_payloads_on_shutdown(
+                    components.newrelic_client.clone(),
+                    components.config.clone(),
+                )
+                .await;
+                
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),
                     components.config.clone(),
                     components.global_log_processor.clone(),
                 )
                 .await;
+                
+                info!("Standard mode shutdown: All data processed and sent");
                 break;
             }
         }
@@ -660,7 +729,7 @@ pub async fn process_apm_request(
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
-    let Some(mut state) = state else {
+    let Some(state) = state else {
         error!("No processing state found for request: {}", request_id);
         return;
     };
@@ -672,42 +741,13 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // Unified approach: Skip runtime.done wait for all invocations (APM mode)
-    // Late payloads will be processed in next invocation
-    debug!(
-        "APM mode: Skipping runtime.done wait for request: {} (unified batching approach)",
-        request_id
-    );
-
-    let payload_already_arrived = {
-        if let Ok(buffer) = state.agent_buffer.lock() {
-            !buffer.is_empty()
-        } else {
-            false
-        }
+    // APM mode: Check if run_id is available
+    let has_run_id = {
+        let apm_app_guard = apm_app.read().await;
+        apm_app_guard.is_some()
     };
 
-    // Unified wait timeout for all invocations (APM mode)
-    if !payload_already_arrived {
-        debug!(
-            "APM mode: Waiting up to 100ms for agent payload for request: {}",
-            request_id
-        );
-        tokio::select! {
-            _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
-                debug!("Agent payload received early for request: {} (saved wait time)", request_id);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                debug!("Agent payload wait timeout (100ms) for request: {} - may arrive late", request_id);
-            }
-        }
-    } else {
-        debug!(
-            "Agent payload already in buffer for request: {} - no wait needed",
-            request_id
-        );
-    }
-
+    // Check if we have agent payload
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -716,27 +756,14 @@ pub async fn process_apm_request(
         }
     };
 
-    let got_payload_now = !agent_payloads.is_empty();
+    let got_payload = !agent_payloads.is_empty();
 
-    // Check if there was a detected error but no agent payload (APM mode)
-    // This can happen when the function code has errors but doesn't send telemetry
-    if !got_payload_now {
-        if let Ok(guard) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
-            if let Some(ref detected_error) = *guard {
-                if detected_error.request_id == request_id {
-                    info!(
-                        "APM mode: No agent payload for request {} but error detected: {} - error event was already sent by log processor",
-                        request_id, detected_error.error_type
-                    );
-                    // Error event was already sent by log processor via send_error_event_from_fault
-                }
-            }
-        }
-    }
-
-    let send_agent_task = if got_payload_now {
+    // Flow 1: If run_id exists and payload arrived, send it immediately
+    // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
+    // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
+    let send_agent_task = if has_run_id && got_payload {
         info!(
-            "APM mode: Sending {} agent payload(s) immediately to APM collector",
+            "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
             agent_payloads.len()
         );
         let request_id_clone = request_id.clone();
@@ -745,18 +772,20 @@ pub async fn process_apm_request(
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
         let apm_app_clone = apm_app.clone();
+        let agent_payloads_clone = agent_payloads.clone();
 
         Some(tokio::spawn(async move {
-            for payload_bytes in agent_payloads {
+            let mut all_sent = true;
+            for payload_bytes in &agent_payloads_clone {
                 extract_and_coordinate_trace_id(
-                    &payload_bytes,
+                    payload_bytes,
                     &config_clone,
                     &global_log_processor_clone,
                 )
                 .await;
 
-                if let Err(e) = send_to_apm_collector(
-                    &payload_bytes,
+                match send_to_apm_collector(
+                    payload_bytes,
                     &request_id_clone,
                     &invoked_function_arn_clone,
                     &newrelic_client_clone,
@@ -765,31 +794,68 @@ pub async fn process_apm_request(
                 )
                 .await
                 {
-                    error!("Failed to send agent payload to APM collector: {}", e);
+                    Ok(()) => {
+                        info!("APM mode: Agent payload sent successfully");
+                    }
+                    Err(e) => {
+                        error!("Failed to send agent payload to APM collector: {}", e);
+                        all_sent = false;
+                    }
                 }
             }
+            (all_sent, agent_payloads_clone)
         }))
     } else {
-        debug!(
-            "APM mode: No agent payload yet for request: {} - buffer kept alive for late arrival",
-            request_id
-        );
+        // Flow 2 or 3: Either no run_id yet, or no payload yet
+        if !has_run_id && got_payload {
+            info!(
+                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
+                agent_payloads.len()
+            );
+            // Put payloads back in buffer to send when run_id arrives
+            if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+                if let Ok(mut buffer) = buffer_ref.lock() {
+                    buffer.extend(agent_payloads);
+                }
+            }
+        } else if has_run_id && !got_payload {
+            debug!(
+                "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
+                request_id
+            );
+        } else {
+            debug!(
+                "APM mode: No run_id and no agent payload for request: {} - normal flow",
+                request_id
+            );
+        }
         None
     };
 
+    // Spawn agent send in background - don't wait for it to complete
+    // This ensures we return to /next quickly without blocking on agent sends
+    if let Some(handle) = send_agent_task {
+        tokio::spawn(async move {
+            match handle.await {
+                Ok((success, payloads)) => {
+                    if !success && !payloads.is_empty() {
+                        debug!("Agent send completed with failures - payloads will be retried in next invocation");
+                    }
+                }
+                Err(e) => {
+                    error!("Agent send task failed: {}", e);
+                }
+            }
+        });
+    }
+
+    // Wait for logs and platform to complete before returning
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
 
-    let (log_result, platform_result, agent_result) = tokio::join!(
+    let (log_result, platform_result) = tokio::join!(
         log_flushing,
         platform_flushing,
-        async {
-            if let Some(handle) = send_agent_task {
-                handle.await
-            } else {
-                Ok(())
-            }
-        }
     );
 
     if let Err(e) = log_result {
@@ -798,26 +864,15 @@ pub async fn process_apm_request(
     if let Err(e) = platform_result {
         error!("Failed to flush platform for request {}: {}", request_id, e);
     }
-    if let Err(e) = agent_result {
-        error!("Agent send task failed for request {}: {}", request_id, e);
-    }
 
-    if got_payload_now {
-        debug!(
-            "APM mode: Agent payload sent - cleaning up all resources for request: {}",
-            request_id
-        );
-        cleanup_request_processing_state_internal(&request_id, false);
+    // Note: We do NOT wait for runtime.done here because platform.runtimeDone event
+    // arrives during the NEXT invocation in APM mode, not the current one.
+    // Agent payloads that arrive late will be caught by warm start logic.
 
-        if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
-            *active_request = None;
-        }
-    } else {
-        cleanup_request_processing_state_internal(&request_id, true);
+    cleanup_request_processing_state_internal(&request_id, true);
 
-        if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
-            *active_request = Some(request_id.clone());
-        }
+    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+        *active_request = Some(request_id.clone());
     }
 
     debug!(
@@ -848,7 +903,12 @@ async fn send_to_apm_collector(
             request_id
         );
     } else {
-        error!("APM app not initialized - cannot send payload");
+        // Go-style pattern: APM connection still in progress - buffer will be kept for retry
+        warn!(
+            "APM connection still in progress - payload for {} will be buffered and retried",
+            request_id
+        );
+        return Err("APM connection not ready yet - payload buffered for retry".into());
     }
     Ok(())
 }
@@ -1187,7 +1247,7 @@ async fn process_and_send_agent_payload(
     request_id: &str,
     invoked_function_arn: &str,
     log_processor: &Arc<LogProcessor>,
-    newrelic_client: &Arc<NewRelicClient>,
+    _newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1208,52 +1268,31 @@ async fn process_and_send_agent_payload(
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
         info!(
-            "APM mode: Processing agent payload (size: {} bytes)",
+            "APM mode: Processing agent payload for request: {} (size: {} bytes)",
+            request_id,
             payload_bytes.len()
         );
         match app.process_agent_payload(payload_bytes.to_vec()).await {
             Ok(()) => {
-                info!("APM agent payload processed and sent successfully");
+                info!("APM mode: Agent payload sent successfully for request: {}", request_id);
             }
             Err(e) => {
-                error!("Failed to send agent payload to APM collector: {}", e);
+                error!("APM mode: Failed to send agent payload to APM collector: {}", e);
                 buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
                 warn!(
-                    "APM agent payload buffered for retry (size: {} bytes)",
+                    "APM mode: Agent payload buffered for retry (size: {} bytes)",
                     payload_bytes.len()
                 );
             }
         }
     } else {
-        match send_agent_payload_to_newrelic(
-            payload_bytes,
+        // APM connection not ready - buffer the payload, do NOT send to telemetry endpoint
+        warn!(
+            "APM connection not established - buffering agent payload for request: {} (size: {} bytes)",
             request_id,
-            invoked_function_arn,
-            newrelic_client,
-            config,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(
-                    "Agent payload processed and sent (size: {} bytes)",
-                    payload_bytes.len()
-                );
-            }
-            Err(e) => {
-                error!(
-                    "Failed to send agent payload for request {}: {}",
-                    request_id, e
-                );
-
-                buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
-
-                warn!(
-                    "Agent payload buffered for retry (size: {} bytes)",
-                    payload_bytes.len()
-                );
-            }
-        }
+            payload_bytes.len()
+        );
+        buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
     }
 
     Ok(())
