@@ -385,6 +385,7 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 Some(runtime_done_tx),
+                config.new_relic.apm_lambda_mode,
             )
             .await?;
 
@@ -409,6 +410,7 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 Some(runtime_done_tx),
+                config.new_relic.apm_lambda_mode,
             )
             .await?;
 

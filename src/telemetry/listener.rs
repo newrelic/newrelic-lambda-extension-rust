@@ -33,6 +33,7 @@ pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    is_apm_mode: bool,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
     let listener = TcpListener::bind(addr).await.map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
@@ -45,6 +46,7 @@ pub async fn setup_telemetry_listener(
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
                     let runtime_done_tx_clone = runtime_done_tx.clone();
+                    let is_apm_mode_clone = is_apm_mode;
                     
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -54,6 +56,7 @@ pub async fn setup_telemetry_listener(
                                 log_processor.clone(),
                                 platform_processor.clone(),
                                 runtime_done_tx_clone.clone(),
+                                is_apm_mode_clone,
                             )
                         });
                         
@@ -82,6 +85,7 @@ async fn handle_telemetry_request(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    is_apm_mode: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -130,57 +134,61 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
                                     
-                                    {
+                                    if is_apm_mode {
+                                        // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
                                         if let Some(ref app) = *apm_app_read {
                                             if let Err(e) = app.send_platform_report_metrics(&report_line).await {
-                                                warn!("Failed to send platform.report metrics for {}: {}", request_id_str, e);
+                                                warn!("APM mode: Failed to send platform.report metrics for {}: {}", request_id_str, e);
                                             } else {
-                                                debug!("Sent platform.report metrics for request: {}", request_id_str);
+                                                debug!("APM mode: Sent platform.report metrics for request: {}", request_id_str);
                                             }
                                         }
-                                    }
-                                    
-                                    if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
-                                        batch_item.report_line = Some(report_line);
-                                        debug!("Matched platform.report with batched agent for request: {}", request_id_str);
-                                    }
-                                    else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
-                                        let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
-                                        if has_agent {
-                                            debug!("Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
-                                            
-                                            let arn = REQUEST_CONTEXTS.get(request_id_str)
-                                                .map(|ctx_ref| {
-                                                    ctx_ref.lock()
-                                                        .ok()
-                                                        .map(|ctx| ctx.invoked_function_arn.clone())
-                                                        .unwrap_or_else(|| "unknown".to_string())
-                                                })
-                                                .unwrap_or_else(|| "unknown".to_string());
-                                            
-                                            if let Ok(buffer_guard) = buffer.lock() {
-                                                for payload_bytes in buffer_guard.iter() {
-                                                    add_to_batch(
-                                                        request_id_str.to_string(),
-                                                        payload_bytes.clone(),
-                                                        Some(report_line.clone()),
-                                                        arn.clone(),
-                                                    );
+                                        // In APM mode, platform.report and agent payloads are INDEPENDENT
+                                        // Agent payloads go directly to APM collector when run_id is available
+                                    } else {
+                                        // STANDARD MODE: Match platform.report with agent payloads for batching
+                                        if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
+                                            batch_item.report_line = Some(report_line);
+                                            debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                        }
+                                        else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
+                                            let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
+                                            if has_agent {
+                                                debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                                
+                                                let arn = REQUEST_CONTEXTS.get(request_id_str)
+                                                    .map(|ctx_ref| {
+                                                        ctx_ref.lock()
+                                                            .ok()
+                                                            .map(|ctx| ctx.invoked_function_arn.clone())
+                                                            .unwrap_or_else(|| "unknown".to_string())
+                                                    })
+                                                    .unwrap_or_else(|| "unknown".to_string());
+                                                
+                                                if let Ok(buffer_guard) = buffer.lock() {
+                                                    for payload_bytes in buffer_guard.iter() {
+                                                        add_to_batch(
+                                                            request_id_str.to_string(),
+                                                            payload_bytes.clone(),
+                                                            Some(report_line.clone()),
+                                                            arn.clone(),
+                                                        );
+                                                    }
                                                 }
+                                                
+                                                drop(buffer);
+                                                REQUEST_AGENT_BUFFERS.remove(request_id_str);
+                                                debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                            } else {
+                                                PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                                debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                             }
-                                            
-                                            drop(buffer);
-                                            REQUEST_AGENT_BUFFERS.remove(request_id_str);
-                                            debug!("Cleared agent buffer for request {} after matching with report", request_id_str);
-                                        } else {
-                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
-                                            debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
-                                    }
-                                    else {
-                                        PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
-                                        debug!("Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                        else {
+                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                        }
                                     }
                                 }
                             }

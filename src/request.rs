@@ -20,6 +20,7 @@ pub struct RequestProcessingState {
     pub platform_processor: Arc<PlatformProcessor>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     pub coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
+    pub runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,11 +118,15 @@ pub fn create_request_processing_state(
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
+    let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
+    RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
+
     let state = RequestProcessingState {
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
         coordination_rx: Some(payload_rx),
+        runtime_done_rx: Some(runtime_done_rx),
     };
 
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);
