@@ -202,7 +202,7 @@ impl ExtensionConfig {
             .unwrap_or(true);
 
         config.new_relic.license_key = env::var("NEW_RELIC_LICENSE_KEY").ok();
-        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID").unwrap_or_default();
+        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET").unwrap_or_default();
         config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
         
@@ -315,7 +315,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             };
 
             let filter_directive = format!(
-                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,{}",
+                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
                 log_level,
                 log_level
             );
@@ -325,7 +325,7 @@ pub fn init_config() -> &'static ExtensionConfig {
                 Ok(filter) => filter,
                 Err(e) => {
                     eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
-                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,hyper=info,h2=info,info";
+                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
                     EnvFilter::try_new(fallback_directive)
                         .expect("Fallback filter directive should always be valid")
                 }

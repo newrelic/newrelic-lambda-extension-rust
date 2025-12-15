@@ -12,7 +12,7 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::warn;
+use tracing::{debug, warn};
 use crate::config::Configuration;
 
 /// License key secret structure for JSON parsing
@@ -213,14 +213,14 @@ pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     
     if let Ok(secret_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SECRET) {
         if !secret_name_or_arn.is_empty() {
-
+            debug!("Using NEW_RELIC_LICENSE_KEY_SECRET environment variable to fetch from Secrets Manager: {}", secret_name_or_arn);
             return try_license_key_from_secret(&secret_name_or_arn).await;
         }
     }
     
     if let Ok(parameter_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SSM_PARAMETER) {
         if !parameter_name_or_arn.is_empty() {
-
+            debug!("Using NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME environment variable to fetch from SSM: {}", parameter_name_or_arn);
             return try_license_key_from_ssm_parameter(&parameter_name_or_arn).await;
         }
     }
