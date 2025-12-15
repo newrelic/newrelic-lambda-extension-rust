@@ -183,6 +183,27 @@ impl LogProcessor {
 
    
     pub async fn process_record(&self, record: TelemetryRecord) {
+
+        let message_str = match &record.record {
+            serde_json::Value::String(s) => s.as_str(),
+            serde_json::Value::Object(obj) => {
+                if let Some(message_value) = obj.get("message") {
+                    message_value.as_str().unwrap_or("")
+                } else {
+                    &serde_json::to_string(&record.record).unwrap_or_default()
+                }
+            }
+            _ => {
+                &serde_json::to_string(&record.record).unwrap_or_default()
+            }
+        };
+
+        // Filter out the "Skipping" trace messages to prevent recursive loop
+        if message_str.contains("Skipping function log") || 
+        message_str.contains("Skipping extension log") {
+            return;
+        }
+        
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
@@ -200,21 +221,7 @@ impl LogProcessor {
                 trace!("Processing unknown log type: {}", record.record_type);
             }
         }
-        
-        let message_str = match &record.record {
-            serde_json::Value::String(s) => s.as_str(),
-            serde_json::Value::Object(obj) => {
-                if let Some(message_value) = obj.get("message") {
-                    message_value.as_str().unwrap_or("")
-                } else {
-                    &serde_json::to_string(&record.record).unwrap_or_default()
-                }
-            }
-            _ => {
-                &serde_json::to_string(&record.record).unwrap_or_default()
-            }
-        };
-        
+
         if 
            message_str.contains("Processing log record") ||
            message_str.contains("Added log to batch") ||
