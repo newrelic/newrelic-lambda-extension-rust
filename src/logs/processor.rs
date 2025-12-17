@@ -186,13 +186,11 @@ impl LogProcessor {
         match record.record_type.as_str() {
             "function" => {
                 if !self.config.extension.send_function_logs {
-                    trace!("Skipping function log - send_function_logs is disabled");
                     return;
                 }
             }
             "extension" => {
                 if !self.config.extension.send_extension_logs {
-                    trace!("Skipping extension log - send_extension_logs is disabled");
                     return;
                 }
             }
@@ -214,41 +212,6 @@ impl LogProcessor {
                 &serde_json::to_string(&record.record).unwrap_or_default()
             }
         };
-        
-        if 
-           message_str.contains("Processing log record") ||
-           message_str.contains("Added log to batch") ||
-           message_str.contains("Batching log for") ||
-           message_str.contains("No logs in batch to send") ||
-           message_str.contains("Buffered log for trace ID extraction") ||
-           message_str.contains("Applied trace ID to") && message_str.contains("buffered logs") ||
-           message_str.contains("Flushing batch of") && message_str.contains("logs") ||
-           message_str.contains("Chunking") && message_str.contains("logs into") && message_str.contains("batches") ||
-           message_str.contains("Successfully sent") && (message_str.contains("log batch") || message_str.contains("previously failed logs")) ||
-           message_str.contains("Failed to send") && (message_str.contains("log batch") || message_str.contains("previously failed logs")) ||
-           message_str.contains("Full telemetry record") ||
-           message_str.contains("Extracted message") ||
-           message_str.contains("Processing log message") ||
-           message_str.contains("No 'message' field found in record") ||
-           message_str.contains("Available fields") ||
-           message_str.contains("checkout") ||
-           message_str.contains("Http::connect") ||
-           message_str.contains("http1 handshake") ||
-           message_str.contains("waiting for connection") ||
-           message_str.contains("connection is ready") ||
-           message_str.contains("connecting to") ||
-           message_str.contains("connected to") ||
-           message_str.contains("put; add idle connection") ||
-           message_str.contains("put; found waiter") ||
-           message_str.contains("Sending") && message_str.contains("log messages to NR") ||
-           message_str.contains("Sending payload to NR endpoint") ||
-           message_str.contains("Successfully sent payload to NR") ||
-           message_str.contains("Request timeout") ||
-           message_str.contains("LogProcessor received record type") ||
-           message_str.contains("Processing unknown log type") ||
-           message_str.contains("Added log to batch for coordinated flush") {
-            return;
-        }
     
         if let Some(log_message) = self.to_log_message(record.clone()) {
             let has_valid_context = {
@@ -481,7 +444,7 @@ impl LogProcessor {
 
     fn extract_log_level(&self, message: &str) -> &'static str {
 
-        let check_str = &message[..message.len().min(100)]; // Check first 100 chars
+        let check_str: String = message.chars().take(50).collect();
         
         if let Some(bracket_end) = check_str.find(']') {
             let after_bracket = &check_str[bracket_end+1..].trim_start();
