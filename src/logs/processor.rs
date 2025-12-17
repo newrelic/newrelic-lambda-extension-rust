@@ -444,7 +444,7 @@ impl LogProcessor {
 
     fn extract_log_level(&self, message: &str) -> &'static str {
 
-        let check_str = &message[..message.len().min(100)]; // Check first 100 chars
+        let check_str: String = message.chars().take(50).collect();
         
         if let Some(bracket_end) = check_str.find(']') {
             let after_bracket = &check_str[bracket_end+1..].trim_start();
