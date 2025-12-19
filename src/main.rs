@@ -93,22 +93,35 @@ async fn main() -> std::io::Result<()> {
             message
         );
         eprintln!("[NR_EXT] ERROR Panic location: {}", location);
-
     }));
 
-    match run_extension().await {
-        Ok(_) => {
-            eprintln!("[NR_EXT] INFO Extension completed successfully");
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!(
-                "[NR_EXT] ERROR Extension failed but continuing gracefully: {}",
-                e
-            );
-            eprintln!("[NR_EXT] WARN Lambda function will continue without New Relic monitoring");
+    let extension_handle = tokio::spawn(async move {
+        run_extension().await
+    });
 
-            Ok(())
+    match extension_handle.await {
+        Ok(extension_result) => match extension_result {
+            Ok(_) => {
+                eprintln!("[NR_EXT] INFO Extension completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!(
+                    "[NR_EXT] ERROR Extension failed but continuing gracefully: {}",
+                    e
+                );
+                eprintln!("[NR_EXT] WARN Lambda function will continue without New Relic monitoring");
+                return Ok(());
+            }
+        },
+        // Task panicked - Lambda will continue but extension is inactive
+        Err(join_error) => {
+            eprintln!("[NR_EXT] CRITICAL Extension panicked but Lambda will continue");
+            if join_error.is_panic() {
+                eprintln!("[NR_EXT] CRITICAL Panic detected: {:?}", join_error);
+            }
+            eprintln!("[NR_EXT] INFO Lambda function will continue without New Relic monitoring");
+            return Ok(());
         }
     }
 }
