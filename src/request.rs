@@ -269,6 +269,7 @@ pub async fn wait_for_all_requests_completion(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<crate::logs::processor::LogProcessor>,
+    shutdown_start_time: std::time::Instant,
 ) {
     let pending_count = REQUEST_PROCESSORS.len();
 
@@ -329,7 +330,9 @@ pub async fn wait_for_all_requests_completion(
         error!("Shutdown: Logs flush task failed: {}", e);
     }
 
+    let shutdown_duration = shutdown_start_time.elapsed();
     info!("Shutdown: All pending data flushed");
+    info!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
 }
 
 /// Cleanup old request buffers by sending their payloads to New Relic first

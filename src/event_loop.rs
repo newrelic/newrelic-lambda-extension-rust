@@ -251,7 +251,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
+                let shutdown_start_time = std::time::Instant::now();
+                info!("[NR_EXT] APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -368,13 +369,45 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 } else {
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
-                
+
+                // Process any pending platform.report lines as metrics (APM mode)
+                let all_pending_reports: Vec<(String, String)> = PENDING_REPORTS
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect();
+
+                if !all_pending_reports.is_empty() {
+                    info!("APM mode shutdown: Found {} pending platform.report(s) to send as metrics", all_pending_reports.len());
+
+                    let apm_app_guard = components.apm_app.read().await;
+                    if let Some(ref app) = *apm_app_guard {
+                        for (request_id, report_line) in all_pending_reports {
+                            info!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
+
+                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                                error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
+                            } else {
+                                info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
+                            }
+
+                            // Remove from pending reports after sending
+                            PENDING_REPORTS.remove(&request_id);
+                        }
+                    } else {
+                        warn!("APM mode shutdown: APM app not initialized - cannot send platform metrics");
+                    }
+                } else {
+                    debug!("APM mode shutdown: No pending platform.report lines to process");
+                }
+
                 // Final flush of logs
                 if let Err(e) = components.global_log_processor.flush().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
-                
+
+                let shutdown_duration = shutdown_start_time.elapsed();
                 info!("APM mode shutdown: All data processed and sent");
+                info!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
                 break;
             }
         }
@@ -532,7 +565,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                info!("Standard mode: Extension shutting down with reason: {}", shutdown_reason);
+                let shutdown_start_time = std::time::Instant::now();
+                info!("[NR_EXT] Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -587,14 +621,15 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     components.config.clone(),
                 )
                 .await;
-                
+
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),
                     components.config.clone(),
                     components.global_log_processor.clone(),
+                    shutdown_start_time,
                 )
                 .await;
-                
+
                 info!("Standard mode shutdown: All data processed and sent");
                 break;
             }
@@ -847,6 +882,31 @@ pub async fn process_apm_request(
                 }
             }
         });
+    }
+
+    // Check for pending platform.report and send as metrics to Metric API (APM mode)
+    if let Some(entry) = PENDING_REPORTS.get(&request_id) {
+        let report_line = entry.value().clone();
+        drop(entry); // Release the lock before async operations
+
+        info!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
+
+        let apm_app_guard = apm_app.read().await;
+        if let Some(ref app) = *apm_app_guard {
+            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
+            } else {
+                info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
+            }
+        } else {
+            warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
+        }
+        drop(apm_app_guard);
+
+        // Remove from pending reports after sending
+        PENDING_REPORTS.remove(&request_id);
+    } else {
+        debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
 
     // Wait for logs and platform to complete before returning
@@ -1235,6 +1295,27 @@ async fn process_pending_agent_payloads(
                     error!("Failed to process pending agent payload: {}", e);
                 }
             }
+        }
+
+        // Check for pending platform.report for this old request and send as metrics (APM mode)
+        if let Some(entry) = PENDING_REPORTS.get(&request_id) {
+            let report_line = entry.value().clone();
+            drop(entry);
+
+            info!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
+
+            let apm_app_guard = apm_app.read().await;
+            if let Some(ref app) = *apm_app_guard {
+                if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                    error!("APM mode: Failed to send platform report metrics for previous request {}: {}", request_id, e);
+                } else {
+                    info!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);
+                }
+            }
+            drop(apm_app_guard);
+
+            // Remove from pending reports after sending
+            PENDING_REPORTS.remove(&request_id);
         }
 
         cleanup_request_processing_state_internal(&request_id, false);

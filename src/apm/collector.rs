@@ -86,6 +86,7 @@ pub async fn send_error_events(
         uncompressed_len
     );
 
+    let start_time = std::time::Instant::now();
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -97,12 +98,14 @@ pub async fn send_error_events(
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
+    let duration = start_time.elapsed();
 
     let status = response.status();
     let status_code = status.as_u16();
 
     if status.is_success() {
         debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
+        info!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
         info!("Successfully sent {} error events (status: {})", error_events.len(), status);
         Ok(())
     } else {
@@ -173,6 +176,7 @@ pub async fn send_apm_telemetry(
         uncompressed_len
     );
 
+    let start_time = std::time::Instant::now();
     let response = client
         .post(&url)
         .header("NR-Session", run_id)
@@ -184,12 +188,14 @@ pub async fn send_apm_telemetry(
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
+    let duration = start_time.elapsed();
 
     let status = response.status();
     let status_code = status.as_u16();
 
     if status.is_success() {
         debug!("Status Code for {} telemetry: {}", command, status_code);
+        info!("Send {} duration: {}ms", command, duration.as_millis());
         info!("Successfully sent {} (status: {})", command, status);
         Ok(())
     } else {
@@ -244,21 +250,24 @@ pub async fn send_platform_metrics(
         compressed.len()
     );
 
+    let start_time = std::time::Instant::now();
     let response = client
         .post(metric_endpoint)
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20)) 
+        .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
+    let duration = start_time.elapsed();
 
     let status = response.status();
     let status_code = status.as_u16();
-    
+
     if status.is_success() {
         debug!("Status Code for platform_metrics telemetry: {}", status_code);
+        info!("Send platform_metrics duration: {}ms", duration.as_millis());
         info!("Successfully sent {} platform metrics", metrics.len());
         Ok(())
     } else {
