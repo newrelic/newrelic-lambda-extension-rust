@@ -218,33 +218,6 @@ impl ExtensionConfig {
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
-        let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
-
-        if let Ok(host) = env::var("NEW_RELIC_HOST") {
-            config.new_relic.apm_host = host;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
-        }
-
-        if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
-            config.new_relic.metric_endpoint = endpoint;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
-        }
-
-        if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
-            config.new_relic.telemetry_endpoint = endpoint;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.telemetry_endpoint =
-                "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
-        }
-
-        if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
-            config.new_relic.log_endpoint = endpoint;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
-        }
-
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
         }
