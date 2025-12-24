@@ -277,7 +277,36 @@ async fn perform_one_time_initialization(
     };
 
     let mut updated_config = (*config).clone();
-    updated_config.new_relic.license_key = Some(license_key);
+    updated_config.new_relic.license_key = Some(license_key.clone());
+
+    // Detect EU endpoints from license key prefix
+    let license_key_prefix = license_key.get(0..2);
+
+    if let Ok(host) = env::var("NEW_RELIC_HOST") {
+        updated_config.new_relic.apm_host = host;
+    } else if let Some("eu") = license_key_prefix {
+        updated_config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+    }
+
+    if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
+        updated_config.new_relic.metric_endpoint = endpoint;
+    } else if let Some("eu") = license_key_prefix {
+        updated_config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+    }
+
+    if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
+        updated_config.new_relic.telemetry_endpoint = endpoint;
+    } else if let Some("eu") = license_key_prefix {
+        updated_config.new_relic.telemetry_endpoint =
+            "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
+    }
+
+    if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
+        updated_config.new_relic.log_endpoint = endpoint;
+    } else if let Some("eu") = license_key_prefix {
+        updated_config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
+    }
+
     let config = Arc::new(updated_config);
 
     info!("License key validated and extension registered - proceeding with full initialization");
