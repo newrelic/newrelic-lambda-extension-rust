@@ -10,6 +10,7 @@ pub mod error_event;
 pub mod id_generator;
 pub mod metric_converter;
 pub mod payload_parser;
+pub mod telemetry_buffer;
 
 pub use app::{ApmApp, SharedApmApp};
 

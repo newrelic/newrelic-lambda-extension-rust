@@ -369,6 +369,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 } else {
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
+                info!("APM mode shutdown: Retrying all buffered telemetry");
+                crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                    &components.client,
+                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
+                )
+                .await;
+
+                let remaining_count = crate::apm::telemetry_buffer::get_buffer_count();
+                if remaining_count > 0 {
+                    error!("APM mode shutdown: {} telemetry items could not be sent", remaining_count);
+                }
 
                 // Process any pending platform.report lines as metrics (APM mode)
                 let all_pending_reports: Vec<(String, String)> = PENDING_REPORTS
@@ -474,6 +485,12 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
                 error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
+
+                crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                    &components.client,
+                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
+                )
+                .await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone());
@@ -957,7 +974,7 @@ async fn send_to_apm_collector(
             request_id,
             payload_bytes.len()
         );
-        app.process_agent_payload(payload_bytes.to_vec()).await?;
+        app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
         info!(
             "APM mode: Agent payload sent successfully for request: {}",
             request_id
@@ -1353,7 +1370,7 @@ async fn process_and_send_agent_payload(
             request_id,
             payload_bytes.len()
         );
-        match app.process_agent_payload(payload_bytes.to_vec()).await {
+        match app.process_agent_payload(payload_bytes.to_vec(), request_id).await {
             Ok(()) => {
                 info!("APM mode: Agent payload sent successfully for request: {}", request_id);
             }
