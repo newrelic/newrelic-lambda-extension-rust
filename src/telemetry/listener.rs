@@ -137,12 +137,22 @@ async fn handle_telemetry_request(
                                     if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
-                                        if let Some(ref app) = *apm_app_read {
+                                        let send_failed = if let Some(ref app) = *apm_app_read {
                                             if let Err(e) = app.send_platform_report_metrics(&report_line).await {
-                                                warn!("APM mode: Failed to send platform.report metrics for {}: {}", request_id_str, e);
+                                                warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id_str, e);
+                                                true
                                             } else {
                                                 debug!("APM mode: Sent platform.report metrics for request: {}", request_id_str);
+                                                false
                                             }
+                                        } else {
+                                            warn!("APM mode: APM app not ready - storing report for retry");
+                                            true
+                                        };
+
+                                        if send_failed {
+                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            debug!("APM mode: Stored failed platform.report for request: {} (will retry later)", request_id_str);
                                         }
                                         // In APM mode, platform.report and agent payloads are INDEPENDENT
                                         // Agent payloads go directly to APM collector when run_id is available

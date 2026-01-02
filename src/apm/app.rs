@@ -23,6 +23,7 @@ pub struct ApmApp {
     pub entity_guid: String,
     pub collector_host: String,
     pub license_key: String,
+    pub metric_endpoint: String,
     pub client: Client,
 }
 
@@ -30,7 +31,7 @@ impl ApmApp {
     pub async fn new(
         license_key: String,
         apm_host: String,
-        _metric_endpoint: String,
+        metric_endpoint: String,
         client: Client,
         function_name: String,
         function_version: String,
@@ -48,6 +49,7 @@ impl ApmApp {
             match Self::try_connect(
                 &license_key,
                 &apm_host,
+                &metric_endpoint,
                 &client,
                 &function_name,
                 &function_version,
@@ -82,6 +84,7 @@ impl ApmApp {
     async fn try_connect(
         license_key: &str,
         apm_host: &str,
+        metric_endpoint: &str,
         client: &Client,
         function_name: &str,
         function_version: &str,
@@ -152,12 +155,13 @@ impl ApmApp {
             entity_guid,
             collector_host,
             license_key: license_key.to_string(),
+            metric_endpoint: metric_endpoint.to_string(),
             client: client.clone(),
         })
     }
 
-    pub async fn process_agent_payload(&self, payload: Vec<u8>) -> Result<()> {
-        debug!("Processing agent payload ({} bytes)", payload.len());
+    pub async fn process_agent_payload(&self, payload: Vec<u8>, request_id: &str) -> Result<()> {
+        debug!("Processing agent payload ({} bytes) for request {}", payload.len(), request_id);
 
         let (mut telemetry_map, protocol_version) =
             parse_agent_payload(&payload).context("Failed to parse agent payload")?;
@@ -221,10 +225,12 @@ impl ApmApp {
             let license_key = self.license_key.clone();
             let collector_host = self.collector_host.clone();
             let run_id = self.run_id.clone();
+            let request_id_owned = request_id.to_string();
 
             let task = tokio::spawn(async move {
-                if telemetry_type == "error_event_data" {
-                    if let Err(e) = send_error_events(
+                let request_id = request_id_owned;
+                let send_result = if telemetry_type == "error_event_data" {
+                    send_error_events(
                         &client,
                         &license_key,
                         &collector_host,
@@ -232,37 +238,41 @@ impl ApmApp {
                         &data,
                     )
                     .await
-                    {
-                        warn!("Failed to send {}: {}", telemetry_type, e);
-                    }
-                    return;
-                }
+                } else {
+                    let command = match telemetry_type.as_str() {
+                        "metric_data" => CMD_METRICS,
+                        "span_event_data" => CMD_SPAN_EVENTS,
+                        "error_data" => CMD_ERROR_DATA,
+                        "analytic_event_data" => CMD_ANALYTIC_EVENTS,
+                        "custom_event_data" => CMD_CUSTOM_EVENTS,
+                        "log_event_data" => CMD_LOG_EVENTS,
+                        "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
+                        _ => {
+                            warn!("Unknown telemetry type: {}", telemetry_type);
+                            return;
+                        }
+                    };
 
-                let command = match telemetry_type.as_str() {
-                    "metric_data" => CMD_METRICS,
-                    "span_event_data" => CMD_SPAN_EVENTS,
-                    "error_data" => CMD_ERROR_DATA,
-                    "analytic_event_data" => CMD_ANALYTIC_EVENTS,
-                    "custom_event_data" => CMD_CUSTOM_EVENTS,
-                    "log_event_data" => CMD_LOG_EVENTS,
-                    "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
-                    _ => {
-                        warn!("Unknown telemetry type: {}", telemetry_type);
-                        return;
-                    }
+                    send_apm_telemetry(
+                        &client,
+                        &license_key,
+                        &collector_host,
+                        &run_id,
+                        command,
+                        &data,
+                    )
+                    .await
                 };
 
-                if let Err(e) = send_apm_telemetry(
-                    &client,
-                    &license_key,
-                    &collector_host,
-                    &run_id,
-                    command,
-                    &data,
-                )
-                .await
-                {
-                    warn!("Failed to send {}: {}", telemetry_type, e);
+                if let Err(e) = send_result {
+                    warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
+                    super::telemetry_buffer::buffer_failed_telemetry(
+                        telemetry_type.clone(),
+                        data,
+                        request_id,
+                        run_id,
+                        collector_host,
+                    );
                 }
             });
 
@@ -304,7 +314,7 @@ impl ApmApp {
         send_platform_metrics(
             &self.client,
             &self.license_key,
-            "https://metric-api.newrelic.com/metric/v1",
+            &self.metric_endpoint,
             metrics,
         )
         .await
@@ -679,6 +689,7 @@ mod tests {
             entity_guid: "test_guid".to_string(),
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
+            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             client,
         };
 

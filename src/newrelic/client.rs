@@ -107,6 +107,12 @@ impl NewRelicClient {
             common_attributes.extend(version_attrs.clone());
         }
 
+        // Add NR_TAGS as common attributes
+        for (key, value) in crate::config::parse_nr_tags() {
+            debug!("Adding NR_TAGS to log payload: {}={}", key, value);
+            common_attributes.insert(key, serde_json::json!(value));
+        }
+
         let log_count = batch.len();
         let log_data = vec![payload::LogPayload {
             common: payload::Common { attributes: common_attributes },
