@@ -20,6 +20,7 @@ pub struct RequestProcessingState {
     pub platform_processor: Arc<PlatformProcessor>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
     pub coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
+    #[allow(dead_code)]
     pub runtime_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 

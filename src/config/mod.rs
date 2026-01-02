@@ -24,6 +24,7 @@ pub struct NewRelicConfig {
     pub lambda_handler: Option<String>,
     pub telemetry_endpoint: String,
     pub log_endpoint: String,
+    #[allow(dead_code)]
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
     pub add_version_detail_tags: bool,
@@ -271,6 +272,36 @@ where
     }
 }
 
+/// Parse NR_TAGS environment variable into key-value pairs
+/// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
+/// 
+/// # Example
+/// ```
+/// std::env::set_var("NR_TAGS", "env:prod;team:backend");
+/// let tags = parse_nr_tags();
+/// assert_eq!(tags, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
+/// ```
+pub fn parse_nr_tags() -> Vec<(String, String)> {
+    let nr_tags = match env::var("NR_TAGS") {
+        Ok(tags) if !tags.is_empty() => tags,
+        _ => return Vec::new(),
+    };
+
+    let delimiter = env::var("NR_ENV_DELIMITER").unwrap_or_else(|_| ";".to_string());
+
+    nr_tags
+        .split(&delimiter)
+        .filter_map(|tag| {
+            let parts: Vec<&str> = tag.split(':').collect();
+            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Global configuration instance
 static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
 static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
@@ -324,5 +355,159 @@ pub fn init_config() -> &'static ExtensionConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn test_parse_nr_tags_with_default_delimiter() {
+        // Save and clear environment
+        let original_tags = env::var("NR_TAGS").ok();
+        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
+        
+        env::set_var("NR_TAGS", "env:prod;team:backend;region:us-east-1");
+        env::remove_var("NR_ENV_DELIMITER");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 3);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        assert!(tags.contains(&("region".to_string(), "us-east-1".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+        if let Some(val) = original_delimiter {
+            env::set_var("NR_ENV_DELIMITER", val);
+        } else {
+            env::remove_var("NR_ENV_DELIMITER");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_with_custom_delimiter() {
+        let original_tags = env::var("NR_TAGS").ok();
+        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
+        
+        env::set_var("NR_TAGS", "env:prod|team:backend");
+        env::set_var("NR_ENV_DELIMITER", "|");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+        if let Some(val) = original_delimiter {
+            env::set_var("NR_ENV_DELIMITER", val);
+        } else {
+            env::remove_var("NR_ENV_DELIMITER");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_with_whitespace() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::set_var("NR_TAGS", " env : prod ; team : backend ");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_invalid_format() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        // Test invalid formats - should be skipped
+        env::set_var("NR_TAGS", "invalid;env:prod;also-invalid;team:backend");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_empty_values() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        // Test empty keys/values - should be skipped
+        env::set_var("NR_TAGS", ":value;key:;env:prod");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 1);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_not_set() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::remove_var("NR_TAGS");
+        
+        let tags = parse_nr_tags();
+        
+        assert!(tags.is_empty());
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_empty_string() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::set_var("NR_TAGS", "");
+        
+        let tags = parse_nr_tags();
+        
+        assert!(tags.is_empty());
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+}
 

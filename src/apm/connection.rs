@@ -5,7 +5,6 @@
 use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::io::Write;
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -340,28 +339,7 @@ fn detect_agent_version_internal(runtime: &str) -> String {
     "unknown".to_string()
 }
 
-/// Parse NR_TAGS environment variable into key-value pairs
-/// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
-fn parse_nr_tags() -> Vec<(String, String)> {
-    let nr_tags = match env::var("NR_TAGS") {
-        Ok(tags) if !tags.is_empty() => tags,
-        _ => return Vec::new(),
-    };
-
-    let delimiter = env::var("NR_ENV_DELIMITER").unwrap_or_else(|_| ";".to_string());
-
-    nr_tags
-        .split(&delimiter)
-        .filter_map(|tag| {
-            let parts: Vec<&str> = tag.split(':').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
-}
+// Note: parse_nr_tags() is now defined in config::mod for shared use
 
 /// Get labels for Connect request, including aws.arn, isLambdaFunction, and NR_TAGS
 fn get_labels(function_arn: &str) -> Vec<Label> {
@@ -376,7 +354,7 @@ fn get_labels(function_arn: &str) -> Vec<Label> {
         },
     ];
 
-    for (key, value) in parse_nr_tags() {
+    for (key, value) in crate::config::parse_nr_tags() {
         debug!("Added custom label from NR_TAGS: {}={}", key, value);
         labels.push(Label {
             label_type: key,
