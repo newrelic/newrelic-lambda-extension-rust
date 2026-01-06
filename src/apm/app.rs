@@ -310,6 +310,8 @@ impl ApmApp {
             .unwrap_or_else(|_| "unknown".to_string());
 
         let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
+        
+        info!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
         send_platform_metrics(
             &self.client,
