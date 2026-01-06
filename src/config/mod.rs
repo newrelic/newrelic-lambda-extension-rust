@@ -28,6 +28,7 @@ pub struct NewRelicConfig {
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
     pub add_version_detail_tags: bool,
+    pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
     pub apm_host: String,
     pub metric_endpoint: String,
@@ -92,6 +93,7 @@ impl Default for NewRelicConfig {
             harvest_interval: Duration::from_secs(2),
             collect_trace_id: false,
             add_version_detail_tags: false,
+            layer_version: None,
             apm_lambda_mode: false,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
@@ -216,6 +218,8 @@ impl ExtensionConfig {
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
+        config.new_relic.layer_version = env::var("NEW_RELIC_LAYER_VERSION").ok();
+
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
@@ -223,8 +227,7 @@ impl ExtensionConfig {
             config.aws.runtime_api = runtime_api;
         }
 
-        config.aws.function_name =
-            env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
+        // Note: function_name is set from extension registration response, not from env var
 
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);

@@ -96,7 +96,7 @@ impl NewRelicClient {
 
         if config.new_relic.add_version_detail_tags {
             let version_attrs = self.cached_version_attrs.get_or_init(|| {
-                let version_info = VersionInfo::get_or_detect();
+                let version_info = VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
                 let version_tags = version_info.as_tags();
                 let mut attrs = serde_json::Map::new();
                 for (key, value) in version_tags {

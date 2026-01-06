@@ -17,11 +17,11 @@ use crate::apm::app::ApmApp;
 /// Safe mutex operations that won't panic and allow graceful degradation
 trait SafeMutexOps<T> {
    
-    fn safe_lock(&self) -> Option<std::sync::MutexGuard<T>>;
+    fn safe_lock(&self) -> Option<std::sync::MutexGuard<'_, T>>;
 }
 
 impl<T> SafeMutexOps<T> for Mutex<T> {
-    fn safe_lock(&self) -> Option<std::sync::MutexGuard<T>> {
+    fn safe_lock(&self) -> Option<std::sync::MutexGuard<'_, T>> {
         match self.lock() {
             Ok(guard) => Some(guard),
             Err(e) => {

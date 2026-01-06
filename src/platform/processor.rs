@@ -102,6 +102,11 @@ impl PlatformProcessor {
                     .and_then(|v| v.as_str()).unwrap_or("unknown");
                 let phase = record.record.get("phase")
                     .and_then(|v| v.as_str()).unwrap_or("unknown");
+                
+                // Capture runtime version for version info line (e.g., "python3.13", "nodejs20.x")
+                if runtime_version != "unknown" {
+                    crate::version::VersionInfo::set_runtime_version(runtime_version.to_string());
+                }
                     
                 (format!("INIT START RequestId: {} Type: {} Runtime: {} Phase: {}", 
                     self.extract_request_id_from_record(record).unwrap_or_else(|| "unknown".to_string()),

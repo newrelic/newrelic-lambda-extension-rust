@@ -97,15 +97,18 @@ pub fn tag_lambda_function_background(
     agent_version: Option<String>,
     layer_version: Option<String>,
     function_arn: String,
+    layer_version_from_config: Option<String>,
+    add_version_detail_tags: bool,
+    function_name: String,
 ) {
     tokio::spawn(async move {
         let mut final_layer_version = layer_version;
 
-        // Fallback: if layer version not detected from env vars, try AWS API
-        // This ensures layer tagging works even when AWS_LAMBDA_LAYERS env var is not set
-        if final_layer_version.is_none() {
+        // Fallback: if layer version not detected from env vars and user enabled detailed tags, try AWS API
+        // This ensures layer tagging works when user has configured AWS permissions
+        if final_layer_version.is_none() && add_version_detail_tags {
             debug!("Layer version not detected from env vars, attempting AWS API fallback...");
-            match crate::version::detect_layer_version_async().await {
+            match crate::version::detect_layer_version_async(layer_version_from_config, add_version_detail_tags, function_name).await {
                 Some(layer_ver) => {
                     info!("Layer version detected via AWS API fallback: {}", layer_ver);
                     final_layer_version = Some(layer_ver);

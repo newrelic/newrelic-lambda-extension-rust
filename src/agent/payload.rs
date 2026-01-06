@@ -23,6 +23,7 @@ pub async fn send_agent_payload_to_newrelic(
     invoked_function_arn: &str,
     newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
+    version_info: Option<&Arc<version::VersionInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let function_name = invoked_function_arn.split(':').next_back().unwrap_or("");
     let log_group_name = format!("/aws/lambda/{function_name}");
@@ -34,6 +35,7 @@ pub async fn send_agent_payload_to_newrelic(
         &log_group_name,
         request_id,
         config,
+        version_info,
     );
 
     match newrelic_client
@@ -67,6 +69,7 @@ fn create_wrapped_agent_payload_json(
     log_group_name: &str,
     request_id: &str,
     config: &Arc<ExtensionConfig>,
+    version_info: Option<&Arc<version::VersionInfo>>,
 ) -> String {
     debug!(
         "Processing agent data of {} bytes for function: {}",
@@ -81,12 +84,14 @@ fn create_wrapped_agent_payload_json(
         log_group_name,
         request_id,
         config,
+        version_info,
     )
 }
 
 /// Create New Relic format with Lambda context and stringified log events in entry field
 /// Returns JSON with context and entry fields matching New Relic expected format
 /// NOTE: This is for AGENT payload wrapping, not regular log processing
+/// In serverless mode, appends version line as a second log event (like platform.report)
 fn create_newrelic_log_format(
     agent_data: &[u8],
     function_name: &str,
@@ -94,6 +99,7 @@ fn create_newrelic_log_format(
     log_group_name: &str,
     request_id: &str,
     config: &Arc<ExtensionConfig>,
+    version_info: Option<&Arc<version::VersionInfo>>,
 ) -> String {
     let agent_data_str = String::from_utf8_lossy(agent_data);
     debug!("Agent data to wrap in log format: {}", agent_data_str);
@@ -104,12 +110,33 @@ fn create_newrelic_log_format(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let log_events_payload = serde_json::json!({
-        "logEvents": [{
+    // Build log events array: agent payload first, then report line (if any), then version line (serverless mode only)
+    let mut log_events = vec![
+        serde_json::json!({
             "id": request_id,
             "message": agent_data_str,
             "timestamp": timestamp
-        }],
+        })
+    ];
+
+    // Note: report line is appended separately by caller if needed
+    
+    // Append version line as last log event in serverless mode (after agent payload and report line)
+    if !config.new_relic.apm_lambda_mode {
+        if let Some(version_info) = version_info {
+            let version_line = version_info.format_version_line(request_id);
+            debug!("Serverless mode - appending version line to agent payload: {}", version_line);
+            
+            log_events.push(serde_json::json!({
+                "id": request_id,
+                "message": version_line,
+                "timestamp": timestamp
+            }));
+        }
+    }
+
+    let log_events_payload = serde_json::json!({
+        "logEvents": log_events,
         "logGroup": log_group_name,
         "logStream": "",
         "messageType": "",
@@ -126,7 +153,7 @@ fn create_newrelic_log_format(
     });
 
     if config.new_relic.add_version_detail_tags {
-        let version_info = version::VersionInfo::get_or_detect();
+        let version_info = version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
         let version_tags = version_info.as_tags();
 
         if let Some(context_obj) = context.as_object_mut() {
@@ -147,3 +174,4 @@ fn create_newrelic_log_format(
 
     final_payload.to_string()
 }
+

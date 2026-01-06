@@ -177,28 +177,6 @@ pub async fn retry_buffered_telemetry(
     }
 }
 
-/// Clean up old buffered telemetry (older than 1 hour)
-pub fn cleanup_old_telemetry() {
-    if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-        let initial_count = buffer.len();
-        let now = Utc::now();
-
-        buffer.retain(|item| {
-            let age = now.signed_duration_since(item.failed_at);
-            age.num_minutes() <= 60
-        });
-
-        let removed_count = initial_count - buffer.len();
-        if removed_count > 0 {
-            debug!(
-                "Cleaned up {} old failed telemetry items (kept {} recent ones)",
-                removed_count,
-                buffer.len()
-            );
-        }
-    }
-}
-
 /// Get count of buffered telemetry for monitoring
 pub fn get_buffer_count() -> usize {
     FAILED_TELEMETRY_BUFFER
