@@ -3,19 +3,9 @@
 use tracing::{debug, warn};
 
 /// Fetch layer information from AWS Lambda API
-pub async fn fetch_layer_info_from_aws() -> Option<String> {
+pub async fn fetch_layer_info_from_aws(function_name: String) -> Option<String> {
     debug!("Attempting to fetch layer info from AWS Lambda API...");
-
-    let function_name = match std::env::var("AWS_LAMBDA_FUNCTION_NAME") {
-        Ok(name) => {
-            debug!("Function name: {}", name);
-            name
-        }
-        Err(_) => {
-            debug!("AWS_LAMBDA_FUNCTION_NAME not set");
-            return None;
-        }
-    };
+    debug!("Function name: {}", function_name);
 
     let config = match aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await {
         config => {

@@ -173,8 +173,15 @@ pub async fn send_batched_payloads_with_reports_only(
         batch_items.len()
     );
 
-    // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
-    let mut log_events = Vec::with_capacity(batch_items.len() * 2);
+    // Get version info once for appending to all payloads (serverless mode only)
+    let version_info = if !config.new_relic.apm_lambda_mode {
+        Some(crate::version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone()))
+    } else {
+        None
+    };
+
+    // Pre-allocate capacity: each item needs 2-3 log events (agent + report + optional version)
+    let mut log_events = Vec::with_capacity(batch_items.len() * 3);
 
     for item in &batch_items {
         // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
@@ -185,11 +192,21 @@ pub async fn send_batched_payloads_with_reports_only(
             "timestamp": item.timestamp.timestamp_millis(),
         }));
 
-        // All items in this batch have report lines (filtered)
+        // All items in this batch have report lines (filtered) - append as second log event
         if let Some(ref report) = item.report_line {
             log_events.push(serde_json::json!({
                 "id": item.request_id,
                 "message": report,
+                "timestamp": item.timestamp.timestamp_millis(),
+            }));
+        }
+
+        // Append version line in serverless mode (third log event)
+        if let Some(ref version_info) = version_info {
+            let version_line = version_info.format_version_line(&item.request_id);
+            log_events.push(serde_json::json!({
+                "id": item.request_id,
+                "message": version_line,
                 "timestamp": item.timestamp.timestamp_millis(),
             }));
         }

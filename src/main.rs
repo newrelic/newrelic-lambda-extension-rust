@@ -568,17 +568,6 @@ async fn resolve_license_key_with_aws_fallback(
     }
 }
 
-/// Initialize HTTP client with appropriate timeout
-async fn initialize_http_client_with_timeout(
-) -> Result<Client, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(10)
-        .tcp_keepalive(Duration::from_secs(60))
-        .build()?)
-}
-
 /// Initialize Lambda runtime client and register extension
 /// This ensures /next polling is never affected by other HTTP operations
 async fn initialize_lambda_runtime_client_and_register(

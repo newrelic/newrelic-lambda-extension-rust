@@ -7,7 +7,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     runtime,
-    config::ExtensionConfig,
+    config::{self, ExtensionConfig},
     newrelic::client::NewRelicClient,
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
@@ -149,7 +149,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
-                    tag_lambda_function_once(invoked_function_arn.clone());
+                    tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
@@ -493,7 +493,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 .await;
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
-                    tag_lambda_function_once(invoked_function_arn.clone());
+                    tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
@@ -1185,16 +1185,22 @@ pub async fn process_request_concurrently(
 }
 
 /// Tag Lambda function once on first invocation
-fn tag_lambda_function_once(invoked_function_arn: String) {
+fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
     static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
     TAGGING_DONE.call_once(|| {
         info!("Spawning background task to tag Lambda function with version information");
-        let version_info = version::VersionInfo::get_or_detect();
+        let version_info = version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
+        let add_version_detail_tags = config.new_relic.add_version_detail_tags;
+        let layer_version_from_config = config.new_relic.layer_version.clone();
+        let function_name = config.aws.function_name.clone();
         version::tagging::tag_lambda_function_background(
             version_info.extension_version.clone(),
             version_info.agent_version.clone(),
             version_info.layer_version.clone(),
             invoked_function_arn,
+            layer_version_from_config,
+            add_version_detail_tags,
+            function_name,
         );
     });
 }
@@ -1481,6 +1487,7 @@ async fn retry_failed_agent_payloads(
             &failed_payload.invoked_function_arn,
             newrelic_client,
             config,
+            None, // No version line for retries (already sent in original attempt)
         )
         .await
         {

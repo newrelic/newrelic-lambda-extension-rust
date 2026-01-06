@@ -12,6 +12,9 @@ use tracing::{debug, warn};
 /// Global cache for version information (detected once, reused everywhere)
 static VERSION_INFO_CACHE: OnceCell<Arc<VersionInfo>> = OnceCell::new();
 
+/// Global cache for runtime version from platform.initStart event
+static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
+
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -43,18 +46,19 @@ pub struct VersionInfo {
     pub agent_name: Option<String>,
     pub extension_version: String,
     pub layer_version: Option<String>,
+    pub runtime_version: Option<String>,
 }
 
 impl VersionInfo {
     /// Create version info with detected versions
     /// Uses fast synchronous detection (env vars, filesystem) - no AWS API calls
-    pub fn detect() -> Self {
+    pub fn detect(layer_version_from_config: Option<String>) -> Self {
         debug!("=== Starting version detection (sync) ===");
         let (agent_version, agent_name) = detect_agent_version();
         let extension_version = EXTENSION_VERSION.to_string();
 
-        // Detect layer version from environment variables (fast, no AWS API calls)
-        let layer_version = detect_layer_version_sync();
+        // Detect layer version from config (fast, no AWS API calls)
+        let layer_version = detect_layer_version_sync(layer_version_from_config);
 
         debug!("Version detection complete (sync):");
         debug!("  Extension version: {}", extension_version);
@@ -66,39 +70,16 @@ impl VersionInfo {
             agent_name,
             extension_version,
             layer_version,
+            runtime_version: None, // Will be set from platform.initStart event
         }
     }
 
-    /// Async version detection including AWS API calls for layer info
-    pub async fn detect_async() -> Self {
-        debug!("=== Starting async version detection ===");
-        let (agent_version, agent_name) = detect_agent_version();
-        let extension_version = EXTENSION_VERSION.to_string();
-        let layer_version = detect_layer_version_async().await;
-
-        debug!("Version detection complete:");
-        debug!("  Extension version: {}", extension_version);
-        debug!("  Agent version: {:?} ({})", agent_version, agent_name.as_deref().unwrap_or("none"));
-        debug!("  Layer version: {:?}", layer_version);
-
-        let info = Self {
-            agent_version,
-            agent_name,
-            extension_version,
-            layer_version,
-        };
-
-        let _ = VERSION_INFO_CACHE.set(Arc::new(info.clone()));
-
-        info
-    }
-
     /// Get cached version info or detect if not cached
-    pub fn get_or_detect() -> Arc<VersionInfo> {
+    pub fn get_or_detect(layer_version_from_config: Option<String>) -> Arc<VersionInfo> {
         VERSION_INFO_CACHE
             .get_or_init(|| {
                 debug!("Version info not cached, detecting synchronously...");
-                Arc::new(Self::detect())
+                Arc::new(Self::detect(layer_version_from_config))
             })
             .clone()
     }
@@ -127,6 +108,43 @@ impl VersionInfo {
         }
 
         tags
+    }
+
+    /// Set the runtime version from platform.initStart event (called once during cold start)
+    pub fn set_runtime_version(runtime_version: String) {
+        if RUNTIME_VERSION_CACHE.set(runtime_version.clone()).is_ok() {
+            debug!("Cached runtime version from platform.initStart: {}", runtime_version);
+        }
+    }
+
+    /// Get the cached runtime version
+    fn get_runtime_version() -> Option<String> {
+        RUNTIME_VERSION_CACHE.get().cloned()
+    }
+
+    /// Format version info line for serverless mode logging
+    /// Example: "Version RequestId: abc123 Agent Version: 10.35.0 Extension Version: 0.1.0 Runtime: python3.13 Layer Version: NRTestRustExtensionPythonX86:113"
+    /// Optimized: Pre-allocates buffer capacity and avoids redundant string clones
+    pub fn format_version_line(&self, request_id: &str) -> String {
+        // Priority: 1) cached runtime from platform.initStart, 2) runtime_version field, 3) agent_name, 4) unknown
+        let runtime = Self::get_runtime_version()
+            .or_else(|| self.runtime_version.clone())
+            .or_else(|| self.agent_name.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        
+        // Pre-allocate estimated capacity (reduces allocations)
+        let mut result = String::with_capacity(200);
+        result.push_str("Version RequestId: ");
+        result.push_str(request_id);
+        result.push_str(" Agent Version: ");
+        result.push_str(self.agent_version.as_deref().unwrap_or("unknown"));
+        result.push_str(" Extension Version: ");
+        result.push_str(&self.extension_version);
+        result.push_str(" Runtime: ");
+        result.push_str(&runtime);
+        result.push_str(" Layer Version: ");
+        result.push_str(self.layer_version.as_deref().unwrap_or("unknown"));
+        result
     }
 }
 
@@ -382,48 +400,42 @@ fn read_dotnet_version(base_path: &str) -> Option<String> {
 }
 
 /// Synchronous layer version detection (no AWS API calls)
-/// Only checks environment variables and filesystem - fast enough for first invocation
-fn detect_layer_version_sync() -> Option<String> {
+/// Only checks NEW_RELIC_LAYER_VERSION from config
+fn detect_layer_version_sync(layer_version_from_config: Option<String>) -> Option<String> {
     debug!("Detecting layer version (sync - no AWS API calls)...");
 
-    // Check env var first (instant)
-    if let Ok(layer_version) = std::env::var("NEW_RELIC_LAYER_VERSION") {
-        debug!("Layer version from NEW_RELIC_LAYER_VERSION: {}", layer_version);
+    // Check config value (already read from NEW_RELIC_LAYER_VERSION env var)
+    if let Some(layer_version) = layer_version_from_config {
+        debug!("Layer version from config (NEW_RELIC_LAYER_VERSION): {}", layer_version);
         return Some(layer_version);
     }
 
-    // Check AWS_LAMBDA_LAYERS env var (instant, set by Lambda runtime)
-    match std::env::var("AWS_LAMBDA_LAYERS") {
-        Ok(layers) => {
-            debug!("AWS_LAMBDA_LAYERS found: {}", layers);
-            if let Some(layer_info) = parse_layer_version_from_env(&layers) {
-                return Some(layer_info);
-            }
-        }
-        Err(_) => {
-            debug!("AWS_LAMBDA_LAYERS environment variable not set (will try filesystem)");
-        }
-    }
-
-    // Fall back to filesystem detection (also fast, no network)
-    debug!("Checking filesystem for layer markers...");
-    detect_layer_from_filesystem()
+    debug!("NEW_RELIC_LAYER_VERSION not set - layer version will be 'unknown'");
+    None
 }
 
 /// Async layer version detection using AWS Lambda API
-/// This makes AWS API calls - used as fallback when env vars don't have layer info
+/// This makes AWS API calls - only called if user has set NEW_RELIC_ADD_VERSION_DETAIL_TAGS=true
+/// or NEW_RELIC_LAYER_VERSION (which indicates they have permissions configured)
 /// Public so tagging background task can use it as fallback
-pub async fn detect_layer_version_async() -> Option<String> {
+pub async fn detect_layer_version_async(layer_version_from_config: Option<String>, add_version_detail_tags: bool, function_name: String) -> Option<String> {
     debug!("Detecting layer version (async - includes AWS API calls)...");
 
-    // First try the fast sync methods
-    if let Some(layer_version) = detect_layer_version_sync() {
+    // First try NEW_RELIC_LAYER_VERSION from config
+    if let Some(layer_version) = detect_layer_version_sync(layer_version_from_config) {
         return Some(layer_version);
     }
 
-    // Only if sync detection failed, make AWS API call
-    debug!("Sync detection failed, attempting to fetch layer info from AWS Lambda API...");
-    match aws_layer::fetch_layer_info_from_aws().await {
+    // Check if user has indicated they want detailed version tags
+    // If set, assume they have AWS permissions configured
+    if !add_version_detail_tags {
+        debug!("NEW_RELIC_ADD_VERSION_DETAIL_TAGS not set - skipping AWS API call for layer detection");
+        return None;
+    }
+
+    // User has indicated permissions are configured, make AWS API call
+    debug!("User has set version tags config - attempting to fetch layer info from AWS Lambda API...");
+    match aws_layer::fetch_layer_info_from_aws(function_name).await {
         Some(layer_info) => {
             debug!("✓ Successfully fetched layer info from AWS: {}", layer_info);
             Some(layer_info)
@@ -435,49 +447,7 @@ pub async fn detect_layer_version_async() -> Option<String> {
     }
 }
 
-/// Detect layer from filesystem when environment variable is not available
-fn detect_layer_from_filesystem() -> Option<String> {
-    debug!("Attempting to detect layer from filesystem...");
 
-    let layer_markers = vec![
-        "/opt/newrelic-layer-version",
-        "/opt/extensions/newrelic-lambda-extension",
-    ];
-
-    for marker in layer_markers {
-        if std::path::Path::new(marker).exists() {
-            debug!("Found layer marker: {}", marker);
-        }
-    }
-
-    if let Ok(env_file) = std::fs::read_to_string("/proc/self/environ") {
-        for env_var in env_file.split('\0') {
-            if env_var.starts_with("AWS_LAMBDA") || env_var.contains("layer") {
-                debug!("Found in environ: {}", env_var);
-            }
-        }
-    }
-
-    debug!("Could not detect layer version from filesystem");
-    None
-}
-
-/// Parse layer version from AWS_LAMBDA_LAYERS environment variable
-fn parse_layer_version_from_env(layers_str: &str) -> Option<String> {
-    for layer in layers_str.split(',') {
-        let layer = layer.trim();
-        if layer.contains("newrelic") || layer.contains("NewRelic") {
-            let parts: Vec<&str> = layer.split(':').collect();
-            if parts.len() >= 8 {
-                let layer_name = parts[6];
-                let layer_version = parts[7];
-                return Some(format!("{}:{}", layer_name, layer_version));
-            }
-        }
-    }
-
-    None
-}
 
 #[cfg(test)]
 mod tests {
@@ -490,16 +460,10 @@ mod tests {
             agent_name: Some("python".to_string()),
             extension_version: "0.1.0".to_string(),
             layer_version: Some("NewRelicPython313X86:93".to_string()),
+            runtime_version: None,
         };
 
         let tags = version_info.as_tags();
         assert!(tags.len() >= 2);
-    }
-
-    #[test]
-    fn test_parse_layer_version() {
-        let layers = "arn:aws:lambda:us-east-1:123456789012:layer:NewRelicPython313X86:93";
-        let version = parse_layer_version_from_env(layers);
-        assert_eq!(version, Some("NewRelicPython313X86:93".to_string()));
     }
 }
