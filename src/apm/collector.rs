@@ -239,15 +239,14 @@ pub async fn send_platform_metrics(
     }]);
 
     let payload_json = serde_json::to_string(&payload)?;
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(payload_json.as_bytes())?;
-    let compressed = encoder.finish()?;
+    
+    debug!("Platform metrics payload JSON: {}", payload_json);
 
     debug!(
-        "Sending {} platform metrics to Metric API ({} bytes compressed)",
+        "Sending {} platform metrics to Metric API endpoint: {} ({} bytes uncompressed)",
         metrics.len(),
-        compressed.len()
+        metric_endpoint,
+        payload_json.len()
     );
 
     let start_time = std::time::Instant::now();
@@ -255,8 +254,7 @@ pub async fn send_platform_metrics(
         .post(metric_endpoint)
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
-        .header("Content-Encoding", "gzip")
-        .body(compressed)
+        .body(payload_json)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await?;
