@@ -732,6 +732,13 @@ impl LogProcessor {
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
         
+        // Guard: Don't send logs until first INVOKE event sets the real ARN
+        // Following Go extension pattern: skip flush if ARN is still empty
+        if context.invoked_function_arn.is_empty() {
+            debug!("Skipping log flush - waiting for first INVOKE to set ARN");
+            return Ok(());
+        }
+        
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
         let mut current_chunk = Vec::new();

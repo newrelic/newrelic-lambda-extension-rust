@@ -54,10 +54,11 @@ const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Global current invocation context for telemetry processors
+/// Following Go extension pattern: ARN starts empty, gets set by first INVOKE event
 static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = Lazy::new(|| {
     Arc::new(Mutex::new(InvocationContext {
-        request_id: "temp".to_string(),
-        invoked_function_arn: "temp".to_string(),
+        request_id: String::new(),
+        invoked_function_arn: String::new(),
         trace_id: None,
     }))
 });
