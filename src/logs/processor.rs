@@ -231,7 +231,6 @@ impl LogProcessor {
             if !has_arn {
                 let mut pre_invoke_buf = self.pre_invoke_buffer.lock().unwrap();
                 pre_invoke_buf.push(log_message);
-                debug!("Buffering log in pre_invoke_buffer (waiting for first INVOKE to set ARN)");
                 return;
             }
 
