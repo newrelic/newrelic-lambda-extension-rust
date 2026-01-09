@@ -424,6 +424,12 @@ async fn perform_one_time_initialization(
             let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
             let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
 
+            // Set fallback ARN for emergency shutdown before first INVOKE
+            temp_log_processor.set_fallback_arn(
+                &config.aws.function_name,
+                &config.aws.account_id.clone().unwrap_or_default(),
+            );
+
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
@@ -448,6 +454,12 @@ async fn perform_one_time_initialization(
             let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
             let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
             let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
+
+            // Set fallback ARN for emergency shutdown before first INVOKE
+            temp_log_processor.set_fallback_arn(
+                &config.aws.function_name,
+                &config.aws.account_id.clone().unwrap_or_default(),
+            );
 
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
