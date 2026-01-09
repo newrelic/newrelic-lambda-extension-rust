@@ -231,7 +231,6 @@ impl LogProcessor {
             if !has_arn {
                 let mut pre_invoke_buf = self.pre_invoke_buffer.lock().unwrap();
                 pre_invoke_buf.push(log_message);
-                debug!("Buffering log in pre_invoke_buffer (waiting for first INVOKE to set ARN)");
                 return;
             }
 
@@ -616,7 +615,7 @@ impl LogProcessor {
             return Ok(());
         }
         
-        warn!("Emergency shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
+        warn!("Shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
         
         let function_arn = {
             if let Some(context) = self.invocation_context.safe_lock() {
