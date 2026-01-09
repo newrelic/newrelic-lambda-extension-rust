@@ -164,9 +164,8 @@ pub async fn send_apm_telemetry(
     );
     
     debug!(
-        "Request URL for {}: {}",
-        command,
-        url
+        "Request for command: {}",
+        command
     );
     
     debug!(
