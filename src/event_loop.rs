@@ -157,6 +157,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 components
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
+                
+                // Transfer pre-invoke logs to normal batch with ARN/request_id metadata
+                components
+                    .global_log_processor
+                    .process_pre_invoke_logs();
 
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -411,6 +416,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: No pending platform.report lines to process");
                 }
 
+                // Emergency flush of pre-invoke buffer (logs from INIT phase if shutdown before first INVOKE)
+                if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
+                    error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
+                }
+
                 // Final flush of logs
                 if let Err(e) = components.global_log_processor.flush().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
@@ -501,6 +511,11 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 components
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
+                
+                // Transfer pre-invoke logs to normal batch with ARN/request_id metadata
+                components
+                    .global_log_processor
+                    .process_pre_invoke_logs();
 
                 // SKIP old buffer processing to avoid deadlocks
                 // Late payloads are already handled via the buffer matching on next invocation
@@ -638,6 +653,11 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     components.config.clone(),
                 )
                 .await;
+
+                // Emergency flush of pre-invoke buffer (logs from INIT phase if shutdown before first INVOKE)
+                if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
+                    error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
+                }
 
                 wait_for_all_requests_completion(
                     components.newrelic_client.clone(),

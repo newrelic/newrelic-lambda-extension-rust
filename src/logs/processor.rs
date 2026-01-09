@@ -62,6 +62,12 @@ pub struct LogProcessor {
 
     /// Track pending auto-flush tasks to ensure they complete before function ends
     pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+
+    /// Buffer for logs received during INIT phase before first INVOKE event
+    pre_invoke_buffer: Arc<Mutex<Vec<payload::LogMessage>>>,
+
+    /// Fallback ARN constructed from registration response (function_name + account_id + AWS_REGION)
+    fallback_function_arn: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +119,8 @@ impl LogProcessor {
             failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
             apm_app,
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
+            pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
+            fallback_function_arn: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,14 +154,14 @@ impl LogProcessor {
    
     fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
-            if !context.request_id.is_empty() && context.request_id != "temp" && context.request_id != "unknown" {
+            if !context.request_id.is_empty() && context.request_id != "unknown" {
                 log_message.attributes.insert("aws.lambda_request_id".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
                 log_message.attributes.insert("faas.execution".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
             }
 
-            if !context.invoked_function_arn.is_empty() && context.invoked_function_arn != "temp" {
+            if !context.invoked_function_arn.is_empty() {
                 log_message.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(context.invoked_function_arn.clone()));
             }
@@ -214,18 +222,27 @@ impl LogProcessor {
         };
     
         if let Some(log_message) = self.to_log_message(record.clone()) {
-            let has_valid_context = {
+            // Route to pre_invoke_buffer if ARN is empty (INIT phase before first INVOKE)
+            let has_arn = {
                 let context = self.invocation_context.lock().unwrap();
-                !context.request_id.is_empty() && 
-                context.request_id != "temp" && 
-                !context.invoked_function_arn.is_empty() && 
-                context.invoked_function_arn != "temp"
+                !context.invoked_function_arn.is_empty()
             };
     
-            if !has_valid_context {
+            if !has_arn {
+                let mut pre_invoke_buf = self.pre_invoke_buffer.lock().unwrap();
+                pre_invoke_buf.push(log_message);
+                debug!("Buffering log in pre_invoke_buffer (waiting for first INVOKE to set ARN)");
+                return;
+            }
+
+            let has_valid_request_id = {
+                let context = self.invocation_context.lock().unwrap();
+                !context.request_id.is_empty() && context.request_id != "unknown"
+            };
+    
+            if !has_valid_request_id {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
                 request_buffer.push(log_message);
-               
                 return;
             }
             
@@ -487,6 +504,159 @@ impl LogProcessor {
         }
     }
 
+    /// Construct ARN from registration response Format: arn:aws:lambda:{region}:{account_id}:function:{function_name}
+    fn construct_arn_from_registration(function_name: &str, account_id: &str) -> String {
+        let region = std::env::var("AWS_REGION")
+            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+        
+        format!("arn:aws:lambda:{}:{}:function:{}", region, account_id, function_name)
+    }
+
+    /// Store fallback ARN from registration response for emergency shutdown scenarios
+    pub fn set_fallback_arn(&self, function_name: &str, account_id: &str) {
+        let fallback_arn = Self::construct_arn_from_registration(function_name, account_id);
+        if let Ok(mut arn_guard) = self.fallback_function_arn.lock() {
+            *arn_guard = Some(fallback_arn.clone());
+            debug!("Set fallback ARN for shutdown before INVOKE: {}", fallback_arn);
+        }
+    }
+
+    /// Validate if log has both faas.arn and aws.lambda_request_id Bypass validation if log has nr.force_flushed=true (emergency shutdown)
+    fn is_log_complete(&self, log: &payload::LogMessage) -> bool {
+        // Check for emergency flush marker - these logs bypass validation
+        if let Some(force_flushed) = log.attributes.get("nr.force_flushed") {
+            if force_flushed.as_bool().unwrap_or(false) {
+                return true;
+            }
+        }
+        
+        let has_arn = log.attributes.get("faas.arn")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        
+        let has_request_id = log.attributes.get("aws.lambda_request_id")
+            .and_then(|v| v.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
+        
+        has_arn && has_request_id
+    }
+
+    /// Requeue incomplete logs back to pre_invoke_buffer for next invocation
+    fn requeue_incomplete_logs(&self, logs: Vec<payload::LogMessage>) {
+        if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
+            let count = logs.len();
+            pre_invoke_buf.extend(logs);
+            debug!("Requeued {} incomplete logs to pre_invoke_buffer", count);
+        }
+    }
+
+    /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
+    pub fn process_pre_invoke_logs(&self) {
+        let mut pre_invoke_logs = {
+            let mut buf = self.pre_invoke_buffer.lock().unwrap();
+            std::mem::take(&mut *buf)
+        };
+        
+        if pre_invoke_logs.is_empty() {
+            return;
+        }
+        
+        info!("Processing {} pre-invoke logs with new metadata", pre_invoke_logs.len());
+        
+        for log in &mut pre_invoke_logs {
+            if let Some(context) = self.invocation_context.safe_lock() {
+                if !context.invoked_function_arn.is_empty() {
+                    log.attributes.insert("faas.arn".to_string(),
+                        serde_json::Value::String(context.invoked_function_arn.clone()));
+                }
+                
+                if !context.request_id.is_empty() && context.request_id != "unknown" {
+                    log.attributes.insert("aws.lambda_request_id".to_string(),
+                        serde_json::Value::String(context.request_id.clone()));
+                    log.attributes.insert("faas.execution".to_string(),
+                        serde_json::Value::String(context.request_id.clone()));
+                }
+                
+                if let Some(ref trace_id) = context.trace_id {
+                    log.attributes.insert("trace.id".to_string(),
+                        serde_json::Value::String(trace_id.clone()));
+                }
+            }
+            
+            if let Some(ref apm_app_arc) = self.apm_app {
+                if let Ok(apm_guard) = apm_app_arc.try_read() {
+                    if let Some(ref app) = *apm_guard {
+                        let entity_guid = app.get_entity_guid();
+                        if !entity_guid.is_empty() {
+                            log.attributes.insert("entity.guid".to_string(),
+                                serde_json::Value::String(entity_guid.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if let Ok(mut batch) = self.log_batch.lock() {
+            batch.extend(pre_invoke_logs);
+        }
+    }
+
+    /// Uses registration ARN fallback, empty request_id, and nr.force_flushed=true marker
+    pub async fn flush_pre_invoke_buffer_on_shutdown(&self) -> std::io::Result<()> {
+        let mut pre_invoke_logs = {
+            let mut buf = self.pre_invoke_buffer.lock().unwrap();
+            std::mem::take(&mut *buf)
+        };
+        
+        if pre_invoke_logs.is_empty() {
+            debug!("No pre-invoke logs to flush on shutdown");
+            return Ok(());
+        }
+        
+        warn!("Emergency shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
+        
+        let function_arn = {
+            if let Some(context) = self.invocation_context.safe_lock() {
+                if !context.invoked_function_arn.is_empty() {
+                    context.invoked_function_arn.clone()
+                } else {
+                    self.fallback_function_arn.lock()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().cloned())
+                        .unwrap_or_else(String::new)
+                }
+            } else {
+                String::new()
+            }
+        };
+        
+        if function_arn.is_empty() {
+            error!("Cannot flush pre-invoke logs: no ARN available (INVOKE or registration)");
+            return Ok(());
+        }
+        
+        info!("Using ARN for pre-invoke shutdown flush: {}", function_arn);
+        
+        for log in &mut pre_invoke_logs {
+            log.attributes.insert("faas.arn".to_string(),
+                serde_json::Value::String(function_arn.clone()));
+            log.attributes.insert("aws.lambda_request_id".to_string(),
+                serde_json::Value::String(String::new()));
+            log.attributes.insert("nr.force_flushed".to_string(),
+                serde_json::Value::Bool(true));
+        }
+        
+        let client = Arc::clone(&self.newrelic_client);
+        let config = Arc::clone(&self.config);
+        
+        Self::send_logs_with_chunking(&client, &config, pre_invoke_logs, &function_arn).await;
+        
+        Ok(())
+    }
+
    
     pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
         let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
@@ -731,6 +901,23 @@ impl LogProcessor {
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
+        
+        // Validate all logs before sending - requeue incomplete logs to pre_invoke_buffer
+        let (complete_logs, incomplete_logs): (Vec<_>, Vec<_>) = deduplicated_batch
+            .into_iter()
+            .partition(|log| self.is_log_complete(log));
+        
+        if !incomplete_logs.is_empty() {
+            warn!("Found {} incomplete logs without ARN/request_id - requeuing to pre_invoke_buffer", incomplete_logs.len());
+            self.requeue_incomplete_logs(incomplete_logs);
+        }
+        
+        if complete_logs.is_empty() {
+            debug!("No complete logs to send after validation");
+            return Ok(());
+        }
+        
+        let deduplicated_batch = complete_logs;
         
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
