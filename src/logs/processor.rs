@@ -615,7 +615,7 @@ impl LogProcessor {
             return Ok(());
         }
         
-        warn!("Emergency shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
+        warn!("Shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
         
         let function_arn = {
             if let Some(context) = self.invocation_context.safe_lock() {
