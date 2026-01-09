@@ -125,7 +125,7 @@ pub async fn preconnect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("PreConnect request to: {} (timeout: {}s)", url, PRECONNECT_TIMEOUT_SECS);
+    debug!("PreConnect request to collector (timeout: {}s)", PRECONNECT_TIMEOUT_SECS);
 
     // OPTIMIZATION: 30s timeout for Lambda cold start (network can be slow)
     let response = client
@@ -139,13 +139,14 @@ pub async fn preconnect(
         .send()
         .await
         .map_err(|e| {
-            error!("PreConnect HTTP request failed: {:?}", e);
             if e.is_timeout() {
                 error!("PreConnect TIMEOUT after {}s - Lambda cold start network may be slow", PRECONNECT_TIMEOUT_SECS);
             } else if e.is_connect() {
                 error!("PreConnect CONNECTION ERROR - Cannot reach collector at {}", base_host);
             } else if e.is_request() {
                 error!("PreConnect REQUEST ERROR - Invalid request format or parameters");
+            } else {
+                error!("PreConnect HTTP request failed: {}", e);
             }
             e
         })?;
@@ -154,7 +155,6 @@ pub async fn preconnect(
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
         error!("PreConnect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
-        error!("PreConnect URL was: {}", url);
         error!("This usually means: 1) Invalid license key, 2) Network connectivity issue, 3) Collector endpoint unreachable");
         return Err(anyhow!("PreConnect failed with HTTP {} - {}", status, error_body));
     }
@@ -209,7 +209,7 @@ pub async fn connect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("Connect request to: {} (timeout: {}s)", url, CONNECT_TIMEOUT_SECS);
+    debug!("Connect request to collector (timeout: {}s)", CONNECT_TIMEOUT_SECS);
 
     // OPTIMIZATION: 30s timeout for Lambda cold start
     let response = client
@@ -223,11 +223,12 @@ pub async fn connect(
         .send()
         .await
         .map_err(|e| {
-            error!("Connect HTTP request failed: {:?}", e);
             if e.is_timeout() {
                 error!("Connect TIMEOUT after {}s", CONNECT_TIMEOUT_SECS);
             } else if e.is_connect() {
                 error!("Connect CONNECTION ERROR - Cannot reach collector at {}", collector_host);
+            } else {
+                error!("Connect HTTP request failed: {}", e);
             }
             e
         })?;
@@ -236,7 +237,6 @@ pub async fn connect(
     if !status.is_success() {
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
         error!("Connect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
-        error!("Connect URL was: {}", url);
         return Err(anyhow!("Connect failed with HTTP {} - {}", status, error_body));
     }
 
