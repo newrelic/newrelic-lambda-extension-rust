@@ -1227,9 +1227,24 @@ fn tag_lambda_function_once(invoked_function_arn: String, config: &config::Exten
 
 /// Update global invocation context for telemetry processors
 fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str) {
-    if let Ok(mut global_context) = crate::CURRENT_INVOCATION_CONTEXT.lock() {
+    if let Ok(mut global_context) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+        // Validate ARN before updating
+        if invoked_function_arn.is_empty() {
+            error!(
+                "CRITICAL: Attempted to update global context with EMPTY invoked_function_arn for request_id: {}. Keeping previous ARN: {}",
+                request_id,
+                global_context.invoked_function_arn
+            );
+        } else {
+            debug!(
+                "Updating global context: request_id='{}', invoked_function_arn='{}' (previous ARN: '{}')",
+                request_id,
+                invoked_function_arn,
+                global_context.invoked_function_arn
+            );
+            global_context.invoked_function_arn = invoked_function_arn.to_string();
+        }
         global_context.request_id = request_id.to_string();
-        global_context.invoked_function_arn = invoked_function_arn.to_string();
         global_context.trace_id = None;
     }
 }

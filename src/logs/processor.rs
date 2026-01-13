@@ -504,12 +504,14 @@ impl LogProcessor {
     }
 
     /// Construct ARN from registration response Format: arn:aws:lambda:{region}:{account_id}:function:{function_name}
-    fn construct_arn_from_registration(function_name: &str, account_id: &str) -> String {
+    pub fn construct_arn_from_registration(function_name: &str, account_id: &str) -> String {
         let region = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
         
-        format!("arn:aws:lambda:{}:{}:function:{}", region, account_id, function_name)
+        let arn = format!("arn:aws:lambda:{}:{}:function:{}", region, account_id, function_name);
+        debug!("Constructed ARN from registration: {}", arn);
+        arn
     }
 
     /// Store fallback ARN from registration response for emergency shutdown scenarios
