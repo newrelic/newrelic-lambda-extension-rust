@@ -24,7 +24,7 @@ mod test_telemetry;
 
 use std::{
     env,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 
@@ -55,8 +55,9 @@ const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Global current invocation context for telemetry processors
 /// Following Go extension pattern: ARN starts empty, gets set by first INVOKE event
-static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<Mutex<InvocationContext>>> = Lazy::new(|| {
-    Arc::new(Mutex::new(InvocationContext {
+/// Uses RwLock for optimal concurrent read performance (multiple processors can read simultaneously)
+static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<RwLock<InvocationContext>>> = Lazy::new(|| {
+    Arc::new(RwLock::new(InvocationContext {
         request_id: String::new(),
         invoked_function_arn: String::new(),
         trace_id: None,
@@ -311,6 +312,20 @@ async fn perform_one_time_initialization(
     let config = Arc::new(updated_config);
 
     info!("License key validated and extension registered - proceeding with full initialization");
+    
+    // Initialize global invocation context with fallback ARN to prevent empty ARN issues
+    // This provides a valid ARN for any telemetry that arrives before the first INVOKE event
+    let fallback_arn = format!(
+        "arn:aws:lambda:{}:{}:function:{}",
+        std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+        config.aws.account_id.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+        config.aws.function_name
+    );
+    
+    if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
+        global_context.invoked_function_arn = fallback_arn.clone();
+        debug!("Initialized global context with fallback ARN: {}", fallback_arn);
+    }
 
     info!(
         "NEW_RELIC_COLLECT_TRACE_ID setting: {}",
@@ -420,9 +435,10 @@ async fn perform_one_time_initialization(
                 Arc::clone(&apm_app),
             ));
 
-            let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
-            let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-            let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
+            // Create a Mutex-wrapped context for processors (they expect Arc<Mutex<...>>)
+            let temp_context = Arc::new(Mutex::new(InvocationContext::default()));
+            let temp_log_processor = processor_factory.create_log_processor(temp_context.clone());
+            let temp_platform_processor = processor_factory.create_platform_processor(temp_context, temp_log_processor.clone());
 
             // Set fallback ARN for emergency shutdown before first INVOKE
             temp_log_processor.set_fallback_arn(
@@ -451,9 +467,10 @@ async fn perform_one_time_initialization(
                 Arc::clone(&apm_app),
             ));
 
-            let global_context = Arc::clone(&CURRENT_INVOCATION_CONTEXT);
-            let temp_log_processor = processor_factory.create_log_processor(global_context.clone());
-            let temp_platform_processor = processor_factory.create_platform_processor(global_context, temp_log_processor.clone());
+            // Create a Mutex-wrapped context for processors (they expect Arc<Mutex<...>>)
+            let temp_context = Arc::new(Mutex::new(InvocationContext::default()));
+            let temp_log_processor = processor_factory.create_log_processor(temp_context.clone());
+            let temp_platform_processor = processor_factory.create_platform_processor(temp_context, temp_log_processor.clone());
 
             // Set fallback ARN for emergency shutdown before first INVOKE
             temp_log_processor.set_fallback_arn(

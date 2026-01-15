@@ -7,7 +7,7 @@
 //! - Sending payloads to New Relic serverless ingest API
 
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     config::ExtensionConfig,
@@ -15,6 +15,56 @@ use crate::{
     version,
     EXTENSION_NAME, EXTENSION_VERSION,
 };
+
+/// Extract function name from Lambda ARN with proper validation
+/// Lambda ARN format: arn:aws:lambda:{region}:{account}:function:{function-name}[:version]
+/// Returns the function name or a fallback value from config
+fn extract_function_name_from_arn<'a>(arn: &'a str, config_function_name: &'a str) -> &'a str {
+    if arn.is_empty() {
+        error!(
+            "CRITICAL: invoked_function_arn is EMPTY. Using fallback from config: {}",
+            config_function_name
+        );
+        return config_function_name;
+    }
+
+    let parts: Vec<&str> = arn.split(':').collect();
+    
+    // Standard ARN format: arn:aws:lambda:region:account:function:name[:version]
+    // Positions:              0   1    2      3      4        5        6      7(optional)
+    if parts.len() >= 7 && parts[0] == "arn" && parts[2] == "lambda" && parts[5] == "function" {
+        debug!("Extracted function name '{}' from valid ARN", parts[6]);
+        return parts[6];
+    }
+    
+    // Fallback: try to use last segment ONLY if it looks like a valid function name (for malformed ARNs)
+    if let Some(last_segment) = parts.last() {
+        // Must be non-empty, not a keyword, and at least 3 chars long to be a plausible function name
+        if !last_segment.is_empty() 
+            && *last_segment != "function" 
+            && *last_segment != "arn"
+            && *last_segment != "aws"
+            && *last_segment != "lambda"
+            && last_segment.len() >= 3
+        {
+            warn!(
+                "ARN format validation failed (expected 7+ parts, got {}). Using last segment '{}' as function name. Full ARN: {}",
+                parts.len(),
+                last_segment,
+                arn
+            );
+            return last_segment;
+        }
+    }
+    
+    // Ultimate fallback: use config
+    error!(
+        "Failed to extract function name from malformed ARN '{}'. Using fallback from config: {}",
+        arn,
+        config_function_name
+    );
+    config_function_name
+}
 
 /// Send agent payload to New Relic serverless ingest API
 pub async fn send_agent_payload_to_newrelic(
@@ -25,7 +75,16 @@ pub async fn send_agent_payload_to_newrelic(
     config: &Arc<ExtensionConfig>,
     version_info: Option<&Arc<version::VersionInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let function_name = invoked_function_arn.split(':').next_back().unwrap_or("");
+    // Use robust ARN parsing with validation and fallback
+    let function_name = extract_function_name_from_arn(invoked_function_arn, &config.aws.function_name);
+    
+    // Defensive logging for debugging
+    debug!(
+        "Agent payload context: request_id='{}', invoked_function_arn='{}', extracted_function_name='{}'",
+        request_id,
+        invoked_function_arn,
+        function_name
+    );
     let log_group_name = format!("/aws/lambda/{function_name}");
 
     let wrapped_payload = create_wrapped_agent_payload_json(
