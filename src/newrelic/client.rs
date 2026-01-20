@@ -1,7 +1,7 @@
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
 use reqwest::{header, Client, Error};
 use serde::Serialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -156,7 +156,7 @@ impl NewRelicClient {
                     
                     if status.is_success() {
                         let duration = start_time.elapsed();
-                        info!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
+                        debug!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
@@ -238,9 +238,9 @@ impl NewRelicClient {
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         if let Some(count) = log_count {
-                            info!("Logs sent: {} logs, {} bytes, duration: {:?}", count, payload_size, duration);
+                            debug!("Logs sent: {} logs, {} bytes, duration: {:?}", count, payload_size, duration);
                         } else {
-                            info!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
+                            debug!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         }
                         return Ok(());
                     } else {

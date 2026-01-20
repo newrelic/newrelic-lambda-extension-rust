@@ -45,7 +45,7 @@ pub fn buffer_failed_telemetry(
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
         buffer.push(failed_telemetry);
-        info!(
+        debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
             telemetry_type,
             request_id,
@@ -75,7 +75,7 @@ pub async fn retry_buffered_telemetry(
         return;
     }
 
-    info!(
+    debug!(
         "APM mode: Retrying {} buffered telemetry item(s)",
         failed_telemetry.len()
     );
@@ -170,7 +170,7 @@ pub async fn retry_buffered_telemetry(
     }
 
     if retry_success_count > 0 || retry_failed_count > 0 {
-        info!(
+        debug!(
             "APM telemetry retry results: {} successful, {} still failed",
             retry_success_count, retry_failed_count
         );

@@ -84,7 +84,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
         info!("Starting APM mode event loop (connection may still be in progress)");
         execute_apm_mode_event_loop(components).await
     } else {
-        info!("Starting standard mode event loop");
+        debug!("Starting standard mode event loop");
         execute_standard_mode_event_loop(components).await
     }
 }
@@ -105,7 +105,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // Check if this is a fatal 403 state transition error (AWS shutting down without sending SHUTDOWN event)
                 if error_msg.contains("403") || error_msg.contains("State transition") {
                     error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
-                    info!("Performing emergency shutdown cleanup...");
+                    debug!("Performing emergency shutdown cleanup...");
                     
                     process_pending_agent_payloads(
                         &components.newrelic_client,
@@ -172,7 +172,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let buffer_count = REQUEST_AGENT_BUFFERS.len();
                 if buffer_count > 0 {
-                    info!(
+                    debug!(
                         "APM mode: Found {} request buffer(s) before processing (current: {})",
                         buffer_count, request_id
                     );
@@ -229,13 +229,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let event_time = event_start.elapsed();
                 if is_cold_start {
-                    info!(
+                    debug!(
                         "COLD START: First invocation processed in {:?} (request_id: {})",
                         event_time, request_id
                     );
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    info!(
+                    debug!(
                         "WARM START: Event {} processed in {:?} (request_id: {})",
                         event_counter, event_time, request_id
                     );
@@ -317,7 +317,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
-                info!("APM mode shutdown: Processing all remaining agent payloads");
+                debug!("APM mode shutdown: Processing all remaining agent payloads");
                 
                 // Check all request buffers for unsent payloads
                 let all_request_ids: Vec<String> = REQUEST_AGENT_BUFFERS
@@ -326,7 +326,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .collect();
                 
                 if !all_request_ids.is_empty() {
-                    info!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
+                    debug!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
                     
                     for request_id in all_request_ids {
                         if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
@@ -374,7 +374,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 } else {
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
-                info!("APM mode shutdown: Retrying all buffered telemetry");
+                debug!("APM mode shutdown: Retrying all buffered telemetry");
                 crate::apm::telemetry_buffer::retry_buffered_telemetry(
                     &components.client,
                     components.config.new_relic.license_key.as_deref().unwrap_or(""),
@@ -393,12 +393,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .collect();
 
                 if !all_pending_reports.is_empty() {
-                    info!("APM mode shutdown: Found {} pending platform.report(s) to send as metrics", all_pending_reports.len());
+                    debug!("APM mode shutdown: Found {} pending platform.report(s) to send as metrics", all_pending_reports.len());
 
                     let apm_app_guard = components.apm_app.read().await;
                     if let Some(ref app) = *apm_app_guard {
                         for (request_id, report_line) in all_pending_reports {
-                            info!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
+                            debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
 
                             if let Err(e) = app.send_platform_report_metrics(&report_line).await {
                                 error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
@@ -524,7 +524,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
                 // CRITICAL: Must await to prevent Lambda from freezing network mid-request
                 if should_send_batch_by_threshold() {
-                    info!("Batch threshold reached - sending payloads with report lines only");
+                    debug!("Batch threshold reached - sending payloads with report lines only");
                     send_batched_payloads_with_reports_only(
                         components.newrelic_client.clone(),
                         components.config.clone()
@@ -570,13 +570,13 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 let event_time = event_start.elapsed();
                 if is_cold_start {
-                    info!(
+                    debug!(
                         "COLD START: First invocation processed in {:?} (request_id: {})",
                         event_time, request_id
                     );
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
                 } else {
-                    info!(
+                    debug!(
                         "WARM START: Event {} processed in {:?} (request_id: {})",
                         event_counter, event_time, request_id
                     );
@@ -605,7 +605,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     match shutdown_reason {
                         runtime::ShutdownReason::Timeout => {
                             // Lambda timeout - send timeout error with reason
-                            info!("Shutdown due to timeout - synthesizing timeout error for request: {}", last_request_id);
+                            debug!("Shutdown due to timeout - synthesizing timeout error for request: {}", last_request_id);
                             error_synthesis::send_timeout_error(
                                 &last_request_id,
                                 &last_arn,
@@ -617,7 +617,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         }
                         runtime::ShutdownReason::Failure => {
                             // Lambda failure/fault - send platform fault error
-                            info!("Shutdown due to failure - synthesizing fault error for request: {}", last_request_id);
+                            debug!("Shutdown due to failure - synthesizing fault error for request: {}", last_request_id);
                             error_synthesis::send_platform_fault_error(
                                 &last_request_id,
                                 &last_arn,
@@ -647,7 +647,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
 
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
-                info!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
+                debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
                 send_all_pending_payloads_on_shutdown(
                     components.newrelic_client.clone(),
                     components.config.clone(),
@@ -683,7 +683,7 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
         let loop_start = std::time::Instant::now();
         match runtime::fetch_next_event(client, extension_id).await {
             Ok(runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason: _ }) => {
-                info!("Extension shutting down");
+                debug!("Extension shutting down");
                 break;
             }
             Ok(runtime::LambdaRuntimeEvent::Invoke {
@@ -700,7 +700,7 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
                 let error_msg = e.to_string();
                 if error_msg.contains("403") || error_msg.contains("State transition") {
                     error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
-                    info!("No-op mode exiting due to Lambda shutdown");
+                    debug!("No-op mode exiting due to Lambda shutdown");
                     break;
                 }
                 error!("Error in no-op event loop: {:?}. Continuing.", e);
@@ -742,7 +742,7 @@ pub async fn process_apm_request(
             .collect();
 
         if !pending_buffers.is_empty() {
-            info!(
+            debug!(
                 "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
                 pending_buffers.len()
             );
@@ -834,7 +834,7 @@ pub async fn process_apm_request(
     // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
     let send_agent_task = if has_run_id && got_payload {
-        info!(
+        debug!(
             "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
             agent_payloads.len()
         );
@@ -880,7 +880,7 @@ pub async fn process_apm_request(
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
-            info!(
+            debug!(
                 "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
                 agent_payloads.len()
             );
@@ -926,7 +926,7 @@ pub async fn process_apm_request(
         let report_line = entry.value().clone();
         drop(entry); // Release the lock before async operations
 
-        info!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
+        debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
         let apm_app_guard = apm_app.read().await;
         if let Some(ref app) = *apm_app_guard {
@@ -989,7 +989,7 @@ async fn send_to_apm_collector(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
-        info!(
+        debug!(
             "APM mode: Processing agent payload for request: {} (size: {} bytes)",
             request_id,
             payload_bytes.len()
@@ -1102,7 +1102,7 @@ pub async fn process_request_concurrently(
         if let Ok(guard) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
             if let Some(ref detected_error) = *guard {
                 if detected_error.request_id == request_id {
-                    info!(
+                    debug!(
                         "Standard mode: No agent payload for request {} but error detected: {} - sending to telemetry",
                         request_id, detected_error.error_type
                     );
@@ -1114,11 +1114,11 @@ pub async fn process_request_concurrently(
 
     // Smart batching: Only send complete payloads (with report)
     let send_agent_task = if agent_payloads.is_empty() {
-        info!("Standard mode: No agent payload for request: {}", request_id);
+        debug!("Standard mode: No agent payload for request: {}", request_id);
         None
     } else if let Some(ref report) = report_line {
         // Both payload and report available - send now (complete data)
-        info!(
+        debug!(
             "Standard mode: Payload + report both ready for {} - adding to batch",
             request_id
         );
@@ -1134,7 +1134,7 @@ pub async fn process_request_concurrently(
 
         // Check if batch threshold is met and send if needed (only payloads with report lines)
         if should_send_batch_by_threshold() {
-            info!("Batch threshold reached - sending payloads with report lines only");
+            debug!("Batch threshold reached - sending payloads with report lines only");
             let newrelic_client_clone = newrelic_client.clone();
             let config_clone = config.clone();
 
@@ -1146,7 +1146,7 @@ pub async fn process_request_concurrently(
         }
     } else {
         // Only payload, no report yet - put back in buffer for next invocation
-        info!(
+        debug!(
             "Standard mode: Payload ready but NO report yet for {} - keeping in buffer",
             request_id
         );
@@ -1208,7 +1208,7 @@ pub async fn process_request_concurrently(
 fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
     static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
     TAGGING_DONE.call_once(|| {
-        info!("Spawning background task to tag Lambda function with version information");
+        debug!("Spawning background task to tag Lambda function with version information");
         let version_info = version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
         let add_version_detail_tags = config.new_relic.add_version_detail_tags;
         let layer_version_from_config = config.new_relic.layer_version.clone();
@@ -1260,7 +1260,7 @@ async fn extract_and_coordinate_trace_id(
     }
 
     if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
-        info!("Extracted trace ID: {}, coordinating with logs", trace_id);
+        debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
         if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
             error!("Failed to coordinate logs with trace ID: {}", e);
         }
@@ -1304,7 +1304,7 @@ async fn process_pending_agent_payloads(
         return;
     }
 
-    info!(
+    debug!(
         "Processing {} pending agent payload buffer(s) from previous invocations (excluding current: {})",
         pending_requests.len(),
         current_request_id
@@ -1332,7 +1332,7 @@ async fn process_pending_agent_payloads(
         };
 
         if !payloads.is_empty() {
-            info!(
+            debug!(
                 "Found {} pending agent payload(s) for previous request: {}",
                 payloads.len(),
                 request_id
@@ -1360,7 +1360,7 @@ async fn process_pending_agent_payloads(
             let report_line = entry.value().clone();
             drop(entry);
 
-            info!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
+            debug!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
 
             let apm_app_guard = apm_app.read().await;
             if let Some(ref app) = *apm_app_guard {
@@ -1392,7 +1392,7 @@ async fn process_and_send_agent_payload(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if config.new_relic.collect_trace_id {
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
-            info!("Extracted trace ID: {}, coordinating with logs", trace_id);
+            debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
 
             if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
                 error!("Failed to coordinate logs with trace ID: {}", e);
@@ -1406,7 +1406,7 @@ async fn process_and_send_agent_payload(
 
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
-        info!(
+        debug!(
             "APM mode: Processing agent payload for request: {} (size: {} bytes)",
             request_id,
             payload_bytes.len()
@@ -1453,7 +1453,7 @@ fn buffer_failed_agent_payload(
 
     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
         failed_payloads.push(failed_payload);
-        info!(
+        debug!(
             "Buffered failed agent payload for request {} (total failed: {})",
             request_id,
             failed_payloads.len()
@@ -1485,7 +1485,7 @@ async fn retry_failed_agent_payloads(
         return;
     }
 
-    info!(
+    debug!(
         "Retrying {} failed agent payloads during final flush",
         failed_payloads.len()
     );
@@ -1528,7 +1528,7 @@ async fn retry_failed_agent_payloads(
         {
             Ok(()) => {
                 retry_successful_count += 1;
-                debug!(
+                info!(
                     "Successfully retried agent payload for request {}",
                     failed_payload.request_id
                 );
@@ -1547,7 +1547,7 @@ async fn retry_failed_agent_payloads(
     }
 
     if retry_successful_count > 0 || retry_failed_count > 0 {
-        info!(
+        debug!(
             "Agent payload retry results: {} successful, {} still failed",
             retry_successful_count, retry_failed_count
         );

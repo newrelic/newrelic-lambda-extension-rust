@@ -131,7 +131,7 @@ async fn main() -> std::io::Result<()> {
 /// Run the extension in true no-op mode - follows Extension API lifecycle but does nothing
 /// Registers with Extension API and waits for INVOKE/SHUTDOWN events but processes nothing
 async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("Extension running in NO-OP mode - no telemetry will be collected");
+    debug!("Extension running in NO-OP mode - no telemetry will be collected");
     eprintln!(
         "[NR_EXT] INFO Extension running in NO-OP mode - Lambda function will continue normally"
     );
@@ -139,7 +139,7 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
     let (client, extension_id, _registration) =
         initialize_lambda_runtime_client_and_register().await?;
 
-    info!(
+    debug!(
         "Extension registered in no-op mode with ID: {}",
         extension_id
     );
@@ -156,7 +156,7 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
                 );
             }
             Ok(runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason }) => {
-                info!(
+                debug!(
                     "No-op mode: Extension shutting down: {}",
                     shutdown_reason
                 );
@@ -233,7 +233,7 @@ async fn perform_one_time_initialization(
    
 
     if !config.new_relic.extension_enabled {
-        info!("Extension telemetry processing disabled - entering no-op mode");
+        debug!("Extension telemetry processing disabled - entering no-op mode");
         let (client, extension_id, _registration) =
             initialize_lambda_runtime_client_and_register().await?;
 
@@ -327,17 +327,17 @@ async fn perform_one_time_initialization(
         debug!("Initialized global context with fallback ARN: {}", fallback_arn);
     }
 
-    info!(
+    debug!(
         "NEW_RELIC_COLLECT_TRACE_ID setting: {}",
         config.new_relic.collect_trace_id
     );
     if config.new_relic.add_version_detail_tags {
-        info!("Version detail tagging enabled - will tag function on first invocation");
-        info!("  Extension version: {}", EXTENSION_VERSION);
+        debug!("Version detail tagging enabled - will tag function on first invocation");
+        debug!("  Extension version: {}", EXTENSION_VERSION);
         debug!("Version detection and tagging will happen lazily on first invocation to avoid AWS SDK initialization during INIT");
     }
 
-    info!(
+    debug!(
         "Log forwarding settings: send_function_logs={}, send_extension_logs={}",
         config.extension.send_function_logs, config.extension.send_extension_logs
     );
@@ -361,7 +361,7 @@ async fn perform_one_time_initialization(
     let agent_telemetry_rx = agent_telemetry_rx_result?;
     let (runtime_done_tx, _runtime_done_rx) = runtime_done_channels;
 
-    info!(
+    debug!(
         "Extension components initialized - ID: {} (license key pre-validated)",
         extension_id
     );
@@ -374,7 +374,7 @@ async fn perform_one_time_initialization(
     // This avoids async overhead for standard mode (most common case)
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            info!("APM Lambda mode enabled - non-blocking connection strategy");
+            debug!("APM Lambda mode enabled - non-blocking connection strategy");
 
             // Spawn APM connection as background task - event loop starts immediately
             let apm_app = Arc::new(tokio::sync::RwLock::new(None));
@@ -397,7 +397,7 @@ async fn perform_one_time_initialization(
                 let apm_app_clone = Arc::clone(&apm_app);
 
                 async move {
-                    info!("Background APM connection started...");
+                    debug!("Background APM connection started...");
                     match apm::ApmApp::new(
                         license_key_clone,
                         apm_host,
@@ -501,7 +501,7 @@ async fn perform_one_time_initialization(
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(5); // Default: 5 seconds for frequent log flushing
     
-    info!("Starting log harvester with {}s interval (function_logs={}, extension_logs={})",
+    debug!("Starting log harvester with {}s interval (function_logs={}, extension_logs={})",
         harvest_interval_secs,
         config.extension.send_function_logs,
         config.extension.send_extension_logs
@@ -532,7 +532,7 @@ async fn handle_no_license_key(
     extension_id: String,
     registration: runtime::ExtensionRegistrationResponse,
 ) -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
-    info!("No license key available after checking all sources. Running in no-op mode.");
+    warn!("No license key available after checking all sources. Running in no-op mode.");
 
     let mut updated_config = (*config).clone();
     updated_config.aws.update_from_registration(
@@ -585,11 +585,11 @@ async fn resolve_license_key_with_aws_fallback(
     debug!("License key not in env var, attempting to fetch from AWS Secrets Manager or SSM Parameter Store");
     match get_new_relic_license_key(&credentials_config).await {
         Ok(key) => {
-            debug!("Successfully obtained New Relic license key from AWS");
+            info!("Successfully obtained New Relic license key from AWS");
             Ok(Some(key))
         }
         Err(e) => {
-            info!(
+            debug!(
                 "No license key found from AWS sources: {}. Extension will run in no-op mode.",
                 e
             );
@@ -627,7 +627,7 @@ async fn initialize_agent_telemetry_ipc_channel(
 ) -> Result<mpsc::Receiver<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
     match agent::ipc::init_telemetry_channel().await {
         Ok(rx) => {
-            info!(
+            debug!(
                 "Agent telemetry channel initialized, listening on pipe: {}",
                 agent::ipc::TELEMETRY_NAMED_PIPE_PATH
             );
@@ -651,13 +651,13 @@ fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Recei
 /// Channel-based agent payload collector with immediate processing and notification
 fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
     tokio::spawn(async move {
-        info!("Agent payload collector started - continuously listening for agent payloads");
+        debug!("Agent payload collector started - continuously listening for agent payloads");
         let mut payload_count = 0;
 
         while let Some(payload_bytes) = receiver.recv().await {
             payload_count += 1;
 
-            info!(
+            debug!(
                 "Received agent payload #{} ({} bytes) - processing immediately",
                 payload_count,
                 payload_bytes.len()
@@ -673,7 +673,7 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
             route_payload_to_request_buffer(payload_bytes).await;
         }
 
-        info!("Agent payload collector channel closed. No more agent payloads will be received");
+        debug!("Agent payload collector channel closed. No more agent payloads will be received");
     });
 }
 

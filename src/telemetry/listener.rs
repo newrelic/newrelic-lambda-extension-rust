@@ -12,7 +12,7 @@ use std::{
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -75,7 +75,7 @@ pub async fn setup_telemetry_listener(
         }
     });
 
-    info!("Telemetry listener started on {}", local_addr);
+    debug!("Telemetry listener started on {}", local_addr);
     Ok(local_addr)
 }
 
@@ -220,7 +220,7 @@ async fn handle_telemetry_request(
             if function_count > 0 || extension_count > 0 || platform_count > 0 {
                 let is_cold_start = !crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
                 if is_cold_start && function_count > 0 {
-                    info!("COLD START: Successfully received {} function logs via telemetry API!", function_count);
+                    debug!("COLD START: Successfully received {} function logs via telemetry API!", function_count);
                 }
                
             } else {

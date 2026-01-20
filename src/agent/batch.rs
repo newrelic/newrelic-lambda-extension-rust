@@ -73,7 +73,7 @@ pub fn add_to_batch(
         if meta.oldest_timestamp.is_none() {
             meta.oldest_timestamp = Some(timestamp);
         }
-        info!("Added agent payload to batch (total buffered: {})", meta.agent_count);
+        debug!("Added agent payload to batch (total buffered: {})", meta.agent_count);
     }
 }
 
@@ -86,7 +86,7 @@ pub fn should_send_batch_by_threshold() -> bool {
         .count();
 
     if count_with_reports >= 3 {
-        info!("Batch threshold reached: {} agent payloads with report lines", count_with_reports);
+        debug!("Batch threshold reached: {} agent payloads with report lines", count_with_reports);
         return true;
     }
 
@@ -145,7 +145,7 @@ fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
                 .min();
         }
 
-        info!(
+        debug!(
             "Removed {} payloads with report lines from batch (remaining in buffer: {})",
             items.len(),
             remaining_count
@@ -168,7 +168,7 @@ pub async fn send_batched_payloads_with_reports_only(
         return;
     }
 
-    info!(
+    debug!(
         "Threshold reached: Sending batch of {} agent payloads WITH report lines (payloads without reports kept in buffer)",
         batch_items.len()
     );
@@ -262,13 +262,13 @@ pub async fn send_all_pending_payloads_on_shutdown(
 ) {
     use crate::request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS};
 
-    info!("Shutdown: Collecting all pending telemetry payloads");
+    debug!("Shutdown: Collecting all pending telemetry payloads");
 
     let mut all_payloads: Vec<BatchedAgentPayload> = Vec::new();
 
     // 1. Collect from AGENT_BATCH_BUFFER (already batched payloads)
     let batched_items = get_and_clear_batch();
-    info!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
+    debug!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
     all_payloads.extend(batched_items);
 
     // 2. Collect from REQUEST_AGENT_BUFFERS (late/unbatched payloads)
@@ -286,7 +286,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
             };
 
             if !payloads.is_empty() {
-                info!("Shutdown: Found {} unbatched payload(s) for request: {}", payloads.len(), request_id);
+                debug!("Shutdown: Found {} unbatched payload(s) for request: {}", payloads.len(), request_id);
 
                 // Get report line if available
                 let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| report);
@@ -317,18 +317,18 @@ pub async fn send_all_pending_payloads_on_shutdown(
     }
 
     if all_payloads.is_empty() {
-        info!("Shutdown: No pending payloads to send");
+        debug!("Shutdown: No pending payloads to send");
         return;
     }
 
-    info!("Shutdown: Total {} payload(s) to send", all_payloads.len());
+    debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
 
     // 3. Split into 1MB chunks while keeping each payload + report together
     const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB
 
     let chunks = split_into_chunks(all_payloads, MAX_CHUNK_SIZE, &config);
 
-    info!("Shutdown: Sending {} chunk(s)", chunks.len());
+    debug!("Shutdown: Sending {} chunk(s)", chunks.len());
 
     // 4. Send each chunk
     for (idx, chunk_items) in chunks.iter().enumerate() {
@@ -475,7 +475,7 @@ pub async fn cleanup_old_batch_entries(
         return;
     }
 
-    info!("Periodic cleanup: Found {} old batch entries to send and remove", old_entries.len());
+    debug!("Periodic cleanup: Found {} old batch entries to send and remove", old_entries.len());
 
     // Send the old entries to New Relic (even without report lines - don't lose telemetry!)
     // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
@@ -543,6 +543,6 @@ pub async fn cleanup_old_batch_entries(
         } else {
             AGENT_BATCH_BUFFER.iter().map(|entry| entry.value().timestamp).min()
         };
-        info!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), final_count);
+        debug!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), final_count);
     }
 }

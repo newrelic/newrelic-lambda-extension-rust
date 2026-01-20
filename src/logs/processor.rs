@@ -263,14 +263,14 @@ impl LogProcessor {
                             // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
                             let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
                                 .replace('\n', "\\n").replace('\r', "\\r");
-                            info!("APM mode: Error detected in function log: {}", sanitized_msg);
+                            debug!("APM mode: Error detected in function log: {}", sanitized_msg);
 
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
                             (context.request_id.clone(), context.invoked_function_arn.clone())
                         };
 
-                        info!("APM mode: Sending error event for request_id: {}", request_id);
+                        debug!("APM mode: Sending error event for request_id: {}", request_id);
 
                         let apm_clone = Arc::clone(apm_app_arc);
                         let msg_clone = message_str.to_string();
@@ -315,14 +315,14 @@ impl LogProcessor {
                         // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
                         let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
                             .replace('\n', "\\n").replace('\r', "\\r");
-                        info!("Standard mode: Error detected in function log: {}", sanitized_msg);
+                        debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
 
                         let (request_id, function_arn) = {
                             let context = self.invocation_context.lock().unwrap();
                             (context.request_id.clone(), context.invoked_function_arn.clone())
                         };
 
-                        info!("Standard mode: Sending error for request_id: {}", request_id);
+                        debug!("Standard mode: Sending error for request_id: {}", request_id);
 
                         // Determine error type - use consistent LambdaError for all function errors
                         // (except timeout which should match platform timeout)
@@ -565,7 +565,7 @@ impl LogProcessor {
             return;
         }
         
-        info!("Processing {} pre-invoke logs with new metadata", pre_invoke_logs.len());
+        debug!("Processing {} pre-invoke logs with new metadata", pre_invoke_logs.len());
         
         for log in &mut pre_invoke_logs {
             if let Some(context) = self.invocation_context.safe_lock() {
@@ -639,7 +639,7 @@ impl LogProcessor {
             return Ok(());
         }
         
-        info!("Using ARN for pre-invoke shutdown flush: {}", function_arn);
+        debug!("Using ARN for pre-invoke shutdown flush: {}", function_arn);
         
         for log in &mut pre_invoke_logs {
             log.attributes.insert("faas.arn".to_string(),
@@ -706,7 +706,7 @@ impl LogProcessor {
             };
             
             if !failed_logs.is_empty() {
-                info!("Retrying {} failed logs from previous invocation", failed_logs.len());
+                debug!("Retrying {} failed logs from previous invocation", failed_logs.len());
                 
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
@@ -739,7 +739,7 @@ impl LogProcessor {
                     if !still_failed.is_empty() {
                         let mut buffer = failed_buffer.lock().unwrap();
                         buffer.extend(still_failed);
-                        info!("Re-buffered {} logs that failed retry", buffer.len());
+                        debug!("Re-buffered {} logs that failed retry", buffer.len());
                     }
                 });
             }
@@ -751,7 +751,7 @@ impl LogProcessor {
         };
         
         if !buffered_logs.is_empty() {
-            info!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
+            debug!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
             
             for mut log_message in buffered_logs {
                 log_message.attributes.insert("aws.lambda_request_id".to_string(), 
@@ -820,7 +820,7 @@ impl LogProcessor {
         }
         
         if successful_chunks > 0 {
-            info!("Successfully sent {} buffered log chunks", successful_chunks);
+            debug!("Successfully sent {} buffered log chunks", successful_chunks);
         }
         if failed_count > 0 {
             warn!("Dropped {} buffered logs due to send failures", failed_count);
@@ -886,7 +886,7 @@ impl LogProcessor {
             }
             
             if duplicate_count > 0 {
-                info!("Deduplicated {} duplicate log(s) before sending", duplicate_count);
+                debug!("Deduplicated {} duplicate log(s) before sending", duplicate_count);
             }
             
             unique_logs
@@ -897,7 +897,7 @@ impl LogProcessor {
             return Ok(());
         }
 
-        info!("Final flush: sending {} logs to New Relic", deduplicated_batch.len());
+        debug!("Final flush: sending {} logs to New Relic", deduplicated_batch.len());
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
@@ -943,7 +943,7 @@ impl LogProcessor {
         }
         
         if chunks.len() > 1 {
-            info!("Chunking {} logs into {} size-based batches (max 1MB each)", 
+            debug!("Chunking {} logs into {} size-based batches (max 1MB each)", 
                   chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
         }
         

@@ -15,7 +15,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -38,7 +38,7 @@ impl ApmApp {
         account_id: Option<String>,
         region: Option<String>,
     ) -> Result<Self> {
-        info!("Initializing APM app connection");
+        debug!("Initializing APM app connection");
 
         let backoff_ms = [200, 500, 900];
         let mut last_error = None;
@@ -59,7 +59,7 @@ impl ApmApp {
             .await
             {
                 Ok(app) => {
-                    info!(
+                    debug!(
                         "APM connection successful: run_id={}, entity_guid={}",
                         app.run_id, app.entity_guid
                     );
@@ -311,7 +311,7 @@ impl ApmApp {
 
         let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
         
-        info!("APM: Sending {} platform metrics to Metric API", metrics.len());
+        debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
         send_platform_metrics(
             &self.client,
@@ -338,7 +338,7 @@ impl ApmApp {
             }
         };
 
-        info!(
+        debug!(
             "Sending error event for fault/timeout in request: {}",
             request_id
         );
@@ -370,7 +370,7 @@ impl ApmApp {
             return Ok(());
         }
 
-        info!(
+        debug!(
             "Sending shutdown error event ({}) for request: {}",
             error_class, request_id
         );
