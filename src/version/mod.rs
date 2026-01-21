@@ -15,6 +15,9 @@ static VERSION_INFO_CACHE: OnceCell<Arc<VersionInfo>> = OnceCell::new();
 /// Global cache for runtime version from platform.initStart event
 static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
 
+/// Global cache for detected runtime (nodejs, python, etc.)
+static DETECTED_RUNTIME: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| detect_runtime_internal());
+
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -445,6 +448,64 @@ pub async fn detect_layer_version_async(layer_version_from_config: Option<String
             None
         }
     }
+}
+
+/// Get detected runtime name (nodejs, python, ruby, etc.) - cached, fast
+pub fn get_runtime_name() -> &'static str {
+    DETECTED_RUNTIME.as_str()
+}
+
+/// Get full runtime version from AWS_EXECUTION_ENV (e.g., "nodejs20.x", "python3.12")
+pub fn get_runtime_version() -> String {
+    if let Ok(env) = std::env::var("AWS_EXECUTION_ENV") {
+        if let Some(runtime_version) = env.strip_prefix("AWS_Lambda_") {
+            debug!("Runtime version from AWS_EXECUTION_ENV: {}", runtime_version);
+            return runtime_version.to_string();
+        }
+    }
+
+    // Fallback: return just the runtime name without version
+    let runtime = get_runtime_name();
+    debug!("AWS_EXECUTION_ENV not available, using runtime name only: {}", runtime);
+    runtime.to_string()
+}
+
+/// Returns the runtime name without version (e.g., "nodejs", "python")
+fn detect_runtime_internal() -> String {
+    if let Ok(env) = std::env::var("AWS_EXECUTION_ENV") {
+        if let Some(runtime_part) = env.strip_prefix("AWS_Lambda_") {
+            if runtime_part.starts_with("nodejs") {
+                return "nodejs".to_string();
+            } else if runtime_part.starts_with("python") {
+                return "python".to_string();
+            } else if runtime_part.starts_with("ruby") {
+                return "ruby".to_string();
+            } else if runtime_part.starts_with("dotnet") {
+                return "dotnet".to_string();
+            } else if runtime_part.starts_with("java") {
+                return "java".to_string();
+            } else if runtime_part.starts_with("go") {
+                return "go".to_string();
+            }
+        }
+    }
+
+    // Fallback: Check /var/lang/bin for runtime binaries
+    if Path::new("/var/lang/bin/node").exists() {
+        return "nodejs".to_string();
+    }
+    if Path::new("/var/lang/bin/python").exists() {
+        return "python".to_string();
+    }
+    if Path::new("/var/lang/bin/ruby").exists() {
+        return "ruby".to_string();
+    }
+    if Path::new("/var/lang/bin/dotnet").exists() {
+        return "dotnet".to_string();
+    }
+
+    debug!("No specific runtime detected, defaulting to go");
+    "go".to_string()
 }
 
 

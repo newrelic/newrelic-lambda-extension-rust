@@ -8,22 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::time::Duration;
 use tracing::{debug, error, info};
-use once_cell::sync::Lazy;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
 /// Connection timeouts - MORE AGGRESSIVE than Go for Lambda cold start
 const PRECONNECT_TIMEOUT_SECS: u64 = 20;
 const CONNECT_TIMEOUT_SECS: u64 = 20;
-
-/// OPTIMIZATION: Cache runtime detection (runs once per container lifetime)
-static CACHED_RUNTIME: Lazy<String> = Lazy::new(|| detect_runtime_internal());
-
-/// OPTIMIZATION: Cache agent version detection (runs once per container lifetime)
-static CACHED_AGENT_VERSION: Lazy<String> = Lazy::new(|| {
-    let runtime = CACHED_RUNTIME.as_str();
-    detect_agent_version_internal(runtime)
-});
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
 fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
@@ -201,7 +191,7 @@ pub async fn connect(
                 },
             },
         },
-        labels: get_labels(function_arn),
+        labels: get_labels(function_arn, runtime, agent_version),
     }];
 
     let body = serde_json::to_vec(&connect_req)?;
@@ -251,98 +241,13 @@ pub async fn connect(
     Ok(connect_resp)
 }
 
-/// Get cached runtime (detected once per container)
-/// OPTIMIZATION: Returns cached value - detection happens only once
-pub fn detect_runtime() -> &'static str {
-    CACHED_RUNTIME.as_str()
-}
-
-/// Detect Lambda runtime from /var/lang/bin (internal, called once)
-fn detect_runtime_internal() -> String {
-    // OPTIMIZATION: Check most common runtimes first (Node, Python)
-    // Using direct path construction without heap allocation
-    if std::path::Path::new("/var/lang/bin/node").exists() {
-        return "nodejs".to_string(); // BUGFIX: Collector expects "nodejs", not "node"
-    }
-    if std::path::Path::new("/var/lang/bin/python").exists() {
-        return "python".to_string();
-    }
-    if std::path::Path::new("/var/lang/bin/ruby").exists() {
-        return "ruby".to_string();
-    }
-    if std::path::Path::new("/var/lang/bin/dotnet").exists() {
-        return "dotnet".to_string();
-    }
-
-    debug!("No specific runtime detected, defaulting to go");
-    "go".to_string()
-}
-
-/// Get cached agent version (detected once per container)
-/// OPTIMIZATION: Returns cached value - detection happens only once
-pub fn detect_agent_version(_runtime: &str) -> &'static str {
-    CACHED_AGENT_VERSION.as_str()
-}
-
-/// Get agent version from layer paths (internal, called once)
-fn detect_agent_version_internal(runtime: &str) -> String {
-    match runtime {
-        "nodejs" => { // BUGFIX: Changed from "node" to match runtime string
-            let paths = vec![
-                "/opt/nodejs/node_modules/newrelic/package.json",
-                "/var/task/node_modules/newrelic/package.json",
-            ];
-
-            for path in paths {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(version) = json.get("version").and_then(|v| v.as_str()) {
-                            debug!("Detected Node.js agent version: {}", version);
-                            return version.to_string();
-                        }
-                    }
-                }
-            }
-        }
-        "python" => {
-            let paths = vec![
-                "/opt/python/newrelic/version.txt",
-                "/var/task/newrelic/version.txt",
-            ];
-
-            for path in paths {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    let version = content.trim().to_string();
-                    debug!("Detected Python agent version: {}", version);
-                    return version;
-                }
-            }
-        }
-        "dotnet" | "ruby" => {
-            let paths = vec![
-                format!("/opt/{}/newrelic/version.txt", runtime),
-                format!("/var/task/newrelic/version.txt"),
-            ];
-
-            for path in paths {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    let version = content.trim().to_string();
-                    debug!("Detected {} agent version: {}", runtime, version);
-                    return version;
-                }
-            }
-        }
-        _ => {}
-    }
-
-    debug!("Could not detect agent version, using default");
-    "unknown".to_string()
-}
-
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
-/// Get labels for Connect request, including aws.arn, isLambdaFunction, and NR_TAGS
-fn get_labels(function_arn: &str) -> Vec<Label> {
+/// Get labels for Connect request, including aws.arn, isLambdaFunction, versions, and NR_TAGS
+fn get_labels(function_arn: &str, _runtime: &str, agent_version: &str) -> Vec<Label> {
+    let runtime_version = crate::version::get_runtime_version(); // Get full version like "nodejs20.x" or "python3.12"
+    let extension_version = env!("CARGO_PKG_VERSION");
+    
     let mut labels = vec![
         Label {
             label_type: "aws.arn".to_string(),
@@ -351,6 +256,18 @@ fn get_labels(function_arn: &str) -> Vec<Label> {
         Label {
             label_type: "isLambdaFunction".to_string(),
             label_value: "true".to_string(),
+        },
+        Label {
+            label_type: "newrelic.agent.version".to_string(),
+            label_value: agent_version.to_string(),
+        },
+        Label {
+            label_type: "newrelic.extension.version".to_string(),
+            label_value: extension_version.to_string(),
+        },
+        Label {
+            label_type: "lambda.runtime.version".to_string(),
+            label_value: runtime_version,
         },
     ];
 

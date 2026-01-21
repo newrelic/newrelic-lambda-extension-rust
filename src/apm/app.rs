@@ -93,8 +93,9 @@ impl ApmApp {
     ) -> Result<ApmApp> {
         // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
-        let runtime = super::connection::detect_runtime();
-        let agent_version = super::connection::detect_agent_version(runtime);
+        let runtime = crate::version::get_runtime_name();
+        let version_info = crate::version::VersionInfo::get_or_detect(None);
+        let agent_version = version_info.agent_version.as_deref().unwrap_or("unknown");
 
         // Run preconnect while we have the cached values
         let collector_host = preconnect(client, license_key, apm_host)
@@ -175,7 +176,7 @@ impl ApmApp {
         // Normalize transaction names for Ruby v2 payloads only
         // Ruby agent sends transaction names without proper "OtherTransaction/Ruby/" prefix
         if protocol_version == 2 {
-            let runtime = super::connection::detect_runtime();
+            let runtime = crate::version::get_runtime_name();
             if runtime == "ruby" {
                 debug!("Ruby v2 payload detected - normalizing transaction names");
                 
