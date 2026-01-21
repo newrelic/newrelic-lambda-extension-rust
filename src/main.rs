@@ -313,18 +313,24 @@ async fn perform_one_time_initialization(
 
     info!("License key validated and extension registered - proceeding with full initialization");
     
-    // Initialize global invocation context with fallback ARN to prevent empty ARN issues
-    // This provides a valid ARN for any telemetry that arrives before the first INVOKE event
-    let fallback_arn = format!(
+    // Construct registration fallback ARN once from registration response
+    // This ARN is used for all telemetry before the first INVOKE event provides the actual invoked_function_arn
+    // Also used as fallback when invoked_function_arn is not available
+    // AWS Lambda always provides account_id during registration
+    let registration_fallback_arn = format!(
         "arn:aws:lambda:{}:{}:function:{}",
         std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-        config.aws.account_id.as_ref().map(|s| s.as_str()).unwrap_or("unknown"),
+        config.aws.account_id.as_ref()
+            .expect("CRITICAL: Account ID must be provided by AWS Lambda during registration"),
         config.aws.function_name
     );
     
+    info!("Registration fallback ARN constructed: {}", registration_fallback_arn);
+    
+    // Initialize global invocation context with fallback ARN
     if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
-        global_context.invoked_function_arn = fallback_arn.clone();
-        debug!("Initialized global context with fallback ARN: {}", fallback_arn);
+        global_context.invoked_function_arn = registration_fallback_arn.clone();
+        debug!("Initialized global context with registration fallback ARN");
     }
 
     debug!(
@@ -440,11 +446,8 @@ async fn perform_one_time_initialization(
             let temp_log_processor = processor_factory.create_log_processor(temp_context.clone());
             let temp_platform_processor = processor_factory.create_platform_processor(temp_context, temp_log_processor.clone());
 
-            // Set fallback ARN for emergency shutdown before first INVOKE
-            temp_log_processor.set_fallback_arn(
-                &config.aws.function_name,
-                &config.aws.account_id.clone().unwrap_or_default(),
-            );
+            // Set fallback ARN from registration for emergency shutdown before first INVOKE
+            temp_log_processor.set_fallback_arn(&registration_fallback_arn);
 
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
@@ -472,11 +475,8 @@ async fn perform_one_time_initialization(
             let temp_log_processor = processor_factory.create_log_processor(temp_context.clone());
             let temp_platform_processor = processor_factory.create_platform_processor(temp_context, temp_log_processor.clone());
 
-            // Set fallback ARN for emergency shutdown before first INVOKE
-            temp_log_processor.set_fallback_arn(
-                &config.aws.function_name,
-                &config.aws.account_id.clone().unwrap_or_default(),
-            );
+            // Set fallback ARN from registration for emergency shutdown before first INVOKE
+            temp_log_processor.set_fallback_arn(&registration_fallback_arn);
 
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
