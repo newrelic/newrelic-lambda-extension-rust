@@ -1,5 +1,5 @@
 use std::{env, time::Duration};
-use tracing::{info, debug, Event, Subscriber};
+use tracing::{debug, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
@@ -131,7 +131,7 @@ impl AwsConfig {
             .unwrap_or("123456789012");
 
         if account_id == "123456789012" {
-            info!("Using placeholder account ID - tagging will use actual ARN from invocation event");
+            debug!("Using placeholder account ID - tagging will use actual ARN from invocation event");
         }
 
         Some(format!(
@@ -346,7 +346,7 @@ pub fn init_config() -> &'static ExtensionConfig {
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            info!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
+            debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
             GLOBAL_CONFIG = Some(config);
         });

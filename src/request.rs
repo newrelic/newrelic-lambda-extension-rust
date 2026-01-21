@@ -140,7 +140,7 @@ pub fn create_request_processing_state(
             if let Ok(mut buffer) = agent_buffer.lock() {
                 let count = orphaned.len();
                 buffer.extend(orphaned.drain(..));
-                info!(
+                debug!(
                     "Moved {} orphaned agent payload(s) to request buffer for {}",
                     count, request_id
                 );
@@ -255,7 +255,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
             // No requests exist yet - store in orphaned buffer
             if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
                 orphaned.push(payload_bytes);
-                info!(
+                debug!(
                     "No active requests - stored agent payload in orphaned buffer (total orphaned: {})",
                     orphaned.len()
                 );
@@ -277,7 +277,7 @@ pub async fn wait_for_all_requests_completion(
     if pending_count == 0 {
         debug!("No pending requests at shutdown - proceeding immediately");
     } else {
-        info!(
+        debug!(
             "Waiting for {} request(s) to complete...",
             pending_count
         );
@@ -294,11 +294,11 @@ pub async fn wait_for_all_requests_completion(
             cleanup_request_processing_state(&request_id);
         }
 
-        info!("All requests completed");
+        debug!("All requests completed");
     }
 
     // Send all pending telemetry and logs in parallel with 1MB chunking
-    info!("Shutdown: Flushing all pending telemetry and logs...");
+    debug!("Shutdown: Flushing all pending telemetry and logs...");
 
     use crate::agent::batch::send_all_pending_payloads_on_shutdown;
 
@@ -332,8 +332,8 @@ pub async fn wait_for_all_requests_completion(
     }
 
     let shutdown_duration = shutdown_start_time.elapsed();
-    info!("Shutdown: All pending data flushed");
-    info!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
+    debug!("Shutdown: All pending data flushed");
+    debug!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
 }
 
 /// Cleanup old request buffers by sending their payloads to New Relic first
@@ -359,7 +359,7 @@ pub async fn cleanup_old_request_buffers(
         return;
     }
 
-    info!("Periodic cleanup: Found {} old request buffers to send and remove", old_request_ids.len());
+    debug!("Periodic cleanup: Found {} old request buffers to send and remove", old_request_ids.len());
 
     let mut all_payloads: Vec<BatchedAgentPayload> = Vec::new();
 
@@ -403,7 +403,7 @@ pub async fn cleanup_old_request_buffers(
 
     // Send payloads to New Relic before cleanup
     if !all_payloads.is_empty() {
-        info!("Periodic cleanup: Sending {} payloads from old request buffers", all_payloads.len());
+        debug!("Periodic cleanup: Sending {} payloads from old request buffers", all_payloads.len());
 
         // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
         let mut log_events = Vec::with_capacity(all_payloads.len() * 2);
@@ -464,5 +464,5 @@ pub async fn cleanup_old_request_buffers(
         REQUEST_BUFFER_TIMESTAMPS.remove(request_id);
     }
 
-    info!("Periodic cleanup: Removed {} old request buffers", old_request_ids.len());
+    debug!("Periodic cleanup: Removed {} old request buffers", old_request_ids.len());
 }

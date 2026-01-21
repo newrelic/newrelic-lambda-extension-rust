@@ -3,7 +3,7 @@
 //! This module handles tagging the Lambda function with New Relic version information.
 //! Tags are applied asynchronously in the background to avoid blocking cold start.
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use std::collections::HashMap;
 
 /// Tags the Lambda function with New Relic version information
@@ -17,7 +17,7 @@ pub async fn tag_lambda_function_with_versions(
     function_arn: String,
 ) {
     debug!("Starting Lambda function tagging process...");
-    info!("Tagging Lambda function: {}", function_arn);
+    debug!("Tagging Lambda function: {}", function_arn);
 
     let mut tags = HashMap::new();
     tags.insert(
@@ -34,14 +34,14 @@ pub async fn tag_lambda_function_with_versions(
         tags.insert("newrelic.layer.version".to_string(), layer_ver);
     }
 
-    info!("Tagging Lambda function with {} version tags", tags.len());
+    debug!("Tagging Lambda function with {} version tags", tags.len());
     for (key, value) in &tags {
         debug!("  {}: {}", key, value);
     }
 
     match apply_tags_to_function(&function_arn, tags).await {
         Ok(_) => {
-            info!("Successfully tagged Lambda function with New Relic version information");
+            debug!("Successfully tagged Lambda function with New Relic version information");
         }
         Err(e) => {
             warn!("Failed to tag Lambda function: {}", e);
@@ -110,7 +110,7 @@ pub fn tag_lambda_function_background(
             debug!("Layer version not detected from env vars, attempting AWS API fallback...");
             match crate::version::detect_layer_version_async(layer_version_from_config, add_version_detail_tags, function_name).await {
                 Some(layer_ver) => {
-                    info!("Layer version detected via AWS API fallback: {}", layer_ver);
+                    debug!("Layer version detected via AWS API fallback: {}", layer_ver);
                     final_layer_version = Some(layer_ver);
                 }
                 None => {

@@ -5,7 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use crate::{
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
@@ -75,7 +75,7 @@ pub async fn retry_failed_errors(
         return false;
     }
 
-    info!("Retrying {} failed error(s) from previous invocation(s)", failed_errors.len());
+    debug!("Retrying {} failed error(s) from previous invocation(s)", failed_errors.len());
 
     for failed_error in failed_errors {
         debug!(
@@ -214,7 +214,7 @@ pub async fn send_timeout_error(
             return;
         }
     }
-    info!("Synthesizing timeout error for request {}: {}", request_id, timeout_msg);
+    debug!("Synthesizing timeout error for request {}: {}", request_id, timeout_msg);
 
     // Attempt to send - only mark as sent on success
     match send_error_to_telemetry_internal(
@@ -293,7 +293,7 @@ pub async fn send_platform_fault_error(
         }
     }
 
-    info!("Synthesizing platform fault error for request {}: {}", request_id, fault_msg);
+    debug!("Synthesizing platform fault error for request {}: {}", request_id, fault_msg);
 
     // Attempt to send - only mark as sent on success
     match send_error_to_telemetry_internal(
@@ -347,7 +347,7 @@ pub async fn send_lambda_error(
         }
     }
 
-    info!("Synthesizing Lambda error for request {}: {} - {}", request_id, error_type, error_message);
+    debug!("Synthesizing Lambda error for request {}: {} - {}", request_id, error_type, error_message);
 
     // Attempt to send - only mark as sent on success
     match send_error_to_telemetry_internal(
@@ -420,7 +420,7 @@ async fn send_error_to_telemetry_internal(
 
     let payload_json = payload.to_string();
 
-    info!("Sending synthesized error ({}) to telemetry endpoint for request {}", error_class, request_id);
+    debug!("Sending synthesized error ({}) to telemetry endpoint for request {}", error_class, request_id);
 
     newrelic_client.send_agent_payload(config, &payload_json).await?;
 

@@ -105,7 +105,7 @@ pub async fn send_error_events(
 
     if status.is_success() {
         debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
-        info!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
+        debug!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
         info!("Successfully sent {} error events (status: {})", error_events.len(), status);
         Ok(())
     } else {
@@ -194,7 +194,7 @@ pub async fn send_apm_telemetry(
 
     if status.is_success() {
         debug!("Status Code for {} telemetry: {}", command, status_code);
-        info!("Send {} duration: {}ms", command, duration.as_millis());
+        debug!("Send {} duration: {}ms", command, duration.as_millis());
         info!("Successfully sent {} (status: {})", command, status);
         Ok(())
     } else {
@@ -264,7 +264,7 @@ pub async fn send_platform_metrics(
 
     if status.is_success() {
         debug!("Status Code for platform_metrics telemetry: {}", status_code);
-        info!("Send platform_metrics duration: {}ms", duration.as_millis());
+        debug!("Send platform_metrics duration: {}ms", duration.as_millis());
         info!("Successfully sent {} platform metrics", metrics.len());
         Ok(())
     } else {
