@@ -95,6 +95,7 @@ impl ApmApp {
         // No need for spawn_blocking or parallelization - instant access
         let runtime = crate::version::get_runtime_name();
         let version_info = crate::version::VersionInfo::get_or_detect(None);
+        // Pass "unknown" if no agent detected - will be filtered out from labels
         let agent_version = version_info.agent_version.as_deref().unwrap_or("unknown");
 
         // Run preconnect while we have the cached values

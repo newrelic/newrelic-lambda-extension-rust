@@ -504,8 +504,8 @@ fn detect_runtime_internal() -> String {
         return "dotnet".to_string();
     }
 
-    debug!("No specific runtime detected, defaulting to go");
-    "go".to_string()
+    debug!("No specific runtime detected - could be custom/containerized Lambda. Using 'unknown' to avoid incorrect tagging.");
+    "unknown".to_string()
 }
 
 

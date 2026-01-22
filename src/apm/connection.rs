@@ -244,7 +244,8 @@ pub async fn connect(
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
 /// Get labels for Connect request, including aws.arn, isLambdaFunction, versions, and NR_TAGS
-fn get_labels(function_arn: &str, _runtime: &str, agent_version: &str) -> Vec<Label> {
+/// Only sends agent and runtime labels when known (not "unknown")
+fn get_labels(function_arn: &str, runtime: &str, agent_version: &str) -> Vec<Label> {
     let runtime_version = crate::version::get_runtime_version(); // Get full version like "nodejs20.x" or "python3.12"
     let extension_version = env!("CARGO_PKG_VERSION");
     
@@ -257,19 +258,26 @@ fn get_labels(function_arn: &str, _runtime: &str, agent_version: &str) -> Vec<La
             label_type: "isLambdaFunction".to_string(),
             label_value: "true".to_string(),
         },
-        Label {
-            label_type: "newrelic.agent.version".to_string(),
-            label_value: agent_version.to_string(),
-        },
+        // Always send extension version - we always know it
         Label {
             label_type: "newrelic.extension.version".to_string(),
             label_value: extension_version.to_string(),
         },
-        Label {
+    ];
+
+    if agent_version != "unknown" {
+        labels.push(Label {
+            label_type: "newrelic.agent.version".to_string(),
+            label_value: agent_version.to_string(),
+        });
+    }
+
+    if runtime != "unknown" && !runtime_version.contains("unknown") {
+        labels.push(Label {
             label_type: "lambda.runtime.version".to_string(),
             label_value: runtime_version,
-        },
-    ];
+        });
+    }
 
     for (key, value) in crate::config::parse_nr_tags() {
         debug!("Added custom label from NR_TAGS: {}={}", key, value);
