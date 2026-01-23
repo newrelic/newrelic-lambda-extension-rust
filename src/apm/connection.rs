@@ -191,7 +191,7 @@ pub async fn connect(
                 },
             },
         },
-        labels: get_labels(function_arn, runtime, agent_version),
+        labels: get_labels(function_arn, runtime),
     }];
 
     let body = serde_json::to_vec(&connect_req)?;
@@ -243,10 +243,9 @@ pub async fn connect(
 
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
-/// Get labels for Connect request, including aws.arn, isLambdaFunction, versions, and NR_TAGS
-/// Only sends agent and runtime labels when known (not "unknown")
-fn get_labels(function_arn: &str, runtime: &str, agent_version: &str) -> Vec<Label> {
-    let runtime_version = crate::version::get_runtime_version(); // Get full version like "nodejs20.x" or "python3.12"
+/// Get labels for Connect request
+fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
+    let runtime_version = crate::version::get_runtime_version();
     let extension_version = env!("CARGO_PKG_VERSION");
     
     let mut labels = vec![
@@ -258,21 +257,18 @@ fn get_labels(function_arn: &str, runtime: &str, agent_version: &str) -> Vec<Lab
             label_type: "isLambdaFunction".to_string(),
             label_value: "true".to_string(),
         },
-        // Always send extension version - we always know it
         Label {
             label_type: "newrelic.extension.version".to_string(),
             label_value: extension_version.to_string(),
         },
     ];
 
-    if agent_version != "unknown" {
-        labels.push(Label {
-            label_type: "newrelic.agent.version".to_string(),
-            label_value: agent_version.to_string(),
-        });
-    }
-
-    if runtime != "unknown" && !runtime_version.contains("unknown") {
+    // Only send runtime version if we have actual version info
+    if runtime != "unknown" 
+        && !runtime_version.contains("unknown") 
+        && runtime_version != runtime  
+        && runtime_version.len() > runtime.len()
+    {
         labels.push(Label {
             label_type: "lambda.runtime.version".to_string(),
             label_value: runtime_version,
@@ -280,7 +276,6 @@ fn get_labels(function_arn: &str, runtime: &str, agent_version: &str) -> Vec<Lab
     }
 
     for (key, value) in crate::config::parse_nr_tags() {
-        debug!("Added custom label from NR_TAGS: {}={}", key, value);
         labels.push(Label {
             label_type: key,
             label_value: value,

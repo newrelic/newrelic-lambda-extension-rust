@@ -455,19 +455,19 @@ pub fn get_runtime_name() -> &'static str {
     DETECTED_RUNTIME.as_str()
 }
 
-/// Get full runtime version from AWS_EXECUTION_ENV (e.g., "nodejs20.x", "python3.12")
+/// Get runtime version. Priority: platform.initStart cache, AWS_EXECUTION_ENV, runtime name
 pub fn get_runtime_version() -> String {
+    if let Some(cached_version) = RUNTIME_VERSION_CACHE.get() {
+        return cached_version.clone();
+    }
+
     if let Ok(env) = std::env::var("AWS_EXECUTION_ENV") {
         if let Some(runtime_version) = env.strip_prefix("AWS_Lambda_") {
-            debug!("Runtime version from AWS_EXECUTION_ENV: {}", runtime_version);
             return runtime_version.to_string();
         }
     }
 
-    // Fallback: return just the runtime name without version
-    let runtime = get_runtime_name();
-    debug!("AWS_EXECUTION_ENV not available, using runtime name only: {}", runtime);
-    runtime.to_string()
+    get_runtime_name().to_string()
 }
 
 /// Returns the runtime name without version (e.g., "nodejs", "python")
