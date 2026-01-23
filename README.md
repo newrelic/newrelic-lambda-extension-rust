@@ -1,20 +1,271 @@
-# Introduction
+[![Community Plus header](https://github.com/newrelic/opensource-website/raw/main/src/images/categories/Community_Plus.png)](https://opensource.newrelic.com/oss-category/#community-plus)
 
-extension-project is a Rust project that implements an AWS Lambda extension in Rust.
+# newrelic-lambda-extension (Rust) ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+
+A high-performance Rust implementation of the AWS Lambda extension to collect, enhance, and transport telemetry data from your AWS Lambda functions to New Relic without requiring an external transport such as CloudWatch Logs or Kinesis.
+
+This lightweight AWS Lambda Extension runs alongside your AWS Lambda functions and automatically handles the collection and transport of telemetry data from
+supported New Relic serverless agents. The extension requires a telemetry payload from a New Relic agent. Conditions that delay or prevent that payload from being written may result in longer-than-expected invocation durations.
+
+## Installation
+
+To install the extension, simply include the layer with your instrumented
+Lambda function. The current layer ARN can be found [here][3].
+
+[3]: https://layers.newrelic-external.com
+
+**Note:** This extension is included with all New Relic AWS Lambda layers going forward.
+
+You'll also need to make the New Relic license key available to the extension. Use the [New Relic Lambda CLI][4]
+to install the managed secret, and then add the permission for the secret to your Lambda execution role.
+
+[4]: https://github.com/newrelic/newrelic-lambda-cli
+
+```sh
+newrelic-lambda integrations install \
+    --nr-account-id <account id> \
+    --nr-api-key <api key> \
+    --linked-account-name <linked account name>
+```
+
+Each of the example functions in the `examples` directory has the appropriate license key secret permission. 
+
+After deploying your AWS Lambda function with one of the layer ARNs from the
+link above you should begin seeing telemetry data in New Relic.
+
+See below for details on supported New Relic agents.
+
+## Supported Configurations
+
+The New Relic Extension uses the AWS [Lambda Extensions API](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-extensions-api.html), which supports all Lambda runtimes. For Go lambdas, we suggest using "provided.al2023" or "provided.al2". See the [Custom runtime](https://docs.aws.amazon.com/lambda/latest/dg/runtimes-custom.html) docs for further details.
+
+All of the New Relic Lambda Layers include the Extension and the latest Agent version for the Layer's runtime. The latest 
+New Relic Lambda Layer ARNs for your runtime and region are available [here](https://layers.newrelic-external.com/). The 
+`NewRelicLambdaExtension` layer is suitable for Go runtime Lambda.
+
+## APM Mode
+
+The extension supports an **APM (Application Performance Monitoring) Mode** that enables Lambda functions to report telemetry directly to New Relic's APM platform, providing deep application insights and entity-level correlation with other APM services.
+
+### Quick Start with APM Mode
+
+Enable APM mode by setting the following environment variables in your Lambda function configuration:
+
+- `NEW_RELIC_APM_LAMBDA_MODE`: `true`
+- `NEW_RELIC_LICENSE_KEY`: Your New Relic license key
+
+### APM Mode Features
+
+- **Direct APM Integration**: Lambda functions appear as APM application entities
+- **Comprehensive Telemetry**: Metrics, spans, errors, events, and transaction traces
+- **Platform Metrics**: Lambda platform logs converted to APM metrics (`apm.lambda.transaction.*`)
+- **Enhanced Error Events**: Platform timeouts and faults reported as APM error events with distributed tracing context
+- **Entity Correlation**: Function logs sent with Entity GUID for unified observability
+
+### When to Use APM Mode
+
+**Use APM Mode if you need:**
+- Lambda functions as APM application entities
+- Comprehensive transaction traces and error analytics
+- Correlation with other APM-instrumented services
+- APM-specific features (Service Maps, distributed tracing)
+
+**Use Standard Mode if you need:**
+- Basic serverless monitoring
+- Serverless-specific UI views
 
 ## Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install)
-- [Cargo Lambda](https://www.cargo-lambda.info/guide/installation.html)
+- [Rust](https://www.rust-lang.org/tools/install) (1.70 or later)
+- AWS CLI configured with appropriate credentials
+- For cross-compilation: [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild) or [cross](https://github.com/cross-rs/cross)
 
 ## Building
 
-To build the project for production, run `cargo lambda build --extension --release`. Remove the `--release` flag to build for development.
+The extension can be built using cargo-zigbuild (recommended), cross, or standard cargo toolchain.
 
-Read more about building your lambda extension in [the Cargo Lambda documentation](https://www.cargo-lambda.info/commands/build.html#extensions).
+### Prerequisites for Building
+
+Install one of the following for cross-compilation:
+
+```sh
+# Option 1: cargo-zigbuild (recommended)
+cargo install cargo-zigbuild
+
+# Option 2: cross
+cargo install cross
+```
+
+### Build Commands
+
+To build the extension for production:
+
+```sh
+# Build for x86_64 architecture
+cargo zigbuild --release --target x86_64-unknown-linux-musl
+
+# Build for arm64 architecture
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+```
+
+If using `cross` instead of `cargo-zigbuild`:
+
+```sh
+# Build for x86_64 architecture
+cross build --release --target x86_64-unknown-linux-musl
+
+# Build for arm64 architecture
+cross build --release --target aarch64-unknown-linux-gnu
+```
+
+The compiled binary will be available at `target/<target>/release/newrelic-lambda-extension`.
+
+### Using the Build Script
+
+For automated builds and layer creation, use the provided script:
+
+```sh
+# From the project root
+./scripts/createlayer.sh
+```
+
+This script automatically handles target installation, builds for multiple architectures, and packages the extension into Lambda layer zip files.
 
 ## Deploying
 
-To deploy the project, run `cargo lambda deploy --extension`. This will upload the extension to your AWS account as an AWS Lambda Layer.
+The `scripts/createlayer.sh` script handles building and publishing Lambda layers to multiple AWS regions.
 
-Read more about deploying your lambda extension in [the Cargo Lambda documentation](https://www.cargo-lambda.info/commands/deploy.html#extensions).
+### Basic Usage
+
+To build and publish layers:
+
+```sh
+# Build and publish to default regions
+./scripts/createlayer.sh
+
+# Customize layer prefix and regions
+LAYER_NAME_PREFIX="MyCustomPrefix" \
+REGIONS_X86_64="us-east-1 us-west-2" \
+REGIONS_ARM64="us-east-1 us-west-2" \
+./scripts/createlayer.sh
+```
+
+### Manual Layer Publishing
+
+To manually publish a layer to AWS:
+
+1. Build the extension for your target architecture
+2. Package it into a zip file with the correct structure:
+
+```sh
+# Create layer structure
+mkdir -p layer/extensions
+cp target/x86_64-unknown-linux-musl/release/newrelic-lambda-extension layer/extensions/
+cd layer && zip -r9 ../extension-layer.zip .
+cd ..
+
+# Publish to AWS
+aws lambda publish-layer-version \
+    --layer-name NewRelicLambdaExtension \
+    --zip-file fileb://extension-layer.zip \
+    --compatible-runtimes provided provided.al2 provided.al2023 \
+    --region us-east-1
+```
+
+Be sure that the AWS CLI is configured correctly. You can use the usual [AWS CLI environment variables](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html) to control the account and region.
+
+## Logging
+
+The New Relic Lambda Extension can send your function's logs to New Relic. If you use the Lambda Extension, you can avoid the CloudWatch Logs ingest charge for telemetry gathered by New Relic.
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send function logs to New Relic. |
+| `NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send extension logs in addition to the function logs to New Relic. |
+| `NEW_RELIC_EXTENSION_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` | Set the log level for extension logging. |
+| `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Each tag is composed of a colon-delimited key and value. Multiple key-value pairs are semicolon-delimited; for example, `env:prod;team:myTeam`. |
+| `NR_ENV_DELIMITER` | `;` | Any string | Custom delimiter for `NR_TAGS`. Some users in UTF-8 environments might face difficulty with the default semicolon `;` delimiter. |
+
+## Extension Environment Variables
+
+The New Relic Lambda Extension offers various features, which can be configured using Lambda environment variables:
+
+### Core Configuration
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_LICENSE_KEY` | | String | Your New Relic license key. **Required** unless using Secrets Manager or SSM Parameter Store. |
+| `NEW_RELIC_LICENSE_KEY_SECRET` | | Secret Name or ARN | Specify the name or ARN of the secret from **AWS Secrets Manager** that contains your New Relic license key.<br><br>**Notes:**<br>- This is only used if `NEW_RELIC_LICENSE_KEY` is not set.<br>- The secret must be in the same AWS region as your Lambda function.<br>- Your Lambda function's execution role needs the `secretsmanager:GetSecretValue` permission. |
+| `NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME` | | Parameter Name or ARN | Specify the name or ARN of the parameter from **AWS Systems Manager Parameter Store** that contains your New Relic license key.<br><br>**Notes:**<br>- This is only used if `NEW_RELIC_LICENSE_KEY` is not set.<br>- The SSM parameter must be in the same AWS region as your Lambda function.<br>- Your Lambda function's execution role needs the `ssm:GetParameter` permission. |
+| `NEW_RELIC_LAMBDA_EXTENSION_ENABLED` | `true` | `true`, `false` | Enable or disable the extension. |
+
+### APM and Telemetry Configuration
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_APM_LAMBDA_MODE` | `false` | `true`, `false`, `1`, `0` | Enable APM mode for deep application monitoring and entity correlation. |
+| `NEW_RELIC_COLLECT_TRACE_ID` | `false` | `true`, `false`, `1`, `0` | Add `trace.id` attribute to Lambda logs for distributed tracing correlation. |
+| `NEW_RELIC_ADD_VERSION_DETAIL_TAGS` | `false` | `true`, `false`, `1`, `0` | Add version detail tags to telemetry. |
+| `NEW_RELIC_LAYER_VERSION` | | String | Specify the layer version for tracking purposes. |
+| `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
+| `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
+
+## Testing
+
+### Unit and Integration Tests
+
+Run the Rust test suite:
+
+```sh
+# Run all tests
+cargo test
+
+# Run tests with output
+cargo test -- --nocapture
+
+# Run specific test
+cargo test test_name
+```
+
+### Testing in AWS Lambda
+
+The most reliable way to test the extension is to deploy it to an actual AWS Lambda function:
+
+1. Build and package the extension using the [build script](#using-the-build-script)
+2. Deploy the extension layer to your AWS account
+3. Attach the layer to a test Lambda function
+4. Configure the required environment variables (see [Extension Environment Variables](#extension-environment-variables))
+5. Invoke your Lambda function and verify telemetry in New Relic
+
+### Local Testing Limitations
+
+**Note:** Local testing of Lambda extensions is complex and has significant limitations:
+- AWS Lambda extensions rely on the Lambda runtime environment and Extensions API
+
+For development and testing purposes, we recommend:
+- Using the Rust test suite for unit and integration tests
+- Deploying to a development AWS Lambda function for end-to-end testing
+- Using AWS SAM or Terraform for infrastructure-as-code deployments
+
+## Why Rust?
+
+This Rust implementation provides several advantages over the original Go implementation:
+
+- **Smaller Binary Size**: Optimized for size with aggressive LTO and stripping
+- **Faster Cold Starts**: Reduced initialization time and memory footprint
+- **Lower Memory Usage**: More efficient memory management
+- **Enhanced Safety**: Rust's type system and ownership model prevent common bugs
+
+## Support
+
+New Relic hosts and moderates an online forum where customers can interact with New Relic employees as well as other customers to get help and share best practices. Like all official New Relic open source projects, there's a related Community topic in the New Relic Explorers Hub. You can find this project's topic/threads [in the Explorers Hub](https://discuss.newrelic.com/t/new-relic-lambda-extension/111715).
+
+## Contributing
+
+We encourage your contributions to improve `newrelic-lambda-extension`! Keep in mind when you submit your pull request, you'll need to sign the CLA via the click-through using CLA-Assistant. You only have to sign the CLA one time per project.
+
+If you have any questions, or to execute our corporate CLA, required if your contribution is on behalf of a company, please drop us an email at opensource@newrelic.com.
+
+## License
+
+`newrelic-lambda-extension` is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License. The `newrelic-lambda-extension` also uses source code from third-party libraries. You can find full details on which libraries are used and the terms under which they are licensed in the third-party notices document.
