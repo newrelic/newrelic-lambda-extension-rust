@@ -210,6 +210,11 @@ impl LogProcessor {
                     return;
                 }
             }
+            "platform" => {
+                if !self.config.extension.send_platform_logs {
+                    return;
+                }
+            }
             _ => {
                 trace!("Processing unknown log type: {}", record.record_type);
             }
@@ -846,8 +851,19 @@ impl LogProcessor {
         Ok(())
     }
 
-   
+
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        // Master check: if all log types are disabled, don't send anything
+        if !self.config.extension.send_function_logs
+            && !self.config.extension.send_extension_logs
+            && !self.config.extension.send_platform_logs {
+            debug!("All log types disabled - clearing batch without sending");
+            if let Some(mut batch_guard) = self.log_batch.safe_lock() {
+                batch_guard.clear();
+            }
+            return Ok(());
+        }
+
         // First, await all pending auto-flush tasks to ensure they complete
         // before we do the final flush (prevents logs from being cancelled)
         let pending_handles = {

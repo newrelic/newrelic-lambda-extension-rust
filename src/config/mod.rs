@@ -49,6 +49,7 @@ pub struct AwsConfig {
 pub struct ExtensionSettings {
     pub send_function_logs: bool,
     pub send_extension_logs: bool,
+    pub send_platform_logs: bool,
     pub log_level: String,
 }
 
@@ -174,6 +175,7 @@ impl Default for ExtensionSettings {
         Self {
             send_function_logs: false,
             send_extension_logs: false,
+            send_platform_logs: false,
             log_level: "info".to_string(),
         }
     }
@@ -195,6 +197,7 @@ impl ExtensionConfig {
     pub fn from_env() -> Self {
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
+        let send_platform_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS").unwrap_or_default();
 
         let mut config = Self::default();
 
@@ -231,6 +234,7 @@ impl ExtensionConfig {
 
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
+        config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
 
         let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         config.extension.log_level = Self::validate_log_level(&raw_log_level);
