@@ -1,5 +1,5 @@
 use std::{env, time::Duration};
-use tracing::{debug, Event, Subscriber};
+use tracing::{debug, warn, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
@@ -126,13 +126,13 @@ impl AwsConfig {
             .or_else(|_| env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());
 
-        let account_id = self.account_id.as_ref()
+        // Get account ID, return None if not available (don't use placeholder)
+        let Some(account_id) = self.account_id.as_ref()
             .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
-            .unwrap_or("123456789012");
-
-        if account_id == "123456789012" {
-            debug!("Using placeholder account ID - tagging will use actual ARN from invocation event");
-        }
+        else {
+            warn!("Cannot construct ARN: account ID not available from registration yet");
+            return None;
+        };
 
         Some(format!(
             "arn:aws:lambda:{}:{}:function:{}",

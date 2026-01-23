@@ -172,9 +172,23 @@ async fn handle_telemetry_request(
                                                         ctx_ref.lock()
                                                             .ok()
                                                             .map(|ctx| ctx.invoked_function_arn.clone())
-                                                            .unwrap_or_else(|| "unknown".to_string())
+                                                            .unwrap_or_else(|| {
+                                                                // Fallback to global context ARN (set from registration)
+                                                                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+                                                                    global_ctx.invoked_function_arn.clone()
+                                                                } else {
+                                                                    String::new()
+                                                                }
+                                                            })
                                                     })
-                                                    .unwrap_or_else(|| "unknown".to_string());
+                                                    .unwrap_or_else(|| {
+                                                        // Fallback to global context ARN (set from registration)
+                                                        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+                                                            global_ctx.invoked_function_arn.clone()
+                                                        } else {
+                                                            String::new()
+                                                        }
+                                                    });
                                                 
                                                 if let Ok(buffer_guard) = buffer.lock() {
                                                     for payload_bytes in buffer_guard.iter() {

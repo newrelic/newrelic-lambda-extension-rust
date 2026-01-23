@@ -161,9 +161,17 @@ impl LogProcessor {
                     serde_json::Value::String(context.request_id.clone()));
             }
 
-            if !context.invoked_function_arn.is_empty() {
+            // Always use best available ARN (prefer invoked_function_arn, fallback to global context ARN)
+            let arn = if !context.invoked_function_arn.is_empty() {
+                context.invoked_function_arn.clone()
+            } else {
+                // Use fallback ARN from LogProcessor or global context
+                self.get_best_available_arn()
+            };
+            
+            if !arn.is_empty() {
                 log_message.attributes.insert("faas.arn".to_string(),
-                    serde_json::Value::String(context.invoked_function_arn.clone()));
+                    serde_json::Value::String(arn));
             }
 
             if let Some(ref trace_id) = context.trace_id {
@@ -504,23 +512,32 @@ impl LogProcessor {
     }
 
     /// Construct ARN from registration response Format: arn:aws:lambda:{region}:{account_id}:function:{function_name}
-    pub fn construct_arn_from_registration(function_name: &str, account_id: &str) -> String {
-        let region = std::env::var("AWS_REGION")
-            .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-            .unwrap_or_else(|_| "us-east-1".to_string());
-        
-        let arn = format!("arn:aws:lambda:{}:{}:function:{}", region, account_id, function_name);
-        debug!("Constructed ARN from registration: {}", arn);
-        arn
+    /// Store fallback ARN from registration response for emergency shutdown scenarios
+    /// ARN is pre-constructed from registration data to ensure consistency
+    pub fn set_fallback_arn(&self, registration_fallback_arn: &str) {
+        if let Ok(mut arn_guard) = self.fallback_function_arn.lock() {
+            *arn_guard = Some(registration_fallback_arn.to_string());
+            debug!("Set registration fallback ARN: {}", registration_fallback_arn);
+        }
     }
 
-    /// Store fallback ARN from registration response for emergency shutdown scenarios
-    pub fn set_fallback_arn(&self, function_name: &str, account_id: &str) {
-        let fallback_arn = Self::construct_arn_from_registration(function_name, account_id);
-        if let Ok(mut arn_guard) = self.fallback_function_arn.lock() {
-            *arn_guard = Some(fallback_arn.clone());
-            debug!("Set fallback ARN for shutdown before INVOKE: {}", fallback_arn);
+    /// Get best available ARN: check fallback_function_arn, then global context
+    fn get_best_available_arn(&self) -> String {
+        // First try LogProcessor's fallback ARN
+        if let Ok(arn_guard) = self.fallback_function_arn.lock() {
+            if let Some(ref arn) = *arn_guard {
+                return arn.clone();
+            }
         }
+        
+        // Fallback to global context ARN (set during registration)
+        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            if !global_ctx.invoked_function_arn.is_empty() {
+                return global_ctx.invoked_function_arn.clone();
+            }
+        }
+        
+        String::new()
     }
 
     /// Validate if log has both faas.arn and aws.lambda_request_id Bypass validation if log has nr.force_flushed=true (emergency shutdown)
