@@ -93,8 +93,25 @@ impl ApmApp {
     ) -> Result<ApmApp> {
         // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
-        let runtime = crate::version::get_runtime_name();
         let version_info = crate::version::VersionInfo::get_or_detect(None);
+        
+        let runtime = if let Some(agent_name) = &version_info.agent_name {
+            match agent_name.as_str() {
+                "Node" => "nodejs".to_string(),
+                "Python" => "python".to_string(),
+                "Ruby" => "ruby".to_string(),
+                "Dotnet" => "dotnet".to_string(),
+                _ => agent_name.to_lowercase(),
+            }
+        } else {
+            let detected_runtime = crate::version::get_runtime_name();
+            if detected_runtime == "unknown" {
+                "go".to_string()
+            } else {
+                detected_runtime.to_string()
+            }
+        };
+        
         // Pass "unknown" if no agent detected - will be filtered out from labels
         let agent_version = version_info.agent_version.as_deref().unwrap_or("unknown");
 
