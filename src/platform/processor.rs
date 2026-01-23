@@ -354,10 +354,19 @@ impl PlatformProcessor {
             }
         };
         
-        // Get invoked function ARN from context
+        // Get invoked function ARN from context, use global fallback if empty
         let invoked_function_arn = {
             let context = self.invocation_context.lock().unwrap();
-            context.invoked_function_arn.clone()
+            if !context.invoked_function_arn.is_empty() {
+                context.invoked_function_arn.clone()
+            } else {
+                // Use global context ARN set during registration
+                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+                    global_ctx.invoked_function_arn.clone()
+                } else {
+                    String::new()
+                }
+            }
         };
         
         // Map platform error to appropriate Lambda error type

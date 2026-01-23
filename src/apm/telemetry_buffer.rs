@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Failed telemetry data that needs to be retried
 #[derive(Debug, Clone)]
