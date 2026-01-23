@@ -11,6 +11,21 @@ use std::{
 };
 use tracing::debug;
 
+/// Normalize platform.initStart runtime version ("nodejs:18.v98" -> "nodejs18.x")
+pub(crate) fn normalize_platform_runtime_version(runtime_version: &str) -> String {
+    if let Some((runtime_name, version_part)) = runtime_version.split_once(':') {
+        let major_version = version_part.split('.').next().unwrap_or(version_part);
+        
+        if runtime_name == "nodejs" {
+            format!("{}{}.x", runtime_name, major_version)
+        } else {
+            format!("{}{}", runtime_name, version_part.split('.').take(2).collect::<Vec<_>>().join("."))
+        }
+    } else {
+        runtime_version.to_string()
+    }
+}
+
 /// The PlatformProcessor is responsible for handling all platform-related telemetry events.
 #[derive(Debug)]
 pub struct PlatformProcessor {
@@ -103,9 +118,12 @@ impl PlatformProcessor {
                 let phase = record.record.get("phase")
                     .and_then(|v| v.as_str()).unwrap_or("unknown");
                 
-                // Capture runtime version for version info line (e.g., "python3.13", "nodejs20.x")
+                // Capture runtime version and normalize to AWS standard format
+                // platform.initStart format: "nodejs:18.v98" -> normalize to "nodejs18.x"
+                // platform.initStart format: "python:3.13" -> normalize to "python3.13"
                 if runtime_version != "unknown" {
-                    crate::version::VersionInfo::set_runtime_version(runtime_version.to_string());
+                    let normalized_version = normalize_platform_runtime_version(runtime_version);
+                    crate::version::VersionInfo::set_runtime_version(normalized_version);
                 }
                     
                 (format!("INIT START RequestId: {} Type: {} Runtime: {} Phase: {}", 
@@ -478,4 +496,3 @@ impl Flush for PlatformProcessor {
         Ok(())
     }
 }
-
