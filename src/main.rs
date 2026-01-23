@@ -347,9 +347,11 @@ async fn perform_one_time_initialization(
         debug!("Version detection and tagging will happen lazily on first invocation to avoid AWS SDK initialization during INIT");
     }
 
-    debug!(
-        "Log forwarding settings: send_function_logs={}, send_extension_logs={}",
-        config.extension.send_function_logs, config.extension.send_extension_logs
+    info!(
+        "Log forwarding settings: function={}, extension={}, platform={}",
+        config.extension.send_function_logs,
+        config.extension.send_extension_logs,
+        config.extension.send_platform_logs
     );
 
    
@@ -503,16 +505,17 @@ async fn perform_one_time_initialization(
     // Harvester enabled for periodic log flushing to reduce memory usage
     // Flushes function logs (if NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=true),
     // extension logs (if NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS=true),
-    // and platform logs (always, formatted as log lines except REPORT)
+    // and platform logs (if NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS=true)
     let harvest_interval_secs = std::env::var("NEW_RELIC_HARVEST_INTERVAL_SECONDS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(5); // Default: 5 seconds for frequent log flushing
     
-    debug!("Starting log harvester with {}s interval (function_logs={}, extension_logs={})",
+    debug!("Starting log harvester with {}s interval (function_logs={}, extension_logs={}, platform_logs={})",
         harvest_interval_secs,
         config.extension.send_function_logs,
-        config.extension.send_extension_logs
+        config.extension.send_extension_logs,
+        config.extension.send_platform_logs
     );
     
     let (_harvester, harvester_handle) = start_harvester_background_task(
