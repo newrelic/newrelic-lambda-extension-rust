@@ -159,16 +159,20 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .global_log_processor
                     .process_buffered_logs_with_request_id(&request_id);
                 
-                // Transfer pre-invoke logs to normal batch with ARN/request_id metadata
-                components
-                    .global_log_processor
-                    .process_pre_invoke_logs();
-
+                // Create request state FIRST so we have the updated context
                 let request_state = create_request_processing_state(
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
                 );
+                
+                components
+                    .global_log_processor
+                    .update_invocation_context(request_state.context.clone());
+                components
+                    .global_log_processor
+                    .process_pre_invoke_logs();
+
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
                 let buffer_count = REQUEST_AGENT_BUFFERS.len();
