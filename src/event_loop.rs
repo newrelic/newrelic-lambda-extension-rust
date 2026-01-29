@@ -42,6 +42,7 @@ pub struct ExtensionComponents {
     pub harvester_handle: tokio::task::JoinHandle<()>,
     pub global_log_processor: Arc<LogProcessor>,
     pub apm_app: crate::apm::SharedApmApp,
+    pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +79,9 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or standard mode based on config
+/// Routes to APM or standard mode based on config (or runtime override for Java)
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let apm_mode_enabled = components.config.new_relic.apm_lambda_mode;
+    let apm_mode_enabled = components.apm_mode_enabled;
     if apm_mode_enabled {
         info!("Starting APM mode event loop (connection may still be in progress)");
         execute_apm_mode_event_loop(components).await
@@ -155,10 +156,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                components
-                    .global_log_processor
-                    .process_buffered_logs_with_request_id(&request_id);
-                
                 // Create request state FIRST so we have the updated context
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -166,12 +163,18 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &components.processor_factory,
                 );
                 
+                // Update LogProcessor's context BEFORE processing any logs
                 components
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
+                // Process pre-invoke logs FIRST (add metadata and move to batch)
                 components
                     .global_log_processor
                     .process_pre_invoke_logs();
+                // THEN process buffered logs (so they don't trigger auto-flush of incomplete logs)
+                components
+                    .global_log_processor
+                    .process_buffered_logs_with_request_id(&request_id);
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 

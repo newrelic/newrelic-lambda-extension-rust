@@ -15,9 +15,6 @@ static VERSION_INFO_CACHE: OnceCell<Arc<VersionInfo>> = OnceCell::new();
 /// Global cache for runtime version from platform.initStart event
 static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
 
-/// Global cache for detected runtime (nodejs, python, etc.)
-static DETECTED_RUNTIME: once_cell::sync::Lazy<String> = once_cell::sync::Lazy::new(|| detect_runtime_internal());
-
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -31,6 +28,10 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.10/site-packages/newrelic",
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
+const LAYER_AGENT_PATHS_JAVA: &[&str] = &[
+    "/opt/java/lib/newrelic.jar",
+    "/opt/lib/newrelic.jar",
+];
 const LAYER_AGENT_PATH_DOTNET: &[&str] = &["/opt/lib/newrelic-dotnet-agent"];
 const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
     "/opt/ruby/gems/3.2.0/gems/newrelic_rpm",
@@ -40,6 +41,10 @@ const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
 /// Vendor agent paths (customer installed agents)
 const VENDOR_AGENT_PATH_NODE: &str = "/var/task/node_modules/newrelic";
 const VENDOR_AGENT_PATH_PYTHON: &str = "/var/task/newrelic";
+const VENDOR_AGENT_PATHS_JAVA: &[&str] = &[
+    "/var/task/newrelic/newrelic.jar",
+    "/var/runtime/lib/newrelic.jar",
+];
 const VENDOR_AGENT_PATH_RUBY: &str = "/var/task/vendor/bundle/ruby/3.3.0/gems/newrelic_rpm";
 
 /// Version information structure
@@ -195,6 +200,22 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
     if let Some(version) = read_ruby_version(VENDOR_AGENT_PATH_RUBY) {
         debug!("✓ Detected Ruby agent version: {} from {}", version, VENDOR_AGENT_PATH_RUBY);
         return (Some(version), Some("Ruby".to_string()));
+    }
+
+    for path in LAYER_AGENT_PATHS_JAVA {
+        debug!("Checking Java layer path: {}", path);
+        if let Some(version) = read_java_version(path) {
+            debug!("✓ Detected Java agent version: {} from {}", version, path);
+            return (Some(version), Some("Java".to_string()));
+        }
+    }
+
+    for path in VENDOR_AGENT_PATHS_JAVA {
+        debug!("Checking Java vendor path: {}", path);
+        if let Some(version) = read_java_version(path) {
+            debug!("✓ Detected Java agent version: {} from {}", version, path);
+            return (Some(version), Some("Java".to_string()));
+        }
     }
 
     for path in LAYER_AGENT_PATH_DOTNET {
@@ -387,6 +408,46 @@ fn extract_ruby_version_from_file(file_path: &str) -> Option<String> {
     }
 }
 
+/// Read Java agent version from JAR manifest
+fn read_java_version(jar_path: &str) -> Option<String> {
+    debug!("  Checking if Java agent JAR exists: {}", jar_path);
+    if !Path::new(jar_path).exists() {
+        debug!("  Java agent JAR does not exist");
+        return None;
+    }
+
+    use std::process::Command;
+    match Command::new("unzip")
+        .args(&["-p", jar_path, "META-INF/MANIFEST.MF"])
+        .output()
+    {
+        Ok(output) => {
+            if output.status.success() {
+                let manifest = String::from_utf8_lossy(&output.stdout);
+                for line in manifest.lines() {
+                    let line = line.trim();
+                    if line.starts_with("Implementation-Version:") {
+                        if let Some(version) = line.split(':').nth(1) {
+                            let version = version.trim();
+                            if !version.is_empty() {
+                                debug!("  Found Java agent version in manifest: {}", version);
+                                return Some(version.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("  Could not extract version from JAR manifest");
+            None
+        }
+        Err(e) => {
+            debug!("  Failed to read JAR manifest: {}", e);
+            debug!("  Java agent JAR exists but version extraction failed, marking as detected");
+            Some("detected".to_string())
+        }
+    }
+}
+
 /// Read .NET agent version
 fn read_dotnet_version(base_path: &str) -> Option<String> {
     let version_file = format!("{}/VERSION", base_path);
@@ -450,9 +511,10 @@ pub async fn detect_layer_version_async(layer_version_from_config: Option<String
     }
 }
 
-/// Get detected runtime name (nodejs, python, ruby, etc.) - cached, fast
-pub fn get_runtime_name() -> &'static str {
-    DETECTED_RUNTIME.as_str()
+/// Get detected runtime name (nodejs, python, ruby, etc.)
+/// Checks AWS_EXECUTION_ENV dynamically to handle late environment variable initialization
+pub fn get_runtime_name() -> String {
+    detect_runtime_internal()
 }
 
 /// Get runtime version. Priority: platform.initStart cache, AWS_EXECUTION_ENV, runtime name
@@ -502,6 +564,9 @@ fn detect_runtime_internal() -> String {
     }
     if Path::new("/var/lang/bin/dotnet").exists() {
         return "dotnet".to_string();
+    }
+    if Path::new("/var/lang/bin/java").exists() {
+        return "java".to_string();
     }
 
     debug!("No specific runtime detected - could be custom/containerized Lambda. Using 'unknown' to avoid incorrect tagging.");

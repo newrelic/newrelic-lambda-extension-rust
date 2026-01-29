@@ -68,6 +68,8 @@ pub struct LogProcessor {
 
     /// Fallback ARN constructed from registration response (function_name + account_id + AWS_REGION)
     fallback_function_arn: Arc<Mutex<Option<String>>>,
+
+    is_auto_flushing: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +123,7 @@ impl LogProcessor {
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
             fallback_function_arn: Arc::new(Mutex::new(None)),
+            is_auto_flushing: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -415,6 +418,15 @@ impl LogProcessor {
             let should_flush = batch_size >= FLUSH_THRESHOLD;
 
             if should_flush {
+                // Check if already flushing to prevent infinite recursion
+                let mut is_flushing = self.is_auto_flushing.lock().unwrap();
+                if *is_flushing {
+                    debug!("Auto-flush already in progress - skipping to prevent infinite loop");
+                    return;
+                }
+                *is_flushing = true;
+                drop(is_flushing);
+                
                 let logs_to_send = std::mem::take(&mut *batch);
                 drop(batch);
 
@@ -426,31 +438,105 @@ impl LogProcessor {
                     .into_iter()
                     .partition(|log| self.is_log_complete(log));
                 
+                // Move incomplete logs back to pre_invoke_buffer instead of regular batch
+                // This prevents infinite auto-flush loops
                 if !incomplete_logs.is_empty() {
-                    debug!("Auto-flush: Found {} logs without request_id - keeping in buffer", incomplete_logs.len());
-                    if let Ok(mut batch_guard) = self.log_batch.lock() {
-                        batch_guard.extend(incomplete_logs);
+                    debug!("Auto-flush: Found {} logs without request_id - moving to pre_invoke_buffer", incomplete_logs.len());
+                    if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
+                        pre_invoke_buf.extend(incomplete_logs);
                     }
                 }
                 
                 if complete_logs.is_empty() {
-                    debug!("Auto-flush: No complete logs to send (all waiting for request_id)");
+                    debug!("Auto-flush: No complete logs to send (all waiting for request_id) - skipping this flush cycle");
+                    // Reset the flushing flag before returning
+                    if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+                        *is_flushing = false;
+                    }
                     return;
                 }
 
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
+                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
 
-                // Spawn background task with proper 1MB chunking
+                // Spawn background task with proper retry logic and failed log buffering
                 // Store handle to ensure it completes before function ends
                 let handle = tokio::spawn(async move {
-                    Self::send_logs_with_chunking(&client, &config, complete_logs, &context.invoked_function_arn).await;
+                    const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+                    let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+                    let mut current_chunk = Vec::new();
+                    let mut current_size = 0;
+
+                    for log in complete_logs {
+                        let log_size = 8 + log.message.len() +
+                                      serde_json::to_string(&log.attributes).unwrap_or_default().len();
+
+                        if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                            chunks.push(std::mem::take(&mut current_chunk));
+                            current_size = 0;
+                        }
+
+                        current_chunk.push(log);
+                        current_size += log_size;
+                    }
+
+                    if !current_chunk.is_empty() {
+                        chunks.push(current_chunk);
+                    }
+                    let mut successful = 0;
+                    for chunk in chunks {
+                        let mut retries = 0;
+                        let mut send_failed = false;
+                        
+                        loop {
+                            match client.send_logs(&config, chunk.clone(), &context.invoked_function_arn).await {
+                                Ok(()) => {
+                                    successful += 1;
+                                    break;
+                                },
+                                Err(e) => {
+                                    if retries < MAX_RETRIES {
+                                        retries += 1;
+                                        tokio::time::sleep(get_backoff_delay(retries)).await;
+                                        continue;
+                                    } else {
+                                        warn!("Auto-flush failed after {} retries - buffering {} logs", MAX_RETRIES, chunk.len());
+                                        send_failed = true;
+                                        // Buffer failed logs for retry on next invocation
+                                        if let Ok(mut buffer) = failed_buffer.lock() {
+                                            for log in chunk {
+                                                buffer.push(FailedLogEntry {
+                                                    log_message: log,
+                                                    original_request_id: context.request_id.clone(),
+                                                    retry_count: 0,
+                                                });
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if send_failed {
+                            break; // Stop trying other chunks if one failed
+                        }
+                    }
+                    
+                    if successful > 0 {
+                        debug!("Auto-flush sent {} chunk(s) successfully", successful);
+                    }
                 });
 
                 // Track this handle so end-of-request flush can await it
                 if let Ok(mut handles) = self.pending_flush_handles.lock() {
                     handles.push(handle);
+                }
+                // Reset the flushing flag after spawning background task
+                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+                    *is_flushing = false;
                 }
             }
         } else {
@@ -610,6 +696,8 @@ impl LogProcessor {
                 if !context.invoked_function_arn.is_empty() {
                     log.attributes.insert("faas.arn".to_string(),
                         serde_json::Value::String(context.invoked_function_arn.clone()));
+                } else {
+                    warn!("process_pre_invoke_logs: ARN is empty, logs will remain incomplete");
                 }
                 
                 if !context.request_id.is_empty() && context.request_id != "unknown" {
@@ -621,6 +709,8 @@ impl LogProcessor {
                         serde_json::Value::Object(aws_attrs));
                     log.attributes.insert("faas.execution".to_string(),
                         serde_json::Value::String(context.request_id.clone()));
+                } else {
+                    warn!("process_pre_invoke_logs: request_id is empty or unknown ('{}'), logs will remain incomplete", context.request_id);
                 }
                 
                 if let Some(ref trace_id) = context.trace_id {
