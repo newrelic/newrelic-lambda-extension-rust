@@ -161,6 +161,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
+                    components.apm_mode_enabled,
                 );
                 
                 // Update LogProcessor's context BEFORE processing any logs
@@ -558,6 +559,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
+                    components.apm_mode_enabled, // Use actual mode (handles Java override)
                 );
 
                 components
