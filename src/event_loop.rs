@@ -260,6 +260,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         use crate::request::cleanup_old_request_buffers;
                         cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
                         cleanup_old_request_buffers(newrelic_client, config).await;
+                        cleanup_old_failed_payloads();
                     });
                 }
             }

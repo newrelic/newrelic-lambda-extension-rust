@@ -433,29 +433,6 @@ impl LogProcessor {
                 debug!("Auto-flushing batch of {} logs (threshold={})",
                        logs_to_send.len(), FLUSH_THRESHOLD);
 
-                // Validate all logs have request_id before sending
-                let (complete_logs, incomplete_logs): (Vec<_>, Vec<_>) = logs_to_send
-                    .into_iter()
-                    .partition(|log| self.is_log_complete(log));
-                
-                // Move incomplete logs back to pre_invoke_buffer instead of regular batch
-                // This prevents infinite auto-flush loops
-                if !incomplete_logs.is_empty() {
-                    debug!("Auto-flush: Found {} logs without request_id - moving to pre_invoke_buffer", incomplete_logs.len());
-                    if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
-                        pre_invoke_buf.extend(incomplete_logs);
-                    }
-                }
-                
-                if complete_logs.is_empty() {
-                    debug!("Auto-flush: No complete logs to send (all waiting for request_id) - skipping this flush cycle");
-                    // Reset the flushing flag before returning
-                    if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                        *is_flushing = false;
-                    }
-                    return;
-                }
-
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
@@ -469,7 +446,7 @@ impl LogProcessor {
                     let mut current_chunk = Vec::new();
                     let mut current_size = 0;
 
-                    for log in complete_logs {
+                    for log in logs_to_send {
                         let log_size = 8 + log.message.len() +
                                       serde_json::to_string(&log.attributes).unwrap_or_default().len();
 
@@ -496,7 +473,7 @@ impl LogProcessor {
                                     successful += 1;
                                     break;
                                 },
-                                Err(e) => {
+                                Err(_e) => {
                                     if retries < MAX_RETRIES {
                                         retries += 1;
                                         tokio::time::sleep(get_backoff_delay(retries)).await;
@@ -651,35 +628,27 @@ impl LogProcessor {
         String::new()
     }
 
-    /// Validate that logs have required Lambda metadata (ARN and request ID) before sending
-    fn is_log_complete(&self, log: &payload::LogMessage) -> bool {
-        let has_arn = log.attributes.get("faas.arn")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        
-        // Check for nested aws.lambda_request_id: {"aws": {"lambda_request_id": "..."}}
-        let has_request_id = log.attributes.get("aws")
-            .and_then(|v| v.as_object())
-            .and_then(|obj| obj.get("lambda_request_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        
-        has_arn && has_request_id
-    }
-
-    /// Requeue incomplete logs back to pre_invoke_buffer for next invocation
-    fn requeue_incomplete_logs(&self, logs: Vec<payload::LogMessage>) {
-        if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
-            let count = logs.len();
-            pre_invoke_buf.extend(logs);
-            debug!("Requeued {} incomplete logs to pre_invoke_buffer", count);
-        }
-    }
-
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
+    /// Only processes logs if invocation context is valid. Invalid context leaves logs in buffer.
     pub fn process_pre_invoke_logs(&self) {
+        let context_valid = {
+            if let Some(context) = self.invocation_context.safe_lock() {
+                !context.invoked_function_arn.is_empty() 
+                    && !context.request_id.is_empty() 
+                    && context.request_id != "unknown"
+            } else {
+                false
+            }
+        };
+        
+        if !context_valid {
+            let buf_size = self.pre_invoke_buffer.lock().unwrap().len();
+            if buf_size > 0 {
+                debug!("Skipping pre-invoke log processing - context not ready yet ({} logs waiting)", buf_size);
+            }
+            return;
+        }
+        
         let mut pre_invoke_logs = {
             let mut buf = self.pre_invoke_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
@@ -689,36 +658,31 @@ impl LogProcessor {
             return;
         }
         
-        debug!("Processing {} pre-invoke logs with new metadata", pre_invoke_logs.len());
+        debug!("Processing {} pre-invoke logs with invocation metadata", pre_invoke_logs.len());
         
+        // At this point, context is guaranteed valid - stamp all logs
         for log in &mut pre_invoke_logs {
             if let Some(context) = self.invocation_context.safe_lock() {
-                if !context.invoked_function_arn.is_empty() {
-                    log.attributes.insert("faas.arn".to_string(),
-                        serde_json::Value::String(context.invoked_function_arn.clone()));
-                } else {
-                    warn!("process_pre_invoke_logs: ARN is empty, logs will remain incomplete");
-                }
+                log.attributes.insert("faas.arn".to_string(),
+                    serde_json::Value::String(context.invoked_function_arn.clone()));
                 
-                if !context.request_id.is_empty() && context.request_id != "unknown" {
-                    // New Relic expects nested structure: {"aws": {"lambda_request_id": "..."}}
-                    let mut aws_attrs = serde_json::Map::new();
-                    aws_attrs.insert("lambda_request_id".to_string(),
-                        serde_json::Value::String(context.request_id.clone()));
-                    log.attributes.insert("aws".to_string(),
-                        serde_json::Value::Object(aws_attrs));
-                    log.attributes.insert("faas.execution".to_string(),
-                        serde_json::Value::String(context.request_id.clone()));
-                } else {
-                    warn!("process_pre_invoke_logs: request_id is empty or unknown ('{}'), logs will remain incomplete", context.request_id);
-                }
+                // Stamp request_id in New Relic expected format
+                let mut aws_attrs = serde_json::Map::new();
+                aws_attrs.insert("lambda_request_id".to_string(),
+                    serde_json::Value::String(context.request_id.clone()));
+                log.attributes.insert("aws".to_string(),
+                    serde_json::Value::Object(aws_attrs));
+                log.attributes.insert("faas.execution".to_string(),
+                    serde_json::Value::String(context.request_id.clone()));
                 
+                // Stamp trace_id if available
                 if let Some(ref trace_id) = context.trace_id {
                     log.attributes.insert("trace.id".to_string(),
                         serde_json::Value::String(trace_id.clone()));
                 }
             }
             
+            // Stamp entity.guid if APM app available
             if let Some(ref apm_app_arc) = self.apm_app {
                 if let Ok(apm_guard) = apm_app_arc.try_read() {
                     if let Some(ref app) = *apm_guard {
@@ -732,6 +696,7 @@ impl LogProcessor {
             }
         }
         
+        // All logs are now complete - move to batch for sending
         if let Ok(mut batch) = self.log_batch.lock() {
             batch.extend(pre_invoke_logs);
         }
@@ -1032,6 +997,11 @@ impl LogProcessor {
 
 
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        // FIRST: Try to stamp any remaining pre-invoke logs before final flush
+        // This catches logs that arrived early (before context was ready)
+        debug!("Final flush: Attempting to process pre-invoke logs one last time");
+        self.process_pre_invoke_logs();
+        
         // Master check: if all log types are disabled, don't send anything
         if !self.config.extension.send_function_logs
             && !self.config.extension.send_extension_logs
@@ -1119,23 +1089,6 @@ impl LogProcessor {
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
-        
-        // Validate all logs before sending - requeue incomplete logs to pre_invoke_buffer
-        let (complete_logs, incomplete_logs): (Vec<_>, Vec<_>) = deduplicated_batch
-            .into_iter()
-            .partition(|log| self.is_log_complete(log));
-        
-        if !incomplete_logs.is_empty() {
-            warn!("Found {} incomplete logs without ARN/request_id - requeuing to pre_invoke_buffer", incomplete_logs.len());
-            self.requeue_incomplete_logs(incomplete_logs);
-        }
-        
-        if complete_logs.is_empty() {
-            debug!("No complete logs to send after validation");
-            return Ok(());
-        }
-        
-        let deduplicated_batch = complete_logs;
         
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
