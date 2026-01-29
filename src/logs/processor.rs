@@ -68,6 +68,8 @@ pub struct LogProcessor {
 
     /// Fallback ARN constructed from registration response (function_name + account_id + AWS_REGION)
     fallback_function_arn: Arc<Mutex<Option<String>>>,
+
+    is_auto_flushing: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -121,6 +123,7 @@ impl LogProcessor {
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
             fallback_function_arn: Arc::new(Mutex::new(None)),
+            is_auto_flushing: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -152,11 +155,14 @@ impl LogProcessor {
     }
 
    
-    fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
+    pub fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
             if !context.request_id.is_empty() && context.request_id != "unknown" {
-                log_message.attributes.insert("aws.lambda_request_id".to_string(),
+                let mut aws_attrs = serde_json::Map::new();
+                aws_attrs.insert("lambda_request_id".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
+                log_message.attributes.insert("aws".to_string(),
+                    serde_json::Value::Object(aws_attrs));
                 log_message.attributes.insert("faas.execution".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
             }
@@ -412,6 +418,15 @@ impl LogProcessor {
             let should_flush = batch_size >= FLUSH_THRESHOLD;
 
             if should_flush {
+                // Check if already flushing to prevent infinite recursion
+                let mut is_flushing = self.is_auto_flushing.lock().unwrap();
+                if *is_flushing {
+                    debug!("Auto-flush already in progress - skipping to prevent infinite loop");
+                    return;
+                }
+                *is_flushing = true;
+                drop(is_flushing);
+                
                 let logs_to_send = std::mem::take(&mut *batch);
                 drop(batch);
 
@@ -421,16 +436,84 @@ impl LogProcessor {
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
+                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
 
-                // Spawn background task with proper 1MB chunking
+                // Spawn background task with proper retry logic and failed log buffering
                 // Store handle to ensure it completes before function ends
                 let handle = tokio::spawn(async move {
-                    Self::send_logs_with_chunking(&client, &config, logs_to_send, &context.invoked_function_arn).await;
+                    const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
+                    let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+                    let mut current_chunk = Vec::new();
+                    let mut current_size = 0;
+
+                    for log in logs_to_send {
+                        let log_size = 8 + log.message.len() +
+                                      serde_json::to_string(&log.attributes).unwrap_or_default().len();
+
+                        if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                            chunks.push(std::mem::take(&mut current_chunk));
+                            current_size = 0;
+                        }
+
+                        current_chunk.push(log);
+                        current_size += log_size;
+                    }
+
+                    if !current_chunk.is_empty() {
+                        chunks.push(current_chunk);
+                    }
+                    let mut successful = 0;
+                    for chunk in chunks {
+                        let mut retries = 0;
+                        let mut send_failed = false;
+                        
+                        loop {
+                            match client.send_logs(&config, chunk.clone(), &context.invoked_function_arn).await {
+                                Ok(()) => {
+                                    successful += 1;
+                                    break;
+                                },
+                                Err(_e) => {
+                                    if retries < MAX_RETRIES {
+                                        retries += 1;
+                                        tokio::time::sleep(get_backoff_delay(retries)).await;
+                                        continue;
+                                    } else {
+                                        warn!("Auto-flush failed after {} retries - buffering {} logs", MAX_RETRIES, chunk.len());
+                                        send_failed = true;
+                                        // Buffer failed logs for retry on next invocation
+                                        if let Ok(mut buffer) = failed_buffer.lock() {
+                                            for log in chunk {
+                                                buffer.push(FailedLogEntry {
+                                                    log_message: log,
+                                                    original_request_id: context.request_id.clone(),
+                                                    retry_count: 0,
+                                                });
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if send_failed {
+                            break; // Stop trying other chunks if one failed
+                        }
+                    }
+                    
+                    if successful > 0 {
+                        debug!("Auto-flush sent {} chunk(s) successfully", successful);
+                    }
                 });
 
                 // Track this handle so end-of-request flush can await it
                 if let Ok(mut handles) = self.pending_flush_handles.lock() {
                     handles.push(handle);
+                }
+                // Reset the flushing flag after spawning background task
+                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+                    *is_flushing = false;
                 }
             }
         } else {
@@ -545,39 +628,27 @@ impl LogProcessor {
         String::new()
     }
 
-    /// Validate if log has both faas.arn and aws.lambda_request_id Bypass validation if log has nr.force_flushed=true (emergency shutdown)
-    fn is_log_complete(&self, log: &payload::LogMessage) -> bool {
-        // Check for emergency flush marker - these logs bypass validation
-        if let Some(force_flushed) = log.attributes.get("nr.force_flushed") {
-            if force_flushed.as_bool().unwrap_or(false) {
-                return true;
-            }
-        }
-        
-        let has_arn = log.attributes.get("faas.arn")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        
-        let has_request_id = log.attributes.get("aws.lambda_request_id")
-            .and_then(|v| v.as_str())
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        
-        has_arn && has_request_id
-    }
-
-    /// Requeue incomplete logs back to pre_invoke_buffer for next invocation
-    fn requeue_incomplete_logs(&self, logs: Vec<payload::LogMessage>) {
-        if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
-            let count = logs.len();
-            pre_invoke_buf.extend(logs);
-            debug!("Requeued {} incomplete logs to pre_invoke_buffer", count);
-        }
-    }
-
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
+    /// Only processes logs if invocation context is valid. Invalid context leaves logs in buffer.
     pub fn process_pre_invoke_logs(&self) {
+        let context_valid = {
+            if let Some(context) = self.invocation_context.safe_lock() {
+                !context.invoked_function_arn.is_empty() 
+                    && !context.request_id.is_empty() 
+                    && context.request_id != "unknown"
+            } else {
+                false
+            }
+        };
+        
+        if !context_valid {
+            let buf_size = self.pre_invoke_buffer.lock().unwrap().len();
+            if buf_size > 0 {
+                debug!("Skipping pre-invoke log processing - context not ready yet ({} logs waiting)", buf_size);
+            }
+            return;
+        }
+        
         let mut pre_invoke_logs = {
             let mut buf = self.pre_invoke_buffer.lock().unwrap();
             std::mem::take(&mut *buf)
@@ -587,28 +658,31 @@ impl LogProcessor {
             return;
         }
         
-        debug!("Processing {} pre-invoke logs with new metadata", pre_invoke_logs.len());
+        debug!("Processing {} pre-invoke logs with invocation metadata", pre_invoke_logs.len());
         
+        // At this point, context is guaranteed valid - stamp all logs
         for log in &mut pre_invoke_logs {
             if let Some(context) = self.invocation_context.safe_lock() {
-                if !context.invoked_function_arn.is_empty() {
-                    log.attributes.insert("faas.arn".to_string(),
-                        serde_json::Value::String(context.invoked_function_arn.clone()));
-                }
+                log.attributes.insert("faas.arn".to_string(),
+                    serde_json::Value::String(context.invoked_function_arn.clone()));
                 
-                if !context.request_id.is_empty() && context.request_id != "unknown" {
-                    log.attributes.insert("aws.lambda_request_id".to_string(),
-                        serde_json::Value::String(context.request_id.clone()));
-                    log.attributes.insert("faas.execution".to_string(),
-                        serde_json::Value::String(context.request_id.clone()));
-                }
+                // Stamp request_id in New Relic expected format
+                let mut aws_attrs = serde_json::Map::new();
+                aws_attrs.insert("lambda_request_id".to_string(),
+                    serde_json::Value::String(context.request_id.clone()));
+                log.attributes.insert("aws".to_string(),
+                    serde_json::Value::Object(aws_attrs));
+                log.attributes.insert("faas.execution".to_string(),
+                    serde_json::Value::String(context.request_id.clone()));
                 
+                // Stamp trace_id if available
                 if let Some(ref trace_id) = context.trace_id {
                     log.attributes.insert("trace.id".to_string(),
                         serde_json::Value::String(trace_id.clone()));
                 }
             }
             
+            // Stamp entity.guid if APM app available
             if let Some(ref apm_app_arc) = self.apm_app {
                 if let Ok(apm_guard) = apm_app_arc.try_read() {
                     if let Some(ref app) = *apm_guard {
@@ -622,12 +696,15 @@ impl LogProcessor {
             }
         }
         
+        // All logs are now complete - move to batch for sending
         if let Ok(mut batch) = self.log_batch.lock() {
             batch.extend(pre_invoke_logs);
         }
     }
 
-    /// Uses registration ARN fallback, empty request_id, and nr.force_flushed=true marker
+    /// Send pre-invoke logs on shutdown with last request ID (or force flush with marker in error cases)
+    /// Normal case: Use last request ID from previous invocation
+    /// Error case (crash before first invoke): Send with nr.forceFlushed=true marker
     pub async fn flush_pre_invoke_buffer_on_shutdown(&self) -> std::io::Result<()> {
         let mut pre_invoke_logs = {
             let mut buf = self.pre_invoke_buffer.lock().unwrap();
@@ -639,43 +716,106 @@ impl LogProcessor {
             return Ok(());
         }
         
-        warn!("Shutdown before first INVOKE - flushing {} pre-invoke logs with fallback ARN", pre_invoke_logs.len());
-        
-        let function_arn = {
-            if let Some(context) = self.invocation_context.safe_lock() {
-                if !context.invoked_function_arn.is_empty() {
-                    context.invoked_function_arn.clone()
-                } else {
-                    self.fallback_function_arn.lock()
-                        .ok()
-                        .and_then(|guard| guard.as_ref().cloned())
-                        .unwrap_or_else(String::new)
-                }
-            } else {
-                String::new()
-            }
+        // Try to get last request ID from previous invocations
+        let last_context = if let Ok(guard) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+            guard.as_ref().cloned()
+        } else {
+            None
         };
         
-        if function_arn.is_empty() {
-            error!("Cannot flush pre-invoke logs: no ARN available (INVOKE or registration)");
-            return Ok(());
+        let function_arn = if let Some(context) = self.invocation_context.safe_lock() {
+            if !context.invoked_function_arn.is_empty() {
+                context.invoked_function_arn.clone()
+            } else {
+                self.fallback_function_arn.lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().cloned())
+                    .unwrap_or_else(String::new)
+            }
+        } else {
+            String::new()
+        };
+        
+        match last_context {
+            Some((request_id, arn)) => {
+                info!("Shutdown: Sending {} pre-invoke logs with last request ID: {}", pre_invoke_logs.len(), request_id);
+                
+                let use_arn = if !arn.is_empty() { arn } else { function_arn };
+                
+                for log in &mut pre_invoke_logs {
+                    if !use_arn.is_empty() {
+                        log.attributes.insert("faas.arn".to_string(),
+                            serde_json::Value::String(use_arn.clone()));
+                    }
+                    // Create nested AWS structure: {"aws": {"lambda_request_id": "..."}}
+                    let mut aws_attrs = serde_json::Map::new();
+                    aws_attrs.insert("lambda_request_id".to_string(),
+                        serde_json::Value::String(request_id.clone()));
+                    log.attributes.insert("aws".to_string(),
+                        serde_json::Value::Object(aws_attrs));
+                    log.attributes.insert("faas.execution".to_string(),
+                        serde_json::Value::String(request_id.clone()));
+                    
+                    // Add entity.guid if in APM mode
+                    if let Some(ref apm_app_arc) = self.apm_app {
+                        if let Ok(apm_guard) = apm_app_arc.try_read() {
+                            if let Some(ref app) = *apm_guard {
+                                let entity_guid = app.get_entity_guid();
+                                if !entity_guid.is_empty() {
+                                    log.attributes.insert("entity.guid".to_string(),
+                                        serde_json::Value::String(entity_guid.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                let client = Arc::clone(&self.newrelic_client);
+                let config = Arc::clone(&self.config);
+                
+                Self::send_logs_with_chunking(&client, &config, pre_invoke_logs, &use_arn).await;
+            }
+            None => {
+                // Error case: Crash/shutdown before first invoke - force flush with marker
+                warn!("Shutdown before first invoke (error/crash) - force flushing {} pre-invoke logs with nr.forceFlushed marker", pre_invoke_logs.len());
+                
+                if function_arn.is_empty() {
+                    error!("Cannot flush pre-invoke logs: no ARN available (neither from INVOKE nor registration)");
+                    return Ok(());
+                }
+                
+                for log in &mut pre_invoke_logs {
+                    log.attributes.insert("faas.arn".to_string(),
+                        serde_json::Value::String(function_arn.clone()));
+                    // Create nested AWS structure: {"aws": {"lambda_request_id": "..."}}
+                    let mut aws_attrs = serde_json::Map::new();
+                    aws_attrs.insert("lambda_request_id".to_string(),
+                        serde_json::Value::String("INIT_PHASE_LOGS".to_string()));
+                    log.attributes.insert("aws".to_string(),
+                        serde_json::Value::Object(aws_attrs));
+                    log.attributes.insert("nr.forceFlushed".to_string(),
+                        serde_json::Value::Bool(true));
+                    
+                    // Add entity.guid if in APM mode
+                    if let Some(ref apm_app_arc) = self.apm_app {
+                        if let Ok(apm_guard) = apm_app_arc.try_read() {
+                            if let Some(ref app) = *apm_guard {
+                                let entity_guid = app.get_entity_guid();
+                                if !entity_guid.is_empty() {
+                                    log.attributes.insert("entity.guid".to_string(),
+                                        serde_json::Value::String(entity_guid.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                let client = Arc::clone(&self.newrelic_client);
+                let config = Arc::clone(&self.config);
+                
+                Self::send_logs_with_chunking(&client, &config, pre_invoke_logs, &function_arn).await;
+            }
         }
-        
-        debug!("Using ARN for pre-invoke shutdown flush: {}", function_arn);
-        
-        for log in &mut pre_invoke_logs {
-            log.attributes.insert("faas.arn".to_string(),
-                serde_json::Value::String(function_arn.clone()));
-            log.attributes.insert("aws.lambda_request_id".to_string(),
-                serde_json::Value::String(String::new()));
-            log.attributes.insert("nr.force_flushed".to_string(),
-                serde_json::Value::Bool(true));
-        }
-        
-        let client = Arc::clone(&self.newrelic_client);
-        let config = Arc::clone(&self.config);
-        
-        Self::send_logs_with_chunking(&client, &config, pre_invoke_logs, &function_arn).await;
         
         Ok(())
     }
@@ -776,8 +916,12 @@ impl LogProcessor {
             debug!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
             
             for mut log_message in buffered_logs {
-                log_message.attributes.insert("aws.lambda_request_id".to_string(), 
-                                serde_json::Value::String(request_id.to_string()));
+                // New Relic expects nested structure: {"aws": {"lambda_request_id": "..."}}
+                let mut aws_attrs = serde_json::Map::new();
+                aws_attrs.insert("lambda_request_id".to_string(),
+                    serde_json::Value::String(request_id.to_string()));
+                log_message.attributes.insert("aws".to_string(),
+                    serde_json::Value::Object(aws_attrs));
                 log_message.attributes.insert("faas.execution".to_string(), 
                                 serde_json::Value::String(request_id.to_string()));
                 
@@ -853,6 +997,11 @@ impl LogProcessor {
 
 
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        // FIRST: Try to stamp any remaining pre-invoke logs before final flush
+        // This catches logs that arrived early (before context was ready)
+        debug!("Final flush: Attempting to process pre-invoke logs one last time");
+        self.process_pre_invoke_logs();
+        
         // Master check: if all log types are disabled, don't send anything
         if !self.config.extension.send_function_logs
             && !self.config.extension.send_extension_logs
@@ -903,9 +1052,14 @@ impl LogProcessor {
                 log.message.hash(&mut hasher);
                 log.timestamp.hash(&mut hasher);
                 
-                if let Some(request_id_value) = log.attributes.get("aws.lambda_request_id") {
-                    if let Some(request_id_str) = request_id_value.as_str() {
-                        request_id_str.hash(&mut hasher);
+                // Check nested AWS structure for request_id
+                if let Some(aws_value) = log.attributes.get("aws") {
+                    if let Some(aws_obj) = aws_value.as_object() {
+                        if let Some(request_id_value) = aws_obj.get("lambda_request_id") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                request_id_str.hash(&mut hasher);
+                            }
+                        }
                     }
                 }
                 
@@ -935,23 +1089,6 @@ impl LogProcessor {
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
-        
-        // Validate all logs before sending - requeue incomplete logs to pre_invoke_buffer
-        let (complete_logs, incomplete_logs): (Vec<_>, Vec<_>) = deduplicated_batch
-            .into_iter()
-            .partition(|log| self.is_log_complete(log));
-        
-        if !incomplete_logs.is_empty() {
-            warn!("Found {} incomplete logs without ARN/request_id - requeuing to pre_invoke_buffer", incomplete_logs.len());
-            self.requeue_incomplete_logs(incomplete_logs);
-        }
-        
-        if complete_logs.is_empty() {
-            debug!("No complete logs to send after validation");
-            return Ok(());
-        }
-        
-        let deduplicated_batch = complete_logs;
         
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();

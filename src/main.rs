@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 use reqwest::Client;
 
 use crate::{
+    config::ExtensionConfig,
     context::InvocationContext,
     telemetry::listener::setup_telemetry_listener,
     newrelic::{
@@ -263,6 +264,7 @@ async fn perform_one_time_initialization(
             harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
+            apm_mode_enabled: false,
         });
     }
 
@@ -381,6 +383,9 @@ async fn perform_one_time_initialization(
     start_agent_payload_collector_background_task(agent_telemetry_rx);
 
     cleanup_old_failed_payloads();
+
+    // Override APM mode for Java runtime (not supported)
+    let config = apply_runtime_overrides(config);
 
     // Smart conditional parallelization: only use tokio::join! when APM enabled
     // This avoids async overhead for standard mode (most common case)
@@ -529,10 +534,11 @@ async fn perform_one_time_initialization(
         extension_id,
         processor_factory,
         newrelic_client,
-        config,
+        config: config.clone(),
         harvester_handle,
         global_log_processor: temp_log_processor,
         apm_app,
+        apm_mode_enabled: config.new_relic.apm_lambda_mode,
     })
 }
 
@@ -578,7 +584,31 @@ async fn handle_no_license_key(
         harvester_handle: tokio::spawn(async {}),
         global_log_processor: noop_log_processor,
         apm_app: Arc::new(tokio::sync::RwLock::new(None)),
+        apm_mode_enabled: false,
     })
+}
+
+/// Apply runtime-specific overrides to the configuration
+/// For example, Java runtime doesn't support APM mode, so we force serverless mode
+fn apply_runtime_overrides(config: Arc<ExtensionConfig>) -> Arc<ExtensionConfig> {
+    let detected_runtime = crate::version::get_runtime_name();
+    
+    // Java runtime doesn't support APM mode - force serverless mode
+    if config.new_relic.apm_lambda_mode && detected_runtime == "java" {
+        warn!(
+            "APM mode is not supported for Java runtime. Redirecting to serverless mode. Detected runtime: {}",
+            detected_runtime
+        );
+        
+        // Clone the config and modify the APM mode flag
+        let mut updated_config = (*config).clone();
+        updated_config.new_relic.apm_lambda_mode = false;
+        
+        return Arc::new(updated_config);
+    }
+    
+    // No override needed
+    config
 }
 
 async fn resolve_license_key_with_aws_fallback(

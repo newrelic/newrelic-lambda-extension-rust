@@ -104,6 +104,7 @@ pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>,
+    is_apm_mode: bool,
 ) -> RequestProcessingState {
     let context = Arc::new(Mutex::new(InvocationContext {
         request_id: request_id.to_string(),
@@ -119,15 +120,21 @@ pub fn create_request_processing_state(
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
-    let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
-    RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
+    // Only create runtime.done channel for standard mode (not needed in APM mode)
+    let runtime_done_rx = if !is_apm_mode {
+        let (runtime_done_tx, runtime_done_rx) = mpsc::unbounded_channel();
+        RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
+        Some(runtime_done_rx)
+    } else {
+        None
+    };
 
     let state = RequestProcessingState {
         context: context.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
         coordination_rx: Some(payload_rx),
-        runtime_done_rx: Some(runtime_done_rx),
+        runtime_done_rx,
     };
 
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);

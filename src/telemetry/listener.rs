@@ -249,7 +249,10 @@ async fn handle_telemetry_request(
                         debug!("Successfully sent runtime.done signal for request: {}", request_id);
                     }
                 } else {
-                    warn!("No runtime.done channel found for request: {}", request_id);
+                    // Only warn in standard mode - APM mode doesn't use runtime.done channels
+                    if !is_apm_mode {
+                        debug!("No runtime.done channel found for request: {} (channel may have been cleaned up)", request_id);
+                    }
                 }
 
                 if let Some(ref tx) = runtime_done_tx {

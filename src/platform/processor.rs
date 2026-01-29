@@ -96,8 +96,12 @@ impl PlatformProcessor {
             attributes,
         };
         
-        // Add to existing log batch for unified flushing
-        self.log_processor.add_log_to_batch(log_message);
+        if self.config.extension.send_platform_logs {
+            // Stamp AWS attributes (request_id, ARN) before adding to batch
+            // This prevents logs from being requeued with wrong request_id
+            let stamped_log = self.log_processor.apply_current_invocation_metadata(log_message);
+            self.log_processor.add_log_to_batch(stamped_log);
+        }
     }
 
    
