@@ -29,8 +29,12 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
 const LAYER_AGENT_PATHS_JAVA: &[&str] = &[
-    "/opt/java/lib/newrelic.jar",
-    "/opt/lib/newrelic.jar",
+    "/opt/java/lib",  // Directory to scan for newrelic JARs
+    "/opt/lib",       // Alternative directory to scan
+];
+const LAYER_AGENT_JAR_NAMES: &[&str] = &[
+    "newrelic-java-lambda",  // Prefix for layer JAR (e.g., newrelic-java-lambda-2.2.5.jar)
+    "newrelic.jar",          // Generic name
 ];
 const LAYER_AGENT_PATH_DOTNET: &[&str] = &["/opt/lib/newrelic-dotnet-agent"];
 const LAYER_AGENT_PATHS_RUBY: &[&str] = &[
@@ -203,9 +207,9 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
     }
 
     for path in LAYER_AGENT_PATHS_JAVA {
-        debug!("Checking Java layer path: {}", path);
-        if let Some(version) = read_java_version(path) {
-            debug!("✓ Detected Java agent version: {} from {}", version, path);
+        debug!("Checking Java layer directory: {}", path);
+        if let Some((version, jar_path)) = find_java_agent_in_directory(path) {
+            debug!("✓ Detected Java agent version: {} from {}", version, jar_path);
             return (Some(version), Some("Java".to_string()));
         }
     }
@@ -408,12 +412,71 @@ fn extract_ruby_version_from_file(file_path: &str) -> Option<String> {
     }
 }
 
-/// Read Java agent version from JAR manifest
+/// Find New Relic Java agent JAR in a directory
+fn find_java_agent_in_directory(dir_path: &str) -> Option<(String, String)> {
+    use std::fs;
+    
+    let dir = Path::new(dir_path);
+    if !dir.exists() || !dir.is_dir() {
+        debug!("  Directory does not exist or is not a directory: {}", dir_path);
+        return None;
+    }
+    
+    // Try to read directory contents
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug!("  Failed to read directory {}: {}", dir_path, e);
+            return None;
+        }
+    };
+    
+    // Look for JAR files matching New Relic agent patterns
+    for entry in entries {
+        if let Ok(entry) = entry {
+            let file_name = entry.file_name();
+            let file_name_str = file_name.to_string_lossy();
+            
+            // Check if filename matches any known New Relic agent pattern
+            for pattern in LAYER_AGENT_JAR_NAMES {
+                if file_name_str.starts_with(pattern) && file_name_str.ends_with(".jar") {
+                    let jar_path = entry.path();
+                    let jar_path_str = jar_path.to_string_lossy().to_string();
+                    debug!("  Found potential New Relic JAR: {}", jar_path_str);
+                    
+                    if let Some(version) = read_java_version(&jar_path_str) {
+                        return Some((version, jar_path_str));
+                    }
+                }
+            }
+        }
+    }
+    
+    debug!("  No New Relic Java agent JAR found in {}", dir_path);
+    None
+}
+
+/// Read Java agent version from JAR manifest or filename
 fn read_java_version(jar_path: &str) -> Option<String> {
     debug!("  Checking if Java agent JAR exists: {}", jar_path);
     if !Path::new(jar_path).exists() {
         debug!("  Java agent JAR does not exist");
         return None;
+    }
+
+    // newrelic-java-lambda-2.2.5.jar -> 2.2.5
+    if let Some(filename) = Path::new(jar_path).file_name() {
+        let filename_str = filename.to_string_lossy();
+        
+        // Try newrelic-java-lambda-VERSION.jar pattern
+        if let Some(version_part) = filename_str.strip_prefix("newrelic-java-lambda-") {
+            if let Some(version) = version_part.strip_suffix(".jar") {
+                if !version.is_empty() {
+                    debug!("  Extracted version from filename: {}", version);
+                    return Some(version.to_string());
+                }
+            }
+        }
     }
 
     use std::process::Command;
@@ -424,9 +487,13 @@ fn read_java_version(jar_path: &str) -> Option<String> {
         Ok(output) => {
             if output.status.success() {
                 let manifest = String::from_utf8_lossy(&output.stdout);
+                debug!("  Manifest content (first 500 chars): {}", &manifest.chars().take(500).collect::<String>());
+                
                 for line in manifest.lines() {
                     let line = line.trim();
-                    if line.starts_with("Implementation-Version:") {
+                    if line.starts_with("Implementation-Version:") || 
+                       line.starts_with("Bundle-Version:") ||
+                       line.starts_with("Agent-Version:") {
                         if let Some(version) = line.split(':').nth(1) {
                             let version = version.trim();
                             if !version.is_empty() {
@@ -441,9 +508,8 @@ fn read_java_version(jar_path: &str) -> Option<String> {
             None
         }
         Err(e) => {
-            debug!("  Failed to read JAR manifest: {}", e);
-            debug!("  Java agent JAR exists but version extraction failed, marking as detected");
-            Some("detected".to_string())
+            debug!("  Failed to run unzip command: {}", e);
+            None
         }
     }
 }
