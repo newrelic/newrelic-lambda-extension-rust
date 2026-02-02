@@ -9,6 +9,7 @@ mod logs;
 mod platform;
 mod newrelic;
 mod context;
+mod context_manager;
 mod agent;
 mod credentials;
 mod trace;

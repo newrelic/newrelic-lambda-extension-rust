@@ -40,6 +40,10 @@ aws-sdk-secretsmanager = { version = "1.88", features = ["behavior-version-lates
 aws-sdk-ssm = { version = "1.93", features = ["behavior-version-latest"] }
 aws-sdk-lambda = { version = "1.66", features = ["behavior-version-latest"] }
 
+[lib]
+name = "newrelic_lambda_extension"
+path = "src/lib.rs"
+
 [profile.release]
 lto = "fat"          # Maximum link-time optimization
 codegen-units = 1    # Single codegen unit for better optimization
