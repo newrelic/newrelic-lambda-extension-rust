@@ -27,7 +27,7 @@ impl TraceIDGenerator {
     /// Generate a random float32
     pub fn float32(&self) -> f32 {
         let mut rng = self.rng.lock().unwrap();
-        rng.gen()
+        rng.random()
     }
 
     /// Generate a 32-character hex trace ID
