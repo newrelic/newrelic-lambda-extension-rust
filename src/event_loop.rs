@@ -257,6 +257,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
+                // Cleanup completed request context to prevent memory leaks
+                ContextManager::global().remove_request(&request_id);
+
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
                 cleanup_counter += 1;
                 if cleanup_counter >= 10 {
@@ -269,6 +272,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
                         cleanup_old_request_buffers(newrelic_client, config).await;
                         cleanup_old_failed_payloads();
+                        
+                        // Cleanup any stale request contexts (shouldn't exist but safety net)
+                        let stale_count = ContextManager::global().active_request_count();
+                        if stale_count > 0 {
+                            debug!("Periodic cleanup: Found {} stale request contexts, will be cleaned by TTL", stale_count);
+                        }
                     });
                 }
             }
@@ -601,6 +610,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         event_counter, event_time, request_id
                     );
                 }
+
+                // Cleanup completed request context to prevent memory leaks
+                ContextManager::global().remove_request(&request_id);
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
                 cleanup_counter += 1;
@@ -1267,6 +1279,12 @@ async fn extract_and_coordinate_trace_id(
 
     if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
         debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
+        
+        // Update ContextManager with trace ID for current request
+        if let Some(request_id) = log_processor.get_current_request_id() {
+            ContextManager::global().update_trace_id(&request_id, trace_id.clone());
+        }
+        
         if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
             error!("Failed to coordinate logs with trace ID: {}", e);
         }
@@ -1394,6 +1412,11 @@ async fn process_and_send_agent_payload(
     if config.new_relic.collect_trace_id {
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
             debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
+
+            // Update ContextManager with trace ID for current request
+            if let Some(request_id) = log_processor.get_current_request_id() {
+                ContextManager::global().update_trace_id(&request_id, trace_id.clone());
+            }
 
             if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
                 error!("Failed to coordinate logs with trace ID: {}", e);

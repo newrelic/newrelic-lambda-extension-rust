@@ -158,6 +158,12 @@ impl LogProcessor {
             warn!("Failed to update invocation context - mutex poisoned, extension continuing in degraded mode");
         }
     }
+    
+    /// Get the current request ID being tracked by this processor
+    pub fn get_current_request_id(&self) -> Option<String> {
+        self.current_request_id.safe_lock()
+            .and_then(|guard| guard.clone())
+    }
 
     /// Get invocation context for current request from ContextManager
     /// Returns None if no request is currently being tracked
