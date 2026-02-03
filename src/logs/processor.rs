@@ -3,6 +3,7 @@ use tracing::{debug, error, info, trace, warn};
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
+    context_manager::ContextManager,
     newrelic::{client::NewRelicClient, flush::Flush, payload},
     telemetry::listener::TelemetryRecord,
 };
@@ -47,7 +48,9 @@ pub struct LogProcessor {
     log_batch: Arc<Mutex<Vec<payload::LogMessage>>>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
-    invocation_context: Arc<Mutex<InvocationContext>>,
+    /// Track which request this processor is currently handling
+    /// Used to lookup context from ContextManager per-request map
+    current_request_id: Arc<Mutex<Option<String>>>,
 
     buffered_logs: Option<Arc<Mutex<Vec<payload::LogMessage>>>>,
 
@@ -97,7 +100,7 @@ impl LogProcessor {
     pub fn new(
         newrelic_client: Arc<NewRelicClient>,
         config: Arc<ExtensionConfig>,
-        invocation_context: Arc<Mutex<InvocationContext>>,
+        invocation_context: Arc<Mutex<InvocationContext>>,  // Keep for backward compat during migration
         apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     ) -> Self {
         let (buffered_logs, trace_extraction_state) = if config.new_relic.collect_trace_id {
@@ -109,11 +112,19 @@ impl LogProcessor {
             (None, None)
         };
 
+        // Extract request_id from passed context for tracking
+        let current_request_id = Arc::new(Mutex::new(
+            invocation_context.lock()
+                .ok()
+                .map(|ctx| ctx.request_id.clone())
+                .filter(|id| !id.is_empty())
+        ));
+
         Self {
             log_batch: Arc::new(Mutex::new(Vec::new())),
             newrelic_client,
             config,
-            invocation_context,
+            current_request_id,
             buffered_logs,
             trace_extraction_state,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -137,13 +148,22 @@ impl LogProcessor {
 
    
     pub fn update_invocation_context(&self, new_context: Arc<Mutex<InvocationContext>>) {
-        if let (Some(mut current), Some(new)) = (self.invocation_context.safe_lock(), new_context.safe_lock()) {
-            current.request_id = new.request_id.clone();
-            current.invoked_function_arn = new.invoked_function_arn.clone();
-            current.trace_id = new.trace_id.clone();
+        // Update current_request_id to track which request we're processing
+        if let Some(new) = new_context.safe_lock() {
+            if let Some(mut current_id) = self.current_request_id.safe_lock() {
+                *current_id = Some(new.request_id.clone());
+                debug!("LogProcessor now tracking request: {}", new.request_id);
+            }
         } else {
             warn!("Failed to update invocation context - mutex poisoned, extension continuing in degraded mode");
         }
+    }
+
+    /// Get invocation context for current request from ContextManager
+    /// Returns None if no request is currently being tracked
+    fn get_current_context(&self) -> Option<InvocationContext> {
+        let request_id = self.current_request_id.safe_lock()?.as_ref()?.clone();
+        ContextManager::global().get_invocation_context(&request_id)
     }
    
     pub fn set_invocation_start_time(&self, start_time: chrono::DateTime<chrono::Utc>) {
@@ -156,7 +176,8 @@ impl LogProcessor {
 
    
     pub fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
-        if let Some(context) = self.invocation_context.safe_lock() {
+        // Get context from ContextManager using current_request_id
+        if let Some(context) = self.get_current_context() {
             if !context.request_id.is_empty() && context.request_id != "unknown" {
                 let mut aws_attrs = serde_json::Map::new();
                 aws_attrs.insert("lambda_request_id".to_string(),
@@ -171,8 +192,8 @@ impl LogProcessor {
             let arn = if !context.invoked_function_arn.is_empty() {
                 context.invoked_function_arn.clone()
             } else {
-                // Use fallback ARN from LogProcessor or global context
-                self.get_best_available_arn()
+                // Use fallback ARN from LogProcessor or ContextManager
+                ContextManager::global().get_function_arn().unwrap_or_default()
             };
             
             if !arn.is_empty() {
@@ -242,10 +263,9 @@ impl LogProcessor {
     
         if let Some(log_message) = self.to_log_message(record.clone()) {
             // Route to pre_invoke_buffer if ARN is empty (INIT phase before first INVOKE)
-            let has_arn = {
-                let context = self.invocation_context.lock().unwrap();
-                !context.invoked_function_arn.is_empty()
-            };
+            let has_arn = ContextManager::global()
+                .get_function_arn()
+                .map_or(false, |arn| !arn.is_empty());
     
             if !has_arn {
                 let mut pre_invoke_buf = self.pre_invoke_buffer.lock().unwrap();
@@ -253,10 +273,8 @@ impl LogProcessor {
                 return;
             }
 
-            let has_valid_request_id = {
-                let context = self.invocation_context.lock().unwrap();
-                !context.request_id.is_empty() && context.request_id != "unknown"
-            };
+            let has_valid_request_id = self.get_current_context()
+                .map_or(false, |ctx| !ctx.request_id.is_empty() && ctx.request_id != "unknown");
     
             if !has_valid_request_id {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
@@ -284,9 +302,10 @@ impl LogProcessor {
                                 .replace('\n', "\\n").replace('\r', "\\r");
                             debug!("APM mode: Error detected in function log: {}", sanitized_msg);
 
-                        let (request_id, function_arn) = {
-                            let context = self.invocation_context.lock().unwrap();
+                        let (request_id, function_arn) = if let Some(context) = self.get_current_context() {
                             (context.request_id.clone(), context.invoked_function_arn.clone())
+                        } else {
+                            (String::from("unknown"), String::new())
                         };
 
                         debug!("APM mode: Sending error event for request_id: {}", request_id);
@@ -336,9 +355,10 @@ impl LogProcessor {
                             .replace('\n', "\\n").replace('\r', "\\r");
                         debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
 
-                        let (request_id, function_arn) = {
-                            let context = self.invocation_context.lock().unwrap();
+                        let (request_id, function_arn) = if let Some(context) = self.get_current_context() {
                             (context.request_id.clone(), context.invoked_function_arn.clone())
+                        } else {
+                            (String::from("unknown"), String::new())
                         };
 
                         debug!("Standard mode: Sending error for request_id: {}", request_id);
@@ -395,10 +415,9 @@ impl LogProcessor {
                 (&self.trace_extraction_state, &self.buffered_logs) {
                 
                 let state = extraction_state.lock().unwrap();
-                let has_trace_id = {
-                    let context = self.invocation_context.lock().unwrap();
-                    context.trace_id.is_some()
-                };
+                let has_trace_id = self.get_current_context()
+                    .and_then(|ctx| ctx.trace_id)
+                    .is_some();
                 
                 if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                     drop(state);
@@ -435,7 +454,11 @@ impl LogProcessor {
 
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
-                let context = self.invocation_context.lock().unwrap().clone();
+                let context = self.get_current_context().unwrap_or_else(|| InvocationContext {
+                    request_id: String::from("unknown"),
+                    invoked_function_arn: ContextManager::global().get_function_arn().unwrap_or_default(),
+                    trace_id: None,
+                });
                 let failed_buffer = Arc::clone(&self.failed_logs_buffer);
 
                 // Spawn background task with proper retry logic and failed log buffering
@@ -631,15 +654,12 @@ impl LogProcessor {
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
     /// Only processes logs if invocation context is valid. Invalid context leaves logs in buffer.
     pub fn process_pre_invoke_logs(&self) {
-        let context_valid = {
-            if let Some(context) = self.invocation_context.safe_lock() {
-                !context.invoked_function_arn.is_empty() 
-                    && !context.request_id.is_empty() 
-                    && context.request_id != "unknown"
-            } else {
-                false
-            }
-        };
+        let context_valid = self.get_current_context()
+            .map_or(false, |ctx| {
+                !ctx.invoked_function_arn.is_empty() 
+                    && !ctx.request_id.is_empty() 
+                    && ctx.request_id != "unknown"
+            });
         
         if !context_valid {
             let buf_size = self.pre_invoke_buffer.lock().unwrap().len();
@@ -662,7 +682,7 @@ impl LogProcessor {
         
         // At this point, context is guaranteed valid - stamp all logs
         for log in &mut pre_invoke_logs {
-            if let Some(context) = self.invocation_context.safe_lock() {
+            if let Some(context) = self.get_current_context() {
                 log.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(context.invoked_function_arn.clone()));
                 
@@ -723,18 +743,20 @@ impl LogProcessor {
             None
         };
         
-        let function_arn = if let Some(context) = self.invocation_context.safe_lock() {
-            if !context.invoked_function_arn.is_empty() {
-                context.invoked_function_arn.clone()
-            } else {
+        let function_arn = self.get_current_context()
+            .and_then(|ctx| {
+                if !ctx.invoked_function_arn.is_empty() {
+                    Some(ctx.invoked_function_arn.clone())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
                 self.fallback_function_arn.lock()
                     .ok()
                     .and_then(|guard| guard.as_ref().cloned())
-                    .unwrap_or_else(String::new)
-            }
-        } else {
-            String::new()
-        };
+            })
+            .unwrap_or_default();
         
         match last_context {
             Some((request_id, arn)) => {
@@ -929,10 +951,9 @@ impl LogProcessor {
                     (&self.trace_extraction_state, &self.buffered_logs) {
                     
                     let state = extraction_state.lock().unwrap();
-                    let has_trace_id = {
-                        let context = self.invocation_context.lock().unwrap();
-                        context.trace_id.is_some()
-                    };
+                    let has_trace_id = self.get_current_context()
+                        .and_then(|ctx| ctx.trace_id)
+                        .is_some();
                     
                     if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                         drop(state);
@@ -959,7 +980,11 @@ impl LogProcessor {
         
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = self.get_current_context().unwrap_or_else(|| InvocationContext {
+            request_id: String::from("unknown"),
+            invoked_function_arn: ContextManager::global().get_function_arn().unwrap_or_default(),
+            trace_id: None,
+        });
         
         let chunks: Vec<Vec<payload::LogMessage>> = logs
             .chunks(MAX_BATCH_SIZE)
@@ -1088,7 +1113,11 @@ impl LogProcessor {
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = self.get_current_context().unwrap_or_else(|| InvocationContext {
+            request_id: String::from("unknown"),
+            invoked_function_arn: ContextManager::global().get_function_arn().unwrap_or_default(),
+            trace_id: None,
+        });
         
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
@@ -1200,7 +1229,11 @@ impl LogProcessor {
                     } else {
                         if use_failed_buffer {
                             warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
-                            let context = self.invocation_context.lock().unwrap().clone();
+                            let context = self.get_current_context().unwrap_or_else(|| InvocationContext {
+                                request_id: String::from("unknown"),
+                                invoked_function_arn: ContextManager::global().get_function_arn().unwrap_or_default(),
+                                trace_id: None,
+                            });
                             let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
                             
                             for log in chunk {

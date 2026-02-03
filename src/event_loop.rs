@@ -11,6 +11,7 @@ use crate::{
     newrelic::client::NewRelicClient,
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
+    context_manager::ContextManager,
     request::{
         ProcessorFactory,
         create_request_processing_state,
@@ -28,7 +29,6 @@ use crate::{
     error_synthesis,
     trace,
     version,
-    CURRENT_INVOCATION_CONTEXT,
     IS_WARM_START,
 };
 
@@ -154,7 +154,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
-                update_global_invocation_context(&request_id, &invoked_function_arn);
+                // Set function ARN once during cold start (reused for all requests)
+                if is_cold_start {
+                    ContextManager::global().set_function_arn(invoked_function_arn.clone());
+                    debug!("Cold start: Set function ARN in ContextManager");
+                }
+
+                // Create per-request context (isolated from other concurrent requests)
+                ContextManager::global().set_request(request_id.clone(), None);
 
                 // Create request state FIRST so we have the updated context
                 let request_state = create_request_processing_state(
@@ -351,29 +358,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             if !payloads.is_empty() {
                                 info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
                                 
-                                let invoked_function_arn = REQUEST_CONTEXTS
-                                    .get(&request_id)
-                                    .map(|ctx_ref| {
-                                        ctx_ref.lock()
-                                            .ok()
-                                            .map(|ctx| ctx.invoked_function_arn.clone())
-                                            .unwrap_or_else(|| {
-                                                // Fallback to global context ARN (set from registration)
-                                                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                                    global_ctx.invoked_function_arn.clone()
-                                                } else {
-                                                    String::new()
-                                                }
-                                            })
-                                    })
-                                    .unwrap_or_else(|| {
-                                        // Fallback to global context ARN (set from registration)
-                                        if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                            global_ctx.invoked_function_arn.clone()
-                                        } else {
-                                            String::new()
-                                        }
-                                    });
+                                // Get function ARN from ContextManager (set during cold start)
+                                let invoked_function_arn = ContextManager::global()
+                                    .get_function_arn()
+                                    .unwrap_or_default();
                                 
                                 for payload_bytes in payloads {
                                     if let Err(e) = process_and_send_agent_payload(
@@ -530,7 +518,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
-                update_global_invocation_context(&request_id, &invoked_function_arn);
+                // Set function ARN once during cold start (reused for all requests)
+                if is_cold_start {
+                    ContextManager::global().set_function_arn(invoked_function_arn.clone());
+                    debug!("Cold start: Set function ARN in ContextManager");
+                }
+
+                // Create per-request context (isolated from other concurrent requests)
+                ContextManager::global().set_request(request_id.clone(), None);
 
                 components
                     .global_log_processor
@@ -1250,28 +1245,14 @@ fn tag_lambda_function_once(invoked_function_arn: String, config: &config::Exten
     });
 }
 
-/// Update global invocation context for telemetry processors
-fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str) {
-    if let Ok(mut global_context) = crate::CURRENT_INVOCATION_CONTEXT.write() {
-        // Validate ARN before updating
-        if invoked_function_arn.is_empty() {
-            error!(
-                "CRITICAL: Attempted to update global context with EMPTY invoked_function_arn for request_id: {}. Keeping previous ARN: {}",
-                request_id,
-                global_context.invoked_function_arn
-            );
-        } else {
-            debug!(
-                "Updating global context: request_id='{}', invoked_function_arn='{}' (previous ARN: '{}')",
-                request_id,
-                invoked_function_arn,
-                global_context.invoked_function_arn
-            );
-            global_context.invoked_function_arn = invoked_function_arn.to_string();
-        }
-        global_context.request_id = request_id.to_string();
-        global_context.trace_id = None;
-    }
+/// DEPRECATED: This function is no longer used. Context is now managed by ContextManager.
+/// Will be removed in Phase 4. Kept temporarily for reference during migration.
+#[allow(dead_code)]
+fn update_global_invocation_context_deprecated(_request_id: &str, _invoked_function_arn: &str) {
+    // This function has been replaced by:
+    // - ContextManager.set_function_arn() - Called once during cold start  
+    // - ContextManager.set_request() - Called per request for isolation
+    // Do nothing - context is now managed by ContextManager
 }
 
 /// Extract trace ID from agent payload if enabled in config
@@ -1338,34 +1319,10 @@ async fn process_pending_agent_payloads(
     for (request_id, buffer) in pending_requests {
         let context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
 
-        let invoked_function_arn = if let Some(ctx) = context {
-            if let Ok(ctx_guard) = ctx.lock() {
-                if !ctx_guard.invoked_function_arn.is_empty() {
-                    ctx_guard.invoked_function_arn.clone()
-                } else {
-                    // Use global fallback ARN from registration
-                    if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                        global_ctx.invoked_function_arn.clone()
-                    } else {
-                        String::new()
-                    }
-                }
-            } else {
-                // Use global fallback ARN
-                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                    global_ctx.invoked_function_arn.clone()
-                } else {
-                    String::new()
-                }
-            }
-        } else {
-            // Use global fallback ARN
-            if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                global_ctx.invoked_function_arn.clone()
-            } else {
-                String::new()
-            }
-        };
+        // Get function ARN from ContextManager (set once during cold start)
+        let invoked_function_arn = ContextManager::global()
+            .get_function_arn()
+            .unwrap_or_default();
 
         let payloads = {
             if let Ok(mut buf) = buffer.lock() {

@@ -1,6 +1,7 @@
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
+    context_manager::ContextManager,
     newrelic::{client::NewRelicClient, flush::Flush},
     telemetry::listener::TelemetryRecord,
 };
@@ -32,7 +33,7 @@ pub struct PlatformProcessor {
     log_processor: Arc<crate::logs::processor::LogProcessor>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
-    invocation_context: Arc<Mutex<InvocationContext>>,
+    current_request_id: Arc<Mutex<Option<String>>>,
 }
 
 impl PlatformProcessor {
@@ -43,12 +44,26 @@ impl PlatformProcessor {
         invocation_context: Arc<Mutex<InvocationContext>>,
         log_processor: Arc<crate::logs::processor::LogProcessor>,
     ) -> Self {
+        // Extract request_id from invocation_context for tracking
+        let current_request_id = Arc::new(Mutex::new(
+            invocation_context.lock()
+                .ok()
+                .map(|ctx| ctx.request_id.clone())
+                .filter(|id| !id.is_empty() && id != "temp")
+        ));
+        
         Self {
             log_processor,
             newrelic_client,
             config,
-            invocation_context,
+            current_request_id,
         }
+    }
+    
+    /// Helper method to get current invocation context from ContextManager
+    fn get_current_context(&self) -> Option<InvocationContext> {
+        let request_id = self.current_request_id.lock().ok()?.as_ref()?.clone();
+        ContextManager::global().get_invocation_context(&request_id)
     }
 
    
@@ -254,12 +269,12 @@ impl PlatformProcessor {
                     .map(|s| format!("init-{}", &s[..8.min(s.len())]))
                     .unwrap_or_else(|| {
                         // Last resort: use context or generate ID
-                        let context = self.invocation_context.lock().unwrap();
-                        if !context.request_id.is_empty() && context.request_id != "temp" {
-                            context.request_id.clone()
-                        } else {
-                            format!("init-{}", chrono::Utc::now().timestamp())
+                        if let Some(context) = self.get_current_context() {
+                            if !context.request_id.is_empty() && context.request_id != "temp" {
+                                return context.request_id;
+                            }
                         }
+                        format!("init-{}", chrono::Utc::now().timestamp())
                     })
             }
         } else {
@@ -269,12 +284,12 @@ impl PlatformProcessor {
                 .map(|s| format!("init-{}", &s[..8.min(s.len())]))
                 .unwrap_or_else(|| {
                     // Last resort: use context or generate ID
-                    let context = self.invocation_context.lock().unwrap();
-                    if !context.request_id.is_empty() && context.request_id != "temp" {
-                        context.request_id.clone()
-                    } else {
-                        format!("init-{}", chrono::Utc::now().timestamp())
+                    if let Some(context) = self.get_current_context() {
+                        if !context.request_id.is_empty() && context.request_id != "temp" {
+                            return context.request_id;
+                        }
                     }
+                    format!("init-{}", chrono::Utc::now().timestamp())
                 })
         };
         
@@ -376,20 +391,10 @@ impl PlatformProcessor {
             }
         };
         
-        // Get invoked function ARN from context, use global fallback if empty
-        let invoked_function_arn = {
-            let context = self.invocation_context.lock().unwrap();
-            if !context.invoked_function_arn.is_empty() {
-                context.invoked_function_arn.clone()
-            } else {
-                // Use global context ARN set during registration
-                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                    global_ctx.invoked_function_arn.clone()
-                } else {
-                    String::new()
-                }
-            }
-        };
+        // Get invoked function ARN from ContextManager
+        let invoked_function_arn = ContextManager::global()
+            .get_function_arn()
+            .unwrap_or_default();
         
         // Map platform error to appropriate Lambda error type
         let lambda_error_type = match status {
@@ -486,9 +491,15 @@ impl PlatformProcessor {
 
    
     pub fn process_invoke_event(&self, request_id: &str, invoked_function_arn: &str) {
-        let mut context = self.invocation_context.lock().unwrap();
-        context.request_id = request_id.to_string();
-        context.invoked_function_arn = invoked_function_arn.to_string();
+        // Update current request ID tracker
+        if let Ok(mut current) = self.current_request_id.lock() {
+            *current = Some(request_id.to_string());
+        }
+        
+        // ContextManager already set in event_loop.rs, but update here for completeness
+        // Note: ARN should already be set during cold start, this is redundant but safe
+        ContextManager::global().set_function_arn(invoked_function_arn.to_string());
+        ContextManager::global().set_request(request_id.to_string(), None);
     }
 }
     
