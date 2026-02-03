@@ -1335,7 +1335,7 @@ async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
-        let context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
+        let _context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
 
         // Get function ARN from ContextManager (set once during cold start)
         let invoked_function_arn = ContextManager::global()

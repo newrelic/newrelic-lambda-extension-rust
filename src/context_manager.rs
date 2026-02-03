@@ -144,6 +144,7 @@ impl ContextManager {
     }
 
     /// Check if a request context exists
+    #[allow(dead_code)]
     pub fn has_request(&self, request_id: &str) -> bool {
         self.contexts.contains_key(request_id)
     }

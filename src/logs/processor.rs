@@ -639,6 +639,7 @@ impl LogProcessor {
     }
 
     /// Get best available ARN: check fallback_function_arn, then global context
+    #[allow(dead_code)]
     fn get_best_available_arn(&self) -> String {
         // First try LogProcessor's fallback ARN
         if let Ok(arn_guard) = self.fallback_function_arn.lock() {

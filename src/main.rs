@@ -25,7 +25,7 @@ mod test_telemetry;
 
 use std::{
     env,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
