@@ -1,5 +1,4 @@
-use newrelic_lambda_extension::context_manager::{ContextManager, RequestContext};
-use newrelic_lambda_extension::context::InvocationContext;
+use newrelic_lambda_extension::context_manager::ContextManager;
 
 #[test]
 fn test_function_arn_set_once() {

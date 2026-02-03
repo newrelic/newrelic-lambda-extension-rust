@@ -17,7 +17,7 @@ use crate::{
         create_request_processing_state,
         cleanup_request_processing_state_internal,
         wait_for_all_requests_completion,
-        REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
+        REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS,
         CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
     },
     agent::batch::{
@@ -1335,8 +1335,6 @@ async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
-        let _context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
-
         // Get function ARN from ContextManager (set once during cold start)
         let invoked_function_arn = ContextManager::global()
             .get_function_arn()

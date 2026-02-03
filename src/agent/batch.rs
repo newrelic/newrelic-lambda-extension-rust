@@ -260,7 +260,8 @@ pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    use crate::request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS};
+    use crate::request::{REQUEST_AGENT_BUFFERS, PENDING_REPORTS};
+    use crate::context_manager::ContextManager;
 
     debug!("Shutdown: Collecting all pending telemetry payloads");
 
@@ -291,17 +292,8 @@ pub async fn send_all_pending_payloads_on_shutdown(
                 // Get report line if available
                 let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| report);
 
-                // Get context
-                let arn = REQUEST_CONTEXTS
-                    .get(&request_id)
-                    .map(|ctx_entry| {
-                        ctx_entry
-                            .lock()
-                            .ok()
-                            .map(|ctx| ctx.invoked_function_arn.clone())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
+                // Get ARN from ContextManager (set once during cold start)
+                let arn = ContextManager::global().get_function_arn().unwrap_or_else(|| "unknown".to_string());
 
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {

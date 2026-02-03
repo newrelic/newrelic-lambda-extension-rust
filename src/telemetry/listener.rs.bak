@@ -170,6 +170,10 @@ async fn handle_telemetry_request(
                                                 
                                                 // Get ARN from ContextManager (set once during cold start)
                                                 let arn = ContextManager::global().get_function_arn().unwrap_or_default();
+                                                    .unwrap_or_else(|| {
+                                                        // Fallback to ContextManager global ARN (set from registration)
+                                                        ContextManager::global().get_function_arn().unwrap_or_default()
+                                                    });
                                                 
                                                 if let Ok(buffer_guard) = buffer.lock() {
                                                     for payload_bytes in buffer_guard.iter() {

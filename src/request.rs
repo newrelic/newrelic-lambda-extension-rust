@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     context::InvocationContext,
+    context_manager::ContextManager,
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
@@ -73,9 +74,6 @@ impl ProcessorFactory {
 pub static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-pub static REQUEST_CONTEXTS: Lazy<Arc<DashMap<String, Arc<Mutex<InvocationContext>>>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
 pub static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -137,7 +135,6 @@ pub fn create_request_processing_state(
         runtime_done_rx,
     };
 
-    REQUEST_CONTEXTS.insert(request_id.to_string(), context);
     REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer.clone());
     REQUEST_BUFFER_TIMESTAMPS.insert(request_id.to_string(), chrono::Utc::now());
 
@@ -177,9 +174,6 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
             request_id
         );
     } else {
-        if REQUEST_CONTEXTS.remove(request_id).is_some() {
-            debug!("Cleaned up context for request {}", request_id);
-        }
 
         if REQUEST_AGENT_BUFFERS.remove(request_id).is_some() {
             debug!("Cleaned up agent buffer for request {}", request_id);
@@ -383,17 +377,8 @@ pub async fn cleanup_old_request_buffers(
                 // Get report line if available
                 let report_line = PENDING_REPORTS.get(request_id).map(|entry| entry.value().clone());
 
-                // Get context
-                let arn = REQUEST_CONTEXTS
-                    .get(request_id)
-                    .map(|ctx_entry| {
-                        ctx_entry
-                            .lock()
-                            .ok()
-                            .map(|ctx| ctx.invoked_function_arn.clone())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
+                // Get ARN from ContextManager (set once during cold start)
+                let arn = ContextManager::global().get_function_arn().unwrap_or_else(|| "unknown".to_string());
 
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {
@@ -464,7 +449,6 @@ pub async fn cleanup_old_request_buffers(
 
     // Now cleanup the old buffers
     for request_id in &old_request_ids {
-        REQUEST_CONTEXTS.remove(request_id);
         REQUEST_AGENT_BUFFERS.remove(request_id);
         PAYLOAD_COORDINATION.remove(request_id);
         PENDING_REPORTS.remove(request_id);
