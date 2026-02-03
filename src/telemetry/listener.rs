@@ -1,4 +1,5 @@
 use crate::{
+    context_manager::ContextManager,
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
@@ -173,21 +174,13 @@ async fn handle_telemetry_request(
                                                             .ok()
                                                             .map(|ctx| ctx.invoked_function_arn.clone())
                                                             .unwrap_or_else(|| {
-                                                                // Fallback to global context ARN (set from registration)
-                                                                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                                    global_ctx.invoked_function_arn.clone()
-                                                                } else {
-                                                                    String::new()
-                                                                }
+                                                                // Fallback to ContextManager global ARN (set from registration)
+                                                                ContextManager::global().get_function_arn().unwrap_or_default()
                                                             })
                                                     })
                                                     .unwrap_or_else(|| {
-                                                        // Fallback to global context ARN (set from registration)
-                                                        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                            global_ctx.invoked_function_arn.clone()
-                                                        } else {
-                                                            String::new()
-                                                        }
+                                                        // Fallback to ContextManager global ARN (set from registration)
+                                                        ContextManager::global().get_function_arn().unwrap_or_default()
                                                     });
                                                 
                                                 if let Ok(buffer_guard) = buffer.lock() {

@@ -189,6 +189,16 @@ publish_layer() {
   echo "Published ${runtime_name} layer version ${layer_version} to ${region}"
   echo "Full Layer ARN: ${full_layer_arn}"
 
+  echo "→ Setting public permissions for layer version ${layer_version}" >&2
+  aws lambda add-layer-version-permission \
+    --layer-name "${layer_name}" \
+    --version-number "$layer_version" \
+    --statement-id public \
+    --action lambda:GetLayerVersion \
+    --principal "*" \
+    --region "$region" \
+    --output json >/dev/null
+
   local arch_upper
   arch_upper=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
   local runtime_nodots
@@ -239,7 +249,7 @@ main() {
   build_extension "$target_x86"
 
   # Package and publish standalone extension
-  # package_extension_layer "$target_x86"
+  package_extension_layer "$target_x86"
   # for region in $REGIONS_X86_64; do
   #   publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
   # done
@@ -287,7 +297,7 @@ main() {
   cat "$TMP_ENV_FILE_NAME"
 
   # Cleanup after successful publish
-  cleanup_build_artifacts
+  # cleanup_build_artifacts
 
   echo "To load the layer ARNs into your environment, run:"
   echo "  source $TMP_ENV_FILE_NAME"

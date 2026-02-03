@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, error};
 use crate::{
     config::ExtensionConfig,
+    context_manager::ContextManager,
     newrelic::client::NewRelicClient,
     EXTENSION_VERSION,
 };
@@ -347,13 +348,12 @@ pub async fn send_lambda_error(
         }
     }
 
-    // Ensure ARN is never empty - use global fallback (set from registration)
+    // Ensure ARN is never empty - use ContextManager global fallback (set from registration)
     let arn = if invoked_function_arn.is_empty() {
-        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-            let global_arn = &global_ctx.invoked_function_arn;
+        if let Some(global_arn) = ContextManager::global().get_function_arn() {
             if !global_arn.is_empty() {
                 debug!("Using registration fallback ARN for error synthesis (request: {})", request_id);
-                global_arn.clone()
+                global_arn
             } else {
                 error!("CRITICAL: Global context ARN is empty during error synthesis (request: {}) - this should never happen after registration", request_id);
                 // Last resort: construct from config (account_id is always available from AWS Lambda registration)

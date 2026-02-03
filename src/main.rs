@@ -38,6 +38,7 @@ use reqwest::Client;
 use crate::{
     config::ExtensionConfig,
     context::InvocationContext,
+    context_manager::ContextManager,
     telemetry::listener::setup_telemetry_listener,
     newrelic::{
         client::NewRelicClient,
@@ -54,17 +55,6 @@ use crate::{
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Global current invocation context for telemetry processors
-/// Following Go extension pattern: ARN starts empty, gets set by first INVOKE event
-/// Uses RwLock for optimal concurrent read performance (multiple processors can read simultaneously)
-static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<RwLock<InvocationContext>>> = Lazy::new(|| {
-    Arc::new(RwLock::new(InvocationContext {
-        request_id: String::new(),
-        invoked_function_arn: String::new(),
-        trace_id: None,
-    }))
-});
 
 /// Global flag to track if this is a warm start (for performance optimization)
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
@@ -328,11 +318,9 @@ async fn perform_one_time_initialization(
         );
         info!("Registration fallback ARN constructed: {}", arn);
         
-        // Initialize global invocation context with fallback ARN
-        if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
-            global_context.invoked_function_arn = arn.clone();
-            debug!("Initialized global context with registration fallback ARN");
-        }
+        // Initialize ContextManager with fallback ARN
+        ContextManager::global().set_function_arn(arn.clone());
+        debug!("Initialized ContextManager with registration fallback ARN");
         
         Some(arn)
     } else {
