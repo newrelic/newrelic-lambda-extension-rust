@@ -205,6 +205,8 @@ impl LogProcessor {
             if !arn.is_empty() {
                 log_message.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(arn));
+            } else {
+                warn!("ARN is empty - log will be sent without faas.arn attribute (local testing or registration incomplete)");
             }
 
             if let Some(ref trace_id) = context.trace_id {
@@ -212,7 +214,13 @@ impl LogProcessor {
                     serde_json::Value::String(trace_id.clone()));
             }
         } else {
-            warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
+            warn!("Cannot apply invocation metadata - context not available, buffering log until context is ready");
+            // Buffer log instead of sending without metadata
+            if let Ok(mut pre_invoke_buf) = self.pre_invoke_buffer.lock() {
+                pre_invoke_buf.push(log_message.clone());
+                debug!("Buffered log without context - will stamp when context becomes available");
+            }
+            return log_message;
         }
         
         if let Some(ref apm_app_arc) = self.apm_app {
