@@ -522,13 +522,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
-                // Set function ARN once during cold start (reused for all requests)
-                if is_cold_start {
-                    ContextManager::global().set_function_arn(invoked_function_arn.clone());
-                    debug!("Cold start: Set function ARN in ContextManager");
-                }
-
-                // Create per-request context (isolated from other concurrent requests)
+                // Note: Function ARN already set during registration in main.rs
                 ContextManager::global().set_request(request_id.clone(), None);
 
                 components
