@@ -154,13 +154,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
                 }
 
-                // Set function ARN once during cold start (reused for all requests)
-                if is_cold_start {
-                    ContextManager::global().set_function_arn(invoked_function_arn.clone());
-                    debug!("Cold start: Set function ARN in ContextManager");
-                }
-
                 // Create per-request context (isolated from other concurrent requests)
+                // Note: Function ARN already set during registration in main.rs
                 ContextManager::global().set_request(request_id.clone(), None);
 
                 // Create request state FIRST so we have the updated context
@@ -843,7 +838,7 @@ pub async fn process_apm_request(
     global_log_processor.reset_trace_id_state();
     state
         .platform_processor
-        .process_invoke_event(&request_id, &invoked_function_arn);
+        .process_invoke_event(&request_id);
 
     // APM mode: Check if run_id is available
     let has_run_id = {
@@ -1072,7 +1067,7 @@ pub async fn process_request_concurrently(
     global_log_processor.reset_trace_id_state();
     state
         .platform_processor
-        .process_invoke_event(&request_id, &invoked_function_arn);
+        .process_invoke_event(&request_id);
 
     // Skip runtime.done wait for all invocations (performance optimization)
     // Late payloads will be processed in next invocation

@@ -490,16 +490,14 @@ impl PlatformProcessor {
     }
 
    
-    pub fn process_invoke_event(&self, request_id: &str, invoked_function_arn: &str) {
+    pub fn process_invoke_event(&self, request_id: &str) {
         // Update current request ID tracker
         if let Ok(mut current) = self.current_request_id.lock() {
             *current = Some(request_id.to_string());
         }
         
-        // ContextManager already set in event_loop.rs, but update here for completeness
-        // Note: ARN should already be set during cold start, this is redundant but safe
-        ContextManager::global().set_function_arn(invoked_function_arn.to_string());
-        ContextManager::global().set_request(request_id.to_string(), None);
+        // Note: ContextManager.set_request() already called in event_loop.rs
+        // ARN already set during registration in main.rs
     }
 }
     
