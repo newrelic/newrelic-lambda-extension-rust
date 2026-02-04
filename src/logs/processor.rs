@@ -100,7 +100,7 @@ impl LogProcessor {
     pub fn new(
         newrelic_client: Arc<NewRelicClient>,
         config: Arc<ExtensionConfig>,
-        invocation_context: Arc<Mutex<InvocationContext>>,  // Keep for backward compat during migration
+        invocation_context: Arc<Mutex<InvocationContext>>,  // Used to extract initial request_id during processor creation
         apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     ) -> Self {
         let (buffered_logs, trace_extraction_state) = if config.new_relic.collect_trace_id {
