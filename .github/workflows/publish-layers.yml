@@ -1,0 +1,101 @@
+name: Build and Publish Lambda Layers
+
+on:
+  workflow_dispatch:
+  # Trigger on version tags (e.g., v1.0.0, v1.2.3)
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish-layers:
+    name: Build and Publish Lambda Layers
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cargo-zigbuild for cross-compilation
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Add Rust targets
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install AWS CLI
+        run: |
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install --update
+          aws --version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-west-2
+
+      - name: Set environment variables from workflow inputs
+        id: set-regions
+        run: |
+          # Only set environment variables if provided via workflow_dispatch inputs
+          # Otherwise, the script will use its own defaults
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ -n "${{ github.event.inputs.regions_x86_64 }}" ]; then
+              echo "REGIONS_X86_64=${{ github.event.inputs.regions_x86_64 }}" >> $GITHUB_ENV
+            fi
+            if [ -n "${{ github.event.inputs.regions_arm64 }}" ]; then
+              echo "REGIONS_ARM64=${{ github.event.inputs.regions_arm64 }}" >> $GITHUB_ENV
+            fi
+            if [ -n "${{ github.event.inputs.bucket_prefix }}" ]; then
+              echo "BUCKET_PREFIX=${{ github.event.inputs.bucket_prefix }}" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Build and publish layers
+        run: |
+          chmod +x scripts/ci/publish-layers.sh
+          bash scripts/ci/publish-layers.sh
+
+      - name: Upload layer ARNs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: layer-arns
+          path: dist/layer_arns.txt
+          retention-days: 90
+
+      - name: Display published layer ARNs
+        run: |
+          echo "## Published Layer ARNs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat dist/layer_arns.txt >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

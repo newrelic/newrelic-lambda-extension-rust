@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Local testing script for building and publishing Lambda layers
+# For production CI/CD, use scripts/ci/publish-layers.sh
+
 # Ensure we run from repo root so paths resolve
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(pwd)"
 cd "$ROOT_DIR"
 
 # --- Configuration ---
+# Layer naming prefix - change this to customize all layer names
+LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NewRelicLambdaRustExtension"}
+# eu-west-1 eu-west-2 eu-west-3 us-east-1 us-east-2 us-west-1 us-west-2
+
+# sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2
+# sa-east-1 me-central-1 me-south-1 eu-central-2 eu-north-1 eu-south-2 eu-south-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 ap-south-2 ap-southeast-4 ap-southeast-3 af-south-1
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-2"}
-REGIONS_ARM64=${REGIONS_ARM64:-"us-west-2"}
+REGIONS_X86_64=${REGIONS_X86_64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
+REGIONS_ARM64=${REGIONS_ARM64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
 
 BIN_NAME="newrelic-lambda-extension"
 DIST_DIR="$ROOT_DIR/dist"
@@ -64,22 +73,19 @@ package_extension_layer() {
 }
 
 # Builds a layer for a specific Python version
-build_python_layer() {
-  local py_version="$1"
-  local target="$2"
+build_python_layer_all() {
+  local target="$1"
   local arch="${target%%-*}"
-  local py_dot_version
-  py_dot_version=$(echo "$py_version" | sed 's/\(.\)/\1./')
-  local zip_name="$DIST_DIR/python${py_version}-${arch}.zip"
+  local zip_name="$DIST_DIR/python-all-${arch}.zip"
 
-  echo "Building New Relic layer for python$py_dot_version ($arch)" >&2
+  echo "Building single New Relic layer for all python ($arch)" >&2
 
   rm -rf "$LAYER_DIR"
-  mkdir -p "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
-  
-  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/lib/python${py_dot_version}/site-packages"
+  mkdir -p "$LAYER_DIR/python/"
+
+  pip3 install --no-cache-dir -qU newrelic newrelic-lambda -t "$LAYER_DIR/python/"
   cp "$SCRIPT_DIR/newrelic_lambda_wrapper.py" "$LAYER_DIR/python/newrelic_lambda_wrapper.py"
-  
+
   mkdir -p "$LAYER_DIR/extensions"
   cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
 
@@ -90,20 +96,48 @@ build_python_layer() {
 }
 
 # Builds a layer for a specific Node.js version
-build_nodejs_layer() {
-  local node_version="$1"
-  local target="$2"
+build_nodejs_layer_all() {
+  local target="$1"
   local arch="${target%%-*}"
-  local zip_name="$DIST_DIR/nodejs${node_version}-${arch}.zip"
+  local zip_name="$DIST_DIR/nodejs-all-${arch}.zip"
 
-  echo "Building New Relic layer for nodejs${node_version}.x ($arch)" >&2
+  echo "Building single New Relic layer for all nodejs ($arch)" >&2
 
   rm -rf "$LAYER_DIR"
   mkdir -p "$LAYER_DIR/nodejs/node_modules"
 
-  npm install --prefix "$LAYER_DIR/nodejs" newrelic@latest >/dev/null 2>&1
-  cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/index.js"
+  npm install --install-strategy=nested --prefix "$LAYER_DIR/nodejs" newrelic@latest
+  rm -rf "$LAYER_DIR/nodejs/node_modules/newrelic/node_modules/@opentelemetry"
 
+  # CommonJS wrapper
+  echo "Adding CommonJS wrapper..." >&2
+  mkdir -p "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper"
+  cp "$SCRIPT_DIR/index.js" "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/index.js"
+
+  cat > "$LAYER_DIR/nodejs/node_modules/newrelic-lambda-wrapper/package.json" << 'EOF'
+{
+  "name": "newrelic-lambda-wrapper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "commonjs"
+}
+EOF
+
+  # ESM wrapper
+  echo "Adding ESM wrapper..." >&2
+  mkdir -p "$LAYER_DIR/nodejs/node_modules/newrelic-esm-lambda-wrapper"
+  cp "$SCRIPT_DIR/esm.mjs" "$LAYER_DIR/nodejs/node_modules/newrelic-esm-lambda-wrapper/index.js"
+
+  cat > "$LAYER_DIR/nodejs/node_modules/newrelic-esm-lambda-wrapper/package.json" << 'EOF'
+{
+  "name": "newrelic-esm-lambda-wrapper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module"
+}
+EOF
+
+  # Add extension binary
   mkdir -p "$LAYER_DIR/extensions"
   cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
 
@@ -158,6 +192,19 @@ publish_layer() {
   echo "Published ${runtime_name} layer version ${layer_version} to ${region}"
   echo "Full Layer ARN: ${full_layer_arn}"
 
+  echo "→ Setting public permissions for layer version ${layer_version}" >&2
+  aws lambda add-layer-version-permission \
+    --layer-name "${layer_name}" \
+    --version-number "$layer_version" \
+    --statement-id public \
+    --action lambda:GetLayerVersion \
+    --principal "*" \
+    --region "$region" \
+    --output json >/dev/null
+
+  echo "✓ Layer is now publicly accessible" >&2
+
+
   local arch_upper
   arch_upper=$(echo "$arch" | tr '[:lower:]' '[:upper:]')
   local runtime_nodots
@@ -165,6 +212,35 @@ publish_layer() {
   local env_var_name="LAYER_ARN_${runtime_nodots}_${arch_upper}"
   
   echo "export $env_var_name='$full_layer_arn'" >> "$TMP_ENV_FILE_NAME"
+}
+
+# --- Cleanup Function ---
+
+cleanup_build_artifacts() {
+  echo ""
+  echo "=== Cleaning up build artifacts ==="
+
+  # Remove temporary layer directory
+  if [ -d "$LAYER_DIR" ]; then
+    echo "Removing temporary layer directory: $LAYER_DIR"
+    rm -rf "$LAYER_DIR"
+  fi
+
+  # Remove dist zip files (keep the environment file for reference)
+  if [ -d "$DIST_DIR" ]; then
+    echo "Removing zip files from: $DIST_DIR"
+    find "$DIST_DIR" -name "*.zip" -type f -delete
+  fi
+
+  # Remove Cargo build artifacts (target directory) - optional for local testing
+  # Uncomment the lines below if you want to clean build artifacts after publishing
+  # if [ -d "$ROOT_DIR/target" ]; then
+  #   echo "Removing Cargo build directory: $ROOT_DIR/target"
+  #   rm -rf "$ROOT_DIR/target"
+  # fi
+
+  echo "Cleanup complete!"
+  echo ""
 }
 
 # --- Main Execution Logic ---
@@ -177,55 +253,60 @@ main() {
   # --- Build for x86_64 ---
   local target_x86="x86_64-unknown-linux-musl"
   build_extension "$target_x86"
-  
+
   # Package and publish standalone extension
   package_extension_layer "$target_x86"
   for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "NRRustExtensionX86"
+    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
   done
 
-  # Package and publish Python layers
-  build_python_layer "312" "$target_x86"
+  # Package and publish single Python layer
+  build_python_layer_all "$target_x86"
   for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python312-x86_64.zip" "$region" "python3.12" "x86_64" "NRRustExtensionPython312X86"
+    publish_layer "$DIST_DIR/python-all-x86_64.zip" "$region" "python" "x86_64" "${LAYER_NAME_PREFIX}PythonX86"
   done
 
-  # Package and publish Python layers
-  build_python_layer "313" "$target_x86"
+  # Package and publish single Node.js layer
+  build_nodejs_layer_all "$target_x86"
   for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python313-x86_64.zip" "$region" "python3.13" "x86_64" "NRRustExtensionPython313X86"
+    publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "${LAYER_NAME_PREFIX}NodejsX86"
   done
 
-  # Package and publish Node.js layers
-  build_nodejs_layer "20" "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/nodejs20-x86_64.zip" "$region" "nodejs20.x" "x86_64" "NRRustExtensionNodejs20X86"
-  done
-
-  --- Build for arm64 ---
+  #--- Build for arm64 ---
   local target_arm="aarch64-unknown-linux-musl"
   build_extension "$target_arm"
 
   # Package and publish standalone extension
   package_extension_layer "$target_arm"
   for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "NRTestExtensionARM64"
+    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "${LAYER_NAME_PREFIX}ARM64"
   done
 
-  # Package and publish Python layers
-  build_python_layer "311" "$target_arm"
+  # Package and publish single Python layer
+  build_python_layer_all "$target_arm"
   for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/python311-aarch64.zip" "$region" "python3.11" "arm64" "NRTestExtensionPython311ARM64"
+    publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "${LAYER_NAME_PREFIX}PythonARM64"
   done
 
-  # Package and publish Node.js layers
-  build_nodejs_layer "20" "$target_arm"
+  # Package and publish single Node.js layer
+  build_nodejs_layer_all "$target_arm"
   for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/nodejs20-aarch64.zip" "$region" "nodejs20.x" "arm64" "NRTestExtensionNodejs20ARM64"
+    publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "${LAYER_NAME_PREFIX}NodejsARM64"
   done
 
-  echo "All layers published. Environment variables saved to $TMP_ENV_FILE_NAME"
+  echo ""
+  echo "=========================================="
+  echo "  All layers published successfully!     "
+  echo "=========================================="
+  echo ""
+  echo "Environment variables saved to $TMP_ENV_FILE_NAME"
   cat "$TMP_ENV_FILE_NAME"
+
+  # Cleanup after successful publish
+  cleanup_build_artifacts
+
+  echo "To load the layer ARNs into your environment, run:"
+  echo "  source $TMP_ENV_FILE_NAME"
 }
 
 main "$@"

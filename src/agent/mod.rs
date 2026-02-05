@@ -1,3 +1,4 @@
 // src/agent/mod.rs
 pub mod ipc;
-pub mod processor;
+pub mod batch;
+pub mod payload;

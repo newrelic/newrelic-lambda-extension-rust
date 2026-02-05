@@ -1,3 +1,11 @@
 target
 scripts/.layer/
 scripts/dist/
+.env
+java/dist/
+dist/
+.gradle/
+.idea/
+.vscode/
+.DS_Store
+build/

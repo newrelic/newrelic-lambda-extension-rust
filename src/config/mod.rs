@@ -1,5 +1,5 @@
 use std::{env, time::Duration};
-use tracing::{info, Event, Subscriber};
+use tracing::{debug, warn, Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, FmtContext, FormatEvent, FormatFields},
     registry::LookupSpan,
@@ -9,74 +9,52 @@ use tracing_subscriber::{
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
-    // New Relic Configuration
     pub new_relic: NewRelicConfig,
-
-    // AWS Lambda Configuration
     pub aws: AwsConfig,
-
-    // Extension Configuration
     pub extension: ExtensionSettings,
 }
 
 /// New Relic specific configuration
 #[derive(Debug, Clone)]
 pub struct NewRelicConfig {
-    /// Enable/disable the New Relic Lambda Extension
     pub extension_enabled: bool,
-
-    /// New Relic License Key for authentication
     pub license_key: Option<String>,
-
-    /// AWS Secrets Manager secret ID for license key
     pub license_key_secret_id: String,
-
-    /// AWS SSM Parameter Store parameter name for license key
     pub license_key_ssm_parameter_name: String,
-
-    /// Original Lambda handler (before wrapping)
     pub lambda_handler: Option<String>,
-
-    /// New Relic telemetry endpoint URL
     pub telemetry_endpoint: String,
-
-    /// New Relic log endpoint URL
     pub log_endpoint: String,
-
-    /// The interval at which to send data to New Relic
+    #[allow(dead_code)]
     pub harvest_interval: Duration,
+    pub collect_trace_id: bool,
+    pub add_version_detail_tags: bool,
+    pub layer_version: Option<String>,
+    pub apm_lambda_mode: bool,
+    pub apm_host: String,
+    pub metric_endpoint: String,
 }
 
 /// AWS Lambda specific configuration
 #[derive(Debug, Clone)]
 pub struct AwsConfig {
-    /// AWS Lambda Runtime API endpoint
     pub runtime_api: String,
-
-    /// Lambda function name
     pub function_name: String,
+    pub function_version: Option<String>,
+    pub account_id: Option<String>,
+    pub region: Option<String>,
 }
 
 /// Extension specific settings
 #[derive(Debug, Clone)]
 pub struct ExtensionSettings {
-    /// Extension name
-    pub name: String,
-
-    /// Maximum telemetry items per batch
-    pub max_batch_items: usize,
-
-    /// Maximum telemetry batch size in bytes
-    pub max_batch_size: usize,
-
-    /// Telemetry timeout in milliseconds
-    pub telemetry_timeout: u64,
-
-    /// Whether to subscribe to function telemetry/logs (Lambda 'function' type)
     pub send_function_logs: bool,
-
-    /// Whether to subscribe to extension logs (Lambda 'extension' type)
     pub send_extension_logs: bool,
+    pub send_platform_logs: bool,
+    pub log_level: String,
+    /// NEW_RELIC_EXTENSION_LOGS_ENABLED - Master switch for [NR_EXT] log output
+    /// Default: true (logs enabled)
+    /// If false, suppresses all [NR_EXT] prefixed logs from appearing in CloudWatch
+    pub extension_logs_enabled: bool,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -117,7 +95,13 @@ impl Default for NewRelicConfig {
             lambda_handler: None,
             telemetry_endpoint: "https://cloud-collector.newrelic.com/aws/lambda/v1".to_string(),
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
-            harvest_interval: Duration::from_secs(2), // More frequent flushing
+            harvest_interval: Duration::from_secs(2),
+            collect_trace_id: false,
+            add_version_detail_tags: false,
+            layer_version: None,
+            apm_lambda_mode: false,
+            apm_host: "collector.newrelic.com".to_string(),
+            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
         }
     }
 }
@@ -127,6 +111,65 @@ impl Default for AwsConfig {
         Self {
             runtime_api: "127.0.0.1:9001".to_string(),
             function_name: "unknown".to_string(),
+            function_version: None,
+            account_id: None,
+            region: None,
+        }
+    }
+}
+
+impl AwsConfig {
+    /// Suppress dead_code warning: This function is actually used but the compiler
+    /// cannot detect it due to dynamic dispatch/reflection patterns
+    #[allow(dead_code)]
+    pub fn construct_function_arn(&self) -> Option<String> {
+        if self.function_name.is_empty() {
+            return None;
+        }
+
+        let region = env::var("AWS_REGION")
+            .or_else(|_| env::var("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|_| "us-east-1".to_string());
+
+        // Get account ID, return None if not available (don't use placeholder)
+        let Some(account_id) = self.account_id.as_ref()
+            .and_then(|id| if id.is_empty() { None } else { Some(id.as_str()) })
+        else {
+            warn!("Cannot construct ARN: account ID not available from registration yet");
+            return None;
+        };
+
+        Some(format!(
+            "arn:aws:lambda:{}:{}:function:{}",
+            region, account_id, self.function_name
+        ))
+    }
+
+    pub fn update_from_registration(&mut self, function_name: String, function_version: String, account_id: Option<String>) {
+        self.function_name = function_name;
+        self.function_version = Some(function_version);
+        self.account_id = account_id;
+
+        if self.region.is_none() {
+            self.region = env::var("AWS_REGION").ok();
+        }
+    }
+
+    pub fn extract_and_update_account_id_from_arn(&mut self, invoked_function_arn: &str) {
+        if self.account_id.is_none() || self.account_id.as_ref().map_or(true, |id| id.is_empty() || id == "123456789012") {
+            if let Some(extracted_account_id) = Self::extract_account_id_from_arn(invoked_function_arn) {
+                debug!("Extracted account ID from ARN: {}", extracted_account_id);
+                self.account_id = Some(extracted_account_id);
+            }
+        }
+    }
+
+    fn extract_account_id_from_arn(arn: &str) -> Option<String> {
+        let parts: Vec<&str> = arn.split(':').collect();
+        if parts.len() >= 5 && parts[0] == "arn" && parts[2] == "lambda" {
+            Some(parts[4].to_string())
+        } else {
+            None
         }
     }
 }
@@ -134,23 +177,32 @@ impl Default for AwsConfig {
 impl Default for ExtensionSettings {
     fn default() -> Self {
         Self {
-            name: "newrelic-lambda-extension".to_string(),
-            max_batch_size: 262_144, // 256KB
-            max_batch_items: 1000,
-            telemetry_timeout: 25, // 25ms for immediate delivery
             send_function_logs: false,
             send_extension_logs: false,
+            send_platform_logs: false,
+            log_level: "info".to_string(),
+            extension_logs_enabled: true,
         }
     }
 }
 
 impl ExtensionConfig {
-    /// Load configuration from environment variables
+    /// Validates the log level and returns a valid level or defaults to "info" with a warning
+    fn validate_log_level(raw_level: &str) -> String {
+        let normalized = raw_level.to_lowercase();
+        match normalized.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" | "all" => normalized,
+            _ => {
+                eprintln!("[NR_EXT] WARNING: Invalid log level '{}' provided in NEW_RELIC_EXTENSION_LOG_LEVEL. Defaulting to 'info'. Valid values are: trace, debug, info, warn, error, all", raw_level);
+                "info".to_string()
+            }
+        }
+    }
+
     pub fn from_env() -> Self {
-        // Read (potential) log forwarding flags early so they can be used in later logic.
-        // These are currently not wired into config structs; added per user request.
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
+        let send_platform_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS").unwrap_or_default();
 
         let mut config = Self::default();
 
@@ -161,46 +213,51 @@ impl ExtensionConfig {
             .unwrap_or(true);
 
         config.new_relic.license_key = env::var("NEW_RELIC_LICENSE_KEY").ok();
-        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET_ID").unwrap_or_default();
+        config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET").unwrap_or_default();
         config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
-
-        let license_key_prefix = config.new_relic.license_key.as_deref().unwrap_or("").get(0..2);
-
-        if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
-            config.new_relic.telemetry_endpoint = endpoint;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.telemetry_endpoint =
-                "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
+        
+        fn parse_bool(s: &str) -> bool {
+            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
         }
+        let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
+        config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
-        if let Ok(endpoint) = env::var("NEW_RELIC_LOG_ENDPOINT") {
-            config.new_relic.log_endpoint = endpoint;
-        } else if let Some("eu") = license_key_prefix {
-            config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
-        }
+        let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
+        config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
-        // Load AWS Lambda configuration
+        config.new_relic.layer_version = env::var("NEW_RELIC_LAYER_VERSION").ok();
+
+        let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
+        config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
         }
 
-        config.aws.function_name =
-            env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or(config.aws.function_name);
+        // Note: function_name is set from extension registration response, not from env var
 
-        // Parse the optional boolean flags (accept true/false/1/0/yes/no case-insensitive)
-        fn parse_bool(s: &str) -> bool {
-            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        }
         config.extension.send_function_logs = parse_bool(&send_function_logs_str);
         config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
+        config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
+
+        let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        config.extension.log_level = Self::validate_log_level(&raw_log_level);
+
+        let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
+        config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
 
         config
     }
+
+
 }
 
 /// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
-struct CustomFormatter;
+/// Conditional output based on NEW_RELIC_EXTENSION_LOGS_ENABLED environment variable.
+struct CustomFormatter {
+    enabled: bool,
+}
 
 impl<S, N> FormatEvent<S, N> for CustomFormatter
 where
@@ -213,14 +270,15 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
-        // Add the static prefix
-        write!(writer, "[NR_EXT]")?;
+        // If extension logs are disabled, skip formatting (suppresses output)
+        if !self.enabled {
+            return Ok(());
+        }
 
-        // Add the log level
+        write!(writer, "[NR_EXT] ")?;
         let metadata = event.metadata();
-        write!(writer, ":{}:", metadata.level())?;
+        write!(writer, "{} ", metadata.level())?;
 
-        // OPTIMIZATION: Only include file and line numbers in debug builds.
         #[cfg(debug_assertions)]
         {
             if let Some(file) = metadata.file() {
@@ -231,11 +289,40 @@ where
             }
         }
 
-        // Add the message
         ctx.format_fields(writer.by_ref(), event)?;
 
         writeln!(writer)
     }
+}
+
+/// Parse NR_TAGS environment variable into key-value pairs
+/// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
+/// 
+/// # Example
+/// ```
+/// std::env::set_var("NR_TAGS", "env:prod;team:backend");
+/// let tags = parse_nr_tags();
+/// assert_eq!(tags, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
+/// ```
+pub fn parse_nr_tags() -> Vec<(String, String)> {
+    let nr_tags = match env::var("NR_TAGS") {
+        Ok(tags) if !tags.is_empty() => tags,
+        _ => return Vec::new(),
+    };
+
+    let delimiter = env::var("NR_ENV_DELIMITER").unwrap_or_else(|_| ";".to_string());
+
+    nr_tags
+        .split(&delimiter)
+        .filter_map(|tag| {
+            let parts: Vec<&str> = tag.split(':').collect();
+            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                Some((parts[0].trim().to_string(), parts[1].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Global configuration instance
@@ -248,56 +335,204 @@ pub fn init_config() -> &'static ExtensionConfig {
         CONFIG_INIT.call_once(|| {
             let config = ExtensionConfig::from_env();
 
-            // Read log level from NEW_RELIC_EXTENSION_LOG_LEVEL, defaulting to "info"
-            let log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL")
-                .unwrap_or_else(|_| "info".to_string());
-            let env_filter = EnvFilter::new(log_level);
+            let log_level = if config.extension.log_level.to_lowercase() == "all" {
+                "trace".to_string()
+            } else {
+                config.extension.log_level.clone()
+            };
 
-            // Use the custom formatter
+            let filter_directive = format!(
+                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
+                log_level,
+                log_level
+            );
+
+            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+            let env_filter = match EnvFilter::try_new(&filter_directive) {
+                Ok(filter) => filter,
+                Err(e) => {
+                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
+                    EnvFilter::try_new(fallback_directive)
+                        .expect("Fallback filter directive should always be valid")
+                }
+            };
+
             let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
-                .event_format(CustomFormatter)
+                .event_format(CustomFormatter {
+                    enabled: config.extension.extension_logs_enabled,
+                })
                 .finish();
 
             tracing::subscriber::set_global_default(subscriber)
                 .expect("setting default subscriber failed");
 
-            info!("[Config] New Relic Lambda Extension configuration loaded");
-            info!(
-                "[Config] Extension enabled: {}",
-                config.new_relic.extension_enabled
-            );
-            info!(
-                "[Config] License key: {}",
-                if config.new_relic.license_key.is_some() {
-                    "Set"
-                } else {
-                    "Not set"
-                }
-            );
-            info!(
-                "[Config] Send function logs: {} | Send extension logs: {}",
-                config.extension.send_function_logs,
-                config.extension.send_extension_logs
-            );
-            info!("[Config] Telemetry endpoint: {}", config.new_relic.telemetry_endpoint);
-            info!("[Config] Log endpoint: {}", config.new_relic.log_endpoint);
+            debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
             GLOBAL_CONFIG = Some(config);
         });
 
-        GLOBAL_CONFIG.as_ref().unwrap()
+        #[allow(static_mut_refs)]
+        {
+            GLOBAL_CONFIG.as_ref().unwrap()
+        }
     }
 }
 
-/// Get the global configuration
-pub fn get_config() -> &'static ExtensionConfig {
-    unsafe {
-        GLOBAL_CONFIG
-            .as_ref()
-            .unwrap_or_else(|| {
-                panic!("Configuration not initialized. Call init_config() first.");
-            })
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_nr_tags_with_default_delimiter() {
+        // Save and clear environment
+        let original_tags = env::var("NR_TAGS").ok();
+        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
+        
+        env::set_var("NR_TAGS", "env:prod;team:backend;region:us-east-1");
+        env::remove_var("NR_ENV_DELIMITER");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 3);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        assert!(tags.contains(&("region".to_string(), "us-east-1".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+        if let Some(val) = original_delimiter {
+            env::set_var("NR_ENV_DELIMITER", val);
+        } else {
+            env::remove_var("NR_ENV_DELIMITER");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_with_custom_delimiter() {
+        let original_tags = env::var("NR_TAGS").ok();
+        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
+        
+        env::set_var("NR_TAGS", "env:prod|team:backend");
+        env::set_var("NR_ENV_DELIMITER", "|");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+        if let Some(val) = original_delimiter {
+            env::set_var("NR_ENV_DELIMITER", val);
+        } else {
+            env::remove_var("NR_ENV_DELIMITER");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_with_whitespace() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::set_var("NR_TAGS", " env : prod ; team : backend ");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_invalid_format() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        // Test invalid formats - should be skipped
+        env::set_var("NR_TAGS", "invalid;env:prod;also-invalid;team:backend");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_empty_values() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        // Test empty keys/values - should be skipped
+        env::set_var("NR_TAGS", ":value;key:;env:prod");
+        
+        let tags = parse_nr_tags();
+        
+        assert_eq!(tags.len(), 1);
+        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_not_set() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::remove_var("NR_TAGS");
+        
+        let tags = parse_nr_tags();
+        
+        assert!(tags.is_empty());
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        }
+    }
+
+    #[test]
+    fn test_parse_nr_tags_empty_string() {
+        let original_tags = env::var("NR_TAGS").ok();
+        
+        env::set_var("NR_TAGS", "");
+        
+        let tags = parse_nr_tags();
+        
+        assert!(tags.is_empty());
+        
+        // Restore environment
+        if let Some(val) = original_tags {
+            env::set_var("NR_TAGS", val);
+        } else {
+            env::remove_var("NR_TAGS");
+        }
     }
 }
 
