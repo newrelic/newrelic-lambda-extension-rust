@@ -2,7 +2,7 @@
 name = "newrelic-lambda-extension"
 version = "2.4.5"
 edition = "2021"
-authors = ["Venkata Ravi Teja Maddirala <vmaddirala@newrelic.com>", "Chodavarapu Naga Viswanadha Avinash <aavinash@newrelic.com>"]
+authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
 license = "Apache-2.0"
 repository = "https://github.com/yourusername/newrelic-lambda-extension"
