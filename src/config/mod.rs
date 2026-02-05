@@ -51,6 +51,10 @@ pub struct ExtensionSettings {
     pub send_extension_logs: bool,
     pub send_platform_logs: bool,
     pub log_level: String,
+    /// NEW_RELIC_EXTENSION_LOGS_ENABLED - Master switch for [NR_EXT] log output
+    /// Default: true (logs enabled)
+    /// If false, suppresses all [NR_EXT] prefixed logs from appearing in CloudWatch
+    pub extension_logs_enabled: bool,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -177,6 +181,7 @@ impl Default for ExtensionSettings {
             send_extension_logs: false,
             send_platform_logs: false,
             log_level: "info".to_string(),
+            extension_logs_enabled: true,
         }
     }
 }
@@ -239,6 +244,9 @@ impl ExtensionConfig {
         let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         config.extension.log_level = Self::validate_log_level(&raw_log_level);
 
+        let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
+        config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
+
         config
     }
 
@@ -246,7 +254,10 @@ impl ExtensionConfig {
 }
 
 /// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
-struct CustomFormatter;
+/// Conditional output based on NEW_RELIC_EXTENSION_LOGS_ENABLED environment variable.
+struct CustomFormatter {
+    enabled: bool,
+}
 
 impl<S, N> FormatEvent<S, N> for CustomFormatter
 where
@@ -259,6 +270,11 @@ where
         mut writer: fmt::format::Writer<'_>,
         event: &Event<'_>,
     ) -> std::fmt::Result {
+        // If extension logs are disabled, skip formatting (suppresses output)
+        if !self.enabled {
+            return Ok(());
+        }
+
         write!(writer, "[NR_EXT] ")?;
         let metadata = event.metadata();
         write!(writer, "{} ", metadata.level())?;
@@ -344,7 +360,9 @@ pub fn init_config() -> &'static ExtensionConfig {
 
             let subscriber = fmt::Subscriber::builder()
                 .with_env_filter(env_filter)
-                .event_format(CustomFormatter)
+                .event_format(CustomFormatter {
+                    enabled: config.extension.extension_logs_enabled,
+                })
                 .finish();
 
             tracing::subscriber::set_global_default(subscriber)
