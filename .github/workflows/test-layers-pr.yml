@@ -1,0 +1,238 @@
+name: Build Test Layers on PR
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      # Trigger on Rust code changes
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      # Trigger on scripts that affect layers
+      - 'scripts/**'
+      # Exclude documentation changes
+      - '!**/*.md'
+      - '!docs/**'
+      - '!README.md'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AWS_REGION: us-west-1
+  TEST_MODE: "true"
+
+jobs:
+  build-test-layers:
+    name: Build and Publish Test Layers
+    runs-on: ubuntu-latest
+    
+    outputs:
+      layers_created: ${{ steps.build_layers.outputs.layers_created }}
+      python_x86_arn: ${{ steps.capture_arns.outputs.python_x86_arn }}
+      python_arm_arn: ${{ steps.capture_arns.outputs.python_arm_arn }}
+      nodejs_x86_arn: ${{ steps.capture_arns.outputs.nodejs_x86_arn }}
+      nodejs_arm_arn: ${{ steps.capture_arns.outputs.nodejs_arm_arn }}
+    
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Install cargo-zigbuild for cross-compilation
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Add Rust targets
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+          bundler-cache: false
+
+      - name: Install dependencies
+        run: |
+          # Install jq for JSON parsing
+          sudo apt-get update && sudo apt-get install -y jq
+          
+          # Install bundler for Ruby
+          gem install bundler
+          
+          # Install AWS CLI
+          pip3 install --upgrade pip awscli
+
+      - name: Build and publish test layers
+        id: build_layers
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          # Set environment variables for test mode
+          export TEST_MODE="true"
+          export LAYER_NAME_PREFIX="NRTestRustExtension"
+          export BUCKET_PREFIX="nr-extension-test-layers"
+          export REGIONS_X86_64="us-west-1"
+          export REGIONS_ARM64="us-west-1"
+          export LANGUAGES="python nodejs java dotnet ruby"
+          
+          # Run the unified script
+          chmod +x scripts/createlayer.sh
+          ./scripts/createlayer.sh
+          
+          # Capture layer ARNs
+          if [ -f dist/nr_tmp_env.sh ]; then
+            echo "✓ Layer ARNs generated:"
+            cat dist/nr_tmp_env.sh
+            echo "layers_created=true" >> $GITHUB_OUTPUT
+          else
+            echo "✗ Failed to generate layer ARNs"
+            echo "layers_created=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Capture Layer ARNs
+        id: capture_arns
+        if: steps.build_layers.outputs.layers_created == 'true'
+        run: |
+          # Source the env file and export to GitHub outputs
+          source dist/nr_tmp_env.sh
+          echo "python_x86_arn=${LAYER_ARN_PYTHON_X86_64}" >> $GITHUB_OUTPUT
+          echo "python_arm_arn=${LAYER_ARN_PYTHON_ARM64}" >> $GITHUB_OUTPUT
+          echo "nodejs_x86_arn=${LAYER_ARN_NODEJS_X86_64}" >> $GITHUB_OUTPUT
+          echo "nodejs_arm_arn=${LAYER_ARN_NODEJS_ARM64}" >> $GITHUB_OUTPUT
+
+      - name: Comment on PR with Layer ARNs
+        if: steps.build_layers.outputs.layers_created == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            // Read the environment file with layer ARNs
+            const envFile = fs.readFileSync('dist/nr_tmp_env.sh', 'utf8');
+            
+            // Parse layer ARNs from the file
+            const layerArns = {};
+            envFile.split('\n').forEach(line => {
+              const match = line.match(/export LAYER_ARN_(\w+)='([^']+)'/);
+              if (match) {
+                layerArns[match[1]] = match[2];
+              }
+            });
+            
+            // Build comment body
+            let commentBody = '## 🚀 Test Lambda Layers Published\n\n';
+            commentBody += `Test layers have been successfully published to **${process.env.AWS_REGION}** for this PR.\n\n`;
+            commentBody += '### Layer ARNs\n\n';
+            
+            // Group by language
+            const languages = {
+              'Python': [],
+              'Node.js': [],
+              'Java': [],
+              '.NET': [],
+              'Ruby': []
+            };
+            
+            Object.entries(layerArns).forEach(([key, arn]) => {
+              if (key.includes('PYTHON')) {
+                languages['Python'].push({ key, arn });
+              } else if (key.includes('NODEJS')) {
+                languages['Node.js'].push({ key, arn });
+              } else if (key.includes('JAVA')) {
+                languages['Java'].push({ key, arn });
+              } else if (key.includes('DOTNET')) {
+                languages['.NET'].push({ key, arn });
+              } else if (key.inclu⚠️ Test Layers Notice\n\n';
+            commentBody += '> **These are TEST layers created specifically for this PR.** They are published to `us-west-1` for testing purposes only.\n\n';
+            commentBody += '### Usage\n\n';
+            commentBody += 'You can test these layers in your Lambda functions using the AWS CLI or Console.\n\n';
+            commentBody += '**AWS CLI Example:**\n';
+            commentBody += '```bash\n';
+            commentBody += 'aws lambda update-function-configuration \\\n';
+            commentBody += '  --function-name your-function-name \\\n';
+            commentBody += '  --region us-west-1 \\\n';
+            commentBody += '  --layers "<LAYER_ARN>"\n';
+            commentBody += '```\n\n';
+            commentBody += '---\n';
+            commentBody += `*Test layers created from commit ${context.sha.substring(0, 7)} • Region: us-west-1
+                  const arch = key.includes('X86') ? 'x86_64' : 'arm64';
+                  commentBody += `- **${arch}**: \`${arn}\`\n`;
+                });
+              }
+            }
+            
+            commentBody += '\n### Usage\n\n';
+            commentBody += 'You can test these layers in your Lambda functions using the AWS CLI or Console.\n\n';
+            commentBody += '**AWS CLI Example:**\n';
+            commentBody += '```bash\n';
+            commentBody += 'aws lambda update-function-configuration \\\n';
+            commentBody += '  --function-name your-function-name \\\n';
+            commentBody += '  --layers "<LAYER_ARN>"\n';
+            commentBody += '```\n\n';
+            commentBody += '---\n';
+            commentBody += `*Layers created from commit ${context.sha.substring(0, 7)}*`;
+            
+            // Post comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });
+
+      - name: Upload layer ARNs as artifact
+        if: steps.build_layers.outputs.layers_created == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-layer-arns
+          path: dist/nr_tmp_env.sh
+          retention-days: 30
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.build_layers.outputs.layers_created }}" == "true" ]; then
+            echo "✅ Test layers successfully built and published to us-west-1" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Layer ARNs" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat dist/nr_tmp_env.sh >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Failed to build test layers" >> $GITHUB_STEP_SUMMARY
+          fi
