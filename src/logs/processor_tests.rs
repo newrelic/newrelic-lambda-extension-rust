@@ -438,15 +438,60 @@ mod tests {
     }
 
     #[test]
-    fn test_multiple_keywords_first_wins() {
+    fn test_multiple_keywords_earliest_position_wins() {
         let processor = create_test_processor();
         let record = json!({});
-        
-        // When multiple keywords present, first match in priority order should win
-        // Priority: fatal > critical > error > warning > warn > debug > trace > info
+
+        // With position-priority, the keyword appearing earliest in the message wins.
+        // "warn" at position 0 beats "critical" at position 6.
         assert_eq!(
             processor.extract_log_level(&record, "warn: critical error detected"),
-            "ERROR"  // "fatal" is higher priority, but "critical" appears first
+            "WARN"
+        );
+
+        // "error" at position 0 beats "info" at position 20
+        assert_eq!(
+            processor.extract_log_level(&record, "error occurred, see info panel"),
+            "ERROR"
+        );
+    }
+
+    #[test]
+    fn test_level_prefix_beats_body_keyword() {
+        let processor = create_test_processor();
+        let record = json!({});
+
+        // [INFO] prefix at position 1 beats "error" in "No error detected" in the body
+        assert_eq!(
+            processor.extract_log_level(
+                &record,
+                "[INFO] 2026-02-11T09:34:01.262Z Status check: No error detected. System is running fine."
+            ),
+            "INFO"
+        );
+
+        // [INFO] prefix beats "error" anywhere in the body
+        assert_eq!(
+            processor.extract_log_level(&record, "[INFO] An error was logged but handled gracefully"),
+            "INFO"
+        );
+
+        // [ERROR] prefix beats "info" later in the body
+        assert_eq!(
+            processor.extract_log_level(&record, "[ERROR] See info at https://example.com"),
+            "ERROR"
+        );
+
+        // [WARN] prefix beats "error" in body
+        assert_eq!(
+            processor.extract_log_level(&record, "[WARN] Retrying after error"),
+            "WARN"
+        );
+
+        // INFO prefix (without brackets) beats "error" in body
+        assert_eq!(
+            processor.extract_log_level(&record, "INFO: No error detected in health check"),
+            "INFO"
         );
     }
 
@@ -508,6 +553,21 @@ mod tests {
         
         assert_eq!(
             processor.extract_log_level(&record, "{\"message\":\"Processed successfully\",\"Errors\":[]}"),
+            "INFO"
+        );
+    }
+
+    #[test]
+    fn test_lambda_info_no_error_detected() {
+        let processor = create_test_processor();
+        let record = json!({});
+
+        // Exact format from bug report: INFO-level log with "No error detected" in body
+        assert_eq!(
+            processor.extract_log_level(
+                &record,
+                "[INFO] 2026-02-11T09:34:01.262Z 6f7dec01-8b9d-4e81-a146-99b4884a39c3 Status check: No error detected. System is running fine at 52.53.184.198."
+            ),
             "INFO"
         );
     }

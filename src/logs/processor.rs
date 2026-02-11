@@ -288,23 +288,11 @@ impl LogProcessor {
             }).is_some();
 
             // Determine if this log should be treated as an error
-            // Priority: Check structured JSON level field first, then fall back to keyword matching
-            let structured_level = get_structured_log_level(&record.record);
-            
-            let should_treat_as_error = if record.record_type == "function" && message_str.len() > 0 {
-                match &structured_level {
-                    Some(level) => {
-                        // Respect structured level - only ERROR/FATAL/CRITICAL are errors
-                        matches!(level.as_str(), "ERROR" | "FATAL" | "CRITICAL")
-                    }
-                    None => {
-                        // Fall back to keyword matching ONLY for unstructured logs
-                        message_str.contains("Task timed out") ||
-                        message_str.contains("error") || message_str.contains("Error") ||
-                        message_str.contains("Exception") || message_str.contains("exception") ||
-                        message_str.contains("Fatal") || message_str.contains("fatal")
-                    }
-                }
+            // Uses extract_log_level which handles both structured JSON levels and
+            // unstructured keyword matching with position-priority and word boundaries
+            let should_treat_as_error = if record.record_type == "function" && !message_str.is_empty() {
+                message_str.contains("Task timed out")
+                    || self.extract_log_level(&record.record, message_str) == "ERROR"
             } else {
                 false
             };
@@ -338,7 +326,7 @@ impl LogProcessor {
                 }
 
                 if is_apm_mode {
-                    debug!("APM mode: Error detected in function log (structured={:?}): {}", structured_level, sanitized_msg);
+                    debug!("APM mode: Error detected in function log: {}", sanitized_msg);
                     debug!("APM mode: Sending error event for request_id: {}", request_id);
 
                     if let Some(ref apm_app_arc) = self.apm_app {
@@ -355,7 +343,7 @@ impl LogProcessor {
                     }
                 } else {
                     // Standard (non-APM) mode: Send errors to telemetry endpoint
-                    debug!("Standard mode: Error detected in function log (structured={:?}): {}", structured_level, sanitized_msg);
+                    debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
                     debug!("Standard mode: Sending error for request_id: {}", request_id);
 
                     // Determine error type - use consistent LambdaError for all function errors
@@ -583,14 +571,15 @@ impl LogProcessor {
             };
         }
 
-        // FALLBACK: Efficient single-pass parsing for unstructured logs
-        // Use zero-copy string slice (max 150 chars for better coverage)
+        // FALLBACK: Position-priority parsing for unstructured logs
+        // The earliest keyword match wins, because log level prefixes (e.g. [INFO], ERROR:)
+        // appear at the start of the line, before any message body that might contain
+        // level-like words (e.g. "No error detected").
         let search_limit = message.len().min(150);
         let search_area = &message[..search_limit];
         let lower = search_area.to_lowercase();
-        
-        // Level keywords with priority ordering (most severe first)
-        // Each tuple: (keyword, output_level)
+
+        // Level keywords mapped to their output levels
         const LEVELS: &[(&str, &str)] = &[
             ("fatal", "ERROR"),
             ("critical", "ERROR"),
@@ -601,8 +590,10 @@ impl LogProcessor {
             ("trace", "TRACE"),
             ("info", "INFO"),
         ];
-        
-        // Single-pass keyword detection with word boundary checking
+
+        // Find all keyword matches with valid word boundaries, pick earliest position
+        let mut best_match: Option<(usize, &str)> = None;
+
         for &(keyword, level) in LEVELS {
             if let Some(pos) = lower.find(keyword) {
                 // Check word boundaries to prevent false matches
@@ -611,21 +602,27 @@ impl LogProcessor {
                     let prev_byte = lower.as_bytes()[pos - 1];
                     !prev_byte.is_ascii_alphanumeric()
                 };
-                
+
                 // After: must be end of string or non-alphanumeric
                 let after_pos = pos + keyword.len();
                 let after_ok = after_pos >= lower.len() || {
                     let next_byte = lower.as_bytes()[after_pos];
                     !next_byte.is_ascii_alphanumeric()
                 };
-                
+
                 if before_ok && after_ok {
-                    return level;
+                    match best_match {
+                        Some((best_pos, _)) if pos >= best_pos => {}
+                        _ => best_match = Some((pos, level)),
+                    }
                 }
             }
         }
-        
-        "INFO"
+
+        match best_match {
+            Some((_, level)) => level,
+            None => "INFO",
+        }
     }
 
     /// Construct ARN from registration response Format: arn:aws:lambda:{region}:{account_id}:function:{function_name}
