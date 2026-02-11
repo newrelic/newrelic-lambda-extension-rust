@@ -199,10 +199,38 @@ impl ExtensionConfig {
         }
     }
 
+    /// Parse NEW_RELIC_EXTENSION_SEND_LOGS environment variable
+    /// Accepts comma-separated values: platform, extension, function, all
+    /// Returns (send_function_logs, send_extension_logs, send_platform_logs)
+    fn parse_send_logs(value: &str) -> (bool, bool, bool) {
+        let normalized = value.to_lowercase();
+        let parts: Vec<&str> = normalized.split(',').map(|s| s.trim()).collect();
+        
+        // NEW: Check for empty string
+        if normalized.is_empty() {
+            eprintln!("NEW_RELIC_EXTENSION_SEND_LOGS is empty. No logs will be sent");
+            return (false, false, false);
+        }
+        // Check for "all" first
+        if parts.contains(&"all") {
+           if parts.len() > 1 {
+                eprintln!("[NR_EXT] INFO: 'all' specified in SEND_LOGS;defaulting to 'all'");
+            }
+            return (true, true, true);
+        }
+        
+        let send_function = parts.contains(&"function");
+        let send_extension = parts.contains(&"extension");
+        let send_platform = parts.contains(&"platform");
+        
+        (send_function, send_extension, send_platform)
+    }
+
     pub fn from_env() -> Self {
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
         let send_platform_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS").unwrap_or_default();
+        let send_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_LOGS").unwrap_or_default();
 
         let mut config = Self::default();
 
@@ -237,9 +265,18 @@ impl ExtensionConfig {
 
         // Note: function_name is set from extension registration response, not from env var
 
-        config.extension.send_function_logs = parse_bool(&send_function_logs_str);
-        config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
-        config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
+        // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
+        if !send_logs_str.is_empty() {
+            let (function, extension, platform) = Self::parse_send_logs(&send_logs_str);
+            config.extension.send_function_logs = function;
+            config.extension.send_extension_logs = extension;
+            config.extension.send_platform_logs = platform;
+        } else {
+            // Fall back to individual environment variables for backward compatibility
+            config.extension.send_function_logs = parse_bool(&send_function_logs_str);
+            config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
+            config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
+        }
 
         let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         config.extension.log_level = Self::validate_log_level(&raw_log_level);
@@ -535,4 +572,3 @@ mod tests {
         }
     }
 }
-
