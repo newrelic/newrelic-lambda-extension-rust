@@ -56,6 +56,20 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+          cache: true
+
+      - name: Cache Rust build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Install cargo-zigbuild for cross-compilation
         run: |
@@ -71,23 +85,48 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: 'pip'
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'scripts/package-lock.json'
 
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
+          cache: 'gradle'
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            scripts/java/.gradle
+            scripts/java/build
+          key: ${{ runner.os }}-gradle-${{ hashFiles('scripts/java/**/*.gradle*', 'scripts/java/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
 
       - name: Set up Ruby
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'
-          bundler-cache: false
+          bundler-cache: true
+          working-directory: 'scripts/ruby'
+
+      - name: Cache .NET agent downloads
+        uses: actions/cache@v4
+        with:
+          path: /tmp/newrelic-dotnet-agent*.tar.gz
+          key: ${{ runner.os }}-dotnet-agent-${{ hashFiles('scripts/createlayer.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-dotnet-agent-
 
       - name: Install dependencies
         run: |
