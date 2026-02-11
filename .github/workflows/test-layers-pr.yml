@@ -208,7 +208,7 @@ jobs:
             
             // Group by language
             const languages = {
-              'Extension Only (Rust)': [],
+              'Extension Only': [],
               'Python': [],
               'Node.js': [],
               'Java': [],
@@ -218,7 +218,7 @@ jobs:
             
             Object.entries(layerArns).forEach(([key, arn]) => {
               if (key.includes('EXTENSION') && !key.includes('PYTHON') && !key.includes('NODEJS')) {
-                languages['Extension Only (Go)'].push({ key, arn });
+                languages['Extension Only'].push({ key, arn });
               } else if (key.includes('PYTHON')) {
                 languages['Python'].push({ key, arn });
               } else if (key.includes('NODEJS')) {
