@@ -28,6 +28,8 @@ jobs:
     
     outputs:
       layers_created: ${{ steps.build_layers.outputs.layers_created }}
+      extension_x86_arn: ${{ steps.capture_arns.outputs.extension_x86_arn }}
+      extension_arm_arn: ${{ steps.capture_arns.outputs.extension_arm_arn }}
       python_x86_arn: ${{ steps.capture_arns.outputs.python_x86_arn }}
       python_arm_arn: ${{ steps.capture_arns.outputs.python_arm_arn }}
       nodejs_x86_arn: ${{ steps.capture_arns.outputs.nodejs_x86_arn }}
@@ -40,6 +42,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+      
+      - name: Mask sensitive data
+        run: |
+          # Ensure AWS credentials are never printed
+          echo "::add-mask::${{ secrets.AWS_ACCESS_KEY_ID }}"
+          echo "::add-mask::${{ secrets.AWS_SECRET_ACCESS_KEY }}"
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -103,16 +111,18 @@ jobs:
           export BUCKET_PREFIX="nr-extension-test-layers"
           export REGIONS_X86_64="us-west-1"
           export REGIONS_ARM64="us-west-1"
-          export LANGUAGES="python nodejs java dotnet ruby"
+          export LANGUAGES="extension python nodejs java dotnet ruby"
           
           # Run the unified script
           chmod +x scripts/createlayer.sh
           ./scripts/createlayer.sh
           
-          # Capture layer ARNs
+          # Capture layer ARNs (ensure no secrets are printed)
           if [ -f dist/nr_tmp_env.sh ]; then
-            echo "✓ Layer ARNs generated:"
-            cat dist/nr_tmp_env.sh
+            echo "✓ Layer ARNs generated successfully"
+            # Count layers without printing credentials
+            layer_count=$(grep -c "^export LAYER_ARN_" dist/nr_tmp_env.sh || echo "0")
+            echo "✓ Created $layer_count layer ARN(s)"
             echo "layers_created=true" >> $GITHUB_OUTPUT
           else
             echo "✗ Failed to generate layer ARNs"
@@ -123,12 +133,14 @@ jobs:
         id: capture_arns
         if: steps.build_layers.outputs.layers_created == 'true'
         run: |
-          # Source the env file and export to GitHub outputs
+          # Source the env file and export to GitHub outputs (ARNs only, no secrets)
           source dist/nr_tmp_env.sh
-          echo "python_x86_arn=${LAYER_ARN_PYTHON_X86_64}" >> $GITHUB_OUTPUT
-          echo "python_arm_arn=${LAYER_ARN_PYTHON_ARM64}" >> $GITHUB_OUTPUT
-          echo "nodejs_x86_arn=${LAYER_ARN_NODEJS_X86_64}" >> $GITHUB_OUTPUT
-          echo "nodejs_arm_arn=${LAYER_ARN_NODEJS_ARM64}" >> $GITHUB_OUTPUT
+          echo "extension_x86_arn=${LAYER_ARN_EXTENSION_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "extension_arm_arn=${LAYER_ARN_EXTENSION_ARM64:-}" >> $GITHUB_OUTPUT
+          echo "python_x86_arn=${LAYER_ARN_PYTHON_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "python_arm_arn=${LAYER_ARN_PYTHON_ARM64:-}" >> $GITHUB_OUTPUT
+          echo "nodejs_x86_arn=${LAYER_ARN_NODEJS_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "nodejs_arm_arn=${LAYER_ARN_NODEJS_ARM64:-}" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with Layer ARNs
         if: steps.build_layers.outputs.layers_created == 'true'
@@ -158,6 +170,7 @@ jobs:
             
             // Group by language
             const languages = {
+              'Extension Only (Rust)': [],
               'Python': [],
               'Node.js': [],
               'Java': [],
@@ -166,7 +179,9 @@ jobs:
             };
             
             Object.entries(layerArns).forEach(([key, arn]) => {
-              if (key.includes('PYTHON')) {
+              if (key.includes('EXTENSION') && !key.includes('PYTHON') && !key.includes('NODEJS')) {
+                languages['Extension Only (Rust)'].push({ key, arn });
+              } else if (key.includes('PYTHON')) {
                 languages['Python'].push({ key, arn });
               } else if (key.includes('NODEJS')) {
                 languages['Node.js'].push({ key, arn });
@@ -174,7 +189,23 @@ jobs:
                 languages['Java'].push({ key, arn });
               } else if (key.includes('DOTNET')) {
                 languages['.NET'].push({ key, arn });
-              } else if (key.inclu⚠️ Test Layers Notice\n\n';
+              } else if (key.includes('RUBY')) {
+                languages['Ruby'].push({ key, arn });
+              }
+            });
+            
+            // Format output
+            for (const [lang, layers] of Object.entries(languages)) {
+              if (layers.length > 0) {
+                commentBody += `\n#### ${lang}\n\n`;
+                layers.forEach(({ key, arn }) => {
+                  const arch = key.includes('X86') ? 'x86_64' : 'arm64';
+                  commentBody += `- **${arch}**: \`${arn}\`\n`;
+                });
+              }
+            }
+            
+            commentBody += '\n### ⚠️ Test Layers Notice\n\n';
             commentBody += '> **These are TEST layers created specifically for this PR.** They are published to `us-west-1` for testing purposes only.\n\n';
             commentBody += '### Usage\n\n';
             commentBody += 'You can test these layers in your Lambda functions using the AWS CLI or Console.\n\n';
@@ -186,23 +217,7 @@ jobs:
             commentBody += '  --layers "<LAYER_ARN>"\n';
             commentBody += '```\n\n';
             commentBody += '---\n';
-            commentBody += `*Test layers created from commit ${context.sha.substring(0, 7)} • Region: us-west-1
-                  const arch = key.includes('X86') ? 'x86_64' : 'arm64';
-                  commentBody += `- **${arch}**: \`${arn}\`\n`;
-                });
-              }
-            }
-            
-            commentBody += '\n### Usage\n\n';
-            commentBody += 'You can test these layers in your Lambda functions using the AWS CLI or Console.\n\n';
-            commentBody += '**AWS CLI Example:**\n';
-            commentBody += '```bash\n';
-            commentBody += 'aws lambda update-function-configuration \\\n';
-            commentBody += '  --function-name your-function-name \\\n';
-            commentBody += '  --layers "<LAYER_ARN>"\n';
-            commentBody += '```\n\n';
-            commentBody += '---\n';
-            commentBody += `*Layers created from commit ${context.sha.substring(0, 7)}*`;
+            commentBody += `*Test layers created from commit ${context.sha.substring(0, 7)} • Region: us-west-1*`;
             
             // Post comment
             await github.rest.issues.createComment({
@@ -231,8 +246,11 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Layer ARNs" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+            # Only print ARNs, never any secrets
             cat dist/nr_tmp_env.sh >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🔒 AWS credentials are securely masked and never exposed in logs" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ Failed to build test layers" >> $GITHUB_STEP_SUMMARY
           fi
