@@ -239,10 +239,10 @@ main() {
   build_extension "$target_x86"
 
   # Package and publish standalone extension
-  # package_extension_layer "$target_x86"
-  # for region in $REGIONS_X86_64; do
-  #   publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
-  # done
+  package_extension_layer "$target_x86"
+  for region in $REGIONS_X86_64; do
+    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
+  done
 
   # # Package and publish single Python layer
   # build_python_layer_all "$target_x86"
@@ -251,10 +251,10 @@ main() {
   # done
 
   # Package and publish single Node.js layer
-  build_nodejs_layer_all "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "${LAYER_NAME_PREFIX}NodejsX86"
-  done
+  # build_nodejs_layer_all "$target_x86"
+  # for region in $REGIONS_X86_64; do
+  #   publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "${LAYER_NAME_PREFIX}NodejsX86"
+  # done
 
   #--- Build for arm64 ---
   # local target_arm="aarch64-unknown-linux-musl"
