@@ -180,9 +180,10 @@ The New Relic Lambda Extension can send your function's logs to New Relic. If yo
 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
-| `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send function logs to New Relic. |
-| `NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send extension logs in addition to the function logs to New Relic. |
-| `NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS` | `false` | `true`, `false`, `1`, `0` | Send platform logs (START, END, REPORT, etc.) to New Relic. |
+| `NEW_RELIC_EXTENSION_SEND_LOGS` | | `platform`, `extension`, `function`, `all` | **Unified log configuration** - Send specific log types to New Relic using comma-separated values. Use `all` to send all log types. Examples: `function`, `function,platform`, `all`. This takes precedence over individual log flags below. |
+| `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send function logs to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
+| `NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send extension logs in addition to the function logs to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
+| `NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS` | `false` | `true`, `false`, `1`, `0` | Send platform logs (START, END, REPORT, etc.) to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
 | `NEW_RELIC_EXTENSION_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` | Set the log level for extension logging. |
 | `NEW_RELIC_EXTENSION_LOGS_ENABLED` | `true` | `true`, `false`, `1`, `0` | Enable or disable [NR_EXT] extension log output in CloudWatch. When false, suppresses all extension logs while keeping functionality intact. |
 | `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Each tag is composed of a colon-delimited key and value. Multiple key-value pairs are semicolon-delimited; for example, `env:prod;team:myTeam`. |

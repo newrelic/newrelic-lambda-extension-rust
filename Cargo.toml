@@ -66,3 +66,6 @@ opt-level = "z"
 # Dev profile optimizations for faster development
 [profile.dev]
 opt-level = 1  # Some optimization for better development experience
+
+[dev-dependencies]
+serial_test = "3.0"
