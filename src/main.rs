@@ -379,7 +379,7 @@ async fn perform_one_time_initialization(
     let config = Arc::new(updated_config);
 
     let (agent_telemetry_rx_result, newrelic_client, runtime_done_channels) = tokio::join!(
-        initialize_agent_telemetry_ipc_channel(),
+        async { initialize_agent_telemetry_ipc_channel() },
         async { Arc::new(NewRelicClient::new(&config)) },
         async { mpsc::unbounded_channel::<()>() }
     );
@@ -676,9 +676,9 @@ async fn initialize_lambda_runtime_client_and_register(
 }
 
 /// Initialize agent telemetry IPC channel
-async fn initialize_agent_telemetry_ipc_channel(
+fn initialize_agent_telemetry_ipc_channel(
 ) -> Result<mpsc::Receiver<Vec<u8>>, Box<dyn std::error::Error + Send + Sync>> {
-    match agent::ipc::init_telemetry_channel().await {
+    match agent::ipc::init_telemetry_channel() {
         Ok(rx) => {
             debug!(
                 "Agent telemetry channel initialized, listening on pipe: {}",

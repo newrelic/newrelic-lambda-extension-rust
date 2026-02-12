@@ -9,8 +9,6 @@ use tokio::task;
 use tracing::{debug, error, trace, warn};
 
 pub const TELEMETRY_NAMED_PIPE_PATH: &str = "/tmp/newrelic-telemetry";
-const TELEMETRY_NAMED_PIPE_RETRIES: u32 = 10;
-const TELEMETRY_NAMED_PIPE_RETRY_DELAY: Duration = Duration::from_millis(10);
 const CHANNEL_BUFFER_SIZE: usize = 100;
 
 /// Initializes the named pipe (FIFO) for telemetry and returns a receiver channel.
@@ -18,7 +16,7 @@ const CHANNEL_BUFFER_SIZE: usize = 100;
 /// This function creates a named pipe at `/tmp/newrelic-telemetry` and spawns a background
 /// task that continuously listens for data on the pipe. The data is then sent through an
 /// MPSC channel, the receiver of which is returned by this function.
-pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
+pub fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
     let path = Path::new(TELEMETRY_NAMED_PIPE_PATH);
 
     match fs::remove_file(path) {
@@ -31,16 +29,6 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
     unistd::mkfifo(path, mode)
         .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create FIFO: {}", e)))?;
     debug!("Created new telemetry pipe at {}", TELEMETRY_NAMED_PIPE_PATH);
-
-
-    let mut tries = 0;
-    while !path.exists() {
-        if tries >= TELEMETRY_NAMED_PIPE_RETRIES {
-            return Err(Error::new(ErrorKind::TimedOut, "Failed to confirm pipe creation"));
-        }
-        tries += 1;
-        tokio::time::sleep(TELEMETRY_NAMED_PIPE_RETRY_DELAY).await;
-    }
 
     let (tx, rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
