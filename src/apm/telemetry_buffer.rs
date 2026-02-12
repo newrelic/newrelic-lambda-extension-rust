@@ -104,7 +104,7 @@ pub async fn retry_buffered_telemetry(
         );
 
         // Retry sending
-        let result = if item.telemetry_type == "error_event_data" {
+        let result = if item.telemetry_type == super::collector::CMD_ERROR_EVENTS {
             super::collector::send_error_events(
                 client,
                 license_key,
@@ -113,21 +113,7 @@ pub async fn retry_buffered_telemetry(
                 &item.data,
             )
             .await
-        } else {
-            let command = match item.telemetry_type.as_str() {
-                "metric_data" => super::collector::CMD_METRICS,
-                "span_event_data" => super::collector::CMD_SPAN_EVENTS,
-                "error_data" => super::collector::CMD_ERROR_DATA,
-                "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
-                "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
-                "log_event_data" => super::collector::CMD_LOG_EVENTS,
-                "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
-                _ => {
-                    warn!("Unknown telemetry type: {}", item.telemetry_type);
-                    continue;
-                }
-            };
-
+        } else if let Some(command) = super::collector::resolve_collector_command(&item.telemetry_type) {
             super::collector::send_apm_telemetry(
                 client,
                 license_key,
@@ -137,6 +123,9 @@ pub async fn retry_buffered_telemetry(
                 &item.data,
             )
             .await
+        } else {
+            warn!("Unknown telemetry type: {}", item.telemetry_type);
+            continue;
         };
 
         match result {

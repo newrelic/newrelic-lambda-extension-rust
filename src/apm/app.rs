@@ -3,9 +3,8 @@
 //! Based on internal_app.go NewApp(), connectRoutine(), doHarvest()
 
 use super::collector::{
-    send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS, 
-    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_LOG_EVENTS, CMD_METRICS, CMD_SPAN_EVENTS, 
-    CMD_TRANSACTION_SAMPLES,
+    send_apm_telemetry, send_error_events, send_platform_metrics,
+    resolve_collector_command, CMD_ERROR_EVENTS,
 };
 use super::connection::{connect, preconnect};
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
@@ -248,7 +247,7 @@ impl ApmApp {
 
             let task = tokio::spawn(async move {
                 let request_id = request_id_owned;
-                let send_result = if telemetry_type == "error_event_data" {
+                let send_result = if telemetry_type == CMD_ERROR_EVENTS {
                     send_error_events(
                         &client,
                         &license_key,
@@ -257,21 +256,7 @@ impl ApmApp {
                         &data,
                     )
                     .await
-                } else {
-                    let command = match telemetry_type.as_str() {
-                        "metric_data" => CMD_METRICS,
-                        "span_event_data" => CMD_SPAN_EVENTS,
-                        "error_data" => CMD_ERROR_DATA,
-                        "analytic_event_data" => CMD_ANALYTIC_EVENTS,
-                        "custom_event_data" => CMD_CUSTOM_EVENTS,
-                        "log_event_data" => CMD_LOG_EVENTS,
-                        "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
-                        _ => {
-                            warn!("Unknown telemetry type: {}", telemetry_type);
-                            return;
-                        }
-                    };
-
+                } else if let Some(command) = resolve_collector_command(&telemetry_type) {
                     send_apm_telemetry(
                         &client,
                         &license_key,
@@ -281,6 +266,9 @@ impl ApmApp {
                         &data,
                     )
                     .await
+                } else {
+                    warn!("Unknown telemetry type: {}", telemetry_type);
+                    return;
                 };
 
                 if let Err(e) = send_result {
@@ -411,18 +399,18 @@ impl ApmApp {
 }
 
 /// Check if transaction name needs normalization (doesn't contain '/')
-fn needs_normalization(name: &str) -> bool {
+pub(crate) fn needs_normalization(name: &str) -> bool {
     !name.contains('/')
 }
 
 /// Normalize transaction name by prepending "OtherTransaction/Ruby/"
-fn normalize_transaction_name(original: &str) -> String {
+pub(crate) fn normalize_transaction_name(original: &str) -> String {
     format!("OtherTransaction/Ruby/{}", original)
 }
 
 /// Normalize transaction names in analytic_event_data
 /// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
-fn normalize_analytic_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_analytic_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -469,7 +457,7 @@ fn normalize_analytic_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in span_event_data
 /// Structure: [run_id, {metadata}, [[[span_obj, {}, {}]], ...]]
-fn normalize_span_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_span_event_data(data: &mut Vec<Value>) {
     // Check we have the expected structure: data[2] should be the spans array
     if data.len() < 3 {
         return;
@@ -523,7 +511,7 @@ fn normalize_span_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in metric_data
 /// Structure: [run_id, timestamp_start, timestamp_end, [[[{name: "..."}, [values]]], ...]]
-fn normalize_metric_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_metric_data(data: &mut Vec<Value>) {
     // Check we have the expected structure: data[3] should be the metrics array
     if data.len() < 4 {
         return;
@@ -555,14 +543,13 @@ fn normalize_metric_data(data: &mut Vec<Value>) {
         // Only normalize metrics that reference transaction names
         // These typically start with "OtherTransaction" or similar prefixes
         if name.starts_with("OtherTransaction") {
-            // Check if the last segment needs normalization
-            // Example: "OtherTransactionTotalTime/ruby-hw" should become
-            //          "OtherTransactionTotalTime/Ruby/ruby-hw"
-            if let Some(last_slash_pos) = name.rfind('/') {
-                let prefix = &name[..last_slash_pos];
-                let suffix = &name[last_slash_pos + 1..];
-                
-                // If suffix has no '/', it needs normalization
+            // Use first '/' to split prefix from the rest. If the rest has no further '/',
+            // it's a bare function name that needs normalization. If it already contains '/',
+            // it's already structured (e.g. "OtherTransactionTotalTime/Ruby/ruby-hw").
+            if let Some(first_slash_pos) = name.find('/') {
+                let prefix = &name[..first_slash_pos];
+                let suffix = &name[first_slash_pos + 1..];
+
                 if needs_normalization(suffix) {
                     debug!("Normalizing metric name: '{}'", name);
                     let normalized = format!("{}/Ruby/{}", prefix, suffix);
@@ -582,7 +569,7 @@ fn normalize_metric_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in error_event_data
 /// Structure: [run_id, {metadata}, [[[error_obj, {}, {}]], ...]]
-fn normalize_error_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_error_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -629,7 +616,7 @@ fn normalize_error_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in custom_event_data
 /// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
-fn normalize_custom_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_custom_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -665,7 +652,7 @@ fn normalize_custom_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in transaction_sample_data
 /// Structure: [run_id, [[transaction_id, timestamp, name, duration, encoded_data], ...]]
-fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
     if data.len() < 2 {
         return;
     }

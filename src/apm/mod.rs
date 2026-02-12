@@ -11,7 +11,14 @@ pub mod id_generator;
 pub mod metric_converter;
 pub mod payload_parser;
 pub mod telemetry_buffer;
+#[cfg(test)]
 mod id_generator_tests;
+#[cfg(test)]
+mod collector_tests;
+#[cfg(test)]
+mod app_tests;
+#[cfg(test)]
+mod telemetry_buffer_tests;
 
 pub use app::{ApmApp, SharedApmApp};
 

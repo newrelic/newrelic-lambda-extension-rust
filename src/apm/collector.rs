@@ -22,6 +22,21 @@ pub const CMD_LOG_EVENTS: &str = "log_event_data";
 const PROTOCOL_VERSION: u8 = 17;
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Resolve a telemetry type string to its collector command.
+/// Returns `None` for `CMD_ERROR_EVENTS` (needs special handling) and unknown types.
+pub fn resolve_collector_command(telemetry_type: &str) -> Option<&'static str> {
+    match telemetry_type {
+        CMD_METRICS => Some(CMD_METRICS),
+        CMD_SPAN_EVENTS => Some(CMD_SPAN_EVENTS),
+        CMD_ERROR_DATA => Some(CMD_ERROR_DATA),
+        CMD_ANALYTIC_EVENTS => Some(CMD_ANALYTIC_EVENTS),
+        CMD_CUSTOM_EVENTS => Some(CMD_CUSTOM_EVENTS),
+        CMD_LOG_EVENTS => Some(CMD_LOG_EVENTS),
+        CMD_TRANSACTION_SAMPLES => Some(CMD_TRANSACTION_SAMPLES),
+        _ => None,
+    }
+}
+
 fn get_user_agent() -> String {
     format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
 }
@@ -157,19 +172,7 @@ pub async fn send_apm_telemetry(
     let compressed = encoder.finish()?;
 
     debug!(
-        "Sending {} to APM collector: {} bytes compressed (from {} bytes)",
-        command,
-        compressed.len(),
-        uncompressed_len
-    );
-    
-    debug!(
-        "Request for command: {}",
-        command
-    );
-    
-    debug!(
-        "Sending {} to APM: compressed={} bytes, uncompressed={} bytes",
+        "Sending {} to APM collector: compressed={} bytes, uncompressed={} bytes",
         command,
         compressed.len(),
         uncompressed_len
