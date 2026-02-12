@@ -349,12 +349,24 @@ async fn perform_one_time_initialization(
         debug!("Version detection and tagging will happen lazily on first invocation to avoid AWS SDK initialization during INIT");
     }
 
-    info!(
-        "Log forwarding settings: function={}, extension={}, platform={}",
-        config.extension.send_function_logs,
-        config.extension.send_extension_logs,
-        config.extension.send_platform_logs
-    );
+    // Check if NEW_RELIC_EXTENSION_SEND_LOGS was used
+    let send_logs_env = std::env::var("NEW_RELIC_EXTENSION_SEND_LOGS").ok();
+    if let Some(ref send_logs_value) = send_logs_env {
+        info!(
+            "Log forwarding configured via NEW_RELIC_EXTENSION_SEND_LOGS='{}': function={}, extension={}, platform={}",
+            send_logs_value,
+            config.extension.send_function_logs,
+            config.extension.send_extension_logs,
+            config.extension.send_platform_logs
+        );
+    } else {
+        info!(
+            "Log forwarding settings: function={}, extension={}, platform={}",
+            config.extension.send_function_logs,
+            config.extension.send_extension_logs,
+            config.extension.send_platform_logs
+        );
+    }
 
    
 
