@@ -91,6 +91,22 @@ fn get_backoff_delay(retry_attempt: usize) -> Duration {
     }
 }
 
+/// Extract structured log level from JSON record
+/// Returns the uppercase level string if found in common level field names
+fn get_structured_log_level(record: &serde_json::Value) -> Option<String> {
+    if let serde_json::Value::Object(obj) = record {
+        // Check common level field names used by various logging frameworks
+        for level_key in &["level", "Level", "LogLevel", "log_level", "severity", "Severity"] {
+            if let Some(level_value) = obj.get(*level_key) {
+                if let Some(level_str) = level_value.as_str() {
+                    return Some(level_str.to_uppercase());
+                }
+            }
+        }
+    }
+    None
+}
+
 impl LogProcessor {
     
    
@@ -271,49 +287,53 @@ impl LogProcessor {
                 })
             }).is_some();
 
-            if is_apm_mode {
-                if let Some(ref apm_app_arc) = self.apm_app {
-                    if record.record_type == "function" && message_str.len() > 0 {
-                        if message_str.contains("Task timed out") ||
-                           message_str.contains("error") || message_str.contains("Error") ||
-                           message_str.contains("Exception") || message_str.contains("exception") ||
-                           message_str.contains("Fatal") || message_str.contains("fatal") {
+            // Determine if this log should be treated as an error
+            // Uses extract_log_level which handles both structured JSON levels and
+            // unstructured keyword matching with position-priority and word boundaries
+            let should_treat_as_error = if record.record_type == "function" && !message_str.is_empty() {
+                message_str.contains("Task timed out")
+                    || self.extract_log_level(&record.record, message_str) == "ERROR"
+            } else {
+                false
+            };
 
-                            // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
-                            let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
-                                .replace('\n', "\\n").replace('\r', "\\r");
-                            debug!("APM mode: Error detected in function log: {}", sanitized_msg);
+            if should_treat_as_error {
+                // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+                let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
+                    .replace('\n', "\\n").replace('\r', "\\r");
+                
+                let (request_id, function_arn) = {
+                    let context = self.invocation_context.lock().unwrap();
+                    (context.request_id.clone(), context.invoked_function_arn.clone())
+                };
 
-                        let (request_id, function_arn) = {
-                            let context = self.invocation_context.lock().unwrap();
-                            (context.request_id.clone(), context.invoked_function_arn.clone())
-                        };
+                // Store error details for potential platform fault correlation
+                let error_type = if message_str.contains("Task timed out") {
+                    "Timeout"
+                } else if message_str.contains("Exception") || message_str.contains("exception") {
+                    "Exception"
+                } else if message_str.contains("Fatal") || message_str.contains("fatal") {
+                    "Fatal"
+                } else {
+                    "Error"
+                };
 
-                        debug!("APM mode: Sending error event for request_id: {}", request_id);
+                if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                    *last_error = Some(crate::error_synthesis::LastDetectedError {
+                        request_id: request_id.clone(),
+                        error_type: error_type.to_string(),
+                    });
+                }
 
+                if is_apm_mode {
+                    debug!("APM mode: Error detected in function log: {}", sanitized_msg);
+                    debug!("APM mode: Sending error event for request_id: {}", request_id);
+
+                    if let Some(ref apm_app_arc) = self.apm_app {
                         let apm_clone = Arc::clone(apm_app_arc);
                         let msg_clone = message_str.to_string();
 
-                        // Store error details for potential platform fault correlation
-                        let error_type = if message_str.contains("Task timed out") {
-                            "Timeout"
-                        } else if message_str.contains("Exception") || message_str.contains("exception") {
-                            "Exception"
-                        } else if message_str.contains("Fatal") || message_str.contains("fatal") {
-                            "Fatal"
-                        } else {
-                            "Error"
-                        };
-
-                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
-                            *last_error = Some(crate::error_synthesis::LastDetectedError {
-                                request_id: request_id.clone(),
-                                error_type: error_type.to_string(),
-                            });
-                        }
-
                         // Send error asynchronously during the current invoke
-                        // This prevents accumulation across invocations
                         let apm_guard = apm_clone.read().await;
                         if let Some(ref app) = *apm_guard {
                             if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
@@ -321,71 +341,52 @@ impl LogProcessor {
                             }
                         }
                     }
-                }
-                }
-            } else {
-                // Standard (non-APM) mode: Send errors to telemetry endpoint
-                if record.record_type == "function" && message_str.len() > 0 {
-                    if message_str.contains("Task timed out") ||
-                       message_str.contains("error") || message_str.contains("Error") ||
-                       message_str.contains("Exception") || message_str.contains("exception") ||
-                       message_str.contains("Fatal") || message_str.contains("fatal") {
+                } else {
+                    // Standard (non-APM) mode: Send errors to telemetry endpoint
+                    debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
+                    debug!("Standard mode: Sending error for request_id: {}", request_id);
 
-                        // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
-                        let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
-                            .replace('\n', "\\n").replace('\r', "\\r");
-                        debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
+                    // Determine error type - use consistent LambdaError for all function errors
+                    // (except timeout which should match platform timeout)
+                    let error_type = if message_str.contains("Task timed out") {
+                        "LambdaTimeout"  // Match platform timeout error class
+                    } else {
+                        "LambdaError"    // Use single consistent error class
+                    };
 
-                        let (request_id, function_arn) = {
-                            let context = self.invocation_context.lock().unwrap();
-                            (context.request_id.clone(), context.invoked_function_arn.clone())
-                        };
+                    let client = Arc::clone(&self.newrelic_client);
+                    let config = Arc::clone(&self.config);
+                    let msg_clone = message_str.to_string();
+                    let error_type_clone = error_type.to_string();
 
-                        debug!("Standard mode: Sending error for request_id: {}", request_id);
+                    // Format error message like timeout/platform errors for Error Inbox recognition
+                    // Format: "{ISO_TIMESTAMP} {REQUEST_ID} {ERROR_CLASS} {original_error_message}"
+                    // Keep the original error message with [ERROR] prefix intact
+                    let formatted_error_msg = format!(
+                        "{} {} {} {}",
+                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
+                        request_id,
+                        error_type,  // LambdaError or LambdaTimeout
+                        msg_clone    // Keep original message with [ERROR] prefix
+                    );
 
-                        // Determine error type - use consistent LambdaError for all function errors
-                        // (except timeout which should match platform timeout)
-                        let error_type = if message_str.contains("Task timed out") {
-                            "LambdaTimeout"  // Match platform timeout error class
-                        } else {
-                            "LambdaError"    // Use single consistent error class
-                        };
-
-                        let client = Arc::clone(&self.newrelic_client);
-                        let config = Arc::clone(&self.config);
-                        let msg_clone = message_str.to_string();
-                        let error_type_clone = error_type.to_string();
-
-                        // Format error message like timeout/platform errors for Error Inbox recognition
-                        // Format: "{ISO_TIMESTAMP} {REQUEST_ID} {ERROR_CLASS} {original_error_message}"
-                        // Keep the original error message with [ERROR] prefix intact
-                        let formatted_error_msg = format!(
-                            "{} {} {} {}",
-                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                            request_id,
-                            error_type,  // LambdaError or LambdaTimeout
-                            msg_clone    // Keep original message with [ERROR] prefix
-                        );
-
-                        // Store error details for potential platform fault correlation
-                        if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
-                            *last_error = Some(crate::error_synthesis::LastDetectedError {
-                                request_id: request_id.clone(),
-                                error_type: error_type_clone.clone(),
-                            });
-                        }
-
-                        // Send error asynchronously during the current invoke
-                        // This prevents accumulation across invocations
-                        crate::error_synthesis::send_lambda_error(
-                            &formatted_error_msg,  // Send formatted message, not raw log
-                            &request_id,
-                            &function_arn,
-                            &error_type_clone,
-                            &client,
-                            &config,
-                        ).await;
+                    // Store error details for potential platform fault correlation
+                    if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
+                        *last_error = Some(crate::error_synthesis::LastDetectedError {
+                            request_id: request_id.clone(),
+                            error_type: error_type_clone.clone(),
+                        });
                     }
+
+                    // Send error asynchronously during the current invoke
+                    crate::error_synthesis::send_lambda_error(
+                        &formatted_error_msg,  // Send formatted message, not raw log
+                        &request_id,
+                        &function_arn,
+                        &error_type_clone,
+                        &client,
+                        &config,
+                    ).await;
                 }
             }
     
@@ -539,7 +540,7 @@ impl LogProcessor {
         
         let mut attributes = serde_json::Map::new();
         
-        let log_level = self.extract_log_level(&message);
+        let log_level = self.extract_log_level(&record.record, &message);
         attributes.insert("level".to_string(), log_level.into());
         
         attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
@@ -554,48 +555,73 @@ impl LogProcessor {
         })
     }
 
-    fn extract_log_level(&self, message: &str) -> &'static str {
+    /// Extract log level from structured JSON or unstructured message string
+    /// Priority: 1) Structured JSON fields, 2) Keyword patterns with word boundaries
+    /// Made pub(crate) for unit testing
+    pub(crate) fn extract_log_level(&self, record: &serde_json::Value, message: &str) -> &'static str {
+        // FIRST: Check for structured level field in JSON record
+        if let Some(structured_level) = get_structured_log_level(record) {
+            return match structured_level.as_str() {
+                "TRACE" | "VERBOSE" => "TRACE",
+                "DEBUG" => "DEBUG",
+                "INFO" | "INFORMATION" => "INFO",
+                "WARN" | "WARNING" => "WARN",
+                "ERROR" | "FATAL" | "CRITICAL" => "ERROR",
+                _ => "INFO",
+            };
+        }
 
-        let check_str: String = message.chars().take(50).collect();
-        
-        if let Some(bracket_end) = check_str.find(']') {
-            let after_bracket = &check_str[bracket_end+1..].trim_start();
-            if after_bracket.starts_with("TRACE") || after_bracket.starts_with("trace") {
-                return "TRACE";
-            } else if after_bracket.starts_with("DEBUG") || after_bracket.starts_with("debug") {
-                return "DEBUG";
-            } else if after_bracket.starts_with("INFO") || after_bracket.starts_with("info") {
-                return "INFO";
-            } else if after_bracket.starts_with("WARN") || after_bracket.starts_with("warn") 
-                      || after_bracket.starts_with("WARNING") || after_bracket.starts_with("warning") {
-                return "WARN";
-            } else if after_bracket.starts_with("ERROR") || after_bracket.starts_with("error") 
-                      || after_bracket.starts_with("FATAL") || after_bracket.starts_with("fatal") {
-                return "ERROR";
+        // FALLBACK: Position-priority parsing for unstructured logs
+        // The earliest keyword match wins, because log level prefixes (e.g. [INFO], ERROR:)
+        // appear at the start of the line, before any message body that might contain
+        // level-like words (e.g. "No error detected").
+        let search_limit = message.len().min(150);
+        let search_area = &message[..search_limit];
+        let lower = search_area.to_lowercase();
+
+        // Level keywords mapped to their output levels
+        const LEVELS: &[(&str, &str)] = &[
+            ("fatal", "ERROR"),
+            ("critical", "ERROR"),
+            ("error", "ERROR"),
+            ("warning", "WARN"),
+            ("warn", "WARN"),
+            ("debug", "DEBUG"),
+            ("trace", "TRACE"),
+            ("info", "INFO"),
+        ];
+
+        // Find all keyword matches with valid word boundaries, pick earliest position
+        let mut best_match: Option<(usize, &str)> = None;
+
+        for &(keyword, level) in LEVELS {
+            if let Some(pos) = lower.find(keyword) {
+                // Check word boundaries to prevent false matches
+                // Before: must be start of string or non-alphanumeric
+                let before_ok = pos == 0 || {
+                    let prev_byte = lower.as_bytes()[pos - 1];
+                    !prev_byte.is_ascii_alphanumeric()
+                };
+
+                // After: must be end of string or non-alphanumeric
+                let after_pos = pos + keyword.len();
+                let after_ok = after_pos >= lower.len() || {
+                    let next_byte = lower.as_bytes()[after_pos];
+                    !next_byte.is_ascii_alphanumeric()
+                };
+
+                if before_ok && after_ok {
+                    match best_match {
+                        Some((best_pos, _)) if pos >= best_pos => {}
+                        _ => best_match = Some((pos, level)),
+                    }
+                }
             }
         }
-        
-        if check_str.contains(" ERROR ") || check_str.contains(" error ") 
-           || check_str.contains(" FATAL ") || check_str.contains(" fatal ")
-           || check_str.starts_with("ERROR") || check_str.starts_with("error")
-           || check_str.starts_with("FATAL") || check_str.starts_with("fatal") {
-            "ERROR"
-        } else if check_str.contains(" WARN ") || check_str.contains(" warn ")
-                  || check_str.contains(" WARNING ") || check_str.contains(" warning ")
-                  || check_str.starts_with("WARN") || check_str.starts_with("warn")
-                  || check_str.starts_with("WARNING") || check_str.starts_with("warning") {
-            "WARN"
-        } else if check_str.contains(" DEBUG ") || check_str.contains(" debug ")
-                  || check_str.starts_with("DEBUG") || check_str.starts_with("debug") {
-            "DEBUG"
-        } else if check_str.contains(" TRACE ") || check_str.contains(" trace ")
-                  || check_str.starts_with("TRACE") || check_str.starts_with("trace") {
-            "TRACE"
-        } else if check_str.contains(" INFO ") || check_str.contains(" info ")
-                  || check_str.starts_with("INFO") || check_str.starts_with("info") {
-            "INFO"
-        } else {
-            "INFO"
+
+        match best_match {
+            Some((_, level)) => level,
+            None => "INFO",
         }
     }
 
