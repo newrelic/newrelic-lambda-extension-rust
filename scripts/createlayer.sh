@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Local testing script for building and publishing Lambda layers
+# Unified script for building and publishing Lambda test layers
+# Supports all language runtimes: Python, Node.js, Java, .NET, Ruby
+# Can be used for PR testing or production deployments
 # For production CI/CD, use scripts/ci/publish-layers.sh
 
 # Ensure we run from repo root so paths resolve
@@ -12,18 +14,53 @@ cd "$ROOT_DIR"
 # --- Configuration ---
 # Layer naming prefix - change this to customize all layer names
 LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NewRelicLambdaRustExtension"}
-# eu-west-1 eu-west-2 eu-west-3 us-east-1 us-east-2 us-west-1 us-west-2
+# Test mode (defaults to true for PR testing, set to false for production)
+TEST_MODE=${TEST_MODE:-"true"}
 
-# sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2
-# sa-east-1 me-central-1 me-south-1 eu-central-2 eu-north-1 eu-south-2 eu-south-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 ap-south-2 ap-southeast-4 ap-southeast-3 af-south-1
-BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
-REGIONS_ARM64=${REGIONS_ARM64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
+# If TEST_MODE is true, use test configuration
+if [ "$TEST_MODE" = "true" ]; then
+  LAYER_NAME_PREFIX="NRTestRustExtension"
+  BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
+  REGIONS_X86_64=${REGIONS_X86_64:-"us-west-1"}
+  REGIONS_ARM64=${REGIONS_ARM64:-"us-west-1"}
+else
+  # Production configuration
+  BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
+  REGIONS_X86_64=${REGIONS_X86_64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
+  REGIONS_ARM64=${REGIONS_ARM64:-"sa-east-1 eu-north-1 eu-west-3 eu-west-2 eu-west-1 eu-central-1 ca-central-1 ap-northeast-1 ap-southeast-2 ap-southeast-1 ap-northeast-2 ap-northeast-3 ap-south-1 us-east-1 us-east-2 us-west-1 us-west-2"}
+fi
+
+# Languages to build (can be overridden: "python nodejs java dotnet ruby")
+LANGUAGES=${LANGUAGES:-"python nodejs java dotnet ruby"}
 
 BIN_NAME="newrelic-lambda-extension"
 DIST_DIR="$ROOT_DIR/dist"
 LAYER_DIR="$ROOT_DIR/.layer"
 TMP_ENV_FILE_NAME="$DIST_DIR/nr_tmp_env.sh"
+
+# Java configuration
+BUILD_DIR="$SCRIPT_DIR/java/build"
+GRADLE_ARCHIVE="$BUILD_DIR/distributions/NewRelicJavaLayer.zip"
+JAVA_DIST_DIR="$SCRIPT_DIR/java/dist"
+
+# .NET configuration
+DOTNET_BUILD_DIR="lib"  # AWS Lambda .NET layers use lib/ directory
+if [ -z "${NEWRELIC_DOTNET_AGENT_VERSION:-}" ]; then
+  echo "Fetching latest .NET agent version from GitHub..." >&2
+  NEWRELIC_DOTNET_AGENT_VERSION=$(curl -fsSL https://api.github.com/repos/newrelic/newrelic-dotnet-agent/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+  if [ -z "$NEWRELIC_DOTNET_AGENT_VERSION" ] || [ "$NEWRELIC_DOTNET_AGENT_VERSION" = "null" ]; then
+    echo "Warning: Failed to fetch latest .NET agent version, using default" >&2
+    NEWRELIC_DOTNET_AGENT_VERSION="10.0.0"
+  fi
+  echo "Using .NET agent version: ${NEWRELIC_DOTNET_AGENT_VERSION}" >&2
+fi
+AGENT_DOWNLOAD_BASE_URL="https://download.newrelic.com/dot_net_agent/latest_release"
+
+# Ruby configuration
+RUBY_VERSION=${RUBY_VERSION:-"3.3"}
+RUBY_ASSETS_DIR="$SCRIPT_DIR/ruby"
+WRAPPER_FILE="newrelic_lambda_wrapper.rb"
+GEMFILE="Gemfile"
 
 # --- Build and Package Functions ---
 
@@ -147,6 +184,106 @@ EOF
   echo "Build complete: $zip_name"
 }
 
+# --- Java Layer Functions ---
+
+build_java_layer() {
+  local java_version="$1"
+  local target_zip="$2"
+  local arch="$3"
+  local target="$4"
+  
+  echo "Building New Relic Java layer (Java $java_version, $arch)" >&2
+  
+  # Ensure extension is built and placed in correct location
+  local extension_dir="java/extensions/$arch"
+  mkdir -p "$SCRIPT_DIR/$extension_dir"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$SCRIPT_DIR/$extension_dir/"
+  
+  cd "$SCRIPT_DIR/java"
+  rm -rf "$BUILD_DIR" "$target_zip"
+  ./gradlew packageLayer -P javaVersion="$java_version" -P arch="$arch"
+  
+  mkdir -p "$JAVA_DIST_DIR"
+  cp "$GRADLE_ARCHIVE" "$target_zip"
+  
+  echo "Build complete: $target_zip" >&2
+  cd "$ROOT_DIR"
+}
+
+# --- .NET Layer Functions ---
+
+download_dotnet_agent() {
+  local arch="$1"  # amd64 or arm64
+  local agent_file="newrelic-dotnet-agent_${NEWRELIC_DOTNET_AGENT_VERSION}_${arch}.tar.gz"
+  local download_url="${AGENT_DOWNLOAD_BASE_URL}/${agent_file}"
+  
+  echo "Downloading .NET agent version ${NEWRELIC_DOTNET_AGENT_VERSION} for ${arch}" >&2
+  
+  rm -rf "$LAYER_DIR/$DOTNET_BUILD_DIR"
+  mkdir -p "$LAYER_DIR/$DOTNET_BUILD_DIR"
+  
+  local tmp_agent="/tmp/${agent_file}"
+  curl -fsSL "$download_url" -o "$tmp_agent"
+  
+  echo "Extracting .NET agent to $LAYER_DIR/$DOTNET_BUILD_DIR" >&2
+  tar -xzf "$tmp_agent" -C "$LAYER_DIR/$DOTNET_BUILD_DIR"
+  
+  echo "$NEWRELIC_DOTNET_AGENT_VERSION" > "$LAYER_DIR/$DOTNET_BUILD_DIR/newrelic-dotnet-agent/version.txt"
+  
+  rm -f "$tmp_agent"
+  echo ".NET agent downloaded and extracted successfully" >&2
+}
+
+build_dotnet_layer() {
+  local target="$1"
+  local arch_linux="$2"  # x86_64 or arm64 (Linux arch naming)
+  local arch_dotnet="$3" # amd64 or arm64 (.NET agent naming)
+  local zip_name="$DIST_DIR/dotnet-${arch_linux}.zip"
+
+  echo "Building New Relic layer for .NET (${arch_linux})" >&2
+
+  rm -rf "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR"
+
+  download_dotnet_agent "$arch_dotnet"
+  
+  mkdir -p "$LAYER_DIR/extensions"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
+
+  (cd "$LAYER_DIR" && zip -r9 "$zip_name" . >/dev/null)
+  rm -rf "$LAYER_DIR"
+
+  echo "Build complete: $zip_name" >&2
+}
+
+# --- Ruby Layer Functions ---
+
+build_ruby_layer() {
+  local target="$1"
+  local arch="${target%%-*}"
+  local zip_name="$DIST_DIR/ruby-${arch}.zip"
+
+  echo "Building New Relic layer for Ruby ${RUBY_VERSION} (${arch})" >&2
+
+  rm -rf "$LAYER_DIR"
+  mkdir -p "$LAYER_DIR/ruby/gems/${RUBY_VERSION}.0"
+
+  cd "$RUBY_ASSETS_DIR"
+  bundle config set --local path "$LAYER_DIR/ruby/gems/${RUBY_VERSION}.0"
+  bundle install
+  
+  cp "$RUBY_ASSETS_DIR/$WRAPPER_FILE" "$LAYER_DIR/ruby/gems/${RUBY_VERSION}.0/newrelic_lambda_wrapper.rb"
+
+  mkdir -p "$LAYER_DIR/extensions"
+  cp "$ROOT_DIR/target/$target/release/$BIN_NAME" "$LAYER_DIR/extensions/$BIN_NAME"
+
+  cd "$ROOT_DIR"
+  (cd "$LAYER_DIR" && zip -r9 "$zip_name" . >/dev/null)
+  rm -rf "$LAYER_DIR"
+
+  echo "Build complete: $zip_name" >&2
+}
+
 # --- AWS Publish Functions ---
 
 hash_file() {
@@ -246,53 +383,145 @@ cleanup_build_artifacts() {
 # --- Main Execution Logic ---
 
 main() {
-  mkdir -p "$DIST_DIR"
+  mkdir -p "$DIST_DIR" "$JAVA_DIST_DIR"
   rm -f "$TMP_ENV_FILE_NAME"
   touch "$TMP_ENV_FILE_NAME"
 
+  echo "=========================================="
+  echo "  Building Test Layers                   "
+  echo "  Languages: $LANGUAGES"
+  echo "  Regions: $REGIONS_X86_64"
+  echo "=========================================="
+
   # --- Build for x86_64 ---
   local target_x86="x86_64-unknown-linux-musl"
+  echo ""
+  echo "Building Rust extension for x86_64..."
   build_extension "$target_x86"
 
   # Package and publish standalone extension
-  package_extension_layer "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
-  done
+  if echo "$LANGUAGES" | grep -q "extension"; then
+    package_extension_layer "$target_x86"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$DIST_DIR/${BIN_NAME}-x86_64.zip" "$region" "extension" "x86_64" "${LAYER_NAME_PREFIX}X86"
+    done
+  fi
 
-  # Package and publish single Python layer
-  build_python_layer_all "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/python-all-x86_64.zip" "$region" "python" "x86_64" "${LAYER_NAME_PREFIX}PythonX86"
-  done
+  # Package and publish Python layer
+  if echo "$LANGUAGES" | grep -q "python"; then
+    echo ""
+    echo "Building Python layer for x86_64..."
+    build_python_layer_all "$target_x86"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$DIST_DIR/python-all-x86_64.zip" "$region" "python" "x86_64" "${LAYER_NAME_PREFIX}PythonX86"
+    done
+  fi
 
-  # Package and publish single Node.js layer
-  build_nodejs_layer_all "$target_x86"
-  for region in $REGIONS_X86_64; do
-    publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "${LAYER_NAME_PREFIX}NodejsX86"
-  done
+  # Package and publish Node.js layer
+  if echo "$LANGUAGES" | grep -q "nodejs"; then
+    echo ""
+    echo "Building Node.js layer for x86_64..."
+    build_nodejs_layer_all "$target_x86"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$DIST_DIR/nodejs-all-x86_64.zip" "$region" "nodejs" "x86_64" "${LAYER_NAME_PREFIX}NodejsX86"
+    done
+  fi
+
+  # Package and publish Java layers
+  if echo "$LANGUAGES" | grep -q "java"; then
+    echo ""
+    echo "Building Java layers for x86_64..."
+    # Java 17 (default)
+    build_java_layer "17" "$JAVA_DIST_DIR/java17.x86_64.zip" "x86_64" "$target_x86"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$JAVA_DIST_DIR/java17.x86_64.zip" "$region" "java17" "x86_64" "${LAYER_NAME_PREFIX}Java17X86"
+    done
+  fi
+
+  # Package and publish .NET layer
+  if echo "$LANGUAGES" | grep -q "dotnet"; then
+    echo ""
+    echo "Building .NET layer for x86_64..."
+    build_dotnet_layer "$target_x86" "x86_64" "amd64"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$DIST_DIR/dotnet-x86_64.zip" "$region" "dotnet" "x86_64" "${LAYER_NAME_PREFIX}DotnetX86"
+    done
+  fi
+
+  # Package and publish Ruby layer
+  if echo "$LANGUAGES" | grep -q "ruby"; then
+    echo ""
+    echo "Building Ruby layer for x86_64..."
+    build_ruby_layer "$target_x86"
+    for region in $REGIONS_X86_64; do
+      publish_layer "$DIST_DIR/ruby-x86_64.zip" "$region" "ruby" "x86_64" "${LAYER_NAME_PREFIX}RubyX86"
+    done
+  fi
 
   #--- Build for arm64 ---
   local target_arm="aarch64-unknown-linux-musl"
+  echo ""
+  echo "Building Rust extension for arm64..."
   build_extension "$target_arm"
 
   # Package and publish standalone extension
-  package_extension_layer "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "${LAYER_NAME_PREFIX}ARM64"
-  done
+  if echo "$LANGUAGES" | grep -q "extension"; then
+    package_extension_layer "$target_arm"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$DIST_DIR/${BIN_NAME}-aarch64.zip" "$region" "extension" "arm64" "${LAYER_NAME_PREFIX}ARM64"
+    done
+  fi
 
-  # Package and publish single Python layer
-  build_python_layer_all "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "${LAYER_NAME_PREFIX}PythonARM64"
-  done
+  # Package and publish Python layer
+  if echo "$LANGUAGES" | grep -q "python"; then
+    echo ""
+    echo "Building Python layer for arm64..."
+    build_python_layer_all "$target_arm"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$DIST_DIR/python-all-aarch64.zip" "$region" "python" "arm64" "${LAYER_NAME_PREFIX}PythonARM64"
+    done
+  fi
 
-  # Package and publish single Node.js layer
-  build_nodejs_layer_all "$target_arm"
-  for region in $REGIONS_ARM64; do
-    publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "${LAYER_NAME_PREFIX}NodejsARM64"
-  done
+  # Package and publish Node.js layer
+  if echo "$LANGUAGES" | grep -q "nodejs"; then
+    echo ""
+    echo "Building Node.js layer for arm64..."
+    build_nodejs_layer_all "$target_arm"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$DIST_DIR/nodejs-all-aarch64.zip" "$region" "nodejs" "arm64" "${LAYER_NAME_PREFIX}NodejsARM64"
+    done
+  fi
+
+  # Package and publish Java layers
+  if echo "$LANGUAGES" | grep -q "java"; then
+    echo ""
+    echo "Building Java layers for arm64..."
+    # Java 17 (default)
+    build_java_layer "17" "$JAVA_DIST_DIR/java17.arm64.zip" "arm64" "$target_arm"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$JAVA_DIST_DIR/java17.arm64.zip" "$region" "java17" "arm64" "${LAYER_NAME_PREFIX}Java17ARM"
+    done
+  fi
+
+  # Package and publish .NET layer
+  if echo "$LANGUAGES" | grep -q "dotnet"; then
+    echo ""
+    echo "Building .NET layer for arm64..."
+    build_dotnet_layer "$target_arm" "arm64" "arm64"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$DIST_DIR/dotnet-arm64.zip" "$region" "dotnet" "arm64" "${LAYER_NAME_PREFIX}DotnetARM64"
+    done
+  fi
+
+  # Package and publish Ruby layer
+  if echo "$LANGUAGES" | grep -q "ruby"; then
+    echo ""
+    echo "Building Ruby layer for arm64..."
+    build_ruby_layer "$target_arm"
+    for region in $REGIONS_ARM64; do
+      publish_layer "$DIST_DIR/ruby-aarch64.zip" "$region" "ruby" "arm64" "${LAYER_NAME_PREFIX}RubyARM64"
+    done
+  fi
 
   echo ""
   echo "=========================================="
@@ -305,6 +534,7 @@ main() {
   # Cleanup after successful publish
   cleanup_build_artifacts
 
+  echo ""
   echo "To load the layer ARNs into your environment, run:"
   echo "  source $TMP_ENV_FILE_NAME"
 }
