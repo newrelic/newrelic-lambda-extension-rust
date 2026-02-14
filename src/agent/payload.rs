@@ -87,7 +87,7 @@ pub async fn send_agent_payload_to_newrelic(
     );
     let log_group_name = format!("/aws/lambda/{function_name}");
 
-    let wrapped_payload = create_wrapped_agent_payload_json(
+    let wrapped_payload = create_newrelic_log_format(
         payload_bytes,
         function_name,
         invoked_function_arn,
@@ -118,35 +118,6 @@ pub async fn send_agent_payload_to_newrelic(
     }
 }
 
-/// Create wrapped agent payload JSON string
-/// Create New Relic log format with agent data in message field
-/// NOTE: `Trace ID` extraction is handled separately in `process_and_send_agent_payload`
-fn create_wrapped_agent_payload_json(
-    payload_bytes: &[u8],
-    function_name: &str,
-    invoked_function_arn: &str,
-    log_group_name: &str,
-    request_id: &str,
-    config: &Arc<ExtensionConfig>,
-    version_info: Option<&Arc<version::VersionInfo>>,
-) -> String {
-    debug!(
-        "Processing agent data of {} bytes for function: {}",
-        payload_bytes.len(),
-        function_name
-    );
-
-    create_newrelic_log_format(
-        payload_bytes,
-        function_name,
-        invoked_function_arn,
-        log_group_name,
-        request_id,
-        config,
-        version_info,
-    )
-}
-
 /// Create New Relic format with Lambda context and stringified log events in entry field
 /// Returns JSON with context and entry fields matching New Relic expected format
 /// NOTE: This is for AGENT payload wrapping, not regular log processing
@@ -169,7 +140,8 @@ fn create_newrelic_log_format(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // Build log events array: agent payload first, then report line (if any), then version line (serverless mode only)
+    // Build log events array: agent payload first, then optional version line (serverless mode)
+    // Note: report lines are handled separately by batch.rs (build_newrelic_payload)
     let mut log_events = vec![
         serde_json::json!({
             "id": request_id,
@@ -178,9 +150,7 @@ fn create_newrelic_log_format(
         })
     ];
 
-    // Note: report line is appended separately by caller if needed
-    
-    // Append version line as last log event in serverless mode (after agent payload and report line)
+    // Append version line as last log event in serverless mode
     if !config.new_relic.apm_lambda_mode {
         if let Some(version_info) = version_info {
             let version_line = version_info.format_version_line(request_id);
@@ -234,3 +204,158 @@ fn create_newrelic_log_format(
     final_payload.to_string()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // extract_function_name_from_arn
+    // ========================================================================
+
+    #[test]
+    fn test_extract_from_valid_arn() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "my-function");
+    }
+
+    #[test]
+    fn test_extract_from_arn_with_version_qualifier() {
+        // ARN with version/alias qualifier (8 parts)
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function:prod";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "my-function");
+    }
+
+    #[test]
+    fn test_extract_from_empty_arn_uses_fallback() {
+        assert_eq!(extract_function_name_from_arn("", "my-fallback"), "my-fallback");
+    }
+
+    #[test]
+    fn test_extract_from_malformed_arn_uses_last_segment() {
+        // Malformed but last segment looks like a function name
+        let arn = "arn:aws:lambda:us-east-1:my-function-name";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "my-function-name");
+    }
+
+    #[test]
+    fn test_extract_from_completely_invalid_uses_fallback() {
+        // Last segment is too short (< 3 chars)
+        let arn = "ab";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn test_extract_rejects_keyword_last_segment() {
+        // Last segment is a keyword — should use fallback
+        let arn = "arn:aws:lambda";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "fallback");
+    }
+
+    #[test]
+    fn test_extract_from_arn_wrong_service() {
+        // S3 ARN, not Lambda — should fall back to last segment if it looks valid
+        let arn = "arn:aws:s3:us-east-1:123456789012:bucket:my-bucket-name";
+        // parts[5] is "bucket" not "function", so standard parse fails
+        // Falls to last segment "my-bucket-name" (>= 3 chars, not a keyword)
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "my-bucket-name");
+    }
+
+    #[test]
+    fn test_extract_from_arn_special_characters() {
+        let arn = "arn:aws:lambda:us-west-2:123456789012:function:my-test_function.v2";
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "my-test_function.v2");
+    }
+
+    #[test]
+    fn test_extract_keyword_function_as_last_segment() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function";
+        // Last segment is "function" — rejected as keyword
+        assert_eq!(extract_function_name_from_arn(arn, "fallback"), "fallback");
+    }
+
+    // ========================================================================
+    // create_newrelic_log_format
+    // ========================================================================
+
+    #[test]
+    fn test_create_newrelic_log_format_basic_structure() {
+        let config = Arc::new(ExtensionConfig::default());
+        let payload_bytes = b"test agent payload data";
+
+        let result = create_newrelic_log_format(
+            payload_bytes, "my-function", "arn:test", "/aws/lambda/my-function",
+            "req-123", &config, None,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert!(parsed["context"].is_object());
+        assert!(parsed["entry"].is_string());
+
+        assert_eq!(parsed["context"]["function_name"], "my-function");
+        assert_eq!(parsed["context"]["invoked_function_arn"], "arn:test");
+    }
+
+    #[test]
+    fn test_create_newrelic_log_format_apm_mode_no_version_line() {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(config);
+
+        let result = create_newrelic_log_format(
+            b"payload", "fn", "arn", "/aws/lambda/fn", "req-1", &config, None,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        let entry: serde_json::Value = serde_json::from_str(
+            parsed["entry"].as_str().expect("entry string")
+        ).expect("valid entry");
+
+        // In APM mode with no version_info, should only have 1 log event
+        assert_eq!(entry["logEvents"].as_array().expect("array").len(), 1);
+    }
+
+    #[test]
+    fn test_create_newrelic_log_format_empty_payload() {
+        let config = Arc::new(ExtensionConfig::default());
+
+        let result = create_newrelic_log_format(
+            b"", "fn", "arn", "/aws/lambda/fn", "req-1", &config, None,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        let entry: serde_json::Value = serde_json::from_str(
+            parsed["entry"].as_str().expect("entry")
+        ).expect("valid entry");
+        let log_events = entry["logEvents"].as_array().expect("array");
+        assert_eq!(log_events[0]["message"], "");
+    }
+
+    #[test]
+    fn test_create_newrelic_log_format_non_utf8_bytes() {
+        let config = Arc::new(ExtensionConfig::default());
+        let invalid_utf8: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+
+        let result = create_newrelic_log_format(
+            &invalid_utf8, "fn", "arn", "/aws/lambda/fn", "req-1", &config, None,
+        );
+
+        // Should not panic — uses from_utf8_lossy
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        assert!(parsed["entry"].is_string());
+    }
+
+    #[test]
+    fn test_create_newrelic_log_format_log_stream_name_format() {
+        let config = Arc::new(ExtensionConfig::default());
+
+        let result = create_newrelic_log_format(
+            b"data", "fn", "arn", "/aws/lambda/fn", "req-1", &config, None,
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).expect("valid JSON");
+        let log_stream = parsed["context"]["log_stream_name"].as_str().expect("string");
+        // Should contain the extension name and version
+        assert!(log_stream.contains(':'), "log_stream_name should contain colon separator");
+    }
+
+}

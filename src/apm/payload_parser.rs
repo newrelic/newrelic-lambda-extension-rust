@@ -211,10 +211,97 @@ mod tests {
     #[test]
     fn test_parse_v1_payload() {
         let payload = create_test_payload("1");
-        let (data_map, version) = parse_agent_payload(&payload).unwrap();
+        let (data_map, version) = parse_agent_payload(&payload).expect("should parse v1");
 
         assert_eq!(version, 1);
         assert!(data_map.contains_key("metric_data"));
         assert!(data_map.contains_key("span_event_data"));
+    }
+
+    // ========================================================================
+    // Edge cases
+    // ========================================================================
+
+    #[test]
+    fn test_parse_agent_payload_empty_bytes() {
+        let result = parse_agent_payload(b"");
+        assert!(result.is_ok());
+        let (map, version) = result.expect("should succeed");
+        assert!(map.is_empty());
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn test_parse_agent_payload_non_utf8() {
+        let invalid_utf8: Vec<u8> = vec![0xFF, 0xFE, 0xFD];
+        let result = parse_agent_payload(&invalid_utf8);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_agent_payload_not_starting_with_bracket() {
+        let result = parse_agent_payload(b"not-an-array");
+        assert!(result.is_ok());
+        let (map, version) = result.expect("should succeed");
+        assert!(map.is_empty());
+        assert_eq!(version, 0);
+    }
+
+    #[test]
+    fn test_parse_agent_payload_invalid_base64() {
+        let payload = b"[\"2\", \"NR_LAMBDA_MONITORING\", \"not-valid-base64!!!\"]";
+        let result = parse_agent_payload(payload);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_agent_payload_valid_base64_invalid_gzip() {
+        let not_gzip = general_purpose::STANDARD.encode(b"plain text, not gzip");
+        let payload = format!("[\"2\", \"NR_LAMBDA_MONITORING\", \"{not_gzip}\"]");
+        let result = parse_agent_payload(payload.as_bytes());
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // LambdaData deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_lambda_data_camel_case_fields() {
+        let json = r#"{"metricData": [[1]], "spanEventData": [[2]]}"#;
+        let data: LambdaData = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(data.metric_data.len(), 1);
+        assert_eq!(data.span_event_data.len(), 1);
+    }
+
+    #[test]
+    fn test_lambda_data_empty_json() {
+        let json = "{}";
+        let data: LambdaData = serde_json::from_str(json).expect("should deserialize");
+        assert!(data.metric_data.is_empty());
+        assert!(data.span_event_data.is_empty());
+        assert!(data.error_event_data.is_empty());
+    }
+
+    #[test]
+    fn test_convert_lambda_data_to_map_all_empty() {
+        let data = LambdaData::default();
+        let map = convert_lambda_data_to_map(data);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_convert_lambda_data_to_map_mixed_populated() {
+        let data = LambdaData {
+            metric_data: vec![serde_json::json!([1, 2])],
+            span_event_data: vec![],
+            error_event_data: vec![serde_json::json!("error")],
+            ..LambdaData::default()
+        };
+        let map = convert_lambda_data_to_map(data);
+        assert_eq!(map.len(), 2);
+        assert!(map.contains_key("metric_data"));
+        assert!(map.contains_key("error_event_data"));
+        assert!(!map.contains_key("span_event_data"));
     }
 }

@@ -103,49 +103,30 @@ static AWS_CLIENTS: OnceLock<AwsClients> = OnceLock::new();
 /// Default secret ID for license key
 const DEFAULT_SECRET_ID: &str = "NEW_RELIC_LICENSE_KEY";
 
-/// Environment variable names for AWS credential sources
-const ENV_LICENSE_KEY_SECRET: &str = "NEW_RELIC_LICENSE_KEY_SECRET";
-const ENV_LICENSE_KEY_SSM_PARAMETER: &str = "NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME";
-
 /// Initialize AWS clients with maximum performance optimizations
 async fn initialize_aws_clients() -> Result<()> {
     use std::time::Duration;
-    
+
+    // Already initialized — idempotent guard
+    if AWS_CLIENTS.get().is_some() {
+        return Ok(());
+    }
+
     if std::env::var("AWS_LAMBDA_RUNTIME_API").is_err() {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
-    
-    let config_future = tokio::spawn(async {
+
+    let config = tokio::time::timeout(
+        Duration::from_millis(1000),
         aws_config::defaults(BehaviorVersion::latest())
             .retry_config(aws_config::retry::RetryConfig::disabled())
             .load()
-            .await
-    });
-    
-    let config = tokio::time::timeout(
-        Duration::from_millis(1000),
-        config_future
     ).await
-    .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?
-    .map_err(|e| anyhow!("AWS config failed: {}", e))?;
-    
-    let (secrets_result, ssm_result) = tokio::join!(
-        tokio::spawn({
-            let config = config.clone();
-            async move { SecretsManagerClient::new(&config) }
-        }),
-        tokio::spawn({
-            let config = config.clone();
-            async move { SsmClient::new(&config) }
-        })
-    );
-    
-    let secrets_manager = secrets_result.map_err(|e| anyhow!("Secrets Manager client failed: {}", e))?;
-    let ssm = ssm_result.map_err(|e| anyhow!("SSM client failed: {}", e))?;
+    .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?;
     
     let clients = AwsClients {
-        secrets_manager: DefaultSecretsManager::new(secrets_manager),
-        ssm: DefaultSsm::new(ssm),
+        secrets_manager: DefaultSecretsManager::new(SecretsManagerClient::new(&config)),
+        ssm: DefaultSsm::new(SsmClient::new(&config)),
     };
     
     AWS_CLIENTS.set(clients).map_err(|_| anyhow!("Failed to store AWS clients"))?;
@@ -164,7 +145,7 @@ async fn get_aws_clients() -> Result<&'static AwsClients> {
 }
 
 /// Decode license key from JSON string
-fn decode_license_key(raw_json: &str) -> Result<String> {
+pub(crate) fn decode_license_key(raw_json: &str) -> Result<String> {
     let secret: LicenseKeySecret = serde_json::from_str(raw_json)?;
     
     if secret.license_key.is_empty() {
@@ -178,15 +159,10 @@ fn decode_license_key(raw_json: &str) -> Result<String> {
 async fn try_license_key_from_secret(secret_id: &str) -> Result<String> {
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("Secrets Manager client not initialized"))?;
-    
 
-    
     let secret_string = clients.secrets_manager.get_secret_value(secret_id).await?;
-    
     let license_key = decode_license_key(&secret_string)?;
-    
 
-    
     Ok(license_key)
 }
 
@@ -194,58 +170,41 @@ async fn try_license_key_from_secret(secret_id: &str) -> Result<String> {
 async fn try_license_key_from_ssm_parameter(parameter_name: &str) -> Result<String> {
     let clients = get_aws_clients().await
         .map_err(|_| anyhow!("SSM client not initialized"))?;
-    
 
-    
     let parameter_value = clients.ssm.get_parameter(parameter_name).await?;
-
-
 
     Ok(parameter_value)
 }
 
-/// Get New Relic license key from AWS sources only This function is called only when environment variables are not available.
+/// Get New Relic license key from AWS sources only.
+/// This function is called only when the license key environment variable is not available.
+/// Lookup priority: configured Secrets Manager → configured SSM → default name fallback.
 pub async fn get_new_relic_license_key(conf: &Configuration) -> Result<String> {
     if let Err(e) = initialize_aws_clients().await {
         warn!("Failed to initialize AWS clients: {}. Skipping AWS credential sources.", e);
         return Err(anyhow!("Failed to initialize AWS clients"));
     }
-    
-    if let Ok(secret_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SECRET) {
-        if !secret_name_or_arn.is_empty() {
-            debug!("Using NEW_RELIC_LICENSE_KEY_SECRET environment variable to fetch from Secrets Manager: {}", secret_name_or_arn);
-            return try_license_key_from_secret(&secret_name_or_arn).await;
-        }
-    }
-    
-    if let Ok(parameter_name_or_arn) = std::env::var(ENV_LICENSE_KEY_SSM_PARAMETER) {
-        if !parameter_name_or_arn.is_empty() {
-            debug!("Using NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME environment variable to fetch from SSM: {}", parameter_name_or_arn);
-            return try_license_key_from_ssm_parameter(&parameter_name_or_arn).await;
-        }
-    }
-    
-    let secret_id = &conf.license_key_secret_id;
-    if !secret_id.is_empty() {
 
-        return try_license_key_from_secret(secret_id).await;
+    // 1. Try Secrets Manager if configured (env var or config file)
+    if !conf.license_key_secret_id.is_empty() {
+        debug!("Fetching license key from Secrets Manager: {}", conf.license_key_secret_id);
+        return try_license_key_from_secret(&conf.license_key_secret_id).await;
     }
-    
-    let parameter_name = &conf.license_key_ssm_parameter_name;
-    if !parameter_name.is_empty() {
 
-        return try_license_key_from_ssm_parameter(parameter_name).await;
+    // 2. Try SSM Parameter Store if configured (env var or config file)
+    if !conf.license_key_ssm_parameter_name.is_empty() {
+        debug!("Fetching license key from SSM Parameter Store: {}", conf.license_key_ssm_parameter_name);
+        return try_license_key_from_ssm_parameter(&conf.license_key_ssm_parameter_name).await;
     }
-    
 
-    
+    // 3. Fallback: try default secret/parameter name "NEW_RELIC_LICENSE_KEY"
     if let Ok(license_key) = try_license_key_from_secret(DEFAULT_SECRET_ID).await {
         return Ok(license_key);
     }
-    
+
     if let Ok(license_key) = try_license_key_from_ssm_parameter(DEFAULT_SECRET_ID).await {
         return Ok(license_key);
     }
-    
+
     Err(anyhow!("No license key found from any AWS source"))
 }

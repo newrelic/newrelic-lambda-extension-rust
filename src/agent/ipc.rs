@@ -32,7 +32,6 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
         .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to create FIFO: {}", e)))?;
     debug!("Created new telemetry pipe at {}", TELEMETRY_NAMED_PIPE_PATH);
 
-
     let mut tries = 0;
     while !path.exists() {
         if tries >= TELEMETRY_NAMED_PIPE_RETRIES {

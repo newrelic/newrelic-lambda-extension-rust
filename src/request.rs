@@ -307,13 +307,13 @@ pub async fn wait_for_all_requests_completion(
     // Send all pending telemetry and logs in parallel with 1MB chunking
     debug!("Shutdown: Flushing all pending telemetry and logs...");
 
-    use crate::agent::batch::send_all_pending_payloads_on_shutdown;
+    use crate::agent::batch::DEFAULT_BATCH_BUFFER;
 
     let telemetry_flush = tokio::spawn({
         let client = newrelic_client.clone();
         let cfg = config.clone();
         async move {
-            send_all_pending_payloads_on_shutdown(client, cfg).await;
+            DEFAULT_BATCH_BUFFER.send_all_pending_payloads_on_shutdown(client, cfg).await;
         }
     });
 
@@ -350,7 +350,6 @@ pub async fn cleanup_old_request_buffers(
     config: Arc<ExtensionConfig>,
 ) {
     use crate::agent::batch::BatchedAgentPayload;
-    use crate::EXTENSION_VERSION;
 
     let now = chrono::Utc::now();
     let threshold = chrono::Duration::minutes(5);
@@ -398,7 +397,7 @@ pub async fn cleanup_old_request_buffers(
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {
                         request_id: request_id.clone(),
-                        agent_payload_bytes: Arc::new(payload_bytes),
+                        agent_payload_bytes: Arc::from(payload_bytes),
                         report_line: report_line.clone(),
                         invoked_function_arn: arn.clone(),
                         timestamp: chrono::Utc::now(),
@@ -412,48 +411,7 @@ pub async fn cleanup_old_request_buffers(
     if !all_payloads.is_empty() {
         debug!("Periodic cleanup: Sending {} payloads from old request buffers", all_payloads.len());
 
-        // Pre-allocate capacity: each item needs 1-2 log events (agent + optional report)
-        let mut log_events = Vec::with_capacity(all_payloads.len() * 2);
-
-        for item in &all_payloads {
-            // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
-            let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
-            log_events.push(serde_json::json!({
-                "id": &item.request_id,
-                "message": &*agent_str,
-                "timestamp": item.timestamp.timestamp_millis(),
-            }));
-
-            if let Some(ref report) = item.report_line {
-                log_events.push(serde_json::json!({
-                    "id": item.request_id,
-                    "message": report,
-                    "timestamp": item.timestamp.timestamp_millis(),
-                }));
-            }
-        }
-
-        let most_recent = all_payloads.last().expect("all_payloads should not be empty");
-
-        let entry = serde_json::json!({
-            "logEvents": log_events,
-            "logGroup": format!("/aws/lambda/{}", config.aws.function_name),
-            "logStream": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
-            "messageType": "",
-            "owner": "",
-        });
-
-        let payload = serde_json::json!({
-            "context": {
-                "function_name": config.aws.function_name,
-                "invoked_function_arn": most_recent.invoked_function_arn,
-                "log_group_name": format!("/aws/lambda/{}", config.aws.function_name),
-                "log_stream_name": format!("newrelic-lambda-extension:{}", EXTENSION_VERSION),
-            },
-            "entry": entry.to_string(),
-        });
-
-        let payload_json = payload.to_string();
+        let payload_json = crate::agent::batch::build_newrelic_payload(&all_payloads, &config, None);
 
         if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
             error!("Periodic cleanup: Failed to send old request buffer payloads: {}", e);

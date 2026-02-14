@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};
 use tracing_subscriber::{
@@ -24,6 +25,7 @@ pub struct NewRelicConfig {
     pub lambda_handler: Option<String>,
     pub telemetry_endpoint: String,
     pub log_endpoint: String,
+    /// Read via config in main.rs harvester setup; compiler sees it as unread within this module
     #[allow(dead_code)]
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
@@ -119,8 +121,8 @@ impl Default for AwsConfig {
 }
 
 impl AwsConfig {
-    /// Suppress dead_code warning: This function is actually used but the compiler
-    /// cannot detect it due to dynamic dispatch/reflection patterns
+    /// Construct a Lambda function ARN from config fields
+    /// Used in tests; #[allow(dead_code)] suppresses false positive from test-only usage
     #[allow(dead_code)]
     pub fn construct_function_arn(&self) -> Option<String> {
         if self.function_name.is_empty() {
@@ -233,20 +235,18 @@ impl ExtensionConfig {
 
         let mut config = Self::default();
 
+        fn parse_bool(s: &str) -> bool {
+            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        }
+
         // Load New Relic configuration
-        config.new_relic.extension_enabled = env::var("NEW_RELIC_LAMBDA_EXTENSION_ENABLED")
-            .unwrap_or_else(|_| "true".to_string())
-            .parse()
-            .unwrap_or(true);
+        let extension_enabled_str = env::var("NEW_RELIC_LAMBDA_EXTENSION_ENABLED").unwrap_or_else(|_| "true".to_string());
+        config.new_relic.extension_enabled = parse_bool(&extension_enabled_str);
 
         config.new_relic.license_key = env::var("NEW_RELIC_LICENSE_KEY").ok();
         config.new_relic.license_key_secret_id = env::var("NEW_RELIC_LICENSE_KEY_SECRET").unwrap_or_default();
         config.new_relic.license_key_ssm_parameter_name = env::var("NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME").unwrap_or_default();
         config.new_relic.lambda_handler = env::var("NEW_RELIC_LAMBDA_HANDLER").ok();
-        
-        fn parse_bool(s: &str) -> bool {
-            matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
-        }
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
@@ -285,8 +285,6 @@ impl ExtensionConfig {
 
         config
     }
-
-
 }
 
 /// A custom log formatter that prepends `[NR_EXT]` and follows the desired format.
@@ -335,9 +333,9 @@ where
 /// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
 /// 
 /// # Example
-/// ```
+/// ```no_run
 /// std::env::set_var("NR_TAGS", "env:prod;team:backend");
-/// let tags = parse_nr_tags();
+/// let tags = newrelic_lambda_extension::config::parse_nr_tags();
 /// assert_eq!(tags, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
 /// ```
 pub fn parse_nr_tags() -> Vec<(String, String)> {
@@ -362,58 +360,51 @@ pub fn parse_nr_tags() -> Vec<(String, String)> {
 }
 
 /// Global configuration instance
-static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
-static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_CONFIG: OnceLock<ExtensionConfig> = OnceLock::new();
 
 /// Initialize the global configuration and logging
 pub fn init_config() -> &'static ExtensionConfig {
-    unsafe {
-        CONFIG_INIT.call_once(|| {
-            let config = ExtensionConfig::from_env();
+    GLOBAL_CONFIG.get_or_init(|| {
+        let config = ExtensionConfig::from_env();
 
-            let log_level = if config.extension.log_level.to_lowercase() == "all" {
-                "trace".to_string()
-            } else {
-                config.extension.log_level.clone()
-            };
+        let log_level = if config.extension.log_level.to_lowercase() == "all" {
+            "trace".to_string()
+        } else {
+            config.extension.log_level.clone()
+        };
 
-            let filter_directive = format!(
-                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
-                log_level,
-                log_level
-            );
+        let filter_directive = format!(
+            "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
+            log_level,
+            log_level
+        );
 
-            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
-            let env_filter = match EnvFilter::try_new(&filter_directive) {
-                Ok(filter) => filter,
-                Err(e) => {
-                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
-                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
-                    EnvFilter::try_new(fallback_directive)
-                        .expect("Fallback filter directive should always be valid")
-                }
-            };
+        // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+        let env_filter = match EnvFilter::try_new(&filter_directive) {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
+                EnvFilter::try_new(fallback_directive)
+                    .expect("Fallback filter directive should always be valid")
+            }
+        };
 
-            let subscriber = fmt::Subscriber::builder()
-                .with_env_filter(env_filter)
-                .event_format(CustomFormatter {
-                    enabled: config.extension.extension_logs_enabled,
-                })
-                .finish();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .event_format(CustomFormatter {
+                enabled: config.extension.extension_logs_enabled,
+            })
+            .finish();
 
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("setting default subscriber failed");
+        // Note: set_global_default may fail if called more than once (e.g. in tests),
+        // but that's harmless — the first subscriber wins.
+        let _ = tracing::subscriber::set_global_default(subscriber);
 
-            debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
+        debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
-            GLOBAL_CONFIG = Some(config);
-        });
-
-        #[allow(static_mut_refs)]
-        {
-            GLOBAL_CONFIG.as_ref().unwrap()
-        }
-    }
+        config
+    })
 }
 
 #[cfg(test)]

@@ -18,9 +18,13 @@ mod runtime;
 mod request;
 mod event_loop;
 mod error_synthesis;
+mod retry;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
+
+#[cfg(test)]
+mod integration_tests;
 
 use std::{
     env,
@@ -510,6 +514,7 @@ async fn perform_one_time_initialization(
                 temp_platform_processor,
                 Some(runtime_done_tx),
                 config.new_relic.apm_lambda_mode,
+
             )
             .await?;
 

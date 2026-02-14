@@ -1,7 +1,7 @@
 use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
-    agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
+    agent::batch::DEFAULT_BATCH_BUFFER,
     request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS},
 };
 use chrono::{DateTime, Utc};
@@ -158,7 +158,7 @@ async fn handle_telemetry_request(
                                         // Agent payloads go directly to APM collector when run_id is available
                                     } else {
                                         // STANDARD MODE: Match platform.report with agent payloads for batching
-                                        if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
+                                        if let Some(mut batch_item) = DEFAULT_BATCH_BUFFER.buffer.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
                                             debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
                                         }
@@ -192,7 +192,7 @@ async fn handle_telemetry_request(
                                                 
                                                 if let Ok(buffer_guard) = buffer.lock() {
                                                     for payload_bytes in buffer_guard.iter() {
-                                                        add_to_batch(
+                                                        DEFAULT_BATCH_BUFFER.add_to_batch(
                                                             request_id_str.to_string(),
                                                             payload_bytes.clone(),
                                                             Some(report_line.clone()),

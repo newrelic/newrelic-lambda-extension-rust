@@ -37,7 +37,7 @@ pub fn resolve_collector_command(telemetry_type: &str) -> Option<&'static str> {
     }
 }
 
-fn get_user_agent() -> String {
+pub(crate) fn get_user_agent() -> String {
     format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
 }
 
@@ -120,7 +120,7 @@ pub async fn send_error_events(
 
     if status.is_success() {
         debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
-        debug!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
+        debug!("Send {} duration: {}ms", CMD_ERROR_EVENTS, duration.as_millis());
         info!("Successfully sent {} error events (status: {})", error_events.len(), status);
         Ok(())
     } else {

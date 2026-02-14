@@ -1,4 +1,4 @@
-use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
+use crate::{config::ExtensionConfig, newrelic::payload, retry::get_backoff_delay, version::VersionInfo};
 use reqwest::{header, Client, Error};
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -7,17 +7,8 @@ const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn get_extension_name_with_version() -> String {
-    format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
+    format!("{EXTENSION_NAME}:{EXTENSION_VERSION}")
 }
-
-fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
-    match retry_attempt {
-        1 => std::time::Duration::from_millis(200),
-        2 => std::time::Duration::from_millis(400),
-        _ => std::time::Duration::from_millis(900),
-    }
-}
-
 
 #[derive(Debug)]
 pub struct NewRelicClient {
@@ -137,46 +128,49 @@ impl NewRelicClient {
         debug!("Sending agent payload to NR: {} bytes", payload_size);
         
         let mut retries = 0;
-        const MAX_RETRIES: usize = 3;
+        // Allocate body once; reqwest takes ownership so we clone from this on retry
+        let body = payload_json.to_string();
 
         loop {
-            
             let res = self.client
                 .post(&config.new_relic.telemetry_endpoint)
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(payload_json.to_string())
-                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
+                .body(body.clone())
+                .timeout(std::time::Duration::from_millis(2400))
                 .send()
                 .await;
 
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    
+
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         debug!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
-                    } else {
+                    }
+
+                    // 4xx client errors: not retryable, log and return Ok
+                    if status.is_client_error() {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
                         if retries == 0 {
-                            warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
+                            warn!("[agentsend] Client error {}. Response: {}", status, response_text);
                         }
-                        
-                        if status.is_client_error() {
-                            warn!("[agentsend] Client error (4xx), not retrying");
-                            return Ok(());
-                        }
-                        
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            let delay = get_backoff_delay(retries);
-                            tokio::time::sleep(delay).await;
-                        } else {
-                            warn!("[agentsend] Max retries exceeded");
-                            return Ok(());
-                        }
+                        warn!("[agentsend] Client error (4xx), not retrying");
+                        return Ok(());
+                    }
+
+                    // 5xx server errors: retry with backoff, return Err if exhausted
+                    if retries == 0 {
+                        warn!("[agentsend] Server error ({}), will retry", status);
+                    }
+                    if retries < crate::retry::MAX_RETRIES {
+                        retries += 1;
+                        tokio::time::sleep(get_backoff_delay(retries)).await;
+                    } else {
+                        warn!("[agentsend] Max retries exceeded for server error {}", status);
+                        return Err(response.error_for_status().expect_err("status was not success"));
                     }
                 }
                 Err(e) => {
@@ -191,10 +185,9 @@ impl NewRelicClient {
                         }
                     }
 
-                    if retries < MAX_RETRIES {
+                    if retries < crate::retry::MAX_RETRIES {
                         retries += 1;
-                        let delay = get_backoff_delay(retries);
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(get_backoff_delay(retries)).await;
                     } else {
                         warn!("[agentsend] Max network retries exceeded");
                         return Err(e);
@@ -219,22 +212,20 @@ impl NewRelicClient {
         debug!("Sending payload to NR endpoint: {} bytes", payload_size);
 
         let mut retries = 0;
-        const MAX_RETRIES: usize = 3;
-        
+
         loop {
-            
             let res = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
-                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
+                .timeout(std::time::Duration::from_millis(2400))
                 .send()
                 .await;
 
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    
+
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         if let Some(count) = log_count {
@@ -243,26 +234,28 @@ impl NewRelicClient {
                             debug!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         }
                         return Ok(());
-                    } else {
+                    }
+
+                    // 4xx client errors: not retryable
+                    if status.is_client_error() {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
                         if retries == 0 {
-                            warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
+                            warn!("Client error {}. Response: {}", status, response_text);
                         }
-                        
-                        if status.is_client_error() {
-                            warn!("Client error (4xx), not retrying");
-                            return Ok(());
-                        }
-                        
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            let delay = get_backoff_delay(retries);
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        } else {
-                            warn!("Max retries exceeded");
-                            return Ok(());
-                        }
+                        warn!("Client error (4xx), not retrying");
+                        return Ok(());
+                    }
+
+                    // 5xx server errors: retry with backoff
+                    if retries == 0 {
+                        warn!("Server error ({}), will retry", status);
+                    }
+                    if retries < crate::retry::MAX_RETRIES {
+                        retries += 1;
+                        tokio::time::sleep(get_backoff_delay(retries)).await;
+                    } else {
+                        warn!("Max retries exceeded for server error");
+                        return Err(response.error_for_status().expect_err("status was not success"));
                     }
                 }
                 Err(e) => {
@@ -277,11 +270,9 @@ impl NewRelicClient {
                         }
                     }
 
-                    if retries < MAX_RETRIES {
+                    if retries < crate::retry::MAX_RETRIES {
                         retries += 1;
-                        let delay = get_backoff_delay(retries);
-                        tokio::time::sleep(delay).await;
-                        continue;
+                        tokio::time::sleep(get_backoff_delay(retries)).await;
                     } else {
                         warn!("Max network retries exceeded");
                         return Err(e);

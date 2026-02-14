@@ -101,6 +101,7 @@ fn test_parse_nr_tags_with_default_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_with_custom_delimiter() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "env:prod|team:backend");
@@ -115,6 +116,7 @@ fn test_parse_nr_tags_with_custom_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_with_whitespace() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", " env : prod ; team : backend ");
@@ -128,6 +130,7 @@ fn test_parse_nr_tags_with_whitespace() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_invalid_format() {
     with_clean_env(|| {
         // Test invalid formats - should be skipped
@@ -142,6 +145,7 @@ fn test_parse_nr_tags_invalid_format() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_empty_values() {
     with_clean_env(|| {
         // Test empty keys/values - should be skipped
@@ -155,6 +159,7 @@ fn test_parse_nr_tags_empty_values() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_not_set() {
     with_clean_env(|| {
         let tags = parse_nr_tags();
@@ -163,6 +168,7 @@ fn test_parse_nr_tags_not_set() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_empty_string() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "");
@@ -908,9 +914,9 @@ fn test_from_env_extension_enabled_invalid_value() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_LAMBDA_EXTENSION_ENABLED", "invalid");
         let config = ExtensionConfig::from_env();
-        
-        // Should default to true when parse fails
-        assert!(config.new_relic.extension_enabled);
+
+        // "invalid" is not a recognized true value ("1"/"true"/"yes"/"on"), so returns false
+        assert!(!config.new_relic.extension_enabled);
     });
 }
 
@@ -920,10 +926,9 @@ fn test_from_env_extension_enabled_numeric_zero() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_LAMBDA_EXTENSION_ENABLED", "0");
         let config = ExtensionConfig::from_env();
-        
-        // "0" doesn't parse as bool, so it defaults to true
-        // (extension_enabled uses .parse() not parse_bool())
-        assert!(config.new_relic.extension_enabled);
+
+        // "0" is not a recognized true value, so extension is correctly disabled
+        assert!(!config.new_relic.extension_enabled);
     });
 }
 
@@ -1154,6 +1159,7 @@ fn test_validate_log_level_mixed_case() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_multiple_colons() {
     with_clean_env(|| {
         // Tags with multiple colons should be skipped (only 2 parts allowed)
@@ -1168,6 +1174,7 @@ fn test_parse_nr_tags_multiple_colons() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_only_delimiter() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", ";;;");
@@ -1179,6 +1186,7 @@ fn test_parse_nr_tags_only_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_single_tag() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "environment:production");
@@ -1266,5 +1274,113 @@ fn test_parse_send_logs_extra_spaces() {
         assert!(config.extension.send_extension_logs);
         assert!(!config.extension.send_platform_logs);
     });
+}
+
+#[test]
+#[serial]
+fn test_from_env_extension_logs_enabled_numeric() {
+    // "0" should disable (not a recognized true value)
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_LOGS_ENABLED", "0");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.extension.extension_logs_enabled);
+    });
+
+    // "1" should enable
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_LOGS_ENABLED", "1");
+        let config = ExtensionConfig::from_env();
+        assert!(config.extension.extension_logs_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_update_from_registration_with_none_account_id() {
+    with_full_clean_env(|| {
+        let mut aws_config = AwsConfig::default();
+
+        aws_config.update_from_registration(
+            "my-function".to_string(),
+            "v3".to_string(),
+            None,
+        );
+
+        assert_eq!(aws_config.function_name, "my-function");
+        assert_eq!(aws_config.function_version, Some("v3".to_string()));
+        assert_eq!(aws_config.account_id, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_platform_only() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "platform");
+        let config = ExtensionConfig::from_env();
+
+        assert!(!config.extension.send_function_logs);
+        assert!(!config.extension.send_extension_logs);
+        assert!(config.extension.send_platform_logs);
+    });
+}
+
+// ============================================================================
+// Direct unit tests for parse_send_logs and validate_log_level
+// ============================================================================
+
+#[test]
+fn test_parse_send_logs_direct_function_only() {
+    let (f, e, p) = ExtensionConfig::parse_send_logs("function");
+    assert!(f);
+    assert!(!e);
+    assert!(!p);
+}
+
+#[test]
+fn test_parse_send_logs_direct_all_three() {
+    let (f, e, p) = ExtensionConfig::parse_send_logs("function,extension,platform");
+    assert!(f);
+    assert!(e);
+    assert!(p);
+}
+
+#[test]
+fn test_parse_send_logs_direct_empty() {
+    let (f, e, p) = ExtensionConfig::parse_send_logs("");
+    assert!(!f);
+    assert!(!e);
+    assert!(!p);
+}
+
+#[test]
+fn test_parse_send_logs_direct_all_keyword() {
+    let (f, e, p) = ExtensionConfig::parse_send_logs("all");
+    assert!(f);
+    assert!(e);
+    assert!(p);
+}
+
+#[test]
+fn test_validate_log_level_direct_valid() {
+    assert_eq!(ExtensionConfig::validate_log_level("trace"), "trace");
+    assert_eq!(ExtensionConfig::validate_log_level("debug"), "debug");
+    assert_eq!(ExtensionConfig::validate_log_level("info"), "info");
+    assert_eq!(ExtensionConfig::validate_log_level("warn"), "warn");
+    assert_eq!(ExtensionConfig::validate_log_level("error"), "error");
+    assert_eq!(ExtensionConfig::validate_log_level("all"), "all");
+}
+
+#[test]
+fn test_validate_log_level_direct_invalid() {
+    assert_eq!(ExtensionConfig::validate_log_level("invalid"), "info");
+    assert_eq!(ExtensionConfig::validate_log_level("verbose"), "info");
+    assert_eq!(ExtensionConfig::validate_log_level(""), "info");
+}
+
+#[test]
+fn test_validate_log_level_direct_case_insensitive() {
+    assert_eq!(ExtensionConfig::validate_log_level("TRACE"), "trace");
+    assert_eq!(ExtensionConfig::validate_log_level("DeBuG"), "debug");
 }
 

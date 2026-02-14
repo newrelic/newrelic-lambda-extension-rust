@@ -39,11 +39,10 @@ impl ApmApp {
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
-        let backoff_ms = [200, 500, 900];
         let mut last_error = None;
 
-        for (attempt, delay) in backoff_ms.iter().enumerate() {
-            debug!("APM connection attempt {} of {}", attempt + 1, 3);
+        for attempt in 1..=crate::retry::MAX_RETRIES {
+            debug!("APM connection attempt {} of {}", attempt, crate::retry::MAX_RETRIES);
 
             match Self::try_connect(
                 &license_key,
@@ -65,12 +64,13 @@ impl ApmApp {
                     return Ok(app);
                 }
                 Err(e) => {
-                    warn!("APM connection attempt {} failed: {}", attempt + 1, e);
+                    warn!("APM connection attempt {} failed: {}", attempt, e);
                     last_error = Some(e);
 
-                    if attempt < backoff_ms.len() - 1 {
-                        debug!("Retrying in {}ms", delay);
-                        tokio::time::sleep(tokio::time::Duration::from_millis(*delay)).await;
+                    if attempt < crate::retry::MAX_RETRIES {
+                        let delay = crate::retry::get_backoff_delay(attempt);
+                        debug!("Retrying in {:?}", delay);
+                        tokio::time::sleep(delay).await;
                     }
                 }
             }

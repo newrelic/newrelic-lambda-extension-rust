@@ -63,4 +63,35 @@ mod tests {
         assert_eq!(CollectorError::RestartException, CollectorError::RestartException);
         assert_ne!(CollectorError::Disconnect, CollectorError::RestartException);
     }
+
+    // ========================================================================
+    // get_user_agent + constants
+    // ========================================================================
+
+    use crate::apm::collector::get_user_agent;
+
+    #[test]
+    fn test_get_user_agent_format() {
+        let ua = get_user_agent();
+        assert!(ua.starts_with("NewRelic-Rust-Lambda-Extension/"));
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn test_cmd_constants_have_expected_values() {
+        assert_eq!(CMD_METRICS, "metric_data");
+        assert_eq!(CMD_SPAN_EVENTS, "span_event_data");
+        assert_eq!(CMD_ERROR_EVENTS, "error_event_data");
+        assert_eq!(CMD_ERROR_DATA, "error_data");
+        assert_eq!(CMD_ANALYTIC_EVENTS, "analytic_event_data");
+        assert_eq!(CMD_CUSTOM_EVENTS, "custom_event_data");
+        assert_eq!(CMD_TRANSACTION_SAMPLES, "transaction_sample_data");
+        assert_eq!(CMD_LOG_EVENTS, "log_event_data");
+    }
+
+    #[test]
+    fn test_collector_error_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<CollectorError>();
+    }
 }

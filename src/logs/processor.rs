@@ -7,10 +7,7 @@ use crate::{
     telemetry::listener::TelemetryRecord,
 };
 use async_trait::async_trait;
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex};
 
 use crate::apm::app::ApmApp;
 
@@ -79,17 +76,11 @@ struct FailedLogEntry {
     retry_count: usize,
 }
 
-/// Configuration constants for batching and retry logic
+/// Configuration constants for batching
 const MAX_BATCH_SIZE: usize = 100;
-const MAX_RETRIES: usize = 3;
+const MAX_RETRIES: usize = crate::retry::MAX_RETRIES;
 
-fn get_backoff_delay(retry_attempt: usize) -> Duration {
-    match retry_attempt {
-        1 => Duration::from_millis(200),
-        2 => Duration::from_millis(400),
-        _ => Duration::from_millis(900),
-    }
-}
+use crate::retry::get_backoff_delay;
 
 /// Extract structured log level from JSON record
 /// Returns the uppercase level string if found in common level field names

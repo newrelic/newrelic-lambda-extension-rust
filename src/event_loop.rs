@@ -19,11 +19,7 @@ use crate::{
         REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
         CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
     },
-    agent::batch::{
-        add_to_batch, should_send_batch_by_threshold, 
-        send_batched_payloads_with_reports_only,
-        send_all_pending_payloads_on_shutdown,
-    },
+    agent::batch::DEFAULT_BATCH_BUFFER,
     agent::payload::send_agent_payload_to_newrelic,
     error_synthesis,
     trace,
@@ -257,9 +253,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     let newrelic_client = components.newrelic_client.clone();
                     let config = components.config.clone();
                     tokio::spawn(async move {
-                        use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        DEFAULT_BATCH_BUFFER.cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
                         cleanup_old_request_buffers(newrelic_client, config).await;
                         cleanup_old_failed_payloads();
                     });
@@ -478,7 +473,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                         info!("Performing emergency shutdown cleanup...");
                         
-                        send_batched_payloads_with_reports_only(
+                        DEFAULT_BATCH_BUFFER.send_batched_payloads_with_reports_only(
                             components.newrelic_client.clone(),
                             components.config.clone(),
                         )
@@ -547,9 +542,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
                 // CRITICAL: Must await to prevent Lambda from freezing network mid-request
-                if should_send_batch_by_threshold() {
+                if DEFAULT_BATCH_BUFFER.should_send_batch_by_threshold() {
                     debug!("Batch threshold reached - sending payloads with report lines only");
-                    send_batched_payloads_with_reports_only(
+                    DEFAULT_BATCH_BUFFER.send_batched_payloads_with_reports_only(
                         components.newrelic_client.clone(),
                         components.config.clone()
                     ).await;
@@ -614,9 +609,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     let newrelic_client = components.newrelic_client.clone();
                     let config = components.config.clone();
                     tokio::spawn(async move {
-                        use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        DEFAULT_BATCH_BUFFER.cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
                         cleanup_old_request_buffers(newrelic_client, config).await;
                     });
                 }
@@ -673,7 +667,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
-                send_all_pending_payloads_on_shutdown(
+                DEFAULT_BATCH_BUFFER.send_all_pending_payloads_on_shutdown(
                     components.newrelic_client.clone(),
                     components.config.clone(),
                 )
@@ -1149,7 +1143,7 @@ pub async fn process_request_concurrently(
         );
 
         for payload_bytes in agent_payloads {
-            add_to_batch(
+            DEFAULT_BATCH_BUFFER.add_to_batch(
                 request_id.clone(),
                 payload_bytes,
                 Some(report.clone()),
@@ -1158,13 +1152,13 @@ pub async fn process_request_concurrently(
         }
 
         // Check if batch threshold is met and send if needed (only payloads with report lines)
-        if should_send_batch_by_threshold() {
+        if DEFAULT_BATCH_BUFFER.should_send_batch_by_threshold() {
             debug!("Batch threshold reached - sending payloads with report lines only");
             let newrelic_client_clone = newrelic_client.clone();
             let config_clone = config.clone();
 
             Some(tokio::spawn(async move {
-                send_batched_payloads_with_reports_only(newrelic_client_clone, config_clone).await;
+                DEFAULT_BATCH_BUFFER.send_batched_payloads_with_reports_only(newrelic_client_clone, config_clone).await;
             }))
         } else {
             None

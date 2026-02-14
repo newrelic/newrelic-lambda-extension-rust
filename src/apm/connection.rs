@@ -14,6 +14,11 @@ use flate2::Compression;
 /// Connection timeouts - MORE AGGRESSIVE than Go for Lambda cold start
 const PRECONNECT_TIMEOUT_SECS: u64 = 20;
 const CONNECT_TIMEOUT_SECS: u64 = 20;
+const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn get_user_agent() -> String {
+    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
+}
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
 fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
@@ -122,7 +127,7 @@ pub async fn preconnect(
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
-        .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
+        .header("User-Agent", get_user_agent())
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
         .timeout(Duration::from_secs(PRECONNECT_TIMEOUT_SECS))
@@ -206,7 +211,7 @@ pub async fn connect(
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
-        .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
+        .header("User-Agent", get_user_agent())
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
         .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
@@ -283,4 +288,165 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     }
 
     labels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    // ========================================================================
+    // compress_inline
+    // ========================================================================
+
+    #[test]
+    fn test_compress_inline_roundtrip() {
+        let original = b"Hello, this is test data for compression roundtrip!";
+        let compressed = compress_inline(original).expect("compression should succeed");
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).expect("decompression should succeed");
+
+        assert_eq!(&decompressed, original);
+    }
+
+    #[test]
+    fn test_compress_inline_empty_input() {
+        let compressed = compress_inline(b"").expect("compression of empty should succeed");
+
+        let mut decoder = GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).expect("decompression should succeed");
+
+        assert!(decompressed.is_empty());
+    }
+
+    #[test]
+    fn test_compress_inline_produces_smaller_output_for_large_input() {
+        let large_data = vec![b'A'; 10000];
+        let compressed = compress_inline(&large_data).expect("compression should succeed");
+        assert!(compressed.len() < large_data.len());
+    }
+
+    // ========================================================================
+    // get_labels
+    // ========================================================================
+
+    #[test]
+    fn test_get_labels_mandatory_labels_present() {
+        let labels = get_labels("arn:aws:lambda:us-east-1:123:function:test", "nodejs");
+
+        let label_types: Vec<&str> = labels.iter().map(|l| l.label_type.as_str()).collect();
+        assert!(label_types.contains(&"aws.arn"));
+        assert!(label_types.contains(&"isLambdaFunction"));
+        assert!(label_types.contains(&"newrelic.extension.version"));
+    }
+
+    #[test]
+    fn test_get_labels_extension_version_matches_cargo_pkg() {
+        let labels = get_labels("arn:test", "python");
+        let ext_label = labels.iter()
+            .find(|l| l.label_type == "newrelic.extension.version")
+            .expect("should have extension version label");
+        assert_eq!(ext_label.label_value, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn test_get_labels_is_lambda_function_true() {
+        let labels = get_labels("arn:test", "ruby");
+        let lambda_label = labels.iter()
+            .find(|l| l.label_type == "isLambdaFunction")
+            .expect("should have isLambdaFunction label");
+        assert_eq!(lambda_label.label_value, "true");
+    }
+
+    // ========================================================================
+    // get_user_agent
+    // ========================================================================
+
+    #[test]
+    fn test_get_user_agent_format() {
+        let ua = get_user_agent();
+        assert!(ua.starts_with("NewRelic-Rust-Lambda-Extension/"));
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // ========================================================================
+    // Serialization
+    // ========================================================================
+
+    #[test]
+    fn test_preconnect_request_serialization() {
+        let req = PreconnectRequest {
+            security_policies_token: String::new(),
+            high_security: false,
+        };
+        let json = serde_json::to_string(&req).expect("serialization should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(parsed["security_policies_token"], "");
+        assert_eq!(parsed["high_security"], false);
+    }
+
+    #[test]
+    fn test_connect_request_serialization() {
+        let req = ConnectRequest {
+            pid: 12345,
+            language: "ruby".to_string(),
+            agent_version: "9.5.0".to_string(),
+            host: "arn:test".to_string(),
+            display_host: "my-function".to_string(),
+            app_name: vec!["my-function".to_string()],
+            identifier: "my-function".to_string(),
+            utilization: Utilization {
+                vendors: Vendors {
+                    aws_lambda: AwsLambdaInfo {
+                        arn: "arn:test".to_string(),
+                        region: "us-east-1".to_string(),
+                        account_id: "123456".to_string(),
+                        function_name: "my-function".to_string(),
+                    },
+                },
+            },
+            labels: vec![],
+        };
+        let json = serde_json::to_string(&req).expect("serialization should succeed");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(parsed["pid"], 12345);
+        assert_eq!(parsed["language"], "ruby");
+        assert_eq!(parsed["utilization"]["vendors"]["awslambda"]["aws.arn"], "arn:test");
+        assert_eq!(parsed["utilization"]["vendors"]["awslambda"]["aws.region"], "us-east-1");
+        assert_eq!(parsed["utilization"]["vendors"]["awslambda"]["aws.accountId"], "123456");
+        assert_eq!(parsed["utilization"]["vendors"]["awslambda"]["aws.functionName"], "my-function");
+    }
+
+    // ========================================================================
+    // Deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_preconnect_response_deserialization() {
+        let json = r#"{"return_value": {"redirect_host": "collector-123.newrelic.com"}}"#;
+        let resp: PreconnectResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(resp.return_value.redirect_host, "collector-123.newrelic.com");
+    }
+
+    #[test]
+    fn test_connect_response_deserialization() {
+        let json = r#"{"return_value": {"agent_run_id": "run-123", "entity_guid": "ABCDEF123"}}"#;
+        let resp: ConnectResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(resp.return_value.agent_run_id, "run-123");
+        assert_eq!(resp.return_value.entity_guid, Some("ABCDEF123".to_string()));
+    }
+
+    #[test]
+    fn test_connect_response_missing_entity_guid() {
+        let json = r#"{"return_value": {"agent_run_id": "run-456", "entity_guid": null}}"#;
+        let resp: ConnectResponse = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(resp.return_value.agent_run_id, "run-456");
+        assert_eq!(resp.return_value.entity_guid, None);
+    }
 }

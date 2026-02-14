@@ -219,13 +219,81 @@ mod tests {
             "xyz789",
             "arn:aws:lambda:us-west-2:987654321:function:error-function",
         );
-        
+
         assert!(events.is_some());
-        let events = events.unwrap();
-        let event_array = &events[0].as_array().unwrap();
+        let events = events.expect("should have events");
+        let event_array = events[0].as_array().expect("should be array");
         let event_detail = &event_array[0];
-        
+
         assert_eq!(event_detail["error.class"], "LambdaError");
-        assert!(event_detail["error.message"].as_str().unwrap().contains("ERROR"));
+        assert!(event_detail["error.message"].as_str().expect("string").contains("ERROR"));
+    }
+
+    // ========================================================================
+    // extract_error_message — direct tests
+    // ========================================================================
+
+    #[test]
+    fn test_extract_error_message_with_error_colon_prefix() {
+        let msg = extract_error_message("2024-01-15 error: connection refused");
+        assert!(msg.starts_with("error:"));
+    }
+
+    #[test]
+    fn test_extract_error_message_with_uppercase_error() {
+        let msg = extract_error_message("2024 ERROR Something went wrong");
+        assert!(msg.starts_with("ERROR"));
+    }
+
+    #[test]
+    fn test_extract_error_message_with_error_colon_mixed() {
+        let msg = extract_error_message("module Error: bad config value");
+        assert!(msg.starts_with("Error:"));
+    }
+
+    #[test]
+    fn test_extract_error_message_with_exception_prefix() {
+        let msg = extract_error_message("RuntimeException: null pointer at line 42");
+        assert!(msg.contains("Exception:"));
+    }
+
+    #[test]
+    fn test_extract_error_message_no_known_prefix() {
+        let msg = extract_error_message("Something completely different happened");
+        assert_eq!(msg, "Something completely different happened");
+    }
+
+    #[test]
+    fn test_extract_error_message_very_long_input() {
+        let long_input = "ERROR ".to_string() + &"x".repeat(500);
+        let msg = extract_error_message(&long_input);
+        assert_eq!(msg.chars().count(), 200);
+        assert!(msg.starts_with("ERROR"));
+    }
+
+    #[test]
+    fn test_generate_error_event_returns_non_empty() {
+        let events = generate_error_event("TestError", "test message", "req-1", "arn:test");
+        assert!(!events.is_empty());
+    }
+
+    #[test]
+    fn test_generate_error_event_from_fault_lowercase_exception() {
+        let log = "Unhandled exception in handler";
+        let events = generate_error_event_from_fault(log, "req-1", "arn:test");
+        assert!(events.is_some());
+        let events = events.expect("should be some");
+        let detail = &events[0].as_array().expect("array")[0];
+        assert_eq!(detail["error.class"], "LambdaError");
+    }
+
+    #[test]
+    fn test_extract_function_name_empty_string() {
+        assert_eq!(extract_function_name(""), "unknown");
+    }
+
+    #[test]
+    fn test_extract_function_version_empty_string() {
+        assert_eq!(extract_function_version(""), "$LATEST");
     }
 }

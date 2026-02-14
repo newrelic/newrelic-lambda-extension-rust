@@ -232,4 +232,78 @@ mod tests {
         assert_eq!(first_metric["value"], 123.45);
         assert_eq!(first_metric["attributes"]["entity.guid"], "entity-guid-123");
     }
+
+    #[test]
+    fn test_convert_to_apm_metrics_with_error() {
+        let metrics = LambdaMetrics {
+            request_id: "abc123".to_string(),
+            duration: None,
+            billed_duration: None,
+            memory_size: None,
+            max_memory_used: None,
+            init_duration: None,
+            error: Some("error".to_string()),
+            error_type: None,
+        };
+
+        let apm_metrics = convert_to_apm_metrics(&metrics, "guid", "fn");
+        assert_eq!(apm_metrics.len(), 1);
+        assert_eq!(apm_metrics[0]["name"], "apm.lambda.transaction.error");
+        assert_eq!(apm_metrics[0]["type"], "count");
+        assert_eq!(apm_metrics[0]["value"], 1);
+    }
+
+    #[test]
+    fn test_convert_to_apm_metrics_with_error_and_error_type() {
+        let metrics = LambdaMetrics {
+            request_id: "abc123".to_string(),
+            duration: Some(100.0),
+            billed_duration: None,
+            memory_size: None,
+            max_memory_used: None,
+            init_duration: None,
+            error: Some("error".to_string()),
+            error_type: Some("Runtime.ExitError".to_string()),
+        };
+
+        let apm_metrics = convert_to_apm_metrics(&metrics, "guid", "fn");
+        assert_eq!(apm_metrics.len(), 2);
+
+        let error_metric = apm_metrics.iter()
+            .find(|m| m["name"] == "apm.lambda.transaction.error")
+            .expect("should have error metric");
+        assert_eq!(error_metric["attributes"]["Error Type"], "Runtime.ExitError");
+    }
+
+    #[test]
+    fn test_convert_to_apm_metrics_all_none_fields() {
+        let metrics = LambdaMetrics {
+            request_id: "abc123".to_string(),
+            duration: None,
+            billed_duration: None,
+            memory_size: None,
+            max_memory_used: None,
+            init_duration: None,
+            error: None,
+            error_type: None,
+        };
+
+        let apm_metrics = convert_to_apm_metrics(&metrics, "guid", "fn");
+        assert!(apm_metrics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_lambda_report_log_unparseable_input() {
+        let result = parse_lambda_report_log("This is just a random log line");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_fault_log_missing_error_type() {
+        let log = "RequestId: abc123 Status: error";
+        let metrics = parse_lambda_report_log(log).expect("should parse");
+        assert_eq!(metrics.request_id, "abc123");
+        assert_eq!(metrics.error, Some("error".to_string()));
+        assert_eq!(metrics.error_type, None);
+    }
 }
