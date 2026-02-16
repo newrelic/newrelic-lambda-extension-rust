@@ -110,9 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_error_events_connection_refused() {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build().expect("client");
+        let client = reqwest::Client::new();
         let events = vec![serde_json::json!({"error": "test"})];
 
         // Use unreachable host — should fail
@@ -131,9 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_apm_telemetry_connection_refused() {
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build().expect("client");
+        let client = reqwest::Client::new();
         let data = vec![serde_json::json!("placeholder"), serde_json::json!([1, 2, 3])];
 
         let result = send_apm_telemetry(
