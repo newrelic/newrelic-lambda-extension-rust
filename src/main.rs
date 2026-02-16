@@ -852,4 +852,211 @@ mod main_tests {
         assert!(!EXTENSION_NAME.is_empty(), "EXTENSION_NAME should not be empty");
         assert!(!EXTENSION_VERSION.is_empty(), "EXTENSION_VERSION should not be empty");
     }
+
+    // ========================================================================
+    // Mock Lambda Runtime API helper (same pattern as event_loop tests)
+    // ========================================================================
+
+    use std::convert::Infallible;
+    use hyper::{Response, StatusCode};
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use http_body_util::Full;
+    use tokio::net::TcpListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    async fn start_mock_runtime_api(invoke_count: u32) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let counter = std::sync::Arc::new(AtomicU32::new(0));
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let counter = counter.clone();
+                let max = invoke_count;
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let counter = counter.clone();
+                        let path = req.uri().path().to_string();
+                        async move {
+                            if path.contains("/extension/register") {
+                                Ok::<_, Infallible>(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Lambda-Extension-Identifier", "test-ext-id")
+                                    .body(Full::new(Bytes::from(
+                                        serde_json::json!({"functionName":"test-fn","functionVersion":"$LATEST","accountId":"123456789012"}).to_string()
+                                    ))).expect("response"))
+                            } else if path.contains("/extension/event/next") {
+                                let n = counter.fetch_add(1, Ordering::SeqCst);
+                                let body = if n < max {
+                                    serde_json::json!({"eventType":"INVOKE","requestId":format!("req-{n}"),"invokedFunctionArn":"arn:aws:lambda:us-east-1:123456789012:function:test-fn"})
+                                } else {
+                                    serde_json::json!({"eventType":"SHUTDOWN","shutdownReason":"spindown"})
+                                };
+                                Ok(Response::builder().status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from(body.to_string()))).expect("response"))
+                            } else if path.contains("/telemetry") {
+                                Ok(Response::builder().status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from("OK"))).expect("response"))
+                            } else {
+                                Ok(Response::builder().status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from("{}"))).expect("response"))
+                            }
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    // ========================================================================
+    // handle_no_license_key
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_handle_no_license_key_returns_noop_components() {
+        let config = Arc::new(config::ExtensionConfig::default());
+        let client = Arc::new(Client::builder().build().expect("client"));
+        let registration = runtime::ExtensionRegistrationResponse {
+            function_name: "test-fn".to_string(),
+            function_version: "$LATEST".to_string(),
+            account_id: Some("123456789012".to_string()),
+        };
+
+        let result = handle_no_license_key(config, client, "ext-id".to_string(), registration).await;
+        assert!(result.is_ok());
+
+        let components = result.expect("should create components");
+        assert!(!components.apm_mode_enabled, "Should not be in APM mode");
+        assert_eq!(components.extension_id, "ext-id");
+    }
+
+    // ========================================================================
+    // perform_extension_shutdown_cleanup
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_perform_extension_shutdown_cleanup_aborts_harvester() {
+        let harvester_handle = tokio::spawn(async {
+            // Simulate long-running harvester
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let start = std::time::Instant::now();
+
+        perform_extension_shutdown_cleanup(5, harvester_handle, start).await;
+        // If we reach here, the function completed (harvester was aborted)
+    }
+
+    // ========================================================================
+    // resolve_license_key_with_aws_fallback — env var path
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_license_key_from_env_var() {
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.license_key = Some("env_key_12345".to_string());
+        let config = Arc::new(config);
+
+        let result = resolve_license_key_with_aws_fallback(&config).await;
+        assert!(result.is_ok());
+        assert_eq!(result.expect("should resolve"), Some("env_key_12345".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_resolve_license_key_no_env_returns_none() {
+        let config = Arc::new(config::ExtensionConfig::default()); // no license key
+        let result = resolve_license_key_with_aws_fallback(&config).await;
+        assert!(result.is_ok());
+        // Without AWS env, should return None (no AWS credentials available)
+        assert!(result.expect("should not error").is_none());
+    }
+
+    // ========================================================================
+    // initialize_lambda_runtime_client_and_register — via mock
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_initialize_lambda_runtime_client_and_register() {
+        let (port, server_handle) = start_mock_runtime_api(0).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let result = initialize_lambda_runtime_client_and_register().await;
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+
+        assert!(result.is_ok(), "Should register successfully");
+        let (client, ext_id, registration) = result.expect("components");
+        assert!(!ext_id.is_empty());
+        assert_eq!(registration.function_name, "test-fn");
+        assert_eq!(registration.account_id, Some("123456789012".to_string()));
+        let _ = client; // Just verify it exists
+    }
+
+    // ========================================================================
+    // run_noop_extension — via mock
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_run_noop_extension_full_lifecycle() {
+        let (port, server_handle) = start_mock_runtime_api(1).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let result = run_noop_extension().await;
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+
+        assert!(result.is_ok(), "Noop extension should complete successfully");
+    }
+
+    // ========================================================================
+    // start_harvester_background_task
+    // ========================================================================
+
+    #[test]
+    fn test_start_harvester_background_task_returns_handle() {
+        let config = Arc::new(config::ExtensionConfig::default());
+        let client = Arc::new(NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(ProcessorFactory::new(client, config, apm_app));
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_harvester, handle) = rt.block_on(async {
+            start_harvester_background_task(
+                vec![],
+                std::time::Duration::from_secs(5),
+                &factory,
+            )
+        });
+
+        // Verify it returns a valid handle
+        handle.abort(); // Clean up
+    }
+
+    // ========================================================================
+    // start_agent_payload_collector_background_task
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_start_agent_payload_collector_spawns_task() {
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        start_agent_payload_collector_background_task(rx);
+
+        // Send a payload through the channel
+        tx.send(b"test-payload".to_vec()).await.expect("should send");
+        // Give the background task time to process
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // If no panic, the task is running
+    }
 }

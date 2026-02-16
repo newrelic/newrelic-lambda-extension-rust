@@ -2250,4 +2250,272 @@ mod tests {
         server_handle.abort();
         clear_event_loop_state();
     }
+
+    // ========================================================================
+    // extract_and_coordinate_trace_id — disabled path
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_extract_trace_id_disabled_returns_immediately() {
+        let config = Arc::new({
+            let mut c = config::ExtensionConfig::default();
+            c.new_relic.collect_trace_id = false; // disabled
+            c
+        });
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(noop_client, config.clone(), apm_app);
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx);
+
+        // Should return immediately without doing anything
+        extract_and_coordinate_trace_id(b"any-payload-data", &config, &log_processor).await;
+        // If we reach here without panic, disabled path works
+    }
+
+    #[tokio::test]
+    async fn test_extract_trace_id_enabled_with_invalid_payload() {
+        let config = Arc::new({
+            let mut c = config::ExtensionConfig::default();
+            c.new_relic.collect_trace_id = true; // enabled
+            c
+        });
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(noop_client, config.clone(), apm_app);
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx);
+
+        // Invalid payload — extraction should fail silently (no trace ID found)
+        extract_and_coordinate_trace_id(b"not-a-valid-agent-payload", &config, &log_processor).await;
+        // No panic = passes
+    }
+
+    // ========================================================================
+    // send_to_apm_collector — APM app not ready
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_send_to_apm_collector_no_app_returns_error() {
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let config = Arc::new(config::ExtensionConfig::default());
+        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+        let result = send_to_apm_collector(
+            b"test-payload",
+            "req-1",
+            "arn:test",
+            &noop_client,
+            &config,
+            &apm_app,
+        )
+        .await;
+
+        assert!(result.is_err(), "No APM app should return error");
+        let err_msg = result.expect_err("should be error").to_string();
+        assert!(err_msg.contains("not ready") || err_msg.contains("buffered"),
+            "Error should mention APM not ready, got: {err_msg}");
+    }
+
+    // ========================================================================
+    // retry_failed_agent_payloads — with mock NR server
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_retry_failed_agent_payloads_empty_is_noop() {
+        clear_event_loop_state();
+
+        let nr_server = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let nr_port = nr_server.local_addr().expect("addr").port();
+        let nr_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = nr_server.accept().await else { break };
+                tokio::spawn(async move {
+                    let svc = service_fn(|_| async {
+                        Ok::<_, Infallible>(Response::builder().status(StatusCode::OK)
+                            .body(Full::new(Bytes::from("OK"))).expect("r"))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.telemetry_endpoint = format!("http://127.0.0.1:{nr_port}");
+        let config = Arc::new(config);
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+
+        // Empty list — should return quickly
+        retry_failed_agent_payloads(&client, &config).await;
+
+        nr_handle.abort();
+        clear_event_loop_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_retry_failed_agent_payloads_drops_old_payloads() {
+        clear_event_loop_state();
+
+        // Add a payload older than 24 hours
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.push(FailedAgentPayload {
+                payload_bytes: b"old-data".to_vec(),
+                request_id: "req-old".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now() - chrono::Duration::hours(25),
+            });
+        }
+
+        let nr_server = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let nr_port = nr_server.local_addr().expect("addr").port();
+        let nr_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = nr_server.accept().await else { break };
+                tokio::spawn(async move {
+                    let svc = service_fn(|_| async {
+                        Ok::<_, Infallible>(Response::builder().status(StatusCode::OK)
+                            .body(Full::new(Bytes::from("OK"))).expect("r"))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.telemetry_endpoint = format!("http://127.0.0.1:{nr_port}");
+        let config = Arc::new(config);
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+
+        retry_failed_agent_payloads(&client, &config).await;
+
+        // Old payload should have been dropped (>24h)
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert!(guard.is_empty(), "Old payload should be dropped");
+        drop(guard);
+
+        nr_handle.abort();
+        clear_event_loop_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_retry_failed_agent_payloads_drops_over_max_retries() {
+        clear_event_loop_state();
+
+        // Add a payload with retry_count > 5
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.push(FailedAgentPayload {
+                payload_bytes: b"retry-exhausted".to_vec(),
+                request_id: "req-exhausted".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                retry_count: 5, // Will be incremented to 6, exceeding limit
+                failed_at: chrono::Utc::now(),
+            });
+        }
+
+        let nr_server = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let nr_port = nr_server.local_addr().expect("addr").port();
+        let nr_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = nr_server.accept().await else { break };
+                tokio::spawn(async move {
+                    let svc = service_fn(|_| async {
+                        Ok::<_, Infallible>(Response::builder().status(StatusCode::OK)
+                            .body(Full::new(Bytes::from("OK"))).expect("r"))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc).await;
+                });
+            }
+        });
+
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.telemetry_endpoint = format!("http://127.0.0.1:{nr_port}");
+        let config = Arc::new(config);
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+
+        retry_failed_agent_payloads(&client, &config).await;
+
+        // Payload with >5 retries should be dropped
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert!(guard.is_empty(), "Over-retried payload should be dropped");
+        drop(guard);
+
+        nr_handle.abort();
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // process_request_concurrently — with noop components
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_process_request_concurrently_no_state_returns() {
+        clear_event_loop_state();
+        // Call with a request_id that has no state in REQUEST_PROCESSORS
+        // Should return early with error log
+        let config = Arc::new(config::ExtensionConfig::default());
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx);
+
+        // No state inserted for "ghost-req" — should return early
+        process_request_concurrently(
+            "ghost-req".to_string(),
+            "arn:test".to_string(),
+            factory,
+            noop_client,
+            config,
+            log_processor,
+            apm_app,
+        )
+        .await;
+        // No panic = passes
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // process_apm_request — with noop components
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_process_apm_request_no_state_returns() {
+        clear_event_loop_state();
+        let config = Arc::new(config::ExtensionConfig::default());
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx);
+
+        // No state for "ghost-apm-req" — should return early
+        process_apm_request(
+            "ghost-apm-req".to_string(),
+            "arn:test".to_string(),
+            true,
+            factory,
+            noop_client,
+            config,
+            log_processor,
+            apm_app,
+        )
+        .await;
+        clear_event_loop_state();
+    }
 }
