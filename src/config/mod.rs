@@ -187,7 +187,7 @@ impl Default for ExtensionSettings {
 }
 
 impl ExtensionConfig {
-    /// Validates the log-level and returns a valid level or defaults to "info" with a warning
+    /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
         let normalized = raw_level.to_lowercase();
         match normalized.as_str() {
