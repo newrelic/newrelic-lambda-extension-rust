@@ -2558,7 +2558,6 @@ mod tests {
     async fn test_e2e_apm_app_new_connection_refused() {
         // Point at unreachable host — should fail after retries
         let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
             .connect_timeout(std::time::Duration::from_millis(200))
             .build()
             .expect("client");
