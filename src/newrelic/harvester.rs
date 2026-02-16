@@ -77,3 +77,66 @@ impl std::fmt::Debug for Harvester {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::request::ProcessorFactory;
+    use std::sync::Mutex;
+
+    fn make_harvester(interval_secs: u64) -> Harvester {
+        let config = Arc::new(ExtensionConfig::default());
+        let client = Arc::new(NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        Harvester::new(
+            vec![],
+            Duration::from_secs(interval_secs),
+            log_processor,
+            platform_processor,
+        )
+    }
+
+    #[test]
+    fn test_harvester_new_construction() {
+        let harvester = make_harvester(5);
+        let debug_str = format!("{harvester:?}");
+        assert!(debug_str.contains("Harvester"));
+    }
+
+    #[test]
+    fn test_harvester_debug_shows_processor_count() {
+        let harvester = make_harvester(5);
+        let debug_str = format!("{harvester:?}");
+        assert!(debug_str.contains("processor_count: 0"));
+    }
+
+    #[test]
+    fn test_harvester_debug_shows_interval() {
+        let harvester = make_harvester(10);
+        let debug_str = format!("{harvester:?}");
+        assert!(debug_str.contains("10s") || debug_str.contains("10000"), "Should show 10s interval: {debug_str}");
+    }
+
+    #[test]
+    fn test_harvester_with_different_intervals() {
+        let h1 = make_harvester(1);
+        let h5 = make_harvester(5);
+        let h30 = make_harvester(30);
+
+        let d1 = format!("{h1:?}");
+        let d5 = format!("{h5:?}");
+        let d30 = format!("{h30:?}");
+
+        // All should contain "Harvester"
+        assert!(d1.contains("Harvester"));
+        assert!(d5.contains("Harvester"));
+        assert!(d30.contains("Harvester"));
+    }
+}

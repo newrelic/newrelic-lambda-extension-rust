@@ -97,3 +97,24 @@ async fn poll_for_telemetry() -> Result<Vec<u8>> {
         Err(Error::new(ErrorKind::Other, join_error.to_string()))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_telemetry_named_pipe_path_constant() {
+        assert_eq!(TELEMETRY_NAMED_PIPE_PATH, "/tmp/newrelic-telemetry");
+    }
+
+    #[test]
+    fn test_channel_buffer_size_is_100() {
+        assert_eq!(CHANNEL_BUFFER_SIZE, 100);
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        assert_eq!(TELEMETRY_NAMED_PIPE_RETRIES, 10);
+        assert_eq!(TELEMETRY_NAMED_PIPE_RETRY_DELAY, Duration::from_millis(10));
+    }
+}

@@ -451,3 +451,263 @@ async fn send_error_to_telemetry_internal(
     debug!("Successfully sent synthesized error to telemetry endpoint for request: {}", request_id);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn clear_error_state() {
+        if let Ok(mut m) = LAST_PLATFORM_METRICS.lock() {
+            *m = None;
+        }
+        if let Ok(mut s) = SENT_ERRORS.lock() {
+            s.clear();
+        }
+        if let Ok(mut f) = FAILED_ERRORS.lock() {
+            f.clear();
+        }
+        if let Ok(mut e) = LAST_DETECTED_ERROR.lock() {
+            *e = None;
+        }
+    }
+
+    // ========================================================================
+    // store_platform_metrics
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_store_platform_metrics_sets_value() {
+        clear_error_state();
+        store_platform_metrics("req-1".to_string(), Some(100.5), Some(512), Some(256));
+
+        let guard = LAST_PLATFORM_METRICS.lock().expect("should lock");
+        let metrics = guard.as_ref().expect("should be Some");
+        assert_eq!(metrics.request_id, "req-1");
+        assert_eq!(metrics.duration_ms, Some(100.5));
+        assert_eq!(metrics.memory_size_mb, Some(512));
+        assert_eq!(metrics.max_memory_used_mb, Some(256));
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_store_platform_metrics_overwrites_previous() {
+        clear_error_state();
+        store_platform_metrics("req-1".to_string(), Some(50.0), None, None);
+        store_platform_metrics("req-2".to_string(), Some(200.0), Some(1024), Some(512));
+
+        let guard = LAST_PLATFORM_METRICS.lock().expect("should lock");
+        let metrics = guard.as_ref().expect("should be Some");
+        assert_eq!(metrics.request_id, "req-2");
+        assert_eq!(metrics.duration_ms, Some(200.0));
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_store_platform_metrics_with_none_fields() {
+        clear_error_state();
+        store_platform_metrics("req-x".to_string(), None, None, None);
+
+        let guard = LAST_PLATFORM_METRICS.lock().expect("should lock");
+        let metrics = guard.as_ref().expect("should be Some");
+        assert_eq!(metrics.request_id, "req-x");
+        assert!(metrics.duration_ms.is_none());
+        assert!(metrics.memory_size_mb.is_none());
+        assert!(metrics.max_memory_used_mb.is_none());
+        drop(guard);
+        clear_error_state();
+    }
+
+    // ========================================================================
+    // clear_sent_errors_for_request
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_clear_sent_errors_clears_sent_set() {
+        clear_error_state();
+        if let Ok(mut sent) = SENT_ERRORS.lock() {
+            sent.insert(("req-1".to_string(), "LambdaTimeout".to_string()));
+            sent.insert(("req-2".to_string(), "LambdaError".to_string()));
+        }
+
+        clear_sent_errors_for_request("req-1");
+
+        let guard = SENT_ERRORS.lock().expect("should lock");
+        assert!(guard.is_empty());
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_clear_sent_errors_clears_last_detected_error() {
+        clear_error_state();
+        if let Ok(mut e) = LAST_DETECTED_ERROR.lock() {
+            *e = Some(LastDetectedError {
+                request_id: "req-1".to_string(),
+                error_type: "timeout".to_string(),
+            });
+        }
+
+        clear_sent_errors_for_request("req-1");
+
+        let guard = LAST_DETECTED_ERROR.lock().expect("should lock");
+        assert!(guard.is_none());
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_clear_sent_errors_noop_when_empty() {
+        clear_error_state();
+        // Should not panic when everything is already empty
+        clear_sent_errors_for_request("nonexistent");
+        clear_error_state();
+    }
+
+    // ========================================================================
+    // Struct traits: Clone, Debug
+    // ========================================================================
+
+    #[test]
+    fn test_platform_metrics_struct_clone() {
+        let metrics = PlatformMetrics {
+            request_id: "req-1".to_string(),
+            duration_ms: Some(100.0),
+            memory_size_mb: Some(512),
+            max_memory_used_mb: Some(256),
+        };
+        let cloned = metrics.clone();
+        assert_eq!(cloned.request_id, "req-1");
+        assert_eq!(cloned.duration_ms, Some(100.0));
+        let _ = format!("{metrics:?}");
+    }
+
+    #[test]
+    fn test_failed_error_struct_clone() {
+        let error = FailedError {
+            request_id: "req-1".to_string(),
+            error_type: "LambdaTimeout".to_string(),
+            error_message: "Task timed out".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            error_class: "LambdaTimeout".to_string(),
+        };
+        let cloned = error.clone();
+        assert_eq!(cloned.request_id, "req-1");
+        assert_eq!(cloned.error_type, "LambdaTimeout");
+        let _ = format!("{error:?}");
+    }
+
+    #[test]
+    fn test_last_detected_error_struct_clone() {
+        let error = LastDetectedError {
+            request_id: "req-1".to_string(),
+            error_type: "timeout".to_string(),
+        };
+        let cloned = error.clone();
+        assert_eq!(cloned.request_id, "req-1");
+        let _ = format!("{error:?}");
+    }
+
+    // ========================================================================
+    // Deduplication and accumulation logic
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_sent_errors_dedup_logic() {
+        clear_error_state();
+        if let Ok(mut sent) = SENT_ERRORS.lock() {
+            sent.insert(("req-1".to_string(), "LambdaTimeout".to_string()));
+        }
+
+        let guard = SENT_ERRORS.lock().expect("should lock");
+        assert!(guard.contains(&("req-1".to_string(), "LambdaTimeout".to_string())));
+        assert!(!guard.contains(&("req-1".to_string(), "LambdaPlatformFault".to_string())));
+        assert!(!guard.contains(&("req-2".to_string(), "LambdaTimeout".to_string())));
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_failed_errors_push_and_drain() {
+        clear_error_state();
+        if let Ok(mut failed) = FAILED_ERRORS.lock() {
+            for i in 0..3 {
+                failed.push(FailedError {
+                    request_id: format!("req-{i}"),
+                    error_type: "LambdaTimeout".to_string(),
+                    error_message: "timeout".to_string(),
+                    invoked_function_arn: "arn:test".to_string(),
+                    error_class: "LambdaTimeout".to_string(),
+                });
+            }
+            assert_eq!(failed.len(), 3);
+            let drained = std::mem::take(&mut *failed);
+            assert_eq!(drained.len(), 3);
+            assert!(failed.is_empty());
+        }
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_platform_metrics_request_id_matching() {
+        clear_error_state();
+        store_platform_metrics("req-A".to_string(), Some(150.0), Some(512), Some(300));
+
+        let guard = LAST_PLATFORM_METRICS.lock().expect("should lock");
+        if let Some(ref metrics) = *guard {
+            // Matching request_id
+            assert_eq!(metrics.request_id, "req-A");
+            assert!(metrics.duration_ms.is_some());
+
+            // Non-matching request_id check
+            let matches_b = metrics.request_id == "req-B";
+            assert!(!matches_b);
+        } else {
+            panic!("Expected Some metrics");
+        }
+        drop(guard);
+        clear_error_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_failed_errors_accumulation() {
+        clear_error_state();
+        if let Ok(mut failed) = FAILED_ERRORS.lock() {
+            for i in 0..5 {
+                failed.push(FailedError {
+                    request_id: format!("req-{i}"),
+                    error_type: "Error".to_string(),
+                    error_message: "msg".to_string(),
+                    invoked_function_arn: "arn".to_string(),
+                    error_class: "Error".to_string(),
+                });
+            }
+            assert_eq!(failed.len(), 5);
+        }
+        clear_error_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_retry_failed_errors_empty_returns_false() {
+        clear_error_state();
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        let result = retry_failed_errors(&client, &config).await;
+        assert!(!result, "Empty FAILED_ERRORS should return false");
+        clear_error_state();
+    }
+}

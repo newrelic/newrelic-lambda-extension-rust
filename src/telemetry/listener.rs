@@ -275,3 +275,283 @@ async fn handle_telemetry_request(
         .body(Full::new(Bytes::from("OK")))
         .unwrap())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+
+    #[test]
+    fn test_telemetry_record_deserialize_function_type() {
+        let json = r#"{
+            "time": "2024-01-15T12:34:56.789Z",
+            "type": "function",
+            "record": {"message": "hello world"}
+        }"#;
+        let record: TelemetryRecord =
+            serde_json::from_str(json).expect("should deserialize function record");
+        assert_eq!(record.record_type, "function");
+        assert!(record.record.is_object());
+    }
+
+    #[test]
+    fn test_telemetry_record_deserialize_platform_report() {
+        let json = r#"{
+            "time": "2024-01-15T12:34:56.789Z",
+            "type": "platform.report",
+            "record": {"requestId": "abc-123", "metrics": {"durationMs": 100.5}}
+        }"#;
+        let record: TelemetryRecord =
+            serde_json::from_str(json).expect("should deserialize platform.report record");
+        assert_eq!(record.record_type, "platform.report");
+        assert_eq!(
+            record.record.get("requestId").and_then(|v| v.as_str()),
+            Some("abc-123")
+        );
+    }
+
+    #[test]
+    fn test_telemetry_record_deserialize_platform_runtime_done() {
+        let json = r#"{
+            "time": "2024-01-15T12:34:56.789Z",
+            "type": "platform.runtimeDone",
+            "record": {"requestId": "req-456", "status": "success"}
+        }"#;
+        let record: TelemetryRecord =
+            serde_json::from_str(json).expect("should deserialize platform.runtimeDone record");
+        assert_eq!(record.record_type, "platform.runtimeDone");
+        assert_eq!(
+            record.record.get("requestId").and_then(|v| v.as_str()),
+            Some("req-456")
+        );
+    }
+
+    #[test]
+    fn test_telemetry_record_deserialize_extension_type() {
+        let json = r#"{
+            "time": "2024-01-15T12:34:56.000Z",
+            "type": "extension",
+            "record": {"message": "extension log"}
+        }"#;
+        let record: TelemetryRecord =
+            serde_json::from_str(json).expect("should deserialize extension record");
+        assert_eq!(record.record_type, "extension");
+    }
+
+    #[test]
+    fn test_telemetry_record_deserialize_array() {
+        let json = r#"[
+            {"time": "2024-01-15T12:34:56.000Z", "type": "function", "record": {}},
+            {"time": "2024-01-15T12:34:57.000Z", "type": "extension", "record": {}}
+        ]"#;
+        let records: Vec<TelemetryRecord> =
+            serde_json::from_str(json).expect("should deserialize array of records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record_type, "function");
+        assert_eq!(records[1].record_type, "extension");
+    }
+
+    #[test]
+    fn test_telemetry_record_time_parsing() {
+        let json = r#"{
+            "time": "2024-06-15T10:30:00.123Z",
+            "type": "function",
+            "record": {}
+        }"#;
+        let record: TelemetryRecord =
+            serde_json::from_str(json).expect("should parse ISO 8601 time");
+        assert_eq!(record.time.year(), 2024);
+        assert_eq!(record.time.month(), 6);
+        assert_eq!(record.time.day(), 15);
+    }
+
+    // ========================================================================
+    // handle_telemetry_request — via real HTTP to telemetry listener
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_telemetry_listener_accepts_function_logs() {
+        let config = std::sync::Arc::new(crate::config::ExtensionConfig::default());
+        let client = std::sync::Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            None,
+            false,
+        )
+        .await
+        .expect("should start listener");
+
+        // Send a function log via HTTP
+        let http_client = reqwest::Client::new();
+        let body = serde_json::json!([
+            {
+                "time": "2024-01-15T12:00:00.000Z",
+                "type": "function",
+                "record": {"message": "hello from function"}
+            }
+        ]);
+
+        let resp = http_client
+            .post(format!("http://127.0.0.1:{}/telemetry", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("should send request");
+
+        assert_eq!(resp.status(), 200, "Listener should return 200");
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_listener_accepts_mixed_records() {
+        let config = std::sync::Arc::new(crate::config::ExtensionConfig::default());
+        let client = std::sync::Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            None,
+            false,
+        )
+        .await
+        .expect("should start listener");
+
+        let http_client = reqwest::Client::new();
+        let body = serde_json::json!([
+            {"time": "2024-01-15T12:00:00.000Z", "type": "function", "record": {"message": "fn log"}},
+            {"time": "2024-01-15T12:00:01.000Z", "type": "extension", "record": {"message": "ext log"}},
+            {"time": "2024-01-15T12:00:02.000Z", "type": "platform.start", "record": {"requestId": "req-1"}}
+        ]);
+
+        let resp = http_client
+            .post(format!("http://127.0.0.1:{}/telemetry", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("should send request");
+
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_listener_handles_malformed_json() {
+        let config = std::sync::Arc::new(crate::config::ExtensionConfig::default());
+        let client = std::sync::Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            None,
+            false,
+        )
+        .await
+        .expect("should start listener");
+
+        let http_client = reqwest::Client::new();
+        let resp = http_client
+            .post(format!("http://127.0.0.1:{}/telemetry", addr.port()))
+            .body("this is not valid json at all")
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .expect("should send request");
+
+        // Should still return 200 (errors are logged, not propagated)
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_listener_handles_empty_array() {
+        let config = std::sync::Arc::new(crate::config::ExtensionConfig::default());
+        let client = std::sync::Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            None,
+            false,
+        )
+        .await
+        .expect("should start listener");
+
+        let http_client = reqwest::Client::new();
+        let resp = http_client
+            .post(format!("http://127.0.0.1:{}/telemetry", addr.port()))
+            .json(&serde_json::json!([]))
+            .send()
+            .await
+            .expect("should send request");
+
+        assert_eq!(resp.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_telemetry_listener_runtime_done_sends_signal() {
+        let config = std::sync::Arc::new(crate::config::ExtensionConfig::default());
+        let client = std::sync::Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        let factory = crate::request::ProcessorFactory::new(client, config.clone(), apm_app);
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+        let platform_processor = factory.create_platform_processor(ctx, log_processor.clone());
+
+        let (runtime_done_tx, mut runtime_done_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            Some(runtime_done_tx),
+            false,
+        )
+        .await
+        .expect("should start listener");
+
+        let http_client = reqwest::Client::new();
+        let body = serde_json::json!([
+            {
+                "time": "2024-01-15T12:00:00.000Z",
+                "type": "platform.runtimeDone",
+                "record": {"requestId": "req-signal-test", "status": "success"}
+            }
+        ]);
+
+        let resp = http_client
+            .post(format!("http://127.0.0.1:{}/telemetry", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("should send request");
+
+        assert_eq!(resp.status(), 200);
+
+        // The runtime_done_tx should have received a signal
+        let signal = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            runtime_done_rx.recv(),
+        )
+        .await;
+
+        assert!(signal.is_ok(), "Should have received runtime_done signal within 500ms");
+    }
+}

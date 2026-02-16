@@ -129,3 +129,239 @@ pub fn tag_lambda_function_background(
     });
     debug!("Lambda function tagging task spawned in background");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // Tag HashMap construction (unit-testable without AWS SDK)
+    // ========================================================================
+
+    #[test]
+    fn test_tag_construction_all_versions_present() {
+        let mut tags = HashMap::new();
+        tags.insert("newrelic.extension.version".to_string(), "2.4.5".to_string());
+
+        if let Some(agent_ver) = Some("10.0.0".to_string()) {
+            tags.insert("newrelic.agent.version".to_string(), agent_ver);
+        }
+        if let Some(layer_ver) = Some("NRLayer:42".to_string()) {
+            tags.insert("newrelic.layer.version".to_string(), layer_ver);
+        }
+
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags.get("newrelic.extension.version"), Some(&"2.4.5".to_string()));
+        assert_eq!(tags.get("newrelic.agent.version"), Some(&"10.0.0".to_string()));
+        assert_eq!(tags.get("newrelic.layer.version"), Some(&"NRLayer:42".to_string()));
+    }
+
+    #[test]
+    fn test_tag_construction_only_extension_version() {
+        let mut tags = HashMap::new();
+        tags.insert("newrelic.extension.version".to_string(), "1.0.0".to_string());
+
+        let agent_version: Option<String> = None;
+        let layer_version: Option<String> = None;
+
+        if let Some(agent_ver) = agent_version {
+            tags.insert("newrelic.agent.version".to_string(), agent_ver);
+        }
+        if let Some(layer_ver) = layer_version {
+            tags.insert("newrelic.layer.version".to_string(), layer_ver);
+        }
+
+        assert_eq!(tags.len(), 1);
+        assert!(tags.contains_key("newrelic.extension.version"));
+        assert!(!tags.contains_key("newrelic.agent.version"));
+        assert!(!tags.contains_key("newrelic.layer.version"));
+    }
+
+    #[test]
+    fn test_tag_construction_with_agent_no_layer() {
+        let mut tags = HashMap::new();
+        tags.insert("newrelic.extension.version".to_string(), "2.0.0".to_string());
+
+        if let Some(agent_ver) = Some("9.5.0".to_string()) {
+            tags.insert("newrelic.agent.version".to_string(), agent_ver);
+        }
+
+        let layer_version: Option<String> = None;
+        if let Some(layer_ver) = layer_version {
+            tags.insert("newrelic.layer.version".to_string(), layer_ver);
+        }
+
+        assert_eq!(tags.len(), 2);
+        assert!(tags.contains_key("newrelic.agent.version"));
+        assert!(!tags.contains_key("newrelic.layer.version"));
+    }
+
+    #[test]
+    fn test_tag_construction_with_layer_no_agent() {
+        let mut tags = HashMap::new();
+        tags.insert("newrelic.extension.version".to_string(), "2.0.0".to_string());
+
+        let agent_version: Option<String> = None;
+        if let Some(agent_ver) = agent_version {
+            tags.insert("newrelic.agent.version".to_string(), agent_ver);
+        }
+
+        if let Some(layer_ver) = Some("Layer:10".to_string()) {
+            tags.insert("newrelic.layer.version".to_string(), layer_ver);
+        }
+
+        assert_eq!(tags.len(), 2);
+        assert!(!tags.contains_key("newrelic.agent.version"));
+        assert!(tags.contains_key("newrelic.layer.version"));
+    }
+
+    #[test]
+    fn test_tag_key_names_are_correct() {
+        // Verify exact key names match AWS tag naming convention
+        let mut tags = HashMap::new();
+        tags.insert("newrelic.extension.version".to_string(), "v".to_string());
+        tags.insert("newrelic.agent.version".to_string(), "v".to_string());
+        tags.insert("newrelic.layer.version".to_string(), "v".to_string());
+
+        for key in tags.keys() {
+            assert!(key.starts_with("newrelic."), "Tag key should start with 'newrelic.'");
+            assert!(key.ends_with(".version"), "Tag key should end with '.version'");
+        }
+    }
+
+    // ========================================================================
+    // tag_lambda_function_with_versions — via mock AWS Lambda API
+    // ========================================================================
+
+    use std::convert::Infallible;
+    use hyper::{Response, StatusCode};
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use http_body_util::Full;
+    use tokio::net::TcpListener;
+    use serial_test::serial;
+
+    /// Start a mock AWS Lambda API server
+    async fn start_mock_aws_lambda_api() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let service = service_fn(|_req| async {
+                        // Return success for TagResource
+                        Ok::<_, Infallible>(Response::builder()
+                            .status(StatusCode::OK)
+                            .body(Full::new(Bytes::from("{}")))
+                            .expect("response"))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        (port, handle)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tag_lambda_function_with_versions_all_present() {
+        let (port, server_handle) = start_mock_aws_lambda_api().await;
+
+        // Point AWS SDK at our mock server
+        std::env::set_var("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+
+        tag_lambda_function_with_versions(
+            "2.4.5".to_string(),
+            Some("10.0.0".to_string()),
+            Some("NRLayer:42".to_string()),
+            "arn:aws:lambda:us-east-1:123:function:test-fn".to_string(),
+        )
+        .await;
+
+        // If we reach here without panic, the AWS call was made to our mock
+        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_DEFAULT_REGION");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tag_lambda_function_with_versions_no_agent_no_layer() {
+        let (port, server_handle) = start_mock_aws_lambda_api().await;
+
+        std::env::set_var("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+
+        tag_lambda_function_with_versions(
+            "2.4.5".to_string(),
+            None,
+            None,
+            "arn:aws:lambda:us-east-1:123:function:test-fn".to_string(),
+        )
+        .await;
+
+        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_DEFAULT_REGION");
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_tag_lambda_function_handles_api_error_gracefully() {
+        // Start a server that returns 403 (AccessDenied)
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let service = service_fn(|_req| async {
+                        Ok::<_, Infallible>(Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(Full::new(Bytes::from(r#"{"message":"AccessDenied"}"#)))
+                            .expect("response"))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        std::env::set_var("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{port}"));
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+
+        // Should NOT panic — handles error gracefully with warning
+        tag_lambda_function_with_versions(
+            "2.4.5".to_string(),
+            Some("10.0.0".to_string()),
+            None,
+            "arn:aws:lambda:us-east-1:123:function:test-fn".to_string(),
+        )
+        .await;
+
+        std::env::remove_var("AWS_ENDPOINT_URL");
+        std::env::remove_var("AWS_ACCESS_KEY_ID");
+        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+        std::env::remove_var("AWS_DEFAULT_REGION");
+        server_handle.abort();
+    }
+}

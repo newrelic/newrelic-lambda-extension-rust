@@ -431,3 +431,521 @@ pub async fn cleanup_old_request_buffers(
 
     debug!("Periodic cleanup: Removed {} old request buffers", old_request_ids.len());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn clear_all_global_state() {
+        REQUEST_PROCESSORS.clear();
+        REQUEST_CONTEXTS.clear();
+        REQUEST_AGENT_BUFFERS.clear();
+        PAYLOAD_COORDINATION.clear();
+        RUNTIME_DONE_CHANNELS.clear();
+        PENDING_REPORTS.clear();
+        REQUEST_BUFFER_TIMESTAMPS.clear();
+        if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = None;
+        }
+        if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+            orphaned.clear();
+        }
+    }
+
+    // ========================================================================
+    // cleanup_request_processing_state
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_cleanup_removes_all_maps() {
+        clear_all_global_state();
+        let req_id = "req-cleanup-all";
+
+        // Manually populate all maps
+        REQUEST_CONTEXTS.insert(req_id.to_string(), Arc::new(Mutex::new(InvocationContext::default())));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), Arc::new(Mutex::new(Vec::new())));
+        REQUEST_BUFFER_TIMESTAMPS.insert(req_id.to_string(), chrono::Utc::now());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        PAYLOAD_COORDINATION.insert(req_id.to_string(), tx);
+        let (rt_tx, _rt_rx) = mpsc::unbounded_channel();
+        RUNTIME_DONE_CHANNELS.insert(req_id.to_string(), rt_tx);
+        PENDING_REPORTS.insert(req_id.to_string(), "REPORT line".to_string());
+
+        cleanup_request_processing_state(req_id);
+
+        assert!(!REQUEST_CONTEXTS.contains_key(req_id));
+        assert!(!REQUEST_AGENT_BUFFERS.contains_key(req_id));
+        assert!(!REQUEST_BUFFER_TIMESTAMPS.contains_key(req_id));
+        assert!(!PAYLOAD_COORDINATION.contains_key(req_id));
+        assert!(!RUNTIME_DONE_CHANNELS.contains_key(req_id));
+        assert!(!PENDING_REPORTS.contains_key(req_id));
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_skip_buffer_preserves_buffers() {
+        clear_all_global_state();
+        let req_id = "req-skip-buffer";
+
+        REQUEST_CONTEXTS.insert(req_id.to_string(), Arc::new(Mutex::new(InvocationContext::default())));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), Arc::new(Mutex::new(Vec::new())));
+        REQUEST_BUFFER_TIMESTAMPS.insert(req_id.to_string(), chrono::Utc::now());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        PAYLOAD_COORDINATION.insert(req_id.to_string(), tx);
+        let (rt_tx, _rt_rx) = mpsc::unbounded_channel();
+        RUNTIME_DONE_CHANNELS.insert(req_id.to_string(), rt_tx);
+        PENDING_REPORTS.insert(req_id.to_string(), "report".to_string());
+
+        cleanup_request_processing_state_internal(req_id, true);
+
+        // Buffers and contexts should be preserved
+        assert!(REQUEST_CONTEXTS.contains_key(req_id));
+        assert!(REQUEST_AGENT_BUFFERS.contains_key(req_id));
+        assert!(REQUEST_BUFFER_TIMESTAMPS.contains_key(req_id));
+        assert!(PAYLOAD_COORDINATION.contains_key(req_id));
+
+        // Runtime done and pending reports always cleaned
+        assert!(!RUNTIME_DONE_CHANNELS.contains_key(req_id));
+        assert!(!PENDING_REPORTS.contains_key(req_id));
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_no_skip_removes_everything() {
+        clear_all_global_state();
+        let req_id = "req-no-skip";
+
+        REQUEST_CONTEXTS.insert(req_id.to_string(), Arc::new(Mutex::new(InvocationContext::default())));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), Arc::new(Mutex::new(Vec::new())));
+        let (rt_tx, _rt_rx) = mpsc::unbounded_channel();
+        RUNTIME_DONE_CHANNELS.insert(req_id.to_string(), rt_tx);
+
+        cleanup_request_processing_state_internal(req_id, false);
+
+        assert!(!REQUEST_CONTEXTS.contains_key(req_id));
+        assert!(!REQUEST_AGENT_BUFFERS.contains_key(req_id));
+        assert!(!RUNTIME_DONE_CHANNELS.contains_key(req_id));
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_nonexistent_request_noop() {
+        clear_all_global_state();
+        // Should not panic
+        cleanup_request_processing_state("nonexistent-request-id");
+        cleanup_request_processing_state_internal("another-nonexistent", true);
+        cleanup_request_processing_state_internal("yet-another", false);
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // route_payload_to_request_buffer
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_to_active_request_buffer() {
+        clear_all_global_state();
+        let req_id = "req-active";
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), buffer.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        PAYLOAD_COORDINATION.insert(req_id.to_string(), tx);
+        if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = Some(req_id.to_string());
+        }
+
+        route_payload_to_request_buffer(vec![1, 2, 3]).await;
+
+        let guard = buffer.lock().expect("should lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0], vec![1, 2, 3]);
+        drop(guard);
+        clear_all_global_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_no_active_routes_to_any_buffer() {
+        clear_all_global_state();
+        let req_id = "req-fallback";
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), buffer.clone());
+
+        // No CURRENT_ACTIVE_REQUEST_ID set
+        route_payload_to_request_buffer(vec![4, 5, 6]).await;
+
+        let guard = buffer.lock().expect("should lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0], vec![4, 5, 6]);
+        drop(guard);
+        clear_all_global_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_no_buffers_routes_to_orphaned() {
+        clear_all_global_state();
+        // No active request, no buffers
+        route_payload_to_request_buffer(vec![7, 8, 9]).await;
+
+        let guard = ORPHANED_PAYLOADS.lock().expect("should lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0], vec![7, 8, 9]);
+        drop(guard);
+        clear_all_global_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_active_no_matching_buffer() {
+        clear_all_global_state();
+        // Set active request but NO matching buffer
+        if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = Some("ghost-request".to_string());
+        }
+
+        // Should warn but not panic (payload is lost)
+        route_payload_to_request_buffer(vec![10, 11]).await;
+        clear_all_global_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_coordination_signal_sent() {
+        clear_all_global_state();
+        let req_id = "req-signal";
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), buffer);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        PAYLOAD_COORDINATION.insert(req_id.to_string(), tx);
+        if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = Some(req_id.to_string());
+        }
+
+        route_payload_to_request_buffer(vec![1]).await;
+
+        // Coordination signal should have been sent
+        let signal = rx.try_recv();
+        assert!(signal.is_ok(), "Should have received coordination signal");
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // Orphaned payloads
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_orphaned_payloads_moved_on_create() {
+        clear_all_global_state();
+
+        // Pre-populate orphaned payloads
+        if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+            orphaned.push(vec![10, 20]);
+            orphaned.push(vec![30, 40]);
+        }
+
+        // Simulate the orphan-moving logic from create_request_processing_state
+        let req_id = "req-new";
+        let agent_buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), agent_buffer.clone());
+
+        if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+            if !orphaned.is_empty() {
+                if let Ok(mut buffer) = agent_buffer.lock() {
+                    buffer.extend(orphaned.drain(..));
+                }
+            }
+        }
+
+        // Verify orphans moved to buffer
+        let guard = agent_buffer.lock().expect("should lock");
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0], vec![10, 20]);
+        assert_eq!(guard[1], vec![30, 40]);
+        drop(guard);
+
+        // Verify orphan buffer is now empty
+        let orphaned = ORPHANED_PAYLOADS.lock().expect("should lock");
+        assert!(orphaned.is_empty());
+        drop(orphaned);
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // Multiple sequential cleanups
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_multiple_sequential_cleanups() {
+        clear_all_global_state();
+
+        for i in 0..3 {
+            let req_id = format!("req-seq-{i}");
+            REQUEST_CONTEXTS.insert(req_id.clone(), Arc::new(Mutex::new(InvocationContext::default())));
+            REQUEST_AGENT_BUFFERS.insert(req_id.clone(), Arc::new(Mutex::new(Vec::new())));
+        }
+
+        assert_eq!(REQUEST_CONTEXTS.len(), 3);
+        assert_eq!(REQUEST_AGENT_BUFFERS.len(), 3);
+
+        for i in 0..3 {
+            cleanup_request_processing_state(&format!("req-seq-{i}"));
+        }
+
+        assert_eq!(REQUEST_CONTEXTS.len(), 0);
+        assert_eq!(REQUEST_AGENT_BUFFERS.len(), 0);
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // Concurrent routing (no panic / deadlock)
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrent_route_no_panic() {
+        clear_all_global_state();
+        let req_id = "req-concurrent";
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), buffer.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        PAYLOAD_COORDINATION.insert(req_id.to_string(), tx);
+        if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = Some(req_id.to_string());
+        }
+
+        let mut handles = Vec::new();
+        for i in 0..10u8 {
+            handles.push(tokio::spawn(async move {
+                route_payload_to_request_buffer(vec![i]).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.expect("task should not panic");
+        }
+
+        let guard = buffer.lock().expect("should lock");
+        assert_eq!(guard.len(), 10, "All 10 payloads should be routed");
+        drop(guard);
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // Buffer timestamp filtering
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_old_buffer_timestamp_filtering() {
+        clear_all_global_state();
+        let old_req = "req-old";
+        REQUEST_BUFFER_TIMESTAMPS.insert(
+            old_req.to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(10),
+        );
+
+        let now = chrono::Utc::now();
+        let threshold = chrono::Duration::minutes(5);
+        let old_ids: Vec<String> = REQUEST_BUFFER_TIMESTAMPS
+            .iter()
+            .filter(|entry| now.signed_duration_since(*entry.value()) >= threshold)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        assert_eq!(old_ids.len(), 1);
+        assert_eq!(old_ids[0], old_req);
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_recent_buffer_survives_cleanup() {
+        clear_all_global_state();
+        let recent_req = "req-recent";
+        REQUEST_BUFFER_TIMESTAMPS.insert(
+            recent_req.to_string(),
+            chrono::Utc::now() - chrono::Duration::minutes(2),
+        );
+
+        let now = chrono::Utc::now();
+        let threshold = chrono::Duration::minutes(5);
+        let old_ids: Vec<String> = REQUEST_BUFFER_TIMESTAMPS
+            .iter()
+            .filter(|entry| now.signed_duration_since(*entry.value()) >= threshold)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        assert!(old_ids.is_empty(), "Recent buffer should not be flagged as old");
+        clear_all_global_state();
+    }
+
+    // ========================================================================
+    // ProcessorFactory
+    // ========================================================================
+
+    #[test]
+    fn test_processor_factory_new() {
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+
+        let factory = ProcessorFactory::new(client.clone(), config.clone(), apm_app.clone());
+
+        // Verify fields are stored (via Debug output)
+        let debug_str = format!("{factory:?}");
+        assert!(debug_str.contains("ProcessorFactory"));
+    }
+
+    #[test]
+    fn test_request_processing_state_debug() {
+        let state = RequestProcessingState {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            platform_processor: {
+                let config = Arc::new(crate::config::ExtensionConfig::default());
+                let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+                let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+                let factory = ProcessorFactory::new(client, config, apm_app);
+                let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+                let log_proc = factory.create_log_processor(ctx.clone());
+                factory.create_platform_processor(ctx, log_proc)
+            },
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_rx: None,
+            runtime_done_rx: None,
+        };
+        let debug_str = format!("{state:?}");
+        assert!(debug_str.contains("RequestProcessingState"));
+    }
+
+    // ========================================================================
+    // create_request_processing_state — full flow
+    // ========================================================================
+
+    fn make_factory() -> Arc<ProcessorFactory> {
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        Arc::new(ProcessorFactory::new(client, config, apm_app))
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_request_processing_state_standard_mode() {
+        clear_all_global_state();
+        let factory = make_factory();
+
+        let state = create_request_processing_state(
+            "req-std-001",
+            "arn:aws:lambda:us-east-1:123:function:fn",
+            &factory,
+            false, // standard mode
+        );
+
+        // Verify context set
+        let ctx = state.context.lock().expect("lock");
+        assert_eq!(ctx.request_id, "req-std-001");
+        assert_eq!(ctx.invoked_function_arn, "arn:aws:lambda:us-east-1:123:function:fn");
+        drop(ctx);
+
+        // Verify buffer created in global maps
+        assert!(REQUEST_CONTEXTS.contains_key("req-std-001"));
+        assert!(REQUEST_AGENT_BUFFERS.contains_key("req-std-001"));
+        assert!(REQUEST_BUFFER_TIMESTAMPS.contains_key("req-std-001"));
+        assert!(PAYLOAD_COORDINATION.contains_key("req-std-001"));
+
+        // Standard mode should create runtime_done channel
+        assert!(state.runtime_done_rx.is_some(), "Standard mode should have runtime_done channel");
+        assert!(RUNTIME_DONE_CHANNELS.contains_key("req-std-001"));
+
+        // Verify coordination channel exists
+        assert!(state.coordination_rx.is_some());
+
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_request_processing_state_apm_mode() {
+        clear_all_global_state();
+        let factory = make_factory();
+
+        let state = create_request_processing_state(
+            "req-apm-001",
+            "arn:aws:lambda:us-east-1:123:function:fn",
+            &factory,
+            true, // APM mode
+        );
+
+        // APM mode should NOT create runtime_done channel
+        assert!(state.runtime_done_rx.is_none(), "APM mode should NOT have runtime_done channel");
+        assert!(!RUNTIME_DONE_CHANNELS.contains_key("req-apm-001"));
+
+        // But should still have coordination channel
+        assert!(state.coordination_rx.is_some());
+        assert!(PAYLOAD_COORDINATION.contains_key("req-apm-001"));
+
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_request_processing_state_moves_orphaned_payloads() {
+        clear_all_global_state();
+        let factory = make_factory();
+
+        // Pre-populate orphaned payloads
+        if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+            orphaned.push(vec![1, 2, 3]);
+            orphaned.push(vec![4, 5, 6]);
+        }
+
+        let state = create_request_processing_state(
+            "req-orphan-test",
+            "arn:test",
+            &factory,
+            false,
+        );
+
+        // Orphans should be moved to the new request's buffer
+        let buf = state.agent_buffer.lock().expect("lock");
+        assert_eq!(buf.len(), 2, "Should have 2 orphaned payloads");
+        assert_eq!(buf[0], vec![1, 2, 3]);
+        assert_eq!(buf[1], vec![4, 5, 6]);
+        drop(buf);
+
+        // Orphan buffer should be empty
+        let orphaned = ORPHANED_PAYLOADS.lock().expect("lock");
+        assert!(orphaned.is_empty());
+        drop(orphaned);
+
+        clear_all_global_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_create_request_processing_state_empty_orphans_noop() {
+        clear_all_global_state();
+        let factory = make_factory();
+
+        let state = create_request_processing_state("req-no-orphans", "arn:test", &factory, false);
+
+        let buf = state.agent_buffer.lock().expect("lock");
+        assert!(buf.is_empty(), "No orphans should mean empty buffer");
+        drop(buf);
+
+        clear_all_global_state();
+    }
+}

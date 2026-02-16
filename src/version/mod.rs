@@ -644,6 +644,7 @@ fn detect_runtime_internal() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_version_info_creation() {
@@ -657,5 +658,486 @@ mod tests {
 
         let tags = version_info.as_tags();
         assert!(tags.len() >= 2);
+    }
+
+    // ========================================================================
+    // as_tags() — tag generation
+    // ========================================================================
+
+    #[test]
+    fn test_as_tags_extension_version_always_present() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.2.3".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert!(tags.iter().any(|(k, v)| k == "nr.extensionVersion" && v == "1.2.3"));
+    }
+
+    #[test]
+    fn test_as_tags_with_agent() {
+        let info = VersionInfo {
+            agent_version: Some("10.0.0".to_string()),
+            agent_name: Some("Node".to_string()),
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert!(tags.iter().any(|(k, v)| k == "nr.NodeAgentVersion" && v == "10.0.0"));
+    }
+
+    #[test]
+    fn test_as_tags_without_agent() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert!(!tags.iter().any(|(k, _)| k.contains("AgentVersion")));
+    }
+
+    #[test]
+    fn test_as_tags_with_layer_version() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: Some("LayerName:42".to_string()),
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert!(tags.iter().any(|(k, v)| k == "nr.layerVersion" && v == "LayerName:42"));
+    }
+
+    #[test]
+    fn test_as_tags_without_layer_version() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert!(!tags.iter().any(|(k, _)| k == "nr.layerVersion"));
+    }
+
+    #[test]
+    fn test_as_tags_all_present() {
+        let info = VersionInfo {
+            agent_version: Some("9.0.0".to_string()),
+            agent_name: Some("Python".to_string()),
+            extension_version: "2.0.0".to_string(),
+            layer_version: Some("Layer:1".to_string()),
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert_eq!(tags.len(), 3); // extension + agent + layer
+    }
+
+    #[test]
+    fn test_as_tags_only_extension() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        assert_eq!(tags.len(), 1);
+    }
+
+    #[test]
+    fn test_as_tags_agent_name_only_no_version() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: Some("Ruby".to_string()),
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let tags = info.as_tags();
+        // Requires BOTH agent_name and agent_version — should not produce agent tag
+        assert!(!tags.iter().any(|(k, _)| k.contains("AgentVersion")));
+    }
+
+    // ========================================================================
+    // format_version_line() — output formatting
+    // ========================================================================
+
+    #[test]
+    fn test_format_version_line_all_known() {
+        let info = VersionInfo {
+            agent_version: Some("10.0.0".to_string()),
+            agent_name: Some("Node".to_string()),
+            extension_version: "2.4.5".to_string(),
+            layer_version: Some("NRLayer:50".to_string()),
+            runtime_version: Some("nodejs20.x".to_string()),
+        };
+        let line = info.format_version_line("req-abc");
+        assert!(line.contains("Agent Version: 10.0.0"));
+        assert!(line.contains("Extension Version: 2.4.5"));
+        assert!(line.contains("Layer Version: NRLayer:50"));
+        assert!(line.contains("RequestId: req-abc"));
+    }
+
+    #[test]
+    fn test_format_version_line_unknown_agent() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let line = info.format_version_line("req-1");
+        assert!(line.contains("Agent Version: unknown"));
+    }
+
+    #[test]
+    fn test_format_version_line_unknown_layer() {
+        let info = VersionInfo {
+            agent_version: Some("1.0".to_string()),
+            agent_name: Some("Node".to_string()),
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let line = info.format_version_line("req-1");
+        assert!(line.contains("Layer Version: unknown"));
+    }
+
+    #[test]
+    fn test_format_version_line_request_id_included() {
+        let info = VersionInfo {
+            agent_version: None,
+            agent_name: None,
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let line = info.format_version_line("my-unique-request-id");
+        assert!(line.contains("my-unique-request-id"));
+    }
+
+    #[test]
+    fn test_format_version_line_runtime_priority_agent_name() {
+        // When runtime_version is None but agent_name is Some, runtime falls back to agent_name
+        let info = VersionInfo {
+            agent_version: Some("1.0".to_string()),
+            agent_name: Some("python".to_string()),
+            extension_version: "1.0.0".to_string(),
+            layer_version: None,
+            runtime_version: None,
+        };
+        let line = info.format_version_line("req");
+        assert!(line.contains("Runtime: python"));
+    }
+
+    // ========================================================================
+    // detect_layer_version_sync — sync detection
+    // ========================================================================
+
+    #[test]
+    fn test_detect_layer_version_sync_with_config() {
+        let result = detect_layer_version_sync(Some("v1".to_string()));
+        assert_eq!(result, Some("v1".to_string()));
+    }
+
+    #[test]
+    fn test_detect_layer_version_sync_without_config() {
+        let result = detect_layer_version_sync(None);
+        assert_eq!(result, None);
+    }
+
+    // ========================================================================
+    // detect_runtime_internal / get_runtime_name / get_runtime_version
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_nodejs() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_nodejs20.x");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "nodejs");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_python() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_python3.13");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "python");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_java() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_java21");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "java");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_no_env() {
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        let result = detect_runtime_internal();
+        // On macOS/CI there are no /var/lang/bin paths, so should be "unknown"
+        assert_eq!(result, "unknown");
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_runtime_version_from_env() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_python3.13");
+        let result = get_runtime_version();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        // If RUNTIME_VERSION_CACHE is not set, falls back to env var stripping
+        assert!(
+            result.contains("python") || result.contains("3.13"),
+            "Expected python runtime version, got: {result}"
+        );
+    }
+
+    // ========================================================================
+    // read_nodejs_version — temp file tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_nodejs_version_valid_package_json() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_nodejs");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("package.json"),
+            r#"{"name": "newrelic", "version": "11.23.0"}"#,
+        ).expect("write");
+
+        let result = read_nodejs_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, Some("11.23.0".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_nodejs_version_missing_version_field() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_nodejs_no_ver");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("package.json"),
+            r#"{"name": "newrelic"}"#,
+        ).expect("write");
+
+        let result = read_nodejs_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, None);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_nodejs_version_no_package_json() {
+        let result = read_nodejs_version("/tmp/nr_test_nonexistent_path");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_read_nodejs_version_invalid_json() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_nodejs_bad_json");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("package.json"),
+            "not valid json at all",
+        ).expect("write");
+
+        let result = read_nodejs_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, None);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // ========================================================================
+    // read_python_version — temp file tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_python_version_from_version_py() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_python");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("version.py"),
+            "__version__ = '9.14.0'\n",
+        ).expect("write");
+
+        let result = read_python_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, Some("9.14.0".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_python_version_from_init_py() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_python_init");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(
+            tmp_dir.join("__init__.py"),
+            "version = \"10.0.0\"\n",
+        ).expect("write");
+
+        let result = read_python_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, Some("10.0.0".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_python_version_nonexistent_path() {
+        let result = read_python_version("/tmp/nr_test_nonexistent_python_path");
+        assert_eq!(result, None);
+    }
+
+    // ========================================================================
+    // extract_python_version_from_file — line parsing
+    // ========================================================================
+
+    #[test]
+    fn test_extract_python_version_double_quotes() {
+        let tmp_file = std::env::temp_dir().join("nr_test_pyver_dq.py");
+        std::fs::write(&tmp_file, "__version__ = \"8.5.0\"\n").expect("write");
+
+        let result = extract_python_version_from_file(tmp_file.to_str().expect("path"));
+        assert_eq!(result, Some("8.5.0".to_string()));
+
+        let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_extract_python_version_single_quotes() {
+        let tmp_file = std::env::temp_dir().join("nr_test_pyver_sq.py");
+        std::fs::write(&tmp_file, "__version__ = '7.0.1'\n").expect("write");
+
+        let result = extract_python_version_from_file(tmp_file.to_str().expect("path"));
+        assert_eq!(result, Some("7.0.1".to_string()));
+
+        let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    #[test]
+    fn test_extract_python_version_no_match() {
+        let tmp_file = std::env::temp_dir().join("nr_test_pyver_nomatch.py");
+        std::fs::write(&tmp_file, "# This is a comment\nname = 'newrelic'\n").expect("write");
+
+        let result = extract_python_version_from_file(tmp_file.to_str().expect("path"));
+        assert_eq!(result, None);
+
+        let _ = std::fs::remove_file(&tmp_file);
+    }
+
+    // ========================================================================
+    // read_dotnet_version — temp file tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_dotnet_version_from_file() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_dotnet");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(tmp_dir.join("VERSION"), "10.25.0\n").expect("write");
+
+        let result = read_dotnet_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, Some("10.25.0".to_string()));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_dotnet_version_empty_file() {
+        let tmp_dir = std::env::temp_dir().join("nr_test_dotnet_empty");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        std::fs::write(tmp_dir.join("VERSION"), "").expect("write");
+
+        let result = read_dotnet_version(tmp_dir.to_str().expect("path"));
+        assert_eq!(result, None);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_read_dotnet_version_nonexistent() {
+        let result = read_dotnet_version("/tmp/nr_test_nonexistent_dotnet");
+        assert_eq!(result, None);
+    }
+
+    // ========================================================================
+    // read_ruby_version — directory name parsing
+    // ========================================================================
+
+    #[test]
+    fn test_read_ruby_version_from_directory_name() {
+        // Ruby version from directory: newrelic_rpm-9.16.0
+        let result = read_ruby_version("/opt/ruby/gems/3.3.0/gems/newrelic_rpm-9.16.0");
+        // Directory doesn't exist but the function first tries to parse the dir name
+        // The split-on-dash logic extracts "9.16.0" from "newrelic_rpm-9.16.0"
+        assert_eq!(result, Some("9.16.0".to_string()));
+    }
+
+    // ========================================================================
+    // read_java_version — filename parsing
+    // ========================================================================
+
+    #[test]
+    fn test_read_java_version_nonexistent_jar() {
+        let result = read_java_version("/tmp/nr_test_nonexistent.jar");
+        assert_eq!(result, None);
+    }
+
+    // ========================================================================
+    // detect_runtime for more runtimes
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_dotnet() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_dotnet8");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "dotnet");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_ruby() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_ruby3.3");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "ruby");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_go() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_go1.x");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "go");
+    }
+
+    #[test]
+    #[serial]
+    fn test_detect_runtime_internal_custom_no_prefix() {
+        // AWS_EXECUTION_ENV without AWS_Lambda_ prefix
+        std::env::set_var("AWS_EXECUTION_ENV", "CustomRuntime");
+        let result = detect_runtime_internal();
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        assert_eq!(result, "unknown");
     }
 }

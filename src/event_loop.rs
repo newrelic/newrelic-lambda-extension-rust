@@ -1245,7 +1245,7 @@ fn tag_lambda_function_once(invoked_function_arn: String, config: &config::Exten
 }
 
 /// Update global invocation context for telemetry processors
-fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str) {
+pub(crate) fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str) {
     if let Ok(mut global_context) = crate::CURRENT_INVOCATION_CONTEXT.write() {
         // Validate ARN before updating
         if invoked_function_arn.is_empty() {
@@ -1476,7 +1476,7 @@ async fn process_and_send_agent_payload(
 }
 
 /// Buffer failed agent payload for retry across invocations
-fn buffer_failed_agent_payload(
+pub(crate) fn buffer_failed_agent_payload(
     payload_bytes: &[u8],
     request_id: &str,
     invoked_function_arn: &str,
@@ -1614,3 +1614,640 @@ pub fn cleanup_old_failed_payloads() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn clear_event_loop_state() {
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.clear();
+        }
+        if let Ok(mut ctx) = LAST_REQUEST_CONTEXT.lock() {
+            *ctx = None;
+        }
+    }
+
+    // ========================================================================
+    // update_global_invocation_context
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_update_global_context_valid_arn() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-fn";
+        update_global_invocation_context("req-123", arn);
+
+        if let Ok(ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            assert_eq!(ctx.request_id, "req-123");
+            assert_eq!(ctx.invoked_function_arn, arn);
+            assert!(ctx.trace_id.is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_global_context_empty_arn_preserves_previous() {
+        let arn = "arn:aws:lambda:us-east-1:123:function:fn";
+        update_global_invocation_context("req-1", arn);
+
+        // Now update with empty ARN — should keep previous ARN but update request_id
+        update_global_invocation_context("req-2", "");
+
+        if let Ok(ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            assert_eq!(ctx.request_id, "req-2");
+            assert_eq!(ctx.invoked_function_arn, arn, "ARN should be preserved when empty is passed");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_update_global_context_overwrites() {
+        update_global_invocation_context("req-1", "arn:first");
+        update_global_invocation_context("req-2", "arn:second");
+
+        if let Ok(ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            assert_eq!(ctx.request_id, "req-2");
+            assert_eq!(ctx.invoked_function_arn, "arn:second");
+        }
+    }
+
+    // ========================================================================
+    // buffer_failed_agent_payload
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_buffer_failed_agent_payload_pushes() {
+        clear_event_loop_state();
+        buffer_failed_agent_payload(b"payload-data", "req-1", "arn:test");
+
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("should lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].request_id, "req-1");
+        assert_eq!(guard[0].invoked_function_arn, "arn:test");
+        assert_eq!(guard[0].payload_bytes, b"payload-data");
+        assert_eq!(guard[0].retry_count, 0);
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_buffer_failed_agent_payload_multiple() {
+        clear_event_loop_state();
+        buffer_failed_agent_payload(b"p1", "req-1", "arn:1");
+        buffer_failed_agent_payload(b"p2", "req-2", "arn:2");
+        buffer_failed_agent_payload(b"p3", "req-3", "arn:3");
+
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("should lock");
+        assert_eq!(guard.len(), 3);
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // FailedAgentPayload struct
+    // ========================================================================
+
+    #[test]
+    fn test_failed_agent_payload_struct_construction() {
+        let now = chrono::Utc::now();
+        let payload = FailedAgentPayload {
+            payload_bytes: vec![1, 2, 3],
+            request_id: "req-abc".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:fn".to_string(),
+            retry_count: 2,
+            failed_at: now,
+        };
+        assert_eq!(payload.payload_bytes, vec![1, 2, 3]);
+        assert_eq!(payload.request_id, "req-abc");
+        assert_eq!(payload.retry_count, 2);
+        assert_eq!(payload.failed_at, now);
+    }
+
+    #[test]
+    fn test_failed_agent_payload_clone() {
+        let payload = FailedAgentPayload {
+            payload_bytes: vec![10, 20],
+            request_id: "req".to_string(),
+            invoked_function_arn: "arn".to_string(),
+            retry_count: 0,
+            failed_at: chrono::Utc::now(),
+        };
+        let cloned = payload.clone();
+        assert_eq!(cloned.request_id, payload.request_id);
+        assert_eq!(cloned.retry_count, payload.retry_count);
+        let _ = format!("{payload:?}");
+    }
+
+    // ========================================================================
+    // cleanup_old_failed_payloads
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_cleanup_old_failed_payloads_removes_old() {
+        clear_event_loop_state();
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.push(FailedAgentPayload {
+                payload_bytes: vec![1],
+                request_id: "old-req".to_string(),
+                invoked_function_arn: "arn".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now() - chrono::Duration::hours(25),
+            });
+        }
+
+        cleanup_old_failed_payloads();
+
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("should lock");
+        assert!(guard.is_empty(), "Old payload should have been removed");
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_old_failed_payloads_keeps_recent() {
+        clear_event_loop_state();
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.push(FailedAgentPayload {
+                payload_bytes: vec![1],
+                request_id: "recent-req".to_string(),
+                invoked_function_arn: "arn".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now(),
+            });
+        }
+
+        cleanup_old_failed_payloads();
+
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("should lock");
+        assert_eq!(guard.len(), 1, "Recent payload should survive cleanup");
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_old_failed_payloads_mixed() {
+        clear_event_loop_state();
+        if let Ok(mut payloads) = FAILED_AGENT_PAYLOADS.lock() {
+            payloads.push(FailedAgentPayload {
+                payload_bytes: vec![1],
+                request_id: "old".to_string(),
+                invoked_function_arn: "arn".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now() - chrono::Duration::hours(25),
+            });
+            payloads.push(FailedAgentPayload {
+                payload_bytes: vec![2],
+                request_id: "recent-1".to_string(),
+                invoked_function_arn: "arn".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now(),
+            });
+            payloads.push(FailedAgentPayload {
+                payload_bytes: vec![3],
+                request_id: "recent-2".to_string(),
+                invoked_function_arn: "arn".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now() - chrono::Duration::hours(1),
+            });
+        }
+
+        cleanup_old_failed_payloads();
+
+        let guard = FAILED_AGENT_PAYLOADS.lock().expect("should lock");
+        assert_eq!(guard.len(), 2, "Should keep 2 recent, remove 1 old");
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_cleanup_old_failed_payloads_empty_noop() {
+        clear_event_loop_state();
+        cleanup_old_failed_payloads(); // Should not panic on empty list
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // LAST_REQUEST_CONTEXT
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_last_request_context_stores_tuple() {
+        clear_event_loop_state();
+        if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
+            *guard = Some(("req-1".to_string(), "arn:test".to_string()));
+        }
+
+        let guard = LAST_REQUEST_CONTEXT.lock().expect("should lock");
+        assert_eq!(*guard, Some(("req-1".to_string(), "arn:test".to_string())));
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_last_request_context_overwrites() {
+        clear_event_loop_state();
+        if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
+            *guard = Some(("req-1".to_string(), "arn:1".to_string()));
+        }
+        if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {
+            *guard = Some(("req-2".to_string(), "arn:2".to_string()));
+        }
+
+        let guard = LAST_REQUEST_CONTEXT.lock().expect("should lock");
+        assert_eq!(*guard, Some(("req-2".to_string(), "arn:2".to_string())));
+        drop(guard);
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // Mock Lambda Runtime API — for full event loop flow tests
+    // ========================================================================
+
+    use std::convert::Infallible;
+    use hyper::{Response, StatusCode};
+    use hyper::body::Bytes;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use http_body_util::Full;
+    use tokio::net::TcpListener;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Start a mock Lambda Runtime API server that serves INVOKE then SHUTDOWN events
+    async fn start_mock_runtime_api(
+        invoke_count: u32,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let request_counter = Arc::new(AtomicU32::new(0));
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { break };
+                let counter = request_counter.clone();
+                let max_invokes = invoke_count;
+                tokio::spawn(async move {
+                    let service = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let counter = counter.clone();
+                        let path = req.uri().path().to_string();
+                        async move {
+                            if path.contains("/extension/register") {
+                                let body = serde_json::json!({
+                                    "functionName": "test-function",
+                                    "functionVersion": "$LATEST",
+                                    "accountId": "123456789012"
+                                });
+                                Ok::<_, Infallible>(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header("Lambda-Extension-Identifier", "test-ext-id")
+                                    .body(Full::new(Bytes::from(body.to_string())))
+                                    .expect("response"))
+                            } else if path.contains("/extension/event/next") {
+                                let n = counter.fetch_add(1, Ordering::SeqCst);
+                                let body = if n < max_invokes {
+                                    serde_json::json!({
+                                        "eventType": "INVOKE",
+                                        "requestId": format!("req-{n}"),
+                                        "invokedFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:test-function"
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "eventType": "SHUTDOWN",
+                                        "shutdownReason": "spindown"
+                                    })
+                                };
+                                Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from(body.to_string())))
+                                    .expect("response"))
+                            } else if path.contains("/telemetry") {
+                                Ok(Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(Full::new(Bytes::from("OK")))
+                                    .expect("response"))
+                            } else {
+                                Ok(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("not found")))
+                                    .expect("response"))
+                            }
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        (port, handle)
+    }
+
+    // ========================================================================
+    // execute_noop_event_loop — full INVOKE→SHUTDOWN flow
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_noop_event_loop_processes_invoke_then_shutdown() {
+        let (port, server_handle) = start_mock_runtime_api(2).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+
+        // Run noop event loop — should process 2 INVOKEs then SHUTDOWN
+        execute_noop_event_loop(&client, "test-ext-id").await;
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+        // If we reach here without hanging, the test passed
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_noop_event_loop_immediate_shutdown() {
+        let (port, server_handle) = start_mock_runtime_api(0).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+
+        // 0 invokes → immediate SHUTDOWN
+        execute_noop_event_loop(&client, "test-ext-id").await;
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+    }
+
+    // ========================================================================
+    // run_infinite_event_loop — disabled extension → noop mode
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_run_infinite_event_loop_disabled_runs_noop() {
+        let (port, server_handle) = start_mock_runtime_api(1).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let config = Arc::new({
+            let mut c = crate::config::ExtensionConfig::default();
+            c.new_relic.extension_enabled = false; // disabled → noop
+            c
+        });
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+
+        let components = ExtensionComponents {
+            client,
+            extension_id: "test-ext-id".to_string(),
+            processor_factory: factory,
+            newrelic_client: noop_client,
+            config,
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: false,
+        };
+
+        let (total_events, harvester_handle) = run_infinite_event_loop(components).await;
+        assert_eq!(total_events, 0, "Disabled extension should report 0 events");
+        harvester_handle.abort();
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+    }
+
+    // ========================================================================
+    // run_infinite_event_loop — no license key → noop mode
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_run_infinite_event_loop_no_license_key_noop() {
+        let (port, server_handle) = start_mock_runtime_api(1).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let config = Arc::new({
+            let mut c = crate::config::ExtensionConfig::default();
+            c.new_relic.extension_enabled = true;
+            c.new_relic.license_key = None; // no license → noop
+            c
+        });
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+
+        let components = ExtensionComponents {
+            client,
+            extension_id: "test-ext-id".to_string(),
+            processor_factory: factory,
+            newrelic_client: noop_client,
+            config,
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: false,
+        };
+
+        let (total_events, harvester_handle) = run_infinite_event_loop(components).await;
+        assert_eq!(total_events, 0, "No license key should report 0 events (noop)");
+        harvester_handle.abort();
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+    }
+
+    // ========================================================================
+    // execute_standard_mode_event_loop — full INVOKE→process→SHUTDOWN
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_standard_mode_event_loop_invoke_then_shutdown() {
+        clear_event_loop_state();
+        let (port, server_handle) = start_mock_runtime_api(1).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let config = Arc::new({
+            let mut c = crate::config::ExtensionConfig::default();
+            c.new_relic.extension_enabled = true;
+            c.new_relic.license_key = Some("test-key".to_string());
+            c.new_relic.apm_lambda_mode = false;
+            c
+        });
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+
+        let mut components = ExtensionComponents {
+            client,
+            extension_id: "test-ext-id".to_string(),
+            processor_factory: factory,
+            newrelic_client: noop_client,
+            config,
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: false,
+        };
+
+        let total_events = execute_standard_mode_event_loop(&mut components).await;
+        // event_counter counts INVOKE + SHUTDOWN (1 invoke + 1 shutdown = 2)
+        assert_eq!(total_events, 2, "Should count 1 INVOKE + 1 SHUTDOWN = 2 events");
+
+        // Verify LAST_REQUEST_CONTEXT was set
+        let guard = LAST_REQUEST_CONTEXT.lock().expect("lock");
+        assert!(guard.is_some(), "LAST_REQUEST_CONTEXT should be set after INVOKE");
+        if let Some((req_id, _arn)) = guard.as_ref() {
+            assert_eq!(req_id, "req-0");
+        }
+        drop(guard);
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+        clear_event_loop_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_standard_mode_multiple_invocations() {
+        clear_event_loop_state();
+        let (port, server_handle) = start_mock_runtime_api(3).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let config = Arc::new({
+            let mut c = crate::config::ExtensionConfig::default();
+            c.new_relic.extension_enabled = true;
+            c.new_relic.license_key = Some("test-key".to_string());
+            c.new_relic.apm_lambda_mode = false;
+            c
+        });
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+
+        let mut components = ExtensionComponents {
+            client,
+            extension_id: "test-ext-id".to_string(),
+            processor_factory: factory,
+            newrelic_client: noop_client,
+            config,
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: false,
+        };
+
+        let total_events = execute_standard_mode_event_loop(&mut components).await;
+        // 3 INVOKEs + 1 SHUTDOWN = 4 events
+        assert_eq!(total_events, 4, "Should count 3 INVOKE + 1 SHUTDOWN = 4 events");
+
+        // Last request context should be from the last invocation
+        let guard = LAST_REQUEST_CONTEXT.lock().expect("lock");
+        if let Some((req_id, _)) = guard.as_ref() {
+            assert_eq!(req_id, "req-2", "Last request should be req-2");
+        }
+        drop(guard);
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+        clear_event_loop_state();
+    }
+
+    // ========================================================================
+    // execute_apm_mode_event_loop — APM mode INVOKE→process→SHUTDOWN
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_apm_mode_event_loop_invoke_then_shutdown() {
+        clear_event_loop_state();
+        let (port, server_handle) = start_mock_runtime_api(1).await;
+        std::env::set_var("AWS_LAMBDA_RUNTIME_API", format!("127.0.0.1:{port}"));
+
+        let config = Arc::new({
+            let mut c = crate::config::ExtensionConfig::default();
+            c.new_relic.extension_enabled = true;
+            c.new_relic.license_key = Some("test-key".to_string());
+            c.new_relic.apm_lambda_mode = true;
+            c
+        });
+        let client = Arc::new(reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("client"));
+        let noop_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(crate::request::ProcessorFactory::new(
+            noop_client.clone(), config.clone(), apm_app.clone(),
+        ));
+        let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = factory.create_log_processor(ctx.clone());
+
+        let mut components = ExtensionComponents {
+            client,
+            extension_id: "test-ext-id".to_string(),
+            processor_factory: factory,
+            newrelic_client: noop_client,
+            config,
+            harvester_handle: tokio::spawn(async {}),
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: true,
+        };
+
+        let total_events = execute_apm_mode_event_loop(&mut components).await;
+        // 1 INVOKE + 1 SHUTDOWN = 2 events
+        assert_eq!(total_events, 2, "Should count 1 INVOKE + 1 SHUTDOWN = 2 events in APM mode");
+
+        std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
+        server_handle.abort();
+        clear_event_loop_state();
+    }
+}

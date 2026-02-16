@@ -782,3 +782,74 @@ async fn perform_extension_shutdown_cleanup(
         total_runtime.as_millis()
     );
 }
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use serial_test::serial;
+
+    // ========================================================================
+    // apply_runtime_overrides
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_apply_runtime_overrides_java_disables_apm() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_java21");
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(config);
+
+        let result = apply_runtime_overrides(config);
+        std::env::remove_var("AWS_EXECUTION_ENV");
+
+        assert!(!result.new_relic.apm_lambda_mode, "APM mode should be disabled for Java");
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_runtime_overrides_python_keeps_apm() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_python3.13");
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(config);
+
+        let result = apply_runtime_overrides(config);
+        std::env::remove_var("AWS_EXECUTION_ENV");
+
+        assert!(result.new_relic.apm_lambda_mode, "APM mode should stay true for Python");
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_runtime_overrides_apm_disabled_noop() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_java21");
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = false;
+        let config = Arc::new(config);
+
+        let result = apply_runtime_overrides(config);
+        std::env::remove_var("AWS_EXECUTION_ENV");
+
+        assert!(!result.new_relic.apm_lambda_mode, "Should remain false when already disabled");
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_runtime_overrides_no_env() {
+        std::env::remove_var("AWS_EXECUTION_ENV");
+        let mut config = config::ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(config);
+
+        let result = apply_runtime_overrides(config);
+
+        assert!(result.new_relic.apm_lambda_mode, "APM should stay true with unknown runtime");
+    }
+
+    #[test]
+    fn test_extension_constants() {
+        assert!(!EXTENSION_NAME.is_empty(), "EXTENSION_NAME should not be empty");
+        assert!(!EXTENSION_VERSION.is_empty(), "EXTENSION_VERSION should not be empty");
+    }
+}

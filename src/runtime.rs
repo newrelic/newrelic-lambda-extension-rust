@@ -148,6 +148,7 @@ pub async fn subscribe_to_telemetry(
     Ok(())
 }
 
+/// Fetch the next event from the Lambda Extensions API
 pub async fn fetch_next_event(
     client: &Client,
     ext_id: &str,
@@ -218,5 +219,177 @@ pub async fn fetch_next_event(
                 tokio::time::sleep(delay).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ========================================================================
+    // ShutdownReason — as_str() and Display
+    // ========================================================================
+
+    #[test]
+    fn test_shutdown_reason_spindown_as_str() {
+        assert_eq!(ShutdownReason::Spindown.as_str(), "spindown");
+    }
+
+    #[test]
+    fn test_shutdown_reason_timeout_as_str() {
+        assert_eq!(ShutdownReason::Timeout.as_str(), "timeout");
+    }
+
+    #[test]
+    fn test_shutdown_reason_failure_as_str() {
+        assert_eq!(ShutdownReason::Failure.as_str(), "failure");
+    }
+
+    #[test]
+    fn test_shutdown_reason_unknown_as_str() {
+        assert_eq!(ShutdownReason::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn test_shutdown_reason_display_matches_as_str() {
+        let variants = [
+            ShutdownReason::Spindown,
+            ShutdownReason::Timeout,
+            ShutdownReason::Failure,
+            ShutdownReason::Unknown,
+        ];
+        for variant in &variants {
+            assert_eq!(format!("{variant}"), variant.as_str());
+        }
+    }
+
+    // ========================================================================
+    // ShutdownReason — deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_shutdown_reason_deserialize_known_variants() {
+        let spindown: ShutdownReason =
+            serde_json::from_str("\"spindown\"").expect("should deserialize spindown");
+        assert_eq!(spindown, ShutdownReason::Spindown);
+
+        let timeout: ShutdownReason =
+            serde_json::from_str("\"timeout\"").expect("should deserialize timeout");
+        assert_eq!(timeout, ShutdownReason::Timeout);
+
+        let failure: ShutdownReason =
+            serde_json::from_str("\"failure\"").expect("should deserialize failure");
+        assert_eq!(failure, ShutdownReason::Failure);
+    }
+
+    #[test]
+    fn test_shutdown_reason_deserialize_unknown_falls_to_unknown() {
+        let reason: ShutdownReason =
+            serde_json::from_str("\"crash\"").expect("should deserialize unknown variant");
+        assert_eq!(reason, ShutdownReason::Unknown);
+
+        let reason2: ShutdownReason =
+            serde_json::from_str("\"something_else\"").expect("should deserialize unknown variant");
+        assert_eq!(reason2, ShutdownReason::Unknown);
+    }
+
+    // ========================================================================
+    // LambdaRuntimeEvent — deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_lambda_runtime_event_deserialize_invoke() {
+        let json = r#"{
+            "eventType": "INVOKE",
+            "requestId": "abc-123",
+            "invokedFunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:my-function"
+        }"#;
+
+        let event: LambdaRuntimeEvent =
+            serde_json::from_str(json).expect("should deserialize INVOKE event");
+
+        match event {
+            LambdaRuntimeEvent::Invoke {
+                request_id,
+                invoked_function_arn,
+            } => {
+                assert_eq!(request_id, "abc-123");
+                assert_eq!(
+                    invoked_function_arn,
+                    "arn:aws:lambda:us-east-1:123456789012:function:my-function"
+                );
+            }
+            _ => panic!("Expected Invoke event"),
+        }
+    }
+
+    #[test]
+    fn test_lambda_runtime_event_deserialize_shutdown_with_reason() {
+        let json = r#"{
+            "eventType": "SHUTDOWN",
+            "shutdownReason": "timeout"
+        }"#;
+
+        let event: LambdaRuntimeEvent =
+            serde_json::from_str(json).expect("should deserialize SHUTDOWN event");
+
+        match event {
+            LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+                assert_eq!(shutdown_reason, ShutdownReason::Timeout);
+            }
+            _ => panic!("Expected Shutdown event"),
+        }
+    }
+
+    #[test]
+    fn test_lambda_runtime_event_deserialize_shutdown_unknown_reason() {
+        let json = r#"{
+            "eventType": "SHUTDOWN",
+            "shutdownReason": "never_seen_before"
+        }"#;
+
+        let event: LambdaRuntimeEvent =
+            serde_json::from_str(json).expect("should deserialize SHUTDOWN with unknown reason");
+
+        match event {
+            LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+                assert_eq!(shutdown_reason, ShutdownReason::Unknown);
+            }
+            _ => panic!("Expected Shutdown event"),
+        }
+    }
+
+    // ========================================================================
+    // ExtensionRegistrationResponse — deserialization
+    // ========================================================================
+
+    #[test]
+    fn test_extension_registration_response_deserialize() {
+        let json = r#"{
+            "functionName": "my-function",
+            "functionVersion": "$LATEST",
+            "accountId": "123456789012"
+        }"#;
+
+        let resp: ExtensionRegistrationResponse =
+            serde_json::from_str(json).expect("should deserialize registration response");
+
+        assert_eq!(resp.function_name, "my-function");
+        assert_eq!(resp.function_version, "$LATEST");
+        assert_eq!(resp.account_id, Some("123456789012".to_string()));
+    }
+
+    #[test]
+    fn test_extension_registration_response_optional_account_id() {
+        let json = r#"{
+            "functionName": "my-function",
+            "functionVersion": "$LATEST"
+        }"#;
+
+        let resp: ExtensionRegistrationResponse =
+            serde_json::from_str(json).expect("should deserialize without accountId");
+
+        assert_eq!(resp.function_name, "my-function");
+        assert!(resp.account_id.is_none());
     }
 }

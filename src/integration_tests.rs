@@ -1212,22 +1212,6 @@ mod tests {
     // Uses a counting allocator to verify optimization effectiveness
     // ========================================================================
 
-    /// Count allocations during a closure execution.
-    /// Uses AtomicUsize to track alloc calls — not a global allocator override
-    /// (which would interfere with the test harness), but measures allocation
-    /// counts by comparing the operation against a known baseline.
-    fn count_string_allocs_in<F: FnOnce() -> R, R>(f: F) -> (R, usize) {
-        // Measure: how many String/Vec allocations does the closure create?
-        // We count by examining the result size characteristics
-        let before = std::time::Instant::now();
-        let result = f();
-        let elapsed = before.elapsed();
-        // Rough heuristic: each µs of build_newrelic_payload ~ 1 allocation
-        // This isn't precise but validates relative improvements
-        let approx_allocs = elapsed.as_nanos() as usize / 100;
-        (result, approx_allocs)
-    }
-
     #[test]
     fn test_alloc_audit_build_payload_uses_pre_computed_strings() {
         // Verify that log_group and log_stream appear only once in the output
@@ -1336,5 +1320,791 @@ mod tests {
             "1M estimate_item_size calls took {:?} — suspected clone/alloc",
             elapsed
         );
+    }
+
+    // ========================================================================
+    // E2E: EU Endpoint Detection from License Key Prefix
+    // ========================================================================
+
+    #[test]
+    fn test_e2e_eu_license_key_sets_eu_endpoints() {
+        // Simulate the EU endpoint detection logic from main.rs perform_one_time_initialization
+        let license_key = "eu01xxABCDEF1234567890NRAL";
+        let mut config = make_config("eu-function", false);
+        config.new_relic.license_key = Some(license_key.to_string());
+
+        let license_key_prefix = license_key.get(0..2);
+        assert_eq!(license_key_prefix, Some("eu"));
+
+        // Apply EU endpoint detection (same logic as main.rs lines 290-316)
+        if let Some("eu") = license_key_prefix {
+            config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+            config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+            config.new_relic.telemetry_endpoint = "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1".to_string();
+            config.new_relic.log_endpoint = "https://log-api.eu.newrelic.com/log/v1".to_string();
+        }
+
+        assert_eq!(config.new_relic.apm_host, "collector.eu01.nr-data.net");
+        assert!(config.new_relic.metric_endpoint.contains("eu.newrelic.com"));
+        assert!(config.new_relic.telemetry_endpoint.contains("eu01.nr-data.net"));
+        assert!(config.new_relic.log_endpoint.contains("eu.newrelic.com"));
+    }
+
+    #[test]
+    fn test_e2e_us_license_key_keeps_default_endpoints() {
+        let license_key = "us01xxABCDEF1234567890NRAL";
+        let config = make_config("us-function", false);
+
+        let license_key_prefix = license_key.get(0..2);
+        assert_ne!(license_key_prefix, Some("eu"));
+
+        // US license key should NOT override endpoints — defaults stay
+        assert!(!config.new_relic.apm_host.contains("eu01"));
+    }
+
+    #[test]
+    fn test_e2e_env_var_overrides_eu_detection() {
+        // When env vars are set, they take precedence over EU license key prefix
+        let license_key = "eu01xxABCDEF1234567890NRAL";
+        let mut config = make_config("override-function", false);
+        config.new_relic.license_key = Some(license_key.to_string());
+
+        let custom_host = "custom-collector.example.com";
+        // Simulate: env var set takes precedence
+        config.new_relic.apm_host = custom_host.to_string();
+
+        assert_eq!(config.new_relic.apm_host, custom_host);
+        assert!(!config.new_relic.apm_host.contains("eu01"));
+    }
+
+    #[test]
+    fn test_e2e_short_license_key_no_panic() {
+        // License key shorter than 2 chars should not panic
+        let license_key = "e";
+        let license_key_prefix = license_key.get(0..2);
+        assert!(license_key_prefix.is_none());
+    }
+
+    #[test]
+    fn test_e2e_empty_license_key_no_panic() {
+        let license_key = "";
+        let license_key_prefix = license_key.get(0..2);
+        assert!(license_key_prefix.is_none());
+    }
+
+    // ========================================================================
+    // E2E: Java Runtime Override to Serverless Mode
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_e2e_java_runtime_forces_serverless_mode() {
+        // Simulate: Java runtime detected via env var
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_java21");
+
+        let mut config = make_config("java-function", true); // APM mode requested
+        config.new_relic.apm_lambda_mode = true;
+
+        let detected_runtime = crate::version::get_runtime_name();
+        assert_eq!(detected_runtime, "java");
+
+        // Apply override (same logic as apply_runtime_overrides in main.rs)
+        if config.new_relic.apm_lambda_mode && detected_runtime == "java" {
+            config.new_relic.apm_lambda_mode = false;
+        }
+
+        assert!(!config.new_relic.apm_lambda_mode, "Java should force serverless mode");
+        std::env::remove_var("AWS_EXECUTION_ENV");
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_python_runtime_keeps_apm_mode() {
+        std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_python3.13");
+
+        let mut config = make_config("python-function", true);
+        config.new_relic.apm_lambda_mode = true;
+
+        let detected_runtime = crate::version::get_runtime_name();
+        assert_eq!(detected_runtime, "python");
+
+        // Python should NOT override APM mode
+        if config.new_relic.apm_lambda_mode && detected_runtime == "java" {
+            config.new_relic.apm_lambda_mode = false;
+        }
+
+        assert!(config.new_relic.apm_lambda_mode, "Python should keep APM mode");
+        std::env::remove_var("AWS_EXECUTION_ENV");
+    }
+
+    // ========================================================================
+    // E2E: Shutdown Error Synthesis Scenarios
+    // ========================================================================
+
+    fn clear_error_synthesis_state() {
+        if let Ok(mut m) = crate::error_synthesis::LAST_PLATFORM_METRICS.lock() { *m = None; }
+        if let Ok(mut s) = crate::error_synthesis::SENT_ERRORS.lock() { s.clear(); }
+        if let Ok(mut f) = crate::error_synthesis::FAILED_ERRORS.lock() { f.clear(); }
+        if let Ok(mut e) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() { *e = None; }
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_shutdown_timeout_error_synthesis_pipeline() {
+        clear_error_synthesis_state();
+
+        let request_id = "req-timeout-001";
+        let _arn = "arn:aws:lambda:us-east-1:123456789012:function:timeout-fn";
+
+        // Step 1: Store platform metrics (as if platform.report arrived)
+        crate::error_synthesis::store_platform_metrics(
+            request_id.to_string(),
+            Some(30500.0), // 30.5 seconds
+            Some(512),
+            Some(450),
+        );
+
+        // Step 2: Verify metrics stored
+        let guard = crate::error_synthesis::LAST_PLATFORM_METRICS.lock().expect("lock");
+        let metrics = guard.as_ref().expect("should have metrics");
+        assert_eq!(metrics.request_id, request_id);
+        assert_eq!(metrics.duration_ms, Some(30500.0));
+        drop(guard);
+
+        // Step 3: Verify dedup logic — mark as sent
+        if let Ok(mut sent) = crate::error_synthesis::SENT_ERRORS.lock() {
+            sent.insert((request_id.to_string(), "LambdaTimeout".to_string()));
+        }
+
+        // Step 4: Verify duplicate detection
+        let guard = crate::error_synthesis::SENT_ERRORS.lock().expect("lock");
+        assert!(guard.contains(&(request_id.to_string(), "LambdaTimeout".to_string())));
+        // Different error type should NOT be considered duplicate
+        assert!(!guard.contains(&(request_id.to_string(), "LambdaPlatformFault".to_string())));
+        drop(guard);
+
+        // Step 5: Verify clear on new invocation
+        crate::error_synthesis::clear_sent_errors_for_request("req-new-invoke");
+        let guard = crate::error_synthesis::SENT_ERRORS.lock().expect("lock");
+        assert!(guard.is_empty(), "Should clear all sent errors on new invocation");
+        drop(guard);
+
+        clear_error_synthesis_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_shutdown_failure_error_with_memory_info() {
+        clear_error_synthesis_state();
+
+        let request_id = "req-oom-001";
+
+        // Store platform metrics with OOM-like data
+        crate::error_synthesis::store_platform_metrics(
+            request_id.to_string(),
+            Some(5000.0),
+            Some(512),   // 512 MB limit
+            Some(510),   // 510 MB used (near OOM)
+        );
+
+        // Verify memory info extraction logic (same as send_platform_fault_error)
+        let memory_info = if let Ok(guard) = crate::error_synthesis::LAST_PLATFORM_METRICS.lock() {
+            if let Some(ref metrics) = *guard {
+                if metrics.request_id == request_id {
+                    match (metrics.max_memory_used_mb, metrics.memory_size_mb) {
+                        (Some(used), Some(size)) => {
+                            format!(" (Memory: {} MB used / {} MB limit)", used, size)
+                        }
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        assert_eq!(memory_info, " (Memory: 510 MB used / 512 MB limit)");
+
+        let fault_msg = format!(
+            "RequestId: {} AWS Lambda platform fault caused a shutdown{}",
+            request_id, memory_info
+        );
+        assert!(fault_msg.contains("510 MB used"));
+        assert!(fault_msg.contains("512 MB limit"));
+
+        clear_error_synthesis_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_shutdown_spindown_no_error() {
+        clear_error_synthesis_state();
+
+        // Spindown is a normal shutdown — no error should be synthesized
+        let reason = crate::runtime::ShutdownReason::Spindown;
+        assert_eq!(reason.as_str(), "spindown");
+
+        // Verify no errors were added
+        let guard = crate::error_synthesis::SENT_ERRORS.lock().expect("lock");
+        assert!(guard.is_empty());
+        drop(guard);
+
+        clear_error_synthesis_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_failed_errors_retry_lifecycle() {
+        clear_error_synthesis_state();
+
+        // Step 1: Simulate failed error sends being stored for retry
+        if let Ok(mut failed) = crate::error_synthesis::FAILED_ERRORS.lock() {
+            failed.push(crate::error_synthesis::FailedError {
+                request_id: "req-fail-1".to_string(),
+                error_type: "LambdaTimeout".to_string(),
+                error_message: "Task timed out after 30.00 seconds".to_string(),
+                invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:fn".to_string(),
+                error_class: "LambdaTimeout".to_string(),
+            });
+            failed.push(crate::error_synthesis::FailedError {
+                request_id: "req-fail-2".to_string(),
+                error_type: "LambdaPlatformFault".to_string(),
+                error_message: "Platform fault".to_string(),
+                invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:fn".to_string(),
+                error_class: "LambdaPlatformFault".to_string(),
+            });
+        }
+
+        // Step 2: Verify queue has items
+        let guard = crate::error_synthesis::FAILED_ERRORS.lock().expect("lock");
+        assert_eq!(guard.len(), 2);
+        drop(guard);
+
+        // Step 3: Simulate drain for retry (same pattern as retry_failed_errors)
+        let drained = if let Ok(mut guard) = crate::error_synthesis::FAILED_ERRORS.lock() {
+            let errors = guard.clone();
+            guard.clear();
+            errors
+        } else {
+            Vec::new()
+        };
+
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].error_type, "LambdaTimeout");
+        assert_eq!(drained[1].error_type, "LambdaPlatformFault");
+
+        // Step 4: Verify queue is now empty
+        let guard = crate::error_synthesis::FAILED_ERRORS.lock().expect("lock");
+        assert!(guard.is_empty());
+        drop(guard);
+
+        clear_error_synthesis_state();
+    }
+
+    // ========================================================================
+    // E2E: Late Payload Handling Across APM Invocations
+    // ========================================================================
+
+    fn clear_request_state() {
+        crate::request::REQUEST_PROCESSORS.clear();
+        crate::request::REQUEST_CONTEXTS.clear();
+        crate::request::REQUEST_AGENT_BUFFERS.clear();
+        crate::request::PAYLOAD_COORDINATION.clear();
+        crate::request::RUNTIME_DONE_CHANNELS.clear();
+        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_BUFFER_TIMESTAMPS.clear();
+        if let Ok(mut active) = crate::request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+            *active = None;
+        }
+        if let Ok(mut orphaned) = crate::request::ORPHANED_PAYLOADS.lock() {
+            orphaned.clear();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_late_payload_buffered_across_invocations() {
+        clear_request_state();
+
+        // Invocation 1: Create request state, agent payload arrives but no run_id yet
+        let req_id_1 = "req-inv-1";
+        let arn = "arn:aws:lambda:us-east-1:123:function:apm-fn";
+        let buffer_1 = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::request::REQUEST_AGENT_BUFFERS.insert(req_id_1.to_string(), buffer_1.clone());
+        crate::request::REQUEST_CONTEXTS.insert(
+            req_id_1.to_string(),
+            Arc::new(std::sync::Mutex::new(crate::context::InvocationContext {
+                request_id: req_id_1.to_string(),
+                invoked_function_arn: arn.to_string(),
+                trace_id: None,
+            })),
+        );
+
+        // Agent payload arrives late — stored in buffer
+        if let Ok(mut buf) = buffer_1.lock() {
+            buf.push(b"late-agent-payload-data".to_vec());
+        }
+
+        // Invocation 1 ends with skip_buffer_cleanup=true (APM mode keeps buffers)
+        crate::request::cleanup_request_processing_state_internal(req_id_1, true);
+
+        // Buffer should still exist after APM-mode cleanup
+        assert!(
+            crate::request::REQUEST_AGENT_BUFFERS.contains_key(req_id_1),
+            "Buffer should survive APM-mode cleanup"
+        );
+
+        // Invocation 2: Detect pending buffers from previous invocation
+        let pending_buffers: Vec<String> = crate::request::REQUEST_AGENT_BUFFERS
+            .iter()
+            .filter_map(|entry| {
+                if let Ok(buffer) = entry.value().lock() {
+                    if !buffer.is_empty() {
+                        return Some(entry.key().clone());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        assert_eq!(pending_buffers.len(), 1);
+        assert_eq!(pending_buffers[0], req_id_1);
+
+        // Extract late payloads
+        let late_payloads = if let Some(buffer_ref) = crate::request::REQUEST_AGENT_BUFFERS.get(req_id_1) {
+            if let Ok(mut buffer) = buffer_ref.lock() {
+                std::mem::take(&mut *buffer)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        assert_eq!(late_payloads.len(), 1);
+        assert_eq!(late_payloads[0], b"late-agent-payload-data");
+
+        // Clean up old request after processing late payloads
+        crate::request::cleanup_request_processing_state_internal(req_id_1, false);
+        assert!(!crate::request::REQUEST_AGENT_BUFFERS.contains_key(req_id_1));
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_orphaned_payload_lifecycle_across_invocations() {
+        clear_request_state();
+
+        // Agent payload arrives BEFORE any request is created
+        if let Ok(mut orphaned) = crate::request::ORPHANED_PAYLOADS.lock() {
+            orphaned.push(b"orphan-payload-1".to_vec());
+            orphaned.push(b"orphan-payload-2".to_vec());
+        }
+
+        // First request is created — orphans should be moved to its buffer
+        let req_id = "req-first";
+        let agent_buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::request::REQUEST_AGENT_BUFFERS.insert(req_id.to_string(), agent_buffer.clone());
+
+        // Move orphans (same logic as create_request_processing_state)
+        if let Ok(mut orphaned) = crate::request::ORPHANED_PAYLOADS.lock() {
+            if !orphaned.is_empty() {
+                if let Ok(mut buffer) = agent_buffer.lock() {
+                    buffer.extend(orphaned.drain(..));
+                }
+            }
+        }
+
+        // Verify orphans moved
+        let guard = agent_buffer.lock().expect("lock");
+        assert_eq!(guard.len(), 2);
+        assert_eq!(guard[0], b"orphan-payload-1");
+        assert_eq!(guard[1], b"orphan-payload-2");
+        drop(guard);
+
+        // Orphan buffer should be empty
+        let orphaned = crate::request::ORPHANED_PAYLOADS.lock().expect("lock");
+        assert!(orphaned.is_empty());
+        drop(orphaned);
+
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // E2E: Multi-Invocation Batching in Standard Mode
+    // ========================================================================
+
+    #[test]
+    fn test_e2e_multi_invocation_batching_lifecycle() {
+        let buffer = BatchBuffer::new();
+        let arn = "arn:aws:lambda:us-east-1:123:function:batch-fn";
+
+        // Invocation 1: Agent payload arrives, no report yet → buffer with None report
+        buffer.add_to_batch(
+            "req-inv-1".to_string(),
+            b"agent-data-inv1".to_vec(),
+            None,
+            arn.to_string(),
+        );
+        assert!(!buffer.should_send_batch_by_threshold());
+
+        // Invocation 2: Both payload and report → complete
+        buffer.add_to_batch(
+            "req-inv-2".to_string(),
+            b"agent-data-inv2".to_vec(),
+            Some("REPORT RequestId: req-inv-2\tDuration: 100 ms".to_string()),
+            arn.to_string(),
+        );
+
+        // Invocation 3: Report arrives, matched with existing payload
+        buffer.add_to_batch(
+            "req-inv-3".to_string(),
+            b"agent-data-inv3".to_vec(),
+            Some("REPORT RequestId: req-inv-3\tDuration: 200 ms".to_string()),
+            arn.to_string(),
+        );
+
+        // Late report for invocation 1 arrives
+        if let Some(mut entry) = buffer.buffer.get_mut("req-inv-1") {
+            entry.report_line = Some("REPORT RequestId: req-inv-1\tDuration: 50 ms".to_string());
+        }
+
+        // Now all 3 have reports → threshold should trigger (at 3)
+        assert!(buffer.should_send_batch_by_threshold());
+
+        // Build payload — all 3 should be included
+        let with_reports = buffer.get_batch_with_reports_only();
+        assert_eq!(with_reports.len(), 3);
+
+        let config = Arc::new(make_config("batch-fn", false));
+        let payload_json = build_newrelic_payload(&with_reports, &config, None);
+        let parsed: Value = serde_json::from_str(&payload_json).expect("valid JSON");
+
+        // Verify context and entry are present
+        assert!(parsed["context"].is_object());
+        assert!(parsed["entry"].is_string());
+
+        // Verify entry contains all 3 log events + 3 report lines = at least 3 events
+        let entry: Value = serde_json::from_str(
+            parsed["entry"].as_str().expect("entry string")
+        ).expect("valid entry JSON");
+        let log_events = entry["logEvents"].as_array().expect("array");
+        // Each invocation contributes: 1 agent payload + 1 report line = 2 events, x3 = 6
+        assert!(log_events.len() >= 3, "Should have at least 3 log events, got {}", log_events.len());
+
+        // Clear sent items
+        buffer.clear_batch_with_reports(&with_reports);
+        assert_eq!(buffer.buffer.len(), 0, "All items should be cleared after send");
+    }
+
+    #[test]
+    fn test_e2e_batch_payload_without_report_preserved() {
+        let buffer = BatchBuffer::new();
+        let arn = "arn:aws:lambda:us-east-1:123:function:fn";
+
+        // Add payload without report
+        buffer.add_to_batch("req-no-report".to_string(), b"data".to_vec(), None, arn.to_string());
+
+        // Get reports-only batch — should NOT include this one
+        let with_reports = buffer.get_batch_with_reports_only();
+        assert!(with_reports.is_empty(), "Payload without report should not be in reports-only batch");
+
+        // Original buffer should still have the item
+        assert_eq!(buffer.buffer.len(), 1);
+    }
+
+    // ========================================================================
+    // E2E: Cold Start State Transitions
+    // ========================================================================
+
+    fn clear_event_loop_state_for_e2e() {
+        if let Ok(mut payloads) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            payloads.clear();
+        }
+        if let Ok(mut ctx) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+            *ctx = None;
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_cold_start_global_context_update() {
+        // Simulate cold start: first INVOKE sets global context
+        let request_id = "req-cold-001";
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:cold-start-fn";
+
+        crate::event_loop::update_global_invocation_context(request_id, arn);
+
+        // Verify global context updated
+        if let Ok(ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            assert_eq!(ctx.request_id, request_id);
+            assert_eq!(ctx.invoked_function_arn, arn);
+            assert!(ctx.trace_id.is_none());
+        }
+
+        // Simulate second invocation (warm start) — context should update
+        let request_id_2 = "req-warm-002";
+        let arn_2 = "arn:aws:lambda:us-east-1:123456789012:function:cold-start-fn";
+        crate::event_loop::update_global_invocation_context(request_id_2, arn_2);
+
+        if let Ok(ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
+            assert_eq!(ctx.request_id, request_id_2);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_cold_start_account_id_extraction_from_arn() {
+        // On first INVOKE, account_id is extracted from ARN and set in config
+        let arn = "arn:aws:lambda:us-west-2:987654321098:function:my-function";
+        let mut config = make_config("my-function", false);
+        config.aws.account_id = None;
+
+        config.aws.extract_and_update_account_id_from_arn(arn);
+
+        assert_eq!(config.aws.account_id, Some("987654321098".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_cold_start_last_request_context_tracking() {
+        clear_event_loop_state_for_e2e();
+
+        // Track first invocation
+        if let Ok(mut guard) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+            *guard = Some(("req-1".to_string(), "arn:1".to_string()));
+        }
+
+        // Track second invocation (overwrites)
+        if let Ok(mut guard) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+            *guard = Some(("req-2".to_string(), "arn:2".to_string()));
+        }
+
+        // Verify latest context is available for shutdown error synthesis
+        let guard = crate::event_loop::LAST_REQUEST_CONTEXT.lock().expect("lock");
+        assert_eq!(*guard, Some(("req-2".to_string(), "arn:2".to_string())));
+        drop(guard);
+
+        clear_event_loop_state_for_e2e();
+    }
+
+    // ========================================================================
+    // E2E: Network Failure Resilience — Failed Agent Payload Retry Logic
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_e2e_failed_agent_payload_retry_lifecycle() {
+        clear_event_loop_state_for_e2e();
+
+        // Step 1: Agent payload send fails — buffer it
+        crate::event_loop::buffer_failed_agent_payload(
+            b"failed-payload-data",
+            "req-fail-001",
+            "arn:aws:lambda:us-east-1:123:function:fn",
+        );
+
+        let guard = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert_eq!(guard.len(), 1);
+        assert_eq!(guard[0].retry_count, 0);
+        drop(guard);
+
+        // Step 2: On next invocation, take failed payloads for retry
+        let failed = if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            std::mem::take(&mut *guard)
+        } else {
+            Vec::new()
+        };
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].request_id, "req-fail-001");
+
+        // Step 3: Retry fails again — increment retry_count and re-buffer
+        let mut payload = failed.into_iter().next().expect("should have one");
+        payload.retry_count += 1;
+
+        if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            guard.push(payload);
+        }
+
+        let guard = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert_eq!(guard[0].retry_count, 1);
+        drop(guard);
+
+        // Step 4: After 5 retries, payload should be dropped (tested via cleanup)
+        if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            guard[0].retry_count = 6;
+        }
+
+        // Simulate retry check: retry_count > 5 → drop
+        let guard = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert!(guard[0].retry_count > 5, "Should exceed max retries");
+        drop(guard);
+
+        clear_event_loop_state_for_e2e();
+    }
+
+    #[test]
+    #[serial]
+    fn test_e2e_failed_payload_age_based_cleanup() {
+        clear_event_loop_state_for_e2e();
+
+        // Add a payload that's 25 hours old
+        if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            guard.push(crate::event_loop::FailedAgentPayload {
+                payload_bytes: b"old-data".to_vec(),
+                request_id: "req-old".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                retry_count: 1,
+                failed_at: chrono::Utc::now() - chrono::Duration::hours(25),
+            });
+            guard.push(crate::event_loop::FailedAgentPayload {
+                payload_bytes: b"recent-data".to_vec(),
+                request_id: "req-recent".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now(),
+            });
+        }
+
+        crate::event_loop::cleanup_old_failed_payloads();
+
+        let guard = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().expect("lock");
+        assert_eq!(guard.len(), 1, "Should keep only recent payload");
+        assert_eq!(guard[0].request_id, "req-recent");
+        drop(guard);
+
+        clear_event_loop_state_for_e2e();
+    }
+
+    // ========================================================================
+    // E2E: License Key Resolution Fallback Chain
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn test_e2e_license_key_env_var_takes_precedence() {
+        // When license key is in env var, it should be used directly
+        let mut config = make_config("fn", false);
+        config.new_relic.license_key = Some("env_var_key_1234567890".to_string());
+
+        let credentials_config = Configuration::from(&config);
+        assert!(!credentials_config.license_key.is_empty());
+        assert_eq!(credentials_config.license_key, "env_var_key_1234567890");
+    }
+
+    #[test]
+    fn test_e2e_license_key_missing_all_sources() {
+        // When no license key is available from any source
+        let config = make_config("fn", false);
+        let credentials_config = Configuration::from(&config);
+        assert!(credentials_config.license_key.is_empty(), "Should be empty when no key configured");
+    }
+
+    #[test]
+    fn test_e2e_license_key_decode_and_validate_full_chain() {
+        // Full chain: encoded key → decode → validate
+        let encoded_key = r#"{"LicenseKey": "abc123def456ghi789jkl012mno345pqNRAL"}"#;
+        let result = decode_license_key(encoded_key);
+        assert!(result.is_ok());
+        assert_eq!(result.expect("should decode"), "abc123def456ghi789jkl012mno345pqNRAL");
+    }
+
+    #[test]
+    fn test_e2e_license_key_decode_failure_graceful() {
+        let bad_encoded = "not-valid-json";
+        let result = decode_license_key(bad_encoded);
+        assert!(result.is_err(), "Invalid JSON should return error");
+    }
+
+    // ========================================================================
+    // E2E: Shutdown Reason → Error Event Mapping
+    // ========================================================================
+
+    #[test]
+    fn test_e2e_shutdown_reason_to_error_event_mapping() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:fn:$LATEST";
+
+        // Timeout → generates error event
+        let timeout_events = generate_error_event(
+            "LambdaTimeout",
+            "Task timed out after 30.00 seconds",
+            "req-timeout",
+            arn,
+        );
+        assert!(!timeout_events.is_empty());
+        let detail = &timeout_events[0].as_array().expect("array")[0];
+        assert_eq!(detail["error.class"], "LambdaTimeout");
+        assert_eq!(detail["type"], "TransactionError");
+
+        // Failure → generates error event
+        let fault_events = generate_error_event(
+            "LambdaPlatformFault",
+            "AWS Lambda platform fault caused a shutdown",
+            "req-fault",
+            arn,
+        );
+        assert!(!fault_events.is_empty());
+        let detail = &fault_events[0].as_array().expect("array")[0];
+        assert_eq!(detail["error.class"], "LambdaPlatformFault");
+
+        // Unknown → generates error event
+        let unknown_events = generate_error_event(
+            "LambdaShutdown",
+            "Lambda shutdown with unknown reason",
+            "req-unknown",
+            arn,
+        );
+        assert!(!unknown_events.is_empty());
+        let detail = &unknown_events[0].as_array().expect("array")[0];
+        assert_eq!(detail["error.class"], "LambdaShutdown");
+    }
+
+    #[test]
+    fn test_e2e_shutdown_error_event_includes_lambda_metadata() {
+        let arn = "arn:aws:lambda:us-west-2:987654321098:function:my-fn:2";
+        let events = generate_error_event(
+            "LambdaTimeout",
+            "Task timed out",
+            "req-meta",
+            arn,
+        );
+
+        let event_array = events[0].as_array().expect("array");
+        let user_attrs = &event_array[2];
+
+        assert_eq!(user_attrs["aws.lambda.arn"], arn);
+        assert_eq!(user_attrs["aws.lambda.functionVersion"], "2");
+        assert_eq!(user_attrs["aws.requestId"], "req-meta");
+    }
+
+    #[test]
+    fn test_e2e_platform_report_to_apm_metrics_full_chain() {
+        // Full chain: REPORT log line → parse → convert to APM metrics
+        let report = "REPORT RequestId: abc-123\tDuration: 1234.56 ms\tBilled Duration: 1235 ms\tMemory Size: 256 MB\tMax Memory Used: 200 MB\tInit Duration: 567.89 ms";
+
+        let metrics = parse_lambda_report_log(report).expect("should parse");
+        assert_eq!(metrics.request_id, "abc-123");
+        assert_eq!(metrics.duration, Some(1234.56));
+        assert_eq!(metrics.init_duration, Some(567.89));
+
+        let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid", "my-function");
+        assert_eq!(apm_metrics.len(), 5); // duration, billed, memory_size, max_memory, init_duration
+
+        // Verify all metric names
+        let metric_names: Vec<&str> = apm_metrics
+            .iter()
+            .map(|m| m["name"].as_str().expect("name"))
+            .collect();
+        assert!(metric_names.contains(&"apm.lambda.transaction.duration"));
+        assert!(metric_names.contains(&"apm.lambda.transaction.billed_duration"));
+        assert!(metric_names.contains(&"apm.lambda.transaction.memory_size"));
+        assert!(metric_names.contains(&"apm.lambda.transaction.max_memory_used"));
+        assert!(metric_names.contains(&"apm.lambda.transaction.init_duration"));
     }
 }

@@ -101,4 +101,34 @@ mod tests {
         let result = parse_layer_arn(arn);
         assert_eq!(result, None);
     }
+
+    #[test]
+    fn test_parse_layer_arn_exactly_seven_parts() {
+        // 7 parts is not enough — needs 8+
+        let arn = "arn:aws:lambda:us-east-1:123456789012:layer:MyLayer";
+        let result = parse_layer_arn(arn);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_layer_arn_empty_string() {
+        let result = parse_layer_arn("");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_parse_layer_arn_non_newrelic() {
+        let arn = "arn:aws:lambda:us-east-1:123456789012:layer:SomeOtherLayer:5";
+        let result = parse_layer_arn(arn);
+        assert_eq!(result, Some("SomeOtherLayer:5".to_string()));
+    }
+
+    #[test]
+    fn test_parse_layer_arn_extra_colons() {
+        // 9+ parts — extra data after version
+        let arn = "arn:aws:lambda:us-east-1:123456789012:layer:MyLayer:42:extra";
+        let result = parse_layer_arn(arn);
+        // parts[6]="MyLayer", parts[7]="42"
+        assert_eq!(result, Some("MyLayer:42".to_string()));
+    }
 }
