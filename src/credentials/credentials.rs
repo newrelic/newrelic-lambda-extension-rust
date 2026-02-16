@@ -116,17 +116,38 @@ async fn initialize_aws_clients() -> Result<()> {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
 
-    let config = tokio::time::timeout(
-        Duration::from_millis(1000),
+    let config_future = tokio::spawn(async {
         aws_config::defaults(BehaviorVersion::latest())
             .retry_config(aws_config::retry::RetryConfig::disabled())
             .load()
+            .await
+    });
+
+    let config = tokio::time::timeout(
+        Duration::from_millis(1000),
+        config_future
     ).await
-    .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?;
-    
+    .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?
+    .map_err(|e| anyhow!("AWS config task failed: {}", e))?;
+
+    // Create both AWS clients in PARALLEL (critical for cold start performance)
+    let (secrets_result, ssm_result) = tokio::join!(
+        tokio::spawn({
+            let config = config.clone();
+            async move { SecretsManagerClient::new(&config) }
+        }),
+        tokio::spawn({
+            let config = config.clone();
+            async move { SsmClient::new(&config) }
+        })
+    );
+
+    let secrets_manager = secrets_result.map_err(|e| anyhow!("Secrets Manager client failed: {}", e))?;
+    let ssm = ssm_result.map_err(|e| anyhow!("SSM client failed: {}", e))?;
+
     let clients = AwsClients {
-        secrets_manager: DefaultSecretsManager::new(SecretsManagerClient::new(&config)),
-        ssm: DefaultSsm::new(SsmClient::new(&config)),
+        secrets_manager: DefaultSecretsManager::new(secrets_manager),
+        ssm: DefaultSsm::new(ssm),
     };
     
     AWS_CLIENTS.set(clients).map_err(|_| anyhow!("Failed to store AWS clients"))?;
