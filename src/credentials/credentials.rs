@@ -130,20 +130,10 @@ async fn initialize_aws_clients() -> Result<()> {
     .map_err(|_| anyhow!("AWS config initialization timeout (1s)"))?
     .map_err(|e| anyhow!("AWS config task failed: {}", e))?;
 
-    // Create both AWS clients in PARALLEL (critical for cold start performance)
-    let (secrets_result, ssm_result) = tokio::join!(
-        tokio::spawn({
-            let config = config.clone();
-            async move { SecretsManagerClient::new(&config) }
-        }),
-        tokio::spawn({
-            let config = config.clone();
-            async move { SsmClient::new(&config) }
-        })
-    );
-
-    let secrets_manager = secrets_result.map_err(|e| anyhow!("Secrets Manager client failed: {}", e))?;
-    let ssm = ssm_result.map_err(|e| anyhow!("SSM client failed: {}", e))?;
+    // Create both AWS clients directly (sync constructors — no async work,
+    // so tokio::spawn on current_thread runtime adds overhead without benefit)
+    let secrets_manager = SecretsManagerClient::new(&config);
+    let ssm = SsmClient::new(&config);
 
     let clients = AwsClients {
         secrets_manager: DefaultSecretsManager::new(secrets_manager),

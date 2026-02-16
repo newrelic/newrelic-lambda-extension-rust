@@ -1030,7 +1030,10 @@ mod main_tests {
         let apm_app = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(client, config, apm_app));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
         let (_harvester, handle) = rt.block_on(async {
             start_harvester_background_task(
                 vec![],
