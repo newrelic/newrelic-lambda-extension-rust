@@ -416,9 +416,9 @@ mod tests {
         for (url, username, password) in test_cases {
             let masked = mask_proxy_url(url);
             assert!(!masked.contains(username),
-                "Credential leak: masked URL '{}' still contains username '{}'", masked, username);
+                "Credential leak: masked URL '{}' still contains the original username", masked);
             assert!(!masked.contains(password),
-                "Credential leak: masked URL '{}' still contains password '{}'", masked, password);
+                "Credential leak: masked URL '{}' still contains the original password", masked);
             // Host must still be visible for debugging
             assert!(masked.contains("@"), "Masked URL should preserve @ separator: {}", masked);
             assert!(masked.contains("***:***"), "Masked URL should contain '***:***': {}", masked);
