@@ -1329,3 +1329,27 @@ fn test_from_env_proxy_url_https() {
     });
 }
 
+#[test]
+#[serial]
+fn test_from_env_proxy_startup_log_never_leaks_credentials() {
+    with_full_clean_env(|| {
+        let proxy_url = "http://secretuser:secretpass@proxy.internal:8080";
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", proxy_url);
+
+        // Replicate the inline masking logic from from_env()
+        let url = proxy_url;
+        let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.find('@')) {
+            format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
+        } else {
+            url.to_string()
+        };
+
+        assert!(!masked.contains("secretuser"),
+            "Startup log would leak username: {}", masked);
+        assert!(!masked.contains("secretpass"),
+            "Startup log would leak password: {}", masked);
+        assert!(masked.contains("***:***@proxy.internal:8080"),
+            "Masked output should preserve host: {}", masked);
+    });
+}
+

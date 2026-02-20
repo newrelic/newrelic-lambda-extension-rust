@@ -418,7 +418,7 @@ async fn perform_one_time_initialization(
                 let license_key_clone = license_key.clone();
                 let apm_host = config.new_relic.apm_host.clone();
                 let metric_endpoint = config.new_relic.metric_endpoint.clone();
-                let client_clone = newrelic::client::build_outbound_client(
+                let apm_client = newrelic::client::build_outbound_client(
                     config.new_relic.proxy_url.as_deref(),
                 );
                 if config.new_relic.proxy_url.is_some() {
@@ -436,7 +436,7 @@ async fn perform_one_time_initialization(
                         license_key_clone,
                         apm_host,
                         metric_endpoint,
-                        client_clone,
+                        apm_client,
                         function_name,
                         function_version,
                         account_id,

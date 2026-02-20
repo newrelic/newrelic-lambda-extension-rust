@@ -403,4 +403,25 @@ mod tests {
         let proxy = build_proxy("");
         assert!(proxy.is_none());
     }
+
+    #[test]
+    fn test_mask_proxy_url_never_leaks_credentials() {
+        let test_cases = vec![
+            ("http://myuser:mypassword@proxy:8080", "myuser", "mypassword"),
+            ("https://admin:s3cret!@proxy.internal:3128", "admin", "s3cret!"),
+            ("http://deploy-bot:token%40abc@corp-proxy:80/path", "deploy-bot", "token%40abc"),
+            ("socks5://svc_account:P@$$w0rd@socks-proxy:1080", "svc_account", "P@$$w0rd"),
+        ];
+
+        for (url, username, password) in test_cases {
+            let masked = mask_proxy_url(url);
+            assert!(!masked.contains(username),
+                "Credential leak: masked URL '{}' still contains username '{}'", masked, username);
+            assert!(!masked.contains(password),
+                "Credential leak: masked URL '{}' still contains password '{}'", masked, password);
+            // Host must still be visible for debugging
+            assert!(masked.contains("@"), "Masked URL should preserve @ separator: {}", masked);
+            assert!(masked.contains("***:***"), "Masked URL should contain '***:***': {}", masked);
+        }
+    }
 }
