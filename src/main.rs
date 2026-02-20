@@ -418,7 +418,12 @@ async fn perform_one_time_initialization(
                 let license_key_clone = license_key.clone();
                 let apm_host = config.new_relic.apm_host.clone();
                 let metric_endpoint = config.new_relic.metric_endpoint.clone();
-                let client_clone = (*client).clone();
+                let client_clone = newrelic::client::build_outbound_client(
+                    config.new_relic.proxy_url.as_deref(),
+                );
+                if config.new_relic.proxy_url.is_some() {
+                    info!("Proxy configured for APM client");
+                }
                 let function_name = config.aws.function_name.clone();
                 let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
                 let account_id = config.aws.account_id.clone();
@@ -664,7 +669,10 @@ async fn initialize_lambda_runtime_client_and_register(
 > {
     // Only connect_timeout for TCP setup, NO timeout() for HTTP requests
     // This allows /next to block indefinitely waiting for INVOKE/SHUTDOWN events
+    // .no_proxy() disables system proxy env var auto-detection (HTTP_PROXY, HTTPS_PROXY)
+    // This client only talks to localhost Lambda Extensions API — must never go through a proxy
     let lambda_runtime_client = Arc::new(Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(10))
         .tcp_keepalive(Duration::from_secs(60))
         .pool_idle_timeout(Duration::from_secs(300))  // Keep connections alive 5 min

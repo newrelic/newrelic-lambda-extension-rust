@@ -1,7 +1,7 @@
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
-use reqwest::{header, Client, Error};
+use reqwest::{header, Client, Error, NoProxy, Proxy};
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,6 +18,61 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
     }
 }
 
+/// Mask credentials in a proxy URL for safe logging.
+/// `http://user:pass@proxy:8080` -> `http://***:***@proxy:8080`
+pub fn mask_proxy_url(url: &str) -> String {
+    // Try to find the `@` that separates credentials from host
+    // Pattern: scheme://user:pass@host...
+    if let Some(at_pos) = url.find('@') {
+        if let Some(scheme_end) = url.find("://") {
+            let prefix = &url[..scheme_end + 3]; // "http://" or "https://"
+            let suffix = &url[at_pos..];          // "@proxy:8080/..."
+            return format!("{prefix}***:***{suffix}");
+        }
+    }
+    url.to_string()
+}
+
+/// Parse a proxy URL string into a `reqwest::Proxy` for all traffic.
+/// Excludes localhost/loopback from proxying (Lambda Extensions API, telemetry listener).
+/// Returns `None` and logs a warning if the URL is invalid.
+pub fn build_proxy(proxy_url: &str) -> Option<Proxy> {
+    match Proxy::all(proxy_url) {
+        Ok(proxy) => {
+            let no_proxy = NoProxy::from_string("localhost, 127.0.0.1, [::1]");
+            Some(proxy.no_proxy(no_proxy))
+        }
+        Err(e) => {
+            warn!("Invalid proxy URL '{}', proceeding without proxy: {}", mask_proxy_url(proxy_url), e);
+            None
+        }
+    }
+}
+
+/// Build a reqwest Client for outbound New Relic traffic.
+///
+/// - When `proxy_url` is `Some`, configures an explicit proxy and disables
+///   reqwest's auto-detection of `HTTP_PROXY`/`HTTPS_PROXY` env vars
+///   (calling `.proxy()` sets `auto_sys_proxy = false` internally).
+/// - When `proxy_url` is `None`, auto-detection remains active as a fallback,
+///   so `HTTPS_PROXY` still works for users who rely on it.
+/// - Localhost/loopback is always excluded from proxying via `NoProxy`.
+pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
+    let mut builder = Client::builder()
+        .timeout(std::time::Duration::from_millis(2400))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(30));
+
+    if let Some(url) = proxy_url {
+        if let Some(proxy) = build_proxy(url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+
+    builder.build().expect("Failed to build outbound HTTP client")
+}
 
 #[derive(Debug)]
 pub struct NewRelicClient {
@@ -29,7 +84,7 @@ impl NewRelicClient {
     /// Creates a new New Relic client with the provided configuration.
     pub fn new(config: &ExtensionConfig) -> Self {
         let license_key = config.new_relic.license_key.as_deref().unwrap_or_default();
-        
+
         let mut headers = header::HeaderMap::new();
         headers.insert(
             "Api-Key",
@@ -44,13 +99,22 @@ impl NewRelicClient {
             header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
         );
 
-        let client = Client::builder()
+        let mut builder = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout - safe with separate Lambda Runtime client
+            .timeout(std::time::Duration::from_millis(2400))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
-            .tcp_keepalive(std::time::Duration::from_secs(30))
-            .build().unwrap();
+            .tcp_keepalive(std::time::Duration::from_secs(30));
+
+        if let Some(ref proxy_url) = config.new_relic.proxy_url {
+            if let Some(proxy) = build_proxy(proxy_url) {
+                info!("Proxy configured for New Relic client");
+                builder = builder.proxy(proxy);
+            }
+        }
+
+        let client = builder.build().unwrap();
 
         Self {
             client,
@@ -61,6 +125,7 @@ impl NewRelicClient {
     /// Creates a no-op New Relic client for disabled mode.
     pub fn new_noop() -> Self {
         let client = Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_millis(100))
             .build().unwrap();
 
@@ -146,7 +211,6 @@ impl NewRelicClient {
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(payload_json.to_string())
-                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 
@@ -227,7 +291,6 @@ impl NewRelicClient {
                 .post(endpoint)
                 .header("Content-Type", "application/json")
                 .body(body.clone())
-                .timeout(std::time::Duration::from_millis(2400))  // 2.4s timeout
                 .send()
                 .await;
 
@@ -292,3 +355,52 @@ impl NewRelicClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mask_proxy_url_with_credentials() {
+        assert_eq!(
+            mask_proxy_url("http://user:pass@proxy.internal:8080"),
+            "http://***:***@proxy.internal:8080"
+        );
+    }
+
+    #[test]
+    fn test_mask_proxy_url_without_credentials() {
+        assert_eq!(
+            mask_proxy_url("http://proxy.internal:8080"),
+            "http://proxy.internal:8080"
+        );
+    }
+
+    #[test]
+    fn test_mask_proxy_url_https_with_credentials() {
+        assert_eq!(
+            mask_proxy_url("https://admin:secret123@proxy:3128"),
+            "https://***:***@proxy:3128"
+        );
+    }
+
+    #[test]
+    fn test_mask_proxy_url_with_path() {
+        assert_eq!(
+            mask_proxy_url("http://u:p@proxy:8080/path"),
+            "http://***:***@proxy:8080/path"
+        );
+    }
+
+    #[test]
+    fn test_build_proxy_valid_url() {
+        let proxy = build_proxy("http://proxy:8080");
+        assert!(proxy.is_some());
+    }
+
+    #[test]
+    fn test_build_proxy_empty_url() {
+        // Empty string is the one case reqwest::Proxy::all() rejects
+        let proxy = build_proxy("");
+        assert!(proxy.is_none());
+    }
+}
