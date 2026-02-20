@@ -55,24 +55,6 @@ pub fn add_to_batch(
     report_line: Option<String>,
     arn: String,
 ) {
-    // GUARD: Never batch agent payload without request_id or ARN
-    if request_id.is_empty() {
-        error!(
-            "BLOCKED: Refusing to add agent payload to batch without request_id (arn: '{}'). \
-             This indicates a bug - request_id should always be set from INVOKE event.",
-            arn
-        );
-        return;
-    }
-    if arn.is_empty() {
-        error!(
-            "BLOCKED: Refusing to add agent payload to batch without ARN (request_id: '{}'). \
-             This indicates a bug - ARN should always be set from INVOKE event or registration fallback.",
-            request_id
-        );
-        return;
-    }
-
     let timestamp = chrono::Utc::now();
 
     AGENT_BATCH_BUFFER.insert(
@@ -183,26 +165,6 @@ pub async fn send_batched_payloads_with_reports_only(
 
     if batch_items.is_empty() {
         debug!("No batched payloads with report lines to send");
-        return;
-    }
-
-    // GUARD: Filter out any entries missing request_id or ARN (belt-and-suspenders safety)
-    let invalid_count = batch_items.iter()
-        .filter(|item| item.request_id.is_empty() || item.invoked_function_arn.is_empty())
-        .count();
-    if invalid_count > 0 {
-        error!(
-            "BLOCKED: Found {} batch items with empty request_id or ARN - these will be skipped",
-            invalid_count
-        );
-    }
-    let batch_items: Vec<BatchedAgentPayload> = batch_items
-        .into_iter()
-        .filter(|item| !item.request_id.is_empty() && !item.invoked_function_arn.is_empty())
-        .collect();
-
-    if batch_items.is_empty() {
-        debug!("No valid batched payloads to send after filtering");
         return;
     }
 
@@ -359,26 +321,6 @@ pub async fn send_all_pending_payloads_on_shutdown(
         return;
     }
 
-    // GUARD: Filter out any entries missing request_id or ARN (belt-and-suspenders safety)
-    let invalid_count = all_payloads.iter()
-        .filter(|item| item.request_id.is_empty() || item.invoked_function_arn.is_empty())
-        .count();
-    if invalid_count > 0 {
-        error!(
-            "Shutdown: BLOCKED {} payload(s) with empty request_id or ARN - these will be skipped",
-            invalid_count
-        );
-    }
-    let all_payloads: Vec<BatchedAgentPayload> = all_payloads
-        .into_iter()
-        .filter(|item| !item.request_id.is_empty() && !item.invoked_function_arn.is_empty())
-        .collect();
-
-    if all_payloads.is_empty() {
-        debug!("Shutdown: No valid payloads to send after filtering");
-        return;
-    }
-
     debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
 
     // 3. Split into 1MB chunks while keeping each payload + report together
@@ -527,25 +469,6 @@ pub async fn cleanup_old_batch_entries(
         .iter()
         .filter(|entry| now.signed_duration_since(entry.value().timestamp) >= threshold)
         .map(|entry| entry.value().clone())
-        .collect();
-
-    if old_entries.is_empty() {
-        return;
-    }
-
-    // GUARD: Filter out any entries missing request_id or ARN
-    let invalid_count = old_entries.iter()
-        .filter(|item| item.request_id.is_empty() || item.invoked_function_arn.is_empty())
-        .count();
-    if invalid_count > 0 {
-        error!(
-            "Periodic cleanup: BLOCKED {} old entries with empty request_id or ARN",
-            invalid_count
-        );
-    }
-    let old_entries: Vec<BatchedAgentPayload> = old_entries
-        .into_iter()
-        .filter(|item| !item.request_id.is_empty() && !item.invoked_function_arn.is_empty())
         .collect();
 
     if old_entries.is_empty() {

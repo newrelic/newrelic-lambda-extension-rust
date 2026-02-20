@@ -1029,15 +1029,6 @@ async fn send_to_apm_collector(
     _config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // GUARD: Never send agent payload without request_id
-    if request_id.is_empty() {
-        error!(
-            "BLOCKED: Refusing to send agent payload to APM collector without request_id. \
-             This indicates a bug - request_id should always be set from INVOKE event."
-        );
-        return Err("Cannot send agent payload to APM without request_id".into());
-    }
-
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
         debug!(
@@ -1051,7 +1042,7 @@ async fn send_to_apm_collector(
             request_id
         );
     } else {
-        // Go-style pattern: APM connection still in progress - buffer will be kept for retry
+        // APM connection still in progress - buffer will be kept for retry
         warn!(
             "APM connection still in progress - payload for {} will be buffered and retried",
             request_id
@@ -1463,22 +1454,6 @@ async fn process_and_send_agent_payload(
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // GUARD: Never send agent payload without request_id or ARN
-    if request_id.is_empty() {
-        error!(
-            "BLOCKED: Refusing to process agent payload without request_id (arn: '{}')",
-            invoked_function_arn
-        );
-        return Err("Cannot process agent payload without request_id".into());
-    }
-    if invoked_function_arn.is_empty() {
-        error!(
-            "BLOCKED: Refusing to process agent payload without invoked_function_arn (request_id: '{}')",
-            request_id
-        );
-        return Err("Cannot process agent payload without invoked_function_arn".into());
-    }
-
     if config.new_relic.collect_trace_id {
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
             debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
