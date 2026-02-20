@@ -7,9 +7,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Prioritize rustup's Rust over Homebrew's Rust
-export PATH="$HOME/.cargo/bin:$PATH"
-
 # --- Configuration ---
 LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NRTestRustExtension"}
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
