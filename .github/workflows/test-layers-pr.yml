@@ -147,8 +147,8 @@ jobs:
           export TEST_MODE="true"
           export LAYER_NAME_PREFIX="NRTestRustExtension"
           export BUCKET_PREFIX="nr-extension-test-layers"
-          export REGIONS_X86_64="us-west-1"
-          export REGIONS_ARM64="us-west-1"
+          export REGIONS_X86_64="us-west-1 ca-central-1"
+          export REGIONS_ARM64="us-west-1 ca-central-1"
           export LANGUAGES="extension python nodejs java dotnet ruby"
           
           # Run the unified script
@@ -280,7 +280,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ steps.build_layers.outputs.layers_created }}" == "true" ]; then
-            echo "✅ Test layers successfully built and published to us-west-1" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Test layers successfully built and published to us-west-1 and ca-central-1" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Layer ARNs" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY

@@ -199,7 +199,7 @@ impl ExtensionConfig {
         }
     }
 
-    /// Parse NEW_RELIC_EXTENSION_SEND_LOGS environment variable
+    /// Parse "NEW_RELIC_EXTENSION_SEND_LOGS" environment variable
     /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
     fn parse_send_logs(value: &str) -> (bool, bool, bool) {
         let normalized = value.to_lowercase();
