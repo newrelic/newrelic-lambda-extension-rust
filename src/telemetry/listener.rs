@@ -2,7 +2,7 @@ use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS},
+    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS, TELEMETRY_CURRENT_REQUEST_ID},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -47,7 +47,7 @@ pub async fn setup_telemetry_listener(
                     let platform_processor = platform_processor.clone();
                     let runtime_done_tx_clone = runtime_done_tx.clone();
                     let is_apm_mode_clone = is_apm_mode;
-                    
+
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
                         let service = service_fn(move |req| {
@@ -101,6 +101,8 @@ async fn handle_telemetry_request(
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
+            let record_types: Vec<&str> = records.iter().map(|r| r.record_type.as_str()).collect();
+            debug!("Received telemetry batch with {} records: {:?}", records.len(), record_types);
 
             
             let mut function_completed = false;
@@ -111,6 +113,21 @@ async fn handle_telemetry_request(
 
             for record in records {
                 match record.record_type.as_str() {
+                    "platform.start" => {
+                        // Update TELEMETRY_CURRENT_REQUEST_ID - this is the SOURCE OF TRUTH
+                        // for stamping function/extension logs with the correct request_id.
+                        // platform.start always arrives BEFORE function logs for that request,
+                        // so this ensures late logs from request_A don't get stamped with request_B.
+                        if let Some(request_id_value) = record.record.get("requestId") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                if let Ok(mut telemetry_req) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
+                                    *telemetry_req = Some(request_id_str.to_string());
+                                }
+                                debug!("platform.start: Updated telemetry request_id to: {}", request_id_str);
+                            }
+                        }
+                        platform_processor.process_record(record);
+                    }
                     "function" => {
                         function_count += 1;
                         log_processor.process_record(record).await;
@@ -124,6 +141,11 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 runtime_done_request_id = Some(request_id_str.to_string());
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
+
+                                // Signal runtime done via channel (used by event loop for coordination)
+                                if let Some(tx) = RUNTIME_DONE_CHANNELS.get(request_id_str) {
+                                    let _ = tx.send(());
+                                }
                             }
                         }
                         platform_processor.process_record(record);
@@ -133,7 +155,7 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
-                                    
+
                                     if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
@@ -158,6 +180,7 @@ async fn handle_telemetry_request(
                                         // Agent payloads go directly to APM collector when run_id is available
                                     } else {
                                         // STANDARD MODE: Match platform.report with agent payloads for batching
+                                        // platform.report may arrive in same or next invocation (after freeze/thaw)
                                         if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
                                             debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
@@ -242,17 +265,9 @@ async fn handle_telemetry_request(
             }
             
             if let Some(request_id) = runtime_done_request_id {
+                // Legacy channel - kept for backward compatibility with event_loop
                 if let Some(tx) = RUNTIME_DONE_CHANNELS.get(&request_id) {
-                    if let Err(e) = tx.send(()) {
-                        warn!("Failed to send runtime.done signal for request {}: {}", request_id, e);
-                    } else {
-                        debug!("Successfully sent runtime.done signal for request: {}", request_id);
-                    }
-                } else {
-                    // Only warn in standard mode - APM mode doesn't use runtime.done channels
-                    if !is_apm_mode {
-                        debug!("No runtime.done channel found for request: {} (channel may have been cleaned up)", request_id);
-                    }
+                    let _ = tx.send(());
                 }
 
                 if let Some(ref tx) = runtime_done_tx {

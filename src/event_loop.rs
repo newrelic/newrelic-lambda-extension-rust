@@ -12,12 +12,12 @@ use crate::{
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
     request::{
+        self,
         ProcessorFactory,
         create_request_processing_state,
         cleanup_request_processing_state_internal,
-        wait_for_all_requests_completion,
         REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
-        CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
+        PENDING_REPORTS,
     },
     agent::batch::{
         add_to_batch, should_send_batch_by_threshold, 
@@ -156,22 +156,29 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                // Create request state FIRST so we have the updated context
+                // Set this as the currently active request for agent payload routing
+                if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+                    *active_request = Some(request_id.clone());
+                }
+
+                // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
                     components.apm_mode_enabled,
                 );
-                
-                // Update LogProcessor's context BEFORE processing any logs
+
+                // Update global log processor's context to this request BEFORE processing logs
                 components
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
+
                 // Process pre-invoke logs FIRST (add metadata and move to batch)
                 components
                     .global_log_processor
                     .process_pre_invoke_logs();
+
                 // THEN process buffered logs (so they don't trigger auto-flush of incomplete logs)
                 components
                     .global_log_processor
@@ -532,18 +539,35 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                components
-                    .global_log_processor
-                    .process_buffered_logs_with_request_id(&request_id);
-                
-                // Transfer pre-invoke logs to normal batch with ARN/request_id metadata
-                components
-                    .global_log_processor
-                    .process_pre_invoke_logs();
+                // Set this as the currently active request for agent payload routing
+                if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+                    *active_request = Some(request_id.clone());
+                }
 
                 // SKIP old buffer processing to avoid deadlocks
                 // Late payloads are already handled via the buffer matching on next invocation
                 // The complex locking in this loop was causing 7-second deadlocks
+
+                // Create per-request state (platform_processor, agent_buffer, context)
+                let request_state = create_request_processing_state(
+                    &request_id,
+                    &invoked_function_arn,
+                    &components.processor_factory,
+                    components.apm_mode_enabled, // Use actual mode (handles Java override)
+                );
+
+                // Update global log processor's context to this request BEFORE processing logs
+                components
+                    .global_log_processor
+                    .update_invocation_context(request_state.context.clone());
+
+                // Process buffered logs and pre-invoke logs using global log processor
+                components
+                    .global_log_processor
+                    .process_buffered_logs_with_request_id(&request_id);
+                components
+                    .global_log_processor
+                    .process_pre_invoke_logs();
 
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
                 // CRITICAL: Must await to prevent Lambda from freezing network mid-request
@@ -554,17 +578,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         components.config.clone()
                     ).await;
                 }
-
-                let request_state = create_request_processing_state(
-                    &request_id,
-                    &invoked_function_arn,
-                    &components.processor_factory,
-                    components.apm_mode_enabled, // Use actual mode (handles Java override)
-                );
-
-                components
-                    .global_log_processor
-                    .update_invocation_context(request_state.context.clone());
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
@@ -622,7 +635,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                let shutdown_start_time = std::time::Instant::now();
+                let _shutdown_start_time = std::time::Instant::now();
                 info!("[NR_EXT] Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
@@ -684,13 +697,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                wait_for_all_requests_completion(
-                    components.newrelic_client.clone(),
-                    components.config.clone(),
-                    components.global_log_processor.clone(),
-                    shutdown_start_time,
-                )
-                .await;
+                // TODO: Replace with dispatcher cleanup after migration complete
+                // wait_for_all_requests_completion(
+                //     components.newrelic_client.clone(),
+                //     components.config.clone(),
+                //     components.global_log_processor.clone(),
+                //     shutdown_start_time,
+                // )
+                // .await;
 
                 info!("Standard mode shutdown: All data processed and sent");
                 break;
@@ -746,7 +760,8 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
@@ -993,7 +1008,9 @@ pub async fn process_apm_request(
 
     cleanup_request_processing_state_internal(&request_id, true);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Keep active request set for late payload routing (agent payloads may arrive after processing)
+    // It will be overwritten when next INVOKE arrives
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
@@ -1012,6 +1029,15 @@ async fn send_to_apm_collector(
     _config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // GUARD: Never send agent payload without request_id
+    if request_id.is_empty() {
+        error!(
+            "BLOCKED: Refusing to send agent payload to APM collector without request_id. \
+             This indicates a bug - request_id should always be set from INVOKE event."
+        );
+        return Err("Cannot send agent payload to APM without request_id".into());
+    }
+
     let apm_app_guard = apm_app.read().await;
     if let Some(ref app) = *apm_app_guard {
         debug!(
@@ -1049,11 +1075,12 @@ pub async fn process_request_concurrently(
         request_id
     );
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
-    let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
+    let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
     let Some(mut state) = state else {
         error!("No processing state found for request: {}", request_id);
@@ -1219,8 +1246,10 @@ pub async fn process_request_concurrently(
     // Unified cleanup: Always preserve buffers for late payload handling
     cleanup_request_processing_state_internal(&request_id, true);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = None;
+    // Keep active request set for late payload routing (agent payloads may arrive after processing)
+    // It will be overwritten when next INVOKE arrives
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+        *active_request = Some(request_id.clone());
     }
 
     debug!(
@@ -1434,6 +1463,22 @@ async fn process_and_send_agent_payload(
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // GUARD: Never send agent payload without request_id or ARN
+    if request_id.is_empty() {
+        error!(
+            "BLOCKED: Refusing to process agent payload without request_id (arn: '{}')",
+            invoked_function_arn
+        );
+        return Err("Cannot process agent payload without request_id".into());
+    }
+    if invoked_function_arn.is_empty() {
+        error!(
+            "BLOCKED: Refusing to process agent payload without invoked_function_arn (request_id: '{}')",
+            request_id
+        );
+        return Err("Cannot process agent payload without invoked_function_arn".into());
+    }
+
     if config.new_relic.collect_trace_id {
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
             debug!("Extracted trace ID: {}, coordinating with logs", trace_id);

@@ -75,6 +75,26 @@ pub async fn send_agent_payload_to_newrelic(
     config: &Arc<ExtensionConfig>,
     version_info: Option<&Arc<version::VersionInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // GUARD: Never send agent payload without ARN
+    if invoked_function_arn.is_empty() {
+        error!(
+            "BLOCKED: Refusing to send agent payload without invoked_function_arn (request_id: '{}'). \
+             This indicates a bug in the extension - ARN should always be set from INVOKE event or registration fallback.",
+            request_id
+        );
+        return Err("Cannot send agent payload without invoked_function_arn".into());
+    }
+
+    // GUARD: Never send agent payload without request_id
+    if request_id.is_empty() {
+        error!(
+            "BLOCKED: Refusing to send agent payload without request_id (arn: '{}'). \
+             This indicates a bug in the extension - request_id should always be set from INVOKE event.",
+            invoked_function_arn
+        );
+        return Err("Cannot send agent payload without request_id".into());
+    }
+
     // Use robust ARN parsing with validation and fallback
     let function_name = extract_function_name_from_arn(invoked_function_arn, &config.aws.function_name);
     

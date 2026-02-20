@@ -44,7 +44,7 @@ use crate::{
         flush::Flush,
     },
     credentials::get_new_relic_license_key,
-    request::{route_payload_to_request_buffer, ProcessorFactory},
+    request::ProcessorFactory,
     event_loop::{
         run_infinite_event_loop, ExtensionComponents,
         cleanup_old_failed_payloads,
@@ -72,6 +72,9 @@ static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
 /// Global APM app instance (for sending platform.report metrics in APM mode)
 static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+
+// Request routing uses CURRENT_ACTIVE_REQUEST_ID (2.4.1 approach)
+// Agent payloads are routed to the active request's buffer via request::route_payload_to_request_buffer
 
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
 #[tokio::main(flavor = "current_thread")]
@@ -711,7 +714,7 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
             payload_count += 1;
 
             debug!(
-                "Received agent payload #{} ({} bytes) - processing immediately",
+                "Received agent payload #{} ({} bytes) - routing to active request",
                 payload_count,
                 payload_bytes.len()
             );
@@ -723,7 +726,8 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 debug!("Agent Payload (complete): {}", sanitized);
             }
 
-            route_payload_to_request_buffer(payload_bytes).await;
+            // Route to currently active request using 2.4.1 approach (simple and reliable)
+            request::route_payload_to_request_buffer(payload_bytes).await;
         }
 
         debug!("Agent payload collector channel closed. No more agent payloads will be received");
