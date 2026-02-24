@@ -388,7 +388,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
 }
 
 /// Split payloads into chunks of max_size, keeping each payload + report together
-fn split_into_chunks(
+pub(crate) fn split_into_chunks(
     payloads: Vec<BatchedAgentPayload>,
     max_size: usize,
     config: &Arc<ExtensionConfig>,
@@ -427,7 +427,7 @@ fn split_into_chunks(
 }
 
 /// Estimate the size of a single batched payload item
-fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
+pub(crate) fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
     let mut size = 0;
 
     // Agent payload size
@@ -448,7 +448,7 @@ fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
 }
 
 /// Estimate the base overhead of the JSON structure
-fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
+pub(crate) fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
     // Rough estimate: context object + entry wrapper + logEvents array
     let function_name_len = config.aws.function_name.len();
     let base = 500 + (function_name_len * 3); // Function name appears in multiple places

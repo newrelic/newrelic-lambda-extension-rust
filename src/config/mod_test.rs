@@ -101,6 +101,7 @@ fn test_parse_nr_tags_with_default_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_with_custom_delimiter() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "env:prod|team:backend");
@@ -115,6 +116,7 @@ fn test_parse_nr_tags_with_custom_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_with_whitespace() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", " env : prod ; team : backend ");
@@ -128,6 +130,7 @@ fn test_parse_nr_tags_with_whitespace() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_invalid_format() {
     with_clean_env(|| {
         // Test invalid formats - should be skipped
@@ -142,6 +145,7 @@ fn test_parse_nr_tags_invalid_format() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_empty_values() {
     with_clean_env(|| {
         // Test empty keys/values - should be skipped
@@ -155,6 +159,7 @@ fn test_parse_nr_tags_empty_values() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_not_set() {
     with_clean_env(|| {
         let tags = parse_nr_tags();
@@ -163,6 +168,7 @@ fn test_parse_nr_tags_not_set() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_empty_string() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "");
@@ -1154,6 +1160,7 @@ fn test_validate_log_level_mixed_case() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_multiple_colons() {
     with_clean_env(|| {
         // Tags with multiple colons should be skipped (only 2 parts allowed)
@@ -1168,6 +1175,7 @@ fn test_parse_nr_tags_multiple_colons() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_only_delimiter() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", ";;;");
@@ -1179,6 +1187,7 @@ fn test_parse_nr_tags_only_delimiter() {
 }
 
 #[test]
+#[serial]
 fn test_parse_nr_tags_single_tag() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "environment:production");
