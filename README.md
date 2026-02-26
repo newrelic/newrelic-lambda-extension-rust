@@ -213,6 +213,24 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
 
+### Network / Proxy Configuration
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_LAMBDA_EXTENSION_PROXY` | | URL | HTTP proxy for the extension's outbound traffic to New Relic. Only affects the extension — does not interfere with your Lambda function's own traffic. Supports `http://`, `https://`, and `socks5://` schemes. Credentials are supported via `http://user:pass@proxy:port` format and are masked in all log output. Localhost traffic (Lambda Extensions API) is never proxied. When not set, the extension respects standard `HTTPS_PROXY`/`HTTP_PROXY` environment variables as a fallback. |
+
+**When to use `NEW_RELIC_LAMBDA_EXTENSION_PROXY`:**
+
+If your Lambda runs in a VPC with no direct internet access and routes outbound traffic through an HTTP proxy, set this variable to route only the extension's traffic through the proxy. This avoids using the process-wide `HTTPS_PROXY` variable, which would also affect your application's own HTTP traffic.
+
+```sh
+# Example: route extension traffic through a VPC proxy
+NEW_RELIC_LAMBDA_EXTENSION_PROXY=http://proxy.internal:3128
+
+# Example: with authentication
+NEW_RELIC_LAMBDA_EXTENSION_PROXY=http://user:pass@proxy.internal:3128
+```
+
 ## Testing
 
 ### Unit and Integration Tests

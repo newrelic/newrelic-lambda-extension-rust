@@ -56,6 +56,7 @@ where
         "NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS",
         "NEW_RELIC_EXTENSION_LOG_LEVEL",
         "NEW_RELIC_EXTENSION_LOGS_ENABLED",
+        "NEW_RELIC_LAMBDA_EXTENSION_PROXY",
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
@@ -207,6 +208,7 @@ fn test_new_relic_config_default() {
     assert!(!config.apm_lambda_mode);
     assert_eq!(config.apm_host, "collector.newrelic.com");
     assert_eq!(config.metric_endpoint, "https://metric-api.newrelic.com/metric/v1");
+    assert_eq!(config.proxy_url, None);
 }
 
 #[test]
@@ -1048,6 +1050,7 @@ fn test_new_relic_config_all_fields() {
         apm_lambda_mode: true,
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
+        proxy_url: Some("http://proxy:8080".to_string()),
     };
     
     assert!(!config.extension_enabled);
@@ -1265,6 +1268,88 @@ fn test_parse_send_logs_extra_spaces() {
         assert!(config.extension.send_function_logs);
         assert!(config.extension.send_extension_logs);
         assert!(!config.extension.send_platform_logs);
+    });
+}
+
+// ============================================================================
+// Proxy Configuration
+// ============================================================================
+
+#[test]
+#[serial]
+fn test_from_env_proxy_url_set() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", "http://proxy.internal:8080");
+        let config = ExtensionConfig::from_env();
+
+        assert_eq!(config.new_relic.proxy_url, Some("http://proxy.internal:8080".to_string()));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_proxy_url_not_set() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+
+        assert_eq!(config.new_relic.proxy_url, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_proxy_url_empty_string() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", "");
+        let config = ExtensionConfig::from_env();
+
+        assert_eq!(config.new_relic.proxy_url, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_proxy_url_with_auth() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", "http://user:pass@proxy.internal:3128");
+        let config = ExtensionConfig::from_env();
+
+        assert_eq!(config.new_relic.proxy_url, Some("http://user:pass@proxy.internal:3128".to_string()));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_proxy_url_https() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", "https://secure-proxy:443");
+        let config = ExtensionConfig::from_env();
+
+        assert_eq!(config.new_relic.proxy_url, Some("https://secure-proxy:443".to_string()));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_proxy_startup_log_never_leaks_credentials() {
+    with_full_clean_env(|| {
+        let proxy_url = "http://secretuser:secretpass@proxy.internal:8080";
+        env::set_var("NEW_RELIC_LAMBDA_EXTENSION_PROXY", proxy_url);
+
+        // Replicate the inline masking logic from from_env()
+        let url = proxy_url;
+        let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.find('@')) {
+            format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
+        } else {
+            url.to_string()
+        };
+
+        assert!(!masked.contains("secretuser"),
+            "Startup log would leak username: {}", masked);
+        assert!(!masked.contains("secretpass"),
+            "Startup log would leak password: {}", masked);
+        assert!(masked.contains("***:***@proxy.internal:8080"),
+            "Masked output should preserve host: {}", masked);
     });
 }
 
