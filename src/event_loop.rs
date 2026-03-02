@@ -110,7 +110,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("Performing emergency shutdown cleanup...");
                     
                     process_pending_agent_payloads(
-                        &components.newrelic_client,
                         &components.config,
                         &components.global_log_processor,
                         &components.apm_app,
@@ -195,7 +194,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 let pending_task = Some(tokio::spawn({
-                    let newrelic_client = components.newrelic_client.clone();
                     let config = components.config.clone();
                     let global_log_processor = components.global_log_processor.clone();
                     let apm_app = components.apm_app.clone();
@@ -203,7 +201,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                     async move {
                         process_pending_agent_payloads(
-                            &newrelic_client,
                             &config,
                             &global_log_processor,
                             &apm_app,
@@ -215,7 +212,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
-                let processor_factory_clone = components.processor_factory.clone();
                 let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
@@ -226,7 +222,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         request_id_clone,
                         invoked_function_arn_clone,
                         is_cold_start,
-                        processor_factory_clone,
                         newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
@@ -266,8 +261,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     tokio::spawn(async move {
                         use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
-                        cleanup_old_request_buffers(newrelic_client, config).await;
+                        cleanup_old_batch_entries(newrelic_client, config).await;
+                        cleanup_old_request_buffers().await;
                         cleanup_old_failed_payloads();
                     });
                 }
@@ -388,7 +383,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                         &request_id,
                                         &invoked_function_arn,
                                         &components.global_log_processor,
-                                        &components.newrelic_client,
                                         &components.config,
                                         &components.apm_app,
                                     )
@@ -583,21 +577,17 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
-                let processor_factory_clone = components.processor_factory.clone();
                 let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
-                let apm_app_clone = components.apm_app.clone();
 
                 let processing_handle = tokio::spawn(async move {
                     process_request_concurrently(
                         request_id_clone,
                         invoked_function_arn_clone,
-                        processor_factory_clone,
                         newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
-                        apm_app_clone,
                     )
                     .await;
                 });
@@ -629,13 +619,12 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     tokio::spawn(async move {
                         use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
-                        cleanup_old_request_buffers(newrelic_client, config).await;
+                        cleanup_old_batch_entries(newrelic_client, config).await;
+                        cleanup_old_request_buffers().await;
                     });
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                let _shutdown_start_time = std::time::Instant::now();
                 info!("[NR_EXT] Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
@@ -697,14 +686,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                // TODO: Replace with dispatcher cleanup after migration complete
-                // wait_for_all_requests_completion(
-                //     components.newrelic_client.clone(),
-                //     components.config.clone(),
-                //     components.global_log_processor.clone(),
-                //     shutdown_start_time,
-                // )
-                // .await;
+                // Flush remaining buffered logs
+                if let Err(e) = components.global_log_processor.flush().await {
+                    error!("Standard mode shutdown: Failed to flush logs: {}", e);
+                }
 
                 info!("Standard mode shutdown: All data processed and sent");
                 break;
@@ -752,7 +737,6 @@ pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
     is_cold_start: bool,
-    _processor_factory: Arc<ProcessorFactory>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
@@ -815,9 +799,6 @@ pub async fn process_apm_request(
                     if let Err(e) = send_to_apm_collector(
                         &payload_bytes,
                         &old_request_id,
-                        &invoked_function_arn,
-                        &newrelic_client,
-                        &config,
                         &apm_app,
                     )
                     .await
@@ -899,9 +880,6 @@ pub async fn process_apm_request(
                 match send_to_apm_collector(
                     payload_bytes,
                     &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &newrelic_client_clone,
-                    &config_clone,
                     &apm_app_clone,
                 )
                 .await
@@ -1024,9 +1002,6 @@ pub async fn process_apm_request(
 async fn send_to_apm_collector(
     payload_bytes: &[u8],
     request_id: &str,
-    _invoked_function_arn: &str,
-    _newrelic_client: &Arc<NewRelicClient>,
-    _config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let apm_app_guard = apm_app.read().await;
@@ -1055,11 +1030,9 @@ async fn send_to_apm_collector(
 pub async fn process_request_concurrently(
     request_id: String,
     invoked_function_arn: String,
-    _processor_factory: Arc<ProcessorFactory>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
-    _apm_app: crate::apm::SharedApmApp,
 ) {
     debug!(
         "Standard mode: Starting processing for request: {}",
@@ -1315,7 +1288,6 @@ async fn extract_and_coordinate_trace_id(
 /// Process any pending agent payloads from previous invocation (APM mode only)
 /// Excludes the current request ID to avoid processing empty buffer
 async fn process_pending_agent_payloads(
-    newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
@@ -1408,7 +1380,6 @@ async fn process_pending_agent_payloads(
                     &request_id,
                     &invoked_function_arn,
                     global_log_processor,
-                    newrelic_client,
                     config,
                     apm_app,
                 )
@@ -1450,7 +1421,6 @@ async fn process_and_send_agent_payload(
     request_id: &str,
     invoked_function_arn: &str,
     log_processor: &Arc<LogProcessor>,
-    _newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

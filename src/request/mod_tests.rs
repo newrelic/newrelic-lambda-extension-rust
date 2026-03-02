@@ -489,13 +489,10 @@ mod tests {
     async fn test_cleanup_old_request_buffers_none_old() {
         clear_request_state();
 
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
-
         // Add a recent timestamp
         REQUEST_BUFFER_TIMESTAMPS.insert("recent-req".to_string(), chrono::Utc::now());
 
-        cleanup_old_request_buffers(newrelic_client, config).await;
+        cleanup_old_request_buffers().await;
 
         // Recent entry should remain
         assert!(REQUEST_BUFFER_TIMESTAMPS.get("recent-req").is_some());
@@ -507,9 +504,6 @@ mod tests {
     #[serial]
     async fn test_cleanup_old_request_buffers_removes_old() {
         clear_request_state();
-
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
 
         let old_time = chrono::Utc::now() - chrono::Duration::minutes(10);
         REQUEST_BUFFER_TIMESTAMPS.insert("old-req".to_string(), old_time);
@@ -529,7 +523,7 @@ mod tests {
         // Add pending report
         PENDING_REPORTS.insert("old-req".to_string(), "REPORT old".to_string());
 
-        cleanup_old_request_buffers(newrelic_client, config).await;
+        cleanup_old_request_buffers().await;
 
         // Old request should be cleaned up
         assert!(REQUEST_BUFFER_TIMESTAMPS.get("old-req").is_none());
@@ -544,9 +538,6 @@ mod tests {
     async fn test_cleanup_old_request_buffers_empty_buffer() {
         clear_request_state();
 
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
-
         let old_time = chrono::Utc::now() - chrono::Duration::minutes(10);
         REQUEST_BUFFER_TIMESTAMPS.insert("old-empty".to_string(), old_time);
 
@@ -554,7 +545,7 @@ mod tests {
         let buffer = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
         REQUEST_AGENT_BUFFERS.insert("old-empty".to_string(), buffer);
 
-        cleanup_old_request_buffers(newrelic_client, config).await;
+        cleanup_old_request_buffers().await;
 
         // Should still be cleaned up even with empty buffer
         assert!(REQUEST_BUFFER_TIMESTAMPS.get("old-empty").is_none());

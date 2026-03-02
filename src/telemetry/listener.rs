@@ -264,12 +264,10 @@ async fn handle_telemetry_request(
                 debug!("No telemetry records processed in this batch");
             }
             
-            if let Some(request_id) = runtime_done_request_id {
-                // Legacy channel - kept for backward compatibility with event_loop
-                if let Some(tx) = RUNTIME_DONE_CHANNELS.get(&request_id) {
-                    let _ = tx.send(());
-                }
-
+            if let Some(_request_id) = runtime_done_request_id {
+                // Per-request runtime.done signal (used in standard mode for coordination)
+                // Already sent inline in platform.runtimeDone handler above,
+                // so only send the global signal here
                 if let Some(ref tx) = runtime_done_tx {
                     let _ = tx.send(());
                 }

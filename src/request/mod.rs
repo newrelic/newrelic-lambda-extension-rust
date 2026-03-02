@@ -124,7 +124,7 @@ pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>,
-    _is_apm_mode: bool,
+    is_apm_mode: bool,
 ) -> RequestProcessingState {
     let context = Arc::new(Mutex::new(InvocationContext {
         request_id: request_id.to_string(),
@@ -157,6 +157,12 @@ pub fn create_request_processing_state(
 
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
+
+    // Only create runtime.done channel for standard mode (not needed in APM mode)
+    if !is_apm_mode {
+        let (runtime_done_tx, _runtime_done_rx) = mpsc::unbounded_channel();
+        RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
+    }
 
     let state = RequestProcessingState {
         context: context.clone(),
@@ -191,12 +197,11 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
     PENDING_REPORTS.remove(request_id);
 }
 
-pub async fn cleanup_old_request_buffers(
-    _newrelic_client: Arc<NewRelicClient>,
-    _config: Arc<ExtensionConfig>,
-) {
-    use crate::agent::batch::BatchedAgentPayload;
-    
+/// Periodic cleanup of stale request buffers older than 5 minutes.
+/// Stale buffers occur when agent payloads never get matched with platform.report.
+/// The core sending path (telemetry listener + process_request_concurrently) handles
+/// normal payload+report matching — this just prevents memory leaks from edge cases.
+pub async fn cleanup_old_request_buffers() {
     let now = chrono::Utc::now();
     let threshold = chrono::Duration::minutes(5);
 
@@ -210,47 +215,10 @@ pub async fn cleanup_old_request_buffers(
         return;
     }
 
-    let mut all_payloads: Vec<BatchedAgentPayload> = Vec::new();
-
-    for request_id in &old_request_ids {
-        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id) {
-            let payloads = if let Ok(mut buf) = buffer.lock() {
-                std::mem::take(&mut *buf)
-            } else {
-                Vec::new()
-            };
-
-            if !payloads.is_empty() {
-                let report_line = PENDING_REPORTS.get(request_id).map(|entry| entry.value().clone());
-
-                let arn = REQUEST_CONTEXTS
-                    .get(request_id)
-                    .and_then(|ctx_entry| {
-                        ctx_entry.lock().ok().map(|ctx| ctx.invoked_function_arn.clone())
-                    })
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                for payload_bytes in payloads {
-                    all_payloads.push(BatchedAgentPayload {
-                        request_id: request_id.clone(),
-                        agent_payload_bytes: Arc::new(payload_bytes),
-                        report_line: report_line.clone(),
-                        invoked_function_arn: arn.clone(),
-                        timestamp: chrono::Utc::now(),
-                    });
-                }
-            }
-        }
-    }
-
-    if !all_payloads.is_empty() {
-        // TODO: Remove after migration - legacy batch sending
-        // use crate::agent::batch::send_batch_to_newrelic;
-        // if let Err(e) = send_batch_to_newrelic(&all_payloads, &newrelic_client, &config).await {
-        //     error!("Failed to send old request buffer payloads: {}", e);
-        // }
-        warn!("Skipping legacy batch sending - {} payloads", all_payloads.len());
-    }
+    warn!(
+        "Periodic cleanup: Removing {} stale request buffer(s) older than 5 minutes",
+        old_request_ids.len()
+    );
 
     for request_id in &old_request_ids {
         cleanup_request_processing_state(request_id);
