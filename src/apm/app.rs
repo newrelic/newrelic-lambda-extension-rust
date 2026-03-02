@@ -91,7 +91,7 @@ impl ApmApp {
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
     ) -> Result<ApmApp> {
-        // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
+        // OPTIMIZATION: Runtime & agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
         let version_info = crate::version::VersionInfo::get_or_detect(None);
         
