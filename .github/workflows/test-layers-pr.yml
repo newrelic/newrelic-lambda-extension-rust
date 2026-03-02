@@ -310,14 +310,18 @@ jobs:
     needs: build-test-layers
     runs-on: ubuntu-latest
     if: needs.build-test-layers.outputs.layers_created == 'true'
-    
+
+    env:
+      AWS_REGION: ca-central-1
+      AWS_DEFAULT_REGION: ca-central-1
+
     strategy:
       matrix:
         runtime: [node, python, go, ruby, java, dotnet]
         test_mode: [serverless, apm]
       fail-fast: false
       max-parallel: 12  # Run all 12 combinations in parallel (separate Lambda functions)
-    
+
     steps:
       - name: Set Layer ARNs for ${{ matrix.runtime }}
         id: set_arns
@@ -355,10 +359,15 @@ jobs:
           API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
           echo "🧪 Running COLD start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
+          echo "Region: $AWS_REGION"
           echo "x86 Layer: ${{ steps.set_arns.outputs.x86_arn }}"
           echo "arm Layer: ${{ steps.set_arns.outputs.arm_arn }}"
-          
+
           response=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "x-api-key: $API_KEY" \
@@ -393,8 +402,13 @@ jobs:
           API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
           echo "🔥 Running WARM start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
-          
+          echo "Region: $AWS_REGION"
+
           response=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "x-api-key: $API_KEY" \
@@ -429,8 +443,13 @@ jobs:
           API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
           echo "📝 Running LOGS test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
-          
+          echo "Region: $AWS_REGION"
+
           response=$(curl -s -w "\n%{http_code}" -X POST \
             -H "Content-Type: application/json" \
             -H "x-api-key: $API_KEY" \
