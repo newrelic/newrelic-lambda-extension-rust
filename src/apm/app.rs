@@ -112,7 +112,7 @@ impl ApmApp {
             }
         };
         
-        // Pass "unknown" if no agent detected - will be filtered out from labels
+        // Pass "unknown" if no-agent detected - will be filtered out from labels
         let agent_version = version_info.agent_version.as_deref().unwrap_or("unknown");
 
         // Run preconnect while we have the cached values

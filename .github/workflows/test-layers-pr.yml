@@ -36,6 +36,12 @@ jobs:
       python_arm_arn: ${{ steps.capture_arns.outputs.python_arm_arn }}
       nodejs_x86_arn: ${{ steps.capture_arns.outputs.nodejs_x86_arn }}
       nodejs_arm_arn: ${{ steps.capture_arns.outputs.nodejs_arm_arn }}
+      java_x86_arn: ${{ steps.capture_arns.outputs.java_x86_arn }}
+      java_arm_arn: ${{ steps.capture_arns.outputs.java_arm_arn }}
+      dotnet_x86_arn: ${{ steps.capture_arns.outputs.dotnet_x86_arn }}
+      dotnet_arm_arn: ${{ steps.capture_arns.outputs.dotnet_arm_arn }}
+      ruby_x86_arn: ${{ steps.capture_arns.outputs.ruby_x86_arn }}
+      ruby_arm_arn: ${{ steps.capture_arns.outputs.ruby_arm_arn }}
     
     permissions:
       contents: read
@@ -179,6 +185,12 @@ jobs:
           echo "python_arm_arn=${LAYER_ARN_PYTHON_ARM64:-}" >> $GITHUB_OUTPUT
           echo "nodejs_x86_arn=${LAYER_ARN_NODEJS_X86_64:-}" >> $GITHUB_OUTPUT
           echo "nodejs_arm_arn=${LAYER_ARN_NODEJS_ARM64:-}" >> $GITHUB_OUTPUT
+          echo "java_x86_arn=${LAYER_ARN_JAVA_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "java_arm_arn=${LAYER_ARN_JAVA_ARM64:-}" >> $GITHUB_OUTPUT
+          echo "dotnet_x86_arn=${LAYER_ARN_DOTNET_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "dotnet_arm_arn=${LAYER_ARN_DOTNET_ARM64:-}" >> $GITHUB_OUTPUT
+          echo "ruby_x86_arn=${LAYER_ARN_RUBY_X86_64:-}" >> $GITHUB_OUTPUT
+          echo "ruby_arm_arn=${LAYER_ARN_RUBY_ARM64:-}" >> $GITHUB_OUTPUT
 
       - name: Comment on PR with Layer ARNs
         if: steps.build_layers.outputs.layers_created == 'true'
@@ -292,3 +304,192 @@ jobs:
           else
             echo "❌ Failed to build test layers" >> $GITHUB_STEP_SUMMARY
           fi
+
+  invoke-performance-tests:
+    name: Run Performance Tests
+    needs: build-test-layers
+    runs-on: ubuntu-latest
+    if: needs.build-test-layers.outputs.layers_created == 'true'
+
+    permissions:
+      contents: read
+
+    env:
+      AWS_REGION: ca-central-1
+      AWS_DEFAULT_REGION: ca-central-1
+
+    strategy:
+      matrix:
+        runtime: [node, python, go, ruby, java, dotnet]
+        test_mode: [serverless, apm]
+      fail-fast: false
+      max-parallel: 12  # Run all 12 combinations in parallel (separate Lambda functions)
+
+    steps:
+      - name: Set Layer ARNs for ${{ matrix.runtime }}
+        id: set_arns
+        run: |
+          case "${{ matrix.runtime }}" in
+            node)
+              echo "x86_arn=${{ needs.build-test-layers.outputs.nodejs_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.nodejs_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+            python)
+              echo "x86_arn=${{ needs.build-test-layers.outputs.python_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.python_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+            java)
+              echo "x86_arn=${{ needs.build-test-layers.outputs.java_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.java_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+            dotnet)
+              echo "x86_arn=${{ needs.build-test-layers.outputs.dotnet_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.dotnet_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+            ruby)
+              echo "x86_arn=${{ needs.build-test-layers.outputs.ruby_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.ruby_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+            go)
+              # Go uses extension-only layer
+              echo "x86_arn=${{ needs.build-test-layers.outputs.extension_x86_arn }}" >> $GITHUB_OUTPUT
+              echo "arm_arn=${{ needs.build-test-layers.outputs.extension_arm_arn }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Run Cold Start Test - ${{ matrix.runtime }} (${{ matrix.test_mode }})
+        env:
+          API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
+          API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
+        run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
+          echo "🧪 Running COLD start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
+          echo "Region: $AWS_REGION"
+          echo "x86 Layer: ${{ steps.set_arns.outputs.x86_arn }}"
+          echo "arm Layer: ${{ steps.set_arns.outputs.arm_arn }}"
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $API_KEY" \
+            --data "{
+              \"runtime\": \"${{ matrix.runtime }}\",
+              \"test_mode\": \"${{ matrix.test_mode }}\",
+              \"test_type\": \"cold\",
+              \"x86_layer_arn\": \"${{ steps.set_arns.outputs.x86_arn }}\",
+              \"arm_layer_arn\": \"${{ steps.set_arns.outputs.arm_arn }}\"
+            }" \
+            "$API_URL")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Response code: $http_code"
+          echo "Response body: $body"
+          
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Cold start test failed with HTTP $http_code"
+          fi
+          echo "✅ Cold start test initiated successfully"
+
+      - name: Wait for Cold Start completion
+        run: |
+          echo "⏳ Waiting 8 minutes for cold start tests to complete and functions to cool down..."
+          sleep 480
+
+      - name: Run Warm Start Test - ${{ matrix.runtime }} (${{ matrix.test_mode }})
+        env:
+          API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
+          API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
+        run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
+          echo "🔥 Running WARM start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
+          echo "Region: $AWS_REGION"
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $API_KEY" \
+            --data "{
+              \"runtime\": \"${{ matrix.runtime }}\",
+              \"test_mode\": \"${{ matrix.test_mode }}\",
+              \"test_type\": \"warm\",
+              \"x86_layer_arn\": \"${{ steps.set_arns.outputs.x86_arn }}\",
+              \"arm_layer_arn\": \"${{ steps.set_arns.outputs.arm_arn }}\"
+            }" \
+            "$API_URL")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Response code: $http_code"
+          echo "Response body: $body"
+          
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Warm start test failed with HTTP $http_code"
+          fi
+          echo "✅ Warm start test initiated successfully"
+
+      - name: Wait for Warm Start completion
+        run: |
+          echo "⏳ Waiting 8 minutes for warm start tests to complete..."
+          sleep 480
+
+      - name: Run Logs Test - ${{ matrix.runtime }} (${{ matrix.test_mode }})
+        env:
+          API_URL: ${{ secrets.LAMBDA_PERF_TEST_API_URL }}
+          API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
+        run: |
+          # Set correct AWS region
+          export AWS_DEFAULT_REGION=ca-central-1
+          export AWS_REGION=ca-central-1
+
+          echo "📝 Running LOGS test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
+          echo "Region: $AWS_REGION"
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $API_KEY" \
+            --data "{
+              \"runtime\": \"${{ matrix.runtime }}\",
+              \"test_mode\": \"${{ matrix.test_mode }}\",
+              \"test_type\": \"logs\",
+              \"x86_layer_arn\": \"${{ steps.set_arns.outputs.x86_arn }}\",
+              \"arm_layer_arn\": \"${{ steps.set_arns.outputs.arm_arn }}\"
+            }" \
+            "$API_URL")
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Response code: $http_code"
+          echo "Response body: $body"
+          
+          if [ "$http_code" != "200" ]; then
+            echo "❌ Logs test failed with HTTP $http_code"
+          fi
+          echo "✅ Logs test initiated successfully"
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "## Performance Tests - ${{ matrix.runtime }} (${{ matrix.test_mode }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ All test types completed sequentially:" >> $GITHUB_STEP_SUMMARY
+          echo "  1. Cold start test → 8 min wait" >> $GITHUB_STEP_SUMMARY
+          echo "  2. Warm start test → 8 min wait" >> $GITHUB_STEP_SUMMARY
+          echo "  3. Logs test" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 View detailed results in New Relic custom events: \`LambdaExtensionPerformance\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Runtime: ${{ matrix.runtime }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Mode: ${{ matrix.test_mode }}" >> $GITHUB_STEP_SUMMARY
+          echo "- x86 Layer: \`${{ steps.set_arns.outputs.x86_arn }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- ARM Layer: \`${{ steps.set_arns.outputs.arm_arn }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Total time per job: ~16-20 minutes (all 12 jobs run in parallel)_" >> $GITHUB_STEP_SUMMARY
