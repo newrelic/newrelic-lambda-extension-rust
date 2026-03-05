@@ -16,8 +16,9 @@ use crate::{
         ProcessorFactory,
         create_request_processing_state,
         cleanup_request_processing_state_internal,
-        REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
-        PENDING_REPORTS,
+        REQUEST_PROCESSORS, REQUEST_DATA,
+        get_agent_buffer, get_request_context, get_pending_report,
+        remove_pending_report, request_data_len,
     },
     agent::batch::{
         add_to_batch, should_send_batch_by_threshold, 
@@ -184,7 +185,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                let buffer_count = request_data_len();
                 if buffer_count > 0 {
                     debug!(
                         "APM mode: Found {} request buffer(s) before processing (current: {})",
@@ -329,7 +330,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
                 
                 // Check all request buffers for unsent payloads
-                let all_request_ids: Vec<String> = REQUEST_AGENT_BUFFERS
+                let all_request_ids: Vec<String> = REQUEST_DATA
                     .iter()
                     .map(|entry| entry.key().clone())
                     .collect();
@@ -338,7 +339,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
                     
                     for request_id in all_request_ids {
-                        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+                        if let Some(buffer) = get_agent_buffer(&request_id) {
                             let payloads = {
                                 if let Ok(mut buf) = buffer.lock() {
                                     std::mem::take(&mut *buf)
@@ -350,8 +351,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             if !payloads.is_empty() {
                                 info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
                                 
-                                let invoked_function_arn = REQUEST_CONTEXTS
-                                    .get(&request_id)
+                                let invoked_function_arn = get_request_context(&request_id)
                                     .map(|ctx_ref| {
                                         ctx_ref.lock()
                                             .ok()
@@ -409,9 +409,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 // Process any pending platform.report lines as metrics (APM mode)
-                let all_pending_reports: Vec<(String, String)> = PENDING_REPORTS
+                let all_pending_reports: Vec<(String, String)> = REQUEST_DATA
                     .iter()
-                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .filter_map(|entry| {
+                        entry.pending_report.as_ref().map(|report| {
+                            (entry.key().clone(), report.clone())
+                        })
+                    })
                     .collect();
 
                 if !all_pending_reports.is_empty() {
@@ -428,8 +432,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
                             }
 
-                            // Remove from pending reports after sending
-                            PENDING_REPORTS.remove(&request_id);
+                            // Remove pending report after sending
+                            remove_pending_report(&request_id);
                         }
                     } else {
                         warn!("APM mode shutdown: APM app not initialized - cannot send platform metrics");
@@ -746,12 +750,12 @@ pub async fn process_apm_request(
     }
 
     if !is_cold_start {
-        let pending_buffers: Vec<String> = REQUEST_AGENT_BUFFERS
+        let pending_buffers: Vec<String> = REQUEST_DATA
             .iter()
             .filter_map(|entry| {
                 let req_id = entry.key();
                 if req_id != &request_id {
-                    if let Ok(buffer) = entry.value().lock() {
+                    if let Ok(buffer) = entry.agent_buffer.lock() {
                         if !buffer.is_empty() {
                             return Some(req_id.clone());
                         }
@@ -774,7 +778,7 @@ pub async fn process_apm_request(
                 );
 
                 let late_payloads = if let Some(buffer_ref) =
-                    REQUEST_AGENT_BUFFERS.get(&old_request_id)
+                    get_agent_buffer(&old_request_id)
                 {
                     if let Ok(mut buffer) = buffer_ref.lock() {
                         std::mem::take(&mut *buffer)
@@ -897,7 +901,7 @@ pub async fn process_apm_request(
                 agent_payloads.len()
             );
             // Put payloads back in buffer to send when run_id arrives
-            if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+            if let Some(buffer_ref) = get_agent_buffer(&request_id) {
                 if let Ok(mut buffer) = buffer_ref.lock() {
                     buffer.extend(agent_payloads);
                 }
@@ -934,10 +938,7 @@ pub async fn process_apm_request(
     }
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode)
-    if let Some(entry) = PENDING_REPORTS.get(&request_id) {
-        let report_line = entry.value().clone();
-        drop(entry); // Release the lock before async operations
-
+    if let Some(report_line) = get_pending_report(&request_id) {
         debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
         let apm_app_guard = apm_app.read().await;
@@ -952,8 +953,8 @@ pub async fn process_apm_request(
         }
         drop(apm_app_guard);
 
-        // Remove from pending reports after sending
-        PENDING_REPORTS.remove(&request_id);
+        // Remove pending report after sending
+        remove_pending_report(&request_id);
     } else {
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
@@ -1098,7 +1099,7 @@ pub async fn process_request_concurrently(
         }
     };
 
-    let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| {
+    let report_line = remove_pending_report(&request_id).map(|report| {
         debug!(
             "Found pending platform.report for request: {}",
             request_id
@@ -1165,7 +1166,7 @@ pub async fn process_request_concurrently(
         );
 
         // Put payloads back in buffer (they were taken out with mem::take)
-        if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+        if let Some(buffer_ref) = get_agent_buffer(&request_id) {
             if let Ok(mut buffer) = buffer_ref.lock() {
                 buffer.extend(agent_payloads);
             }
@@ -1287,10 +1288,10 @@ async fn process_pending_agent_payloads(
     apm_app: &crate::apm::SharedApmApp,
     current_request_id: &str,
 ) {
-    let all_buffers: Vec<(String, usize)> = REQUEST_AGENT_BUFFERS
+    let all_buffers: Vec<(String, usize)> = REQUEST_DATA
         .iter()
         .map(|entry| {
-            let buffer_size = entry.value().lock().map(|b| b.len()).unwrap_or(0);
+            let buffer_size = entry.agent_buffer.lock().map(|b| b.len()).unwrap_or(0);
             (entry.key().clone(), buffer_size)
         })
         .collect();
@@ -1301,10 +1302,10 @@ async fn process_pending_agent_payloads(
         all_buffers
     );
 
-    let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_AGENT_BUFFERS
+    let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_DATA
         .iter()
         .filter(|entry| entry.key() != current_request_id)
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .map(|entry| (entry.key().clone(), entry.agent_buffer.clone()))
         .collect();
 
     if pending_requests.is_empty() {
@@ -1322,7 +1323,7 @@ async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
-        let context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
+        let context = get_request_context(&request_id);
 
         let invoked_function_arn = if let Some(ctx) = context {
             if let Ok(ctx_guard) = ctx.lock() {
@@ -1385,10 +1386,7 @@ async fn process_pending_agent_payloads(
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)
-        if let Some(entry) = PENDING_REPORTS.get(&request_id) {
-            let report_line = entry.value().clone();
-            drop(entry);
-
+        if let Some(report_line) = get_pending_report(&request_id) {
             debug!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
 
             let apm_app_guard = apm_app.read().await;
@@ -1401,8 +1399,8 @@ async fn process_pending_agent_payloads(
             }
             drop(apm_app_guard);
 
-            // Remove from pending reports after sending
-            PENDING_REPORTS.remove(&request_id);
+            // Remove pending report after sending
+            remove_pending_report(&request_id);
         }
 
         cleanup_request_processing_state_internal(&request_id, false);

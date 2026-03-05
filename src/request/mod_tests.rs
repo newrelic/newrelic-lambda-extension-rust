@@ -19,11 +19,7 @@ mod tests {
     /// Helper: clear all global request state between tests
     fn clear_request_state() {
         REQUEST_PROCESSORS.clear();
-        REQUEST_CONTEXTS.clear();
-        REQUEST_AGENT_BUFFERS.clear();
-        PAYLOAD_COORDINATION.clear();
-        PENDING_REPORTS.clear();
-        REQUEST_BUFFER_CREATION_INVOCATION.clear();
+        REQUEST_DATA.clear();
 
         // Reset invocation counter for test isolation
         reset_invocation_counter();
@@ -190,7 +186,13 @@ mod tests {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("req-1".to_string(), buffer.clone());
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         {
             let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
@@ -215,7 +217,13 @@ mod tests {
 
         // No active request, but a buffer exists
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("some-req".to_string(), buffer.clone());
+        REQUEST_DATA.insert("some-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         route_payload_to_request_buffer(vec![99]).await;
 
@@ -253,10 +261,14 @@ mod tests {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("req-1".to_string(), buffer);
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        PAYLOAD_COORDINATION.insert("req-1".to_string(), tx);
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer,
+            coordination_tx: Some(tx),
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         {
             let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
@@ -286,21 +298,18 @@ mod tests {
             invoked_function_arn: "arn".to_string(),
             trace_id: None,
         }));
-        REQUEST_CONTEXTS.insert("req-1".to_string(), ctx);
-        REQUEST_AGENT_BUFFERS.insert("req-1".to_string(), Arc::new(Mutex::new(Vec::new())));
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("req-1".to_string(), 0);
-        PENDING_REPORTS.insert("req-1".to_string(), "report".to_string());
-
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        PAYLOAD_COORDINATION.insert("req-1".to_string(), tx);
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: Some(tx),
+            pending_report: Some("report".to_string()),
+            creation_invocation: 0,
+        });
 
         cleanup_request_processing_state("req-1");
 
-        assert!(REQUEST_CONTEXTS.get("req-1").is_none());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-1").is_none());
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("req-1").is_none());
-        assert!(PAYLOAD_COORDINATION.get("req-1").is_none());
-        assert!(PENDING_REPORTS.get("req-1").is_none());
+        assert!(REQUEST_DATA.get("req-1").is_none());
 
         clear_request_state();
     }
@@ -311,25 +320,30 @@ mod tests {
         clear_request_state();
 
         let ctx = Arc::new(Mutex::new(InvocationContext::default()));
-        REQUEST_CONTEXTS.insert("req-1".to_string(), ctx);
-        REQUEST_AGENT_BUFFERS.insert("req-1".to_string(), Arc::new(Mutex::new(Vec::new())));
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("req-1".to_string(), 0);
-        PENDING_REPORTS.insert("req-1".to_string(), "r".to_string());
-
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        PAYLOAD_COORDINATION.insert("req-1".to_string(), tx);
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: Some(tx),
+            pending_report: Some("r".to_string()),
+            creation_invocation: 0,
+        });
 
         cleanup_request_processing_state_internal("req-1", true);
 
-        // With skip_buffer_cleanup=true, these should be preserved
-        assert!(REQUEST_CONTEXTS.get("req-1").is_some());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-1").is_some());
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("req-1").is_some());
-
-        // PAYLOAD_COORDINATION is always cleaned (receiver consumed by process_request_concurrently)
-        assert!(PAYLOAD_COORDINATION.get("req-1").is_none());
-        // PENDING_REPORTS is always cleaned
-        assert!(PENDING_REPORTS.get("req-1").is_none());
+        // With skip_buffer_cleanup=true, entry should still exist with preserved fields
+        {
+            let entry = REQUEST_DATA.get("req-1");
+            assert!(entry.is_some());
+            let entry = entry.unwrap();
+            // Context, buffer, creation_invocation preserved
+            assert!(entry.context.lock().is_ok());
+            assert!(entry.agent_buffer.lock().is_ok());
+            // coordination_tx is always cleaned (receiver consumed by process_request_concurrently)
+            assert!(entry.coordination_tx.is_none());
+            // pending_report is always cleaned
+            assert!(entry.pending_report.is_none());
+        }
 
         clear_request_state();
     }
@@ -384,10 +398,12 @@ mod tests {
         assert!(state.coordination_rx.is_some());
 
         // Verify global maps were populated
-        assert!(REQUEST_CONTEXTS.get("req-create-1").is_some());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-create-1").is_some());
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("req-create-1").is_some());
-        assert!(PAYLOAD_COORDINATION.get("req-create-1").is_some());
+        {
+            let entry = REQUEST_DATA.get("req-create-1");
+            assert!(entry.is_some());
+            let entry = entry.unwrap();
+            assert!(entry.coordination_tx.is_some());
+        }
 
         clear_request_state();
     }
@@ -449,13 +465,19 @@ mod tests {
         clear_request_state();
 
         // Buffer created at current invocation (0) — not stale
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("recent-req".to_string(), current_invocation_count());
+        REQUEST_DATA.insert("recent-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: current_invocation_count(),
+        });
 
         let (client, config) = make_test_client_and_config();
         cleanup_old_request_buffers(client, config).await;
 
         // Recent entry should remain
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("recent-req").is_some());
+        assert!(REQUEST_DATA.get("recent-req").is_some());
 
         clear_request_state();
     }
@@ -466,34 +488,28 @@ mod tests {
         clear_request_state();
 
         // Simulate a buffer created 10 invocations ago (stale: >= 5 threshold)
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("old-req".to_string(), 0);
-        // Advance counter to invocation 10
-        for _ in 0..10 {
-            increment_invocation_counter();
-        }
-
-        // Add buffer with agent data for the old request
-        let buffer = Arc::new(Mutex::new(vec![vec![1, 2, 3]]));
-        REQUEST_AGENT_BUFFERS.insert("old-req".to_string(), buffer);
-
-        // Add context
         let ctx = Arc::new(Mutex::new(InvocationContext {
             request_id: "old-req".to_string(),
             invoked_function_arn: "arn:test".to_string(),
             trace_id: None,
         }));
-        REQUEST_CONTEXTS.insert("old-req".to_string(), ctx);
-
-        // Add pending report
-        PENDING_REPORTS.insert("old-req".to_string(), "REPORT old".to_string());
+        REQUEST_DATA.insert("old-req".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(vec![vec![1, 2, 3]])),
+            coordination_tx: None,
+            pending_report: Some("REPORT old".to_string()),
+            creation_invocation: 0,
+        });
+        // Advance counter to invocation 10
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
 
         let (client, config) = make_test_client_and_config();
         cleanup_old_request_buffers(client, config).await;
 
         // Old request should be cleaned up
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("old-req").is_none());
-        assert!(REQUEST_CONTEXTS.get("old-req").is_none());
-        assert!(REQUEST_AGENT_BUFFERS.get("old-req").is_none());
+        assert!(REQUEST_DATA.get("old-req").is_none());
 
         clear_request_state();
     }
@@ -504,20 +520,22 @@ mod tests {
         clear_request_state();
 
         // Buffer created 10 invocations ago but empty
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("old-empty".to_string(), 0);
+        REQUEST_DATA.insert("old-empty".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::<Vec<u8>>::new())),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
         for _ in 0..10 {
             increment_invocation_counter();
         }
-
-        // Buffer exists but is empty
-        let buffer = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        REQUEST_AGENT_BUFFERS.insert("old-empty".to_string(), buffer);
 
         let (client, config) = make_test_client_and_config();
         cleanup_old_request_buffers(client, config).await;
 
         // Should still be cleaned up even with empty buffer
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("old-empty").is_none());
+        assert!(REQUEST_DATA.get("old-empty").is_none());
 
         clear_request_state();
     }
@@ -533,21 +551,28 @@ mod tests {
         }
 
         // "recent" created at invocation 10 (current) — not stale
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("recent".to_string(), current_invocation_count());
+        REQUEST_DATA.insert("recent".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: current_invocation_count(),
+        });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("old".to_string(), 0);
-
-        REQUEST_AGENT_BUFFERS.insert("recent".to_string(), Arc::new(Mutex::new(vec![vec![1]])));
-        REQUEST_AGENT_BUFFERS.insert("old".to_string(), Arc::new(Mutex::new(vec![vec![2]])));
+        REQUEST_DATA.insert("old".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         let (client, config) = make_test_client_and_config();
         cleanup_old_request_buffers(client, config).await;
 
         // Recent should stay, old should go
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("recent").is_some());
-        assert!(REQUEST_AGENT_BUFFERS.get("recent").is_some());
-        assert!(REQUEST_BUFFER_CREATION_INVOCATION.get("old").is_none());
-        assert!(REQUEST_AGENT_BUFFERS.get("old").is_none());
+        assert!(REQUEST_DATA.get("recent").is_some());
+        assert!(REQUEST_DATA.get("old").is_none());
 
         clear_request_state();
     }
@@ -588,7 +613,13 @@ mod tests {
             let mut guard = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
             *guard = Some("req-old".to_string());
         }
-        REQUEST_AGENT_BUFFERS.insert("req-old".to_string(), Arc::new(Mutex::new(Vec::new())));
+        REQUEST_DATA.insert("req-old".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         // Now clear active (simulating cleanup between invocations)
         {
@@ -600,8 +631,7 @@ mod tests {
         route_payload_to_request_buffer(vec![88]).await;
 
         // Should be in req-old's buffer (fallback to any existing buffer)
-        let stored = REQUEST_AGENT_BUFFERS
-            .get("req-old")
+        let stored = get_agent_buffer("req-old")
             .map(|b| b.lock().unwrap().len())
             .unwrap_or(0);
         assert_eq!(stored, 1);
@@ -656,10 +686,14 @@ mod tests {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("req-coord".to_string(), buffer);
-
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        PAYLOAD_COORDINATION.insert("req-coord".to_string(), tx);
+        REQUEST_DATA.insert("req-coord".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer,
+            coordination_tx: Some(tx),
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         {
             let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
@@ -680,7 +714,7 @@ mod tests {
         clear_request_state();
     }
 
-    /// Cleanup with skip_buffer should still clean PAYLOAD_COORDINATION
+    /// Cleanup with skip_buffer should still clean coordination_tx
     /// since the receiver is already consumed by process_request_concurrently
     #[test]
     #[serial]
@@ -688,18 +722,24 @@ mod tests {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("req-sk".to_string(), buffer);
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("req-sk".to_string(), 0);
-
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        PAYLOAD_COORDINATION.insert("req-sk".to_string(), tx);
+        REQUEST_DATA.insert("req-sk".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer,
+            coordination_tx: Some(tx),
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         cleanup_request_processing_state_internal("req-sk", true);
 
-        // Buffer preserved
-        assert!(REQUEST_AGENT_BUFFERS.get("req-sk").is_some());
-        // But coordination sender should be cleaned (receiver already consumed)
-        assert!(PAYLOAD_COORDINATION.get("req-sk").is_none());
+        // Entry preserved with buffer intact
+        {
+            let entry = REQUEST_DATA.get("req-sk");
+            assert!(entry.is_some());
+            // But coordination sender should be cleaned (receiver already consumed)
+            assert!(entry.unwrap().coordination_tx.is_none());
+        }
 
         clear_request_state();
     }
@@ -711,11 +751,15 @@ mod tests {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        REQUEST_AGENT_BUFFERS.insert("req-drop".to_string(), buffer.clone());
-
         // Create channel and immediately drop receiver
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        PAYLOAD_COORDINATION.insert("req-drop".to_string(), tx);
+        REQUEST_DATA.insert("req-drop".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            coordination_tx: Some(tx),
+            pending_report: None,
+            creation_invocation: 0,
+        });
         drop(rx);
 
         {
@@ -786,12 +830,11 @@ mod tests {
         assert!(state_b.agent_buffer.lock().unwrap().is_empty());
 
         // Global maps should have both
-        assert!(REQUEST_AGENT_BUFFERS.get("req-A").is_some());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-B").is_some());
+        assert!(REQUEST_DATA.get("req-A").is_some());
+        assert!(REQUEST_DATA.get("req-B").is_some());
 
         // A's global buffer should have the data
-        let global_a_len = REQUEST_AGENT_BUFFERS
-            .get("req-A")
+        let global_a_len = get_agent_buffer("req-A")
             .map(|b| b.lock().unwrap().len())
             .unwrap_or(0);
         assert_eq!(global_a_len, 1);
@@ -816,24 +859,30 @@ mod tests {
             trace_id: None,
         }));
 
-        REQUEST_CONTEXTS.insert("req-A".to_string(), ctx_a);
-        REQUEST_CONTEXTS.insert("req-B".to_string(), ctx_b);
-        REQUEST_AGENT_BUFFERS.insert("req-A".to_string(), Arc::new(Mutex::new(vec![vec![1]])));
-        REQUEST_AGENT_BUFFERS.insert("req-B".to_string(), Arc::new(Mutex::new(vec![vec![2]])));
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("req-A".to_string(), 0);
-        REQUEST_BUFFER_CREATION_INVOCATION.insert("req-B".to_string(), 0);
+        REQUEST_DATA.insert("req-A".to_string(), RequestData {
+            context: ctx_a,
+            agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
+        REQUEST_DATA.insert("req-B".to_string(), RequestData {
+            context: ctx_b,
+            agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         // Clean only A
         cleanup_request_processing_state("req-A");
 
         // A gone
-        assert!(REQUEST_CONTEXTS.get("req-A").is_none());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-A").is_none());
+        assert!(REQUEST_DATA.get("req-A").is_none());
 
         // B still intact
-        assert!(REQUEST_CONTEXTS.get("req-B").is_some());
-        assert!(REQUEST_AGENT_BUFFERS.get("req-B").is_some());
-        let b_data = REQUEST_AGENT_BUFFERS.get("req-B").unwrap().lock().unwrap().clone();
+        assert!(REQUEST_DATA.get("req-B").is_some());
+        let b_data = get_agent_buffer("req-B").unwrap().lock().unwrap().clone();
         assert_eq!(b_data, vec![vec![2]]);
 
         clear_request_state();
@@ -849,23 +898,35 @@ mod tests {
 
 
 
-    /// PENDING_REPORTS should be isolated per request_id
+    /// pending_report should be isolated per request_id
     #[test]
     #[serial]
     fn test_pending_reports_per_request_id() {
         clear_request_state();
 
-        PENDING_REPORTS.insert("req-X".to_string(), "REPORT for X".to_string());
-        PENDING_REPORTS.insert("req-Y".to_string(), "REPORT for Y".to_string());
+        REQUEST_DATA.insert("req-X".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: Some("REPORT for X".to_string()),
+            creation_invocation: 0,
+        });
+        REQUEST_DATA.insert("req-Y".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: Some("REPORT for Y".to_string()),
+            creation_invocation: 0,
+        });
 
         // Each request has its own report
-        assert_eq!(PENDING_REPORTS.get("req-X").unwrap().value(), "REPORT for X");
-        assert_eq!(PENDING_REPORTS.get("req-Y").unwrap().value(), "REPORT for Y");
+        assert_eq!(get_pending_report("req-X").unwrap(), "REPORT for X");
+        assert_eq!(get_pending_report("req-Y").unwrap(), "REPORT for Y");
 
         // Removing X doesn't affect Y
-        PENDING_REPORTS.remove("req-X");
-        assert!(PENDING_REPORTS.get("req-X").is_none());
-        assert_eq!(PENDING_REPORTS.get("req-Y").unwrap().value(), "REPORT for Y");
+        remove_pending_report("req-X");
+        assert!(get_pending_report("req-X").is_none());
+        assert_eq!(get_pending_report("req-Y").unwrap(), "REPORT for Y");
 
         clear_request_state();
     }

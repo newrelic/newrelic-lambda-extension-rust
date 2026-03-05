@@ -478,7 +478,7 @@ mod tests {
     #[serial]
     async fn test_shutdown_send_empty_returns_early() {
         clear_batch_state();
-        crate::request::REQUEST_AGENT_BUFFERS.clear();
+        crate::request::REQUEST_DATA.clear();
 
         let config = Arc::new(ExtensionConfig::default());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
@@ -496,9 +496,7 @@ mod tests {
     #[serial]
     async fn test_shutdown_send_from_batch_buffer() {
         clear_batch_state();
-        crate::request::REQUEST_AGENT_BUFFERS.clear();
-        crate::request::REQUEST_CONTEXTS.clear();
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
 
         let config = Arc::new(ExtensionConfig::default());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
@@ -518,39 +516,35 @@ mod tests {
     #[serial]
     async fn test_shutdown_send_from_request_buffers() {
         clear_batch_state();
-        crate::request::REQUEST_AGENT_BUFFERS.clear();
-        crate::request::REQUEST_CONTEXTS.clear();
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
 
         let config = Arc::new(ExtensionConfig::default());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
 
-        // Add payloads to REQUEST_AGENT_BUFFERS (simulating unbatched payloads)
+        // Add payloads to REQUEST_DATA (simulating unbatched payloads)
         let buffer = Arc::new(std::sync::Mutex::new(vec![
             vec![10, 20, 30],
             vec![40, 50, 60],
         ]));
-        crate::request::REQUEST_AGENT_BUFFERS.insert("req-buf-1".to_string(), buffer);
-
-        // Add a context for this request
         let ctx = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext {
             request_id: "req-buf-1".to_string(),
             invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test-fn".to_string(),
             trace_id: None,
         }));
-        crate::request::REQUEST_CONTEXTS.insert("req-buf-1".to_string(), ctx);
-
-        // Add a pending report
-        crate::request::PENDING_REPORTS.insert("req-buf-1".to_string(), "REPORT Duration: 50ms".to_string());
+        crate::request::REQUEST_DATA.insert("req-buf-1".to_string(), crate::request::RequestData {
+            context: ctx,
+            agent_buffer: buffer,
+            coordination_tx: None,
+            pending_report: Some("REPORT Duration: 50ms".to_string()),
+            creation_invocation: 0,
+        });
 
         send_all_pending_payloads_on_shutdown(newrelic_client, config).await;
 
         // Batch buffer should be empty
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);
 
-        crate::request::REQUEST_AGENT_BUFFERS.clear();
-        crate::request::REQUEST_CONTEXTS.clear();
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
         clear_batch_state();
     }
 

@@ -254,13 +254,13 @@ pub async fn send_batched_payloads_with_reports_only(
 }
 
 /// Send all pending payloads on shutdown with 1MB chunking
-/// Collects from: AGENT_BATCH_BUFFER, REQUEST_AGENT_BUFFERS, and matches with PENDING_REPORTS
+/// Collects from: AGENT_BATCH_BUFFER, REQUEST_DATA (agent buffers + pending reports)
 /// Splits into 1MB chunks while keeping each payload + report together
 pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    use crate::request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS};
+    use crate::request::{REQUEST_DATA, get_request_context, remove_pending_report};
 
     debug!("Shutdown: Collecting all pending telemetry payloads");
 
@@ -271,14 +271,14 @@ pub async fn send_all_pending_payloads_on_shutdown(
     debug!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
     all_payloads.extend(batched_items);
 
-    // 2. Collect from REQUEST_AGENT_BUFFERS (late/unbatched payloads)
-    let all_buffer_requests: Vec<String> = REQUEST_AGENT_BUFFERS
+    // 2. Collect from REQUEST_DATA (late/unbatched payloads)
+    let all_buffer_requests: Vec<String> = REQUEST_DATA
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
 
     for request_id in all_buffer_requests {
-        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+        if let Some(buffer) = crate::request::get_agent_buffer(&request_id) {
             let payloads = if let Ok(mut buf) = buffer.lock() {
                 std::mem::take(&mut *buf)
             } else {
@@ -289,11 +289,10 @@ pub async fn send_all_pending_payloads_on_shutdown(
                 debug!("Shutdown: Found {} unbatched payload(s) for request: {}", payloads.len(), request_id);
 
                 // Get report line if available
-                let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| report);
+                let report_line = remove_pending_report(&request_id);
 
                 // Get context
-                let arn = REQUEST_CONTEXTS
-                    .get(&request_id)
+                let arn = get_request_context(&request_id)
                     .map(|ctx_entry| {
                         ctx_entry
                             .lock()

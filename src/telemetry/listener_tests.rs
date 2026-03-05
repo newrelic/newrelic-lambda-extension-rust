@@ -12,6 +12,7 @@ mod tests {
     use serial_test::serial;
     use crate::telemetry::listener::TelemetryRecord;
     use crate::request::TELEMETRY_CURRENT_REQUEST_ID;
+    use crate::context::InvocationContext;
 
     /// Helper: clear telemetry-related global state
     fn clear_telemetry_state() {
@@ -208,7 +209,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use crate::config::ExtensionConfig;
     use crate::newrelic::client::NewRelicClient;
-    use crate::context::InvocationContext;
     use crate::telemetry::listener::setup_telemetry_listener;
 
     /// Helper: create default processors for listener tests
@@ -369,6 +369,15 @@ mod tests {
     async fn test_handle_platform_report_standard_mode_pending() {
         clear_telemetry_state();
 
+        // Create REQUEST_DATA entry so set_pending_report can store the report
+        crate::request::REQUEST_DATA.insert("report-req-1".to_string(), crate::request::RequestData {
+            context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            agent_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
+
         let (log_processor, platform_processor) = create_test_processors();
 
         let addr = setup_telemetry_listener(
@@ -409,11 +418,11 @@ mod tests {
 
         // In standard mode with no matching batch/buffer, report should be stored as pending
         {
-            let pending = crate::request::PENDING_REPORTS.get("report-req-1");
-            assert!(pending.is_some(), "Report should be stored in PENDING_REPORTS");
+            let pending = crate::request::get_pending_report("report-req-1");
+            assert!(pending.is_some(), "Report should be stored as pending");
         }
 
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
         clear_telemetry_state();
     }
 
@@ -624,6 +633,15 @@ mod tests {
     async fn test_handle_platform_report_apm_mode() {
         clear_telemetry_state();
 
+        // Create REQUEST_DATA entry so set_pending_report can store the report
+        crate::request::REQUEST_DATA.insert("apm-report-req".to_string(), crate::request::RequestData {
+            context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            agent_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
+
         let (log_processor, platform_processor) = create_test_processors();
 
         let addr = setup_telemetry_listener(
@@ -660,13 +678,13 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // In APM mode with no APM_APP, report should be stored in PENDING_REPORTS
+        // In APM mode with no APM_APP, report should be stored as pending
         {
-            let pending = crate::request::PENDING_REPORTS.get("apm-report-req");
+            let pending = crate::request::get_pending_report("apm-report-req");
             assert!(pending.is_some(), "APM mode: Report should be stored when APM app not ready");
         }
 
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
         clear_telemetry_state();
     }
 
@@ -675,9 +693,15 @@ mod tests {
     async fn test_handle_platform_report_empty_request_buffer_stores_pending() {
         clear_telemetry_state();
 
-        // REQUEST_AGENT_BUFFERS has the request but buffer is EMPTY
-        let buffer = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        crate::request::REQUEST_AGENT_BUFFERS.insert("empty-buf-req".to_string(), buffer);
+        // REQUEST_DATA has the request but buffer is EMPTY
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        crate::request::REQUEST_DATA.insert("empty-buf-req".to_string(), crate::request::RequestData {
+            context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer,
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         let (log_processor, platform_processor) = create_test_processors();
 
@@ -717,12 +741,11 @@ mod tests {
 
         // Report should be stored as pending since buffer was empty
         {
-            let pending = crate::request::PENDING_REPORTS.get("empty-buf-req");
+            let pending = crate::request::get_pending_report("empty-buf-req");
             assert!(pending.is_some(), "Report should be stored as pending when buffer is empty");
         }
 
-        crate::request::REQUEST_AGENT_BUFFERS.clear();
-        crate::request::PENDING_REPORTS.clear();
+        crate::request::REQUEST_DATA.clear();
         clear_telemetry_state();
     }
 
@@ -802,17 +825,20 @@ mod tests {
     async fn test_handle_platform_report_matches_request_buffer() {
         clear_telemetry_state();
 
-        // Set up REQUEST_AGENT_BUFFERS with agent data for this request
-        let buffer = Arc::new(Mutex::new(vec![vec![10, 20, 30]]));
-        crate::request::REQUEST_AGENT_BUFFERS.insert("buf-report-req".to_string(), buffer);
-
-        // Set up context
-        let ctx = Arc::new(Mutex::new(InvocationContext {
+        // Set up REQUEST_DATA with agent data and context for this request
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(vec![vec![10, 20, 30]]));
+        let ctx = std::sync::Arc::new(std::sync::Mutex::new(InvocationContext {
             request_id: "buf-report-req".to_string(),
             invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test-fn".to_string(),
             trace_id: None,
         }));
-        crate::request::REQUEST_CONTEXTS.insert("buf-report-req".to_string(), ctx);
+        crate::request::REQUEST_DATA.insert("buf-report-req".to_string(), crate::request::RequestData {
+            context: ctx,
+            agent_buffer: buffer,
+            coordination_tx: None,
+            pending_report: None,
+            creation_invocation: 0,
+        });
 
         let (log_processor, platform_processor) = create_test_processors();
 
@@ -859,14 +885,17 @@ mod tests {
             }
         }
 
-        // REQUEST_AGENT_BUFFERS should be cleaned for this request
-        assert!(
-            crate::request::REQUEST_AGENT_BUFFERS.get("buf-report-req").is_none(),
-            "Buffer should be removed after moving to batch"
-        );
+        // Agent buffer should be cleared for this request (entry stays in consolidated map)
+        {
+            let buffer = crate::request::get_agent_buffer("buf-report-req").unwrap();
+            assert!(
+                buffer.lock().unwrap().is_empty(),
+                "Buffer should be cleared after moving to batch"
+            );
+        }
 
         crate::agent::batch::AGENT_BATCH_BUFFER.clear();
-        crate::request::REQUEST_CONTEXTS.clear();
+        crate::request::REQUEST_DATA.clear();
         clear_telemetry_state();
     }
 

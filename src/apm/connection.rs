@@ -275,10 +275,10 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
         });
     }
 
-    for (key, value) in crate::config::parse_nr_tags() {
+    for (key, value) in crate::config::get_nr_tags() {
         labels.push(Label {
-            label_type: key,
-            label_value: value,
+            label_type: key.clone(),
+            label_value: value.clone(),
         });
     }
 

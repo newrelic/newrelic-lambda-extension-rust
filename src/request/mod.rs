@@ -76,26 +76,61 @@ impl ProcessorFactory {
     }
 }
 
-// Legacy state tracking - kept for backward compatibility during migration
+/// Per-request processing state stored in REQUEST_PROCESSORS (inserted by event_loop).
 pub static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-pub static REQUEST_CONTEXTS: Lazy<Arc<DashMap<String, Arc<Mutex<InvocationContext>>>>> =
+/// Consolidated per-request data — replaces 5 separate DashMaps
+/// (context, agent_buffer, coordination_tx, pending_report, creation_invocation).
+///
+/// All fields are accessed via accessor functions below to maintain a clean API.
+#[derive(Debug)]
+pub struct RequestData {
+    pub context: Arc<Mutex<InvocationContext>>,
+    pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub coordination_tx: Option<mpsc::UnboundedSender<()>>,
+    pub pending_report: Option<String>,
+    pub creation_invocation: u64,
+}
+
+pub static REQUEST_DATA: Lazy<Arc<DashMap<String, RequestData>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-pub static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>>>>>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+// ---------------------------------------------------------------------------
+// Accessor functions — backward-compatible API for external modules
+// ---------------------------------------------------------------------------
 
-pub static PAYLOAD_COORDINATION: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+/// Get the invocation context for a request.
+pub fn get_request_context(request_id: &str) -> Option<Arc<Mutex<InvocationContext>>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.context.clone())
+}
 
-pub static PENDING_REPORTS: Lazy<Arc<DashMap<String, String>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+/// Get the agent payload buffer for a request.
+pub fn get_agent_buffer(request_id: &str) -> Option<Arc<Mutex<Vec<Vec<u8>>>>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.agent_buffer.clone())
+}
 
-/// Tracks the invocation number at which each request buffer was created.
-/// Used by cleanup_old_request_buffers to determine staleness by invocation count.
-pub static REQUEST_BUFFER_CREATION_INVOCATION: Lazy<Arc<DashMap<String, u64>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
+/// Get the pending platform.report for a request.
+pub fn get_pending_report(request_id: &str) -> Option<String> {
+    REQUEST_DATA.get(request_id).and_then(|entry| entry.pending_report.clone())
+}
+
+/// Set the pending platform.report for a request.
+pub fn set_pending_report(request_id: &str, report: String) {
+    if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
+        entry.pending_report = Some(report);
+    }
+}
+
+/// Remove and return the pending platform.report for a request.
+pub fn remove_pending_report(request_id: &str) -> Option<String> {
+    REQUEST_DATA.get_mut(request_id).and_then(|mut entry| entry.pending_report.take())
+}
+
+/// Get the number of entries in REQUEST_DATA (used for debug logging).
+pub fn request_data_len() -> usize {
+    REQUEST_DATA.len()
+}
 
 /// Global invocation counter — incremented on each Lambda INVOKE event.
 /// Used to compute how many invocations a request buffer has survived without being processed.
@@ -177,7 +212,15 @@ pub fn create_request_processing_state(
     }
 
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
-    PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
+
+    // Insert consolidated request data (replaces 5 separate DashMap inserts)
+    REQUEST_DATA.insert(request_id.to_string(), RequestData {
+        context: context.clone(),
+        agent_buffer: agent_buffer.clone(),
+        coordination_tx: Some(payload_tx),
+        pending_report: None,
+        creation_invocation: current_invocation_count(),
+    });
 
     let state = RequestProcessingState {
         context: context.clone(),
@@ -186,10 +229,6 @@ pub fn create_request_processing_state(
         agent_buffer: agent_buffer.clone(),
         coordination_rx: Some(payload_rx),
     };
-
-    REQUEST_CONTEXTS.insert(request_id.to_string(), context);
-    REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer.clone());
-    REQUEST_BUFFER_CREATION_INVOCATION.insert(request_id.to_string(), current_invocation_count());
 
     state
 }
@@ -200,17 +239,17 @@ pub fn cleanup_request_processing_state(request_id: &str) {
 
 pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_cleanup: bool) {
     REQUEST_PROCESSORS.remove(request_id);
-    
-    if !skip_buffer_cleanup {
-        REQUEST_CONTEXTS.remove(request_id);
-        REQUEST_AGENT_BUFFERS.remove(request_id);
-        REQUEST_BUFFER_CREATION_INVOCATION.remove(request_id);
-    }
 
-    // Always clean coordination sender — receiver is consumed by process_request_concurrently
-    // so keeping stale senders just wastes memory
-    PAYLOAD_COORDINATION.remove(request_id);
-    PENDING_REPORTS.remove(request_id);
+    if !skip_buffer_cleanup {
+        // Full cleanup: remove the entire consolidated entry
+        REQUEST_DATA.remove(request_id);
+    } else {
+        // Partial cleanup: keep context/buffer/creation_invocation, clear coordination + pending_report
+        if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
+            entry.coordination_tx = None;
+            entry.pending_report = None;
+        }
+    }
 }
 
 /// Periodic cleanup of stale request buffers that have survived more than 5 invocations
@@ -231,9 +270,9 @@ pub async fn cleanup_old_request_buffers(
     let current = current_invocation_count();
     let threshold: u64 = 5;
 
-    let stale_request_ids: Vec<String> = REQUEST_BUFFER_CREATION_INVOCATION
+    let stale_request_ids: Vec<String> = REQUEST_DATA
         .iter()
-        .filter(|entry| current.saturating_sub(*entry.value()) >= threshold)
+        .filter(|entry| current.saturating_sub(entry.creation_invocation) >= threshold)
         .map(|entry| entry.key().clone())
         .collect();
 
@@ -249,41 +288,42 @@ pub async fn cleanup_old_request_buffers(
 
     for request_id in &stale_request_ids {
         // Extract and send any unsent agent payloads before removing
-        if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(request_id) {
-            let payloads: Vec<Vec<u8>> = match buffer_ref.lock() {
+        let (payloads, arn) = if let Some(entry) = REQUEST_DATA.get(request_id) {
+            let payloads: Vec<Vec<u8>> = match entry.agent_buffer.lock() {
                 Ok(mut buf) => buf.drain(..).collect(),
                 Err(_) => Vec::new(),
             };
+            let arn = entry.context.lock()
+                .ok()
+                .map(|c| c.invoked_function_arn.clone())
+                .unwrap_or_else(|| format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name));
+            (payloads, arn)
+        } else {
+            (Vec::new(), format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name))
+        };
 
-            if !payloads.is_empty() {
-                // Get the invoked_function_arn from the request context if available
-                let arn = REQUEST_CONTEXTS
-                    .get(request_id)
-                    .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()))
-                    .unwrap_or_else(|| format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name));
+        if !payloads.is_empty() {
+            info!(
+                "Periodic cleanup: Sending {} stale agent payload(s) for request {} before removal",
+                payloads.len(),
+                request_id
+            );
 
-                info!(
-                    "Periodic cleanup: Sending {} stale agent payload(s) for request {} before removal",
-                    payloads.len(),
-                    request_id
-                );
-
-                for payload_bytes in &payloads {
-                    if let Err(e) = send_agent_payload_to_newrelic(
-                        payload_bytes,
-                        request_id,
-                        &arn,
-                        &newrelic_client,
-                        &config,
-                        None,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Periodic cleanup: Failed to send stale agent payload for {}: {}",
-                            request_id, e
-                        );
-                    }
+            for payload_bytes in &payloads {
+                if let Err(e) = send_agent_payload_to_newrelic(
+                    payload_bytes,
+                    request_id,
+                    &arn,
+                    &newrelic_client,
+                    &config,
+                    None,
+                )
+                .await
+                {
+                    error!(
+                        "Periodic cleanup: Failed to send stale agent payload for {}: {}",
+                        request_id, e
+                    );
                 }
             }
         }
@@ -305,8 +345,8 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
 
     if let Some(request_id) = current_request_id {
         // Route to active request buffer
-        if let Some(request_buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
-            match request_buffer.lock() {
+        if let Some(entry) = REQUEST_DATA.get(&request_id) {
+            match entry.agent_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
                     debug!(
@@ -315,7 +355,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                     );
 
                     // Signal coordination channel that payload arrived
-                    if let Some(tx) = PAYLOAD_COORDINATION.get(&request_id) {
+                    if let Some(ref tx) = entry.coordination_tx {
                         let _ = tx.send(());
                     }
                 }
@@ -331,15 +371,15 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
         }
     } else {
         // No active request - try to route to any existing buffer (late payload scenario)
-        let any_request_id = REQUEST_AGENT_BUFFERS.iter().next().map(|entry| entry.key().clone());
+        let any_request_id = REQUEST_DATA.iter().next().map(|entry| entry.key().clone());
 
         if let Some(request_id) = any_request_id {
             warn!(
                 "No active request - routing late agent payload to buffer: {}",
                 request_id
             );
-            if let Some(request_buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
-                if let Ok(mut buffer) = request_buffer.lock() {
+            if let Some(entry) = REQUEST_DATA.get(&request_id) {
+                if let Ok(mut buffer) = entry.agent_buffer.lock() {
                     buffer.push(payload_bytes);
                     debug!(
                         "Stored late agent payload in buffer for {} (buffer size: {})",

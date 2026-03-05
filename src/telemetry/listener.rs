@@ -2,7 +2,7 @@ use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, TELEMETRY_CURRENT_REQUEST_ID},
+    request::{get_agent_buffer, get_request_context, set_pending_report, TELEMETRY_CURRENT_REQUEST_ID},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -162,7 +162,7 @@ async fn handle_telemetry_request(
                                         };
 
                                         if send_failed {
-                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            set_pending_report(request_id_str, report_line);
                                             debug!("APM mode: Stored failed platform.report for request: {} (will retry later)", request_id_str);
                                         }
                                         // In APM mode, platform.report and agent payloads are INDEPENDENT
@@ -174,12 +174,12 @@ async fn handle_telemetry_request(
                                             batch_item.report_line = Some(report_line);
                                             debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
                                         }
-                                        else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
+                                        else if let Some(buffer) = get_agent_buffer(request_id_str) {
                                             let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
                                             if has_agent {
                                                 debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                                 
-                                                let arn = REQUEST_CONTEXTS.get(request_id_str)
+                                                let arn = get_request_context(request_id_str)
                                                     .map(|ctx_ref| {
                                                         ctx_ref.lock()
                                                             .ok()
@@ -213,16 +213,18 @@ async fn handle_telemetry_request(
                                                     }
                                                 }
                                                 
-                                                drop(buffer);
-                                                REQUEST_AGENT_BUFFERS.remove(request_id_str);
+                                                // Clear buffer contents (entry stays in consolidated map)
+                                                if let Ok(mut buffer_guard) = buffer.lock() {
+                                                    buffer_guard.clear();
+                                                }
                                                 debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
                                             } else {
-                                                PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                                set_pending_report(request_id_str, report_line);
                                                 debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                             }
                                         }
                                         else {
-                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            set_pending_report(request_id_str, report_line);
                                             debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
