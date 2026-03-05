@@ -5,16 +5,18 @@
 //! Each request gets isolated processors with their own InvocationContext.
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{error, info, warn};
 
 use crate::{
     context::InvocationContext,
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
+    agent::payload::send_agent_payload_to_newrelic,
 };
 
 #[derive(Debug)]
@@ -87,14 +89,34 @@ pub static REQUEST_AGENT_BUFFERS: Lazy<Arc<DashMap<String, Arc<Mutex<Vec<Vec<u8>
 pub static PAYLOAD_COORDINATION: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-pub static RUNTIME_DONE_CHANNELS: Lazy<Arc<DashMap<String, mpsc::UnboundedSender<()>>>> =
-    Lazy::new(|| Arc::new(DashMap::new()));
-
 pub static PENDING_REPORTS: Lazy<Arc<DashMap<String, String>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
-pub static REQUEST_BUFFER_TIMESTAMPS: Lazy<Arc<DashMap<String, chrono::DateTime<chrono::Utc>>>> =
+/// Tracks the invocation number at which each request buffer was created.
+/// Used by cleanup_old_request_buffers to determine staleness by invocation count.
+pub static REQUEST_BUFFER_CREATION_INVOCATION: Lazy<Arc<DashMap<String, u64>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
+
+/// Global invocation counter — incremented on each Lambda INVOKE event.
+/// Used to compute how many invocations a request buffer has survived without being processed.
+static GLOBAL_INVOCATION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Increment the global invocation counter and return the new value.
+/// Called from the event loop on each INVOKE event.
+pub fn increment_invocation_counter() -> u64 {
+    GLOBAL_INVOCATION_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Get the current invocation counter value.
+pub fn current_invocation_count() -> u64 {
+    GLOBAL_INVOCATION_COUNTER.load(Ordering::Relaxed)
+}
+
+/// Reset the global invocation counter (for testing only).
+#[cfg(test)]
+pub fn reset_invocation_counter() {
+    GLOBAL_INVOCATION_COUNTER.store(0, Ordering::Relaxed);
+}
 
 /// Agent payloads lack request_id - route to currently active request
 /// This tracks which request is actively processing to route agent payloads correctly
@@ -124,7 +146,6 @@ pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>,
-    is_apm_mode: bool,
 ) -> RequestProcessingState {
     let context = Arc::new(Mutex::new(InvocationContext {
         request_id: request_id.to_string(),
@@ -158,12 +179,6 @@ pub fn create_request_processing_state(
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
     PAYLOAD_COORDINATION.insert(request_id.to_string(), payload_tx);
 
-    // Only create runtime.done channel for standard mode (not needed in APM mode)
-    if !is_apm_mode {
-        let (runtime_done_tx, _runtime_done_rx) = mpsc::unbounded_channel();
-        RUNTIME_DONE_CHANNELS.insert(request_id.to_string(), runtime_done_tx);
-    }
-
     let state = RequestProcessingState {
         context: context.clone(),
         log_processor: log_processor.clone(),
@@ -174,7 +189,7 @@ pub fn create_request_processing_state(
 
     REQUEST_CONTEXTS.insert(request_id.to_string(), context);
     REQUEST_AGENT_BUFFERS.insert(request_id.to_string(), agent_buffer.clone());
-    REQUEST_BUFFER_TIMESTAMPS.insert(request_id.to_string(), chrono::Utc::now());
+    REQUEST_BUFFER_CREATION_INVOCATION.insert(request_id.to_string(), current_invocation_count());
 
     state
 }
@@ -189,38 +204,90 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
     if !skip_buffer_cleanup {
         REQUEST_CONTEXTS.remove(request_id);
         REQUEST_AGENT_BUFFERS.remove(request_id);
-        REQUEST_BUFFER_TIMESTAMPS.remove(request_id);
-        PAYLOAD_COORDINATION.remove(request_id);
+        REQUEST_BUFFER_CREATION_INVOCATION.remove(request_id);
     }
-    
-    RUNTIME_DONE_CHANNELS.remove(request_id);
+
+    // Always clean coordination sender — receiver is consumed by process_request_concurrently
+    // so keeping stale senders just wastes memory
+    PAYLOAD_COORDINATION.remove(request_id);
     PENDING_REPORTS.remove(request_id);
 }
 
-/// Periodic cleanup of stale request buffers older than 5 minutes.
-/// Stale buffers occur when agent payloads never get matched with platform.report.
-/// The core sending path (telemetry listener + process_request_concurrently) handles
-/// normal payload+report matching — this just prevents memory leaks from edge cases.
-pub async fn cleanup_old_request_buffers() {
-    let now = chrono::Utc::now();
-    let threshold = chrono::Duration::minutes(5);
+/// Periodic cleanup of stale request buffers that have survived more than 5 invocations
+/// without being processed through the normal send path.
+///
+/// Stale buffers occur when agent payloads never get matched with platform.report
+/// (e.g., missed events, Lambda execution anomalies).
+///
+/// Unlike the old time-based approach (5 minutes), invocation-count-based cleanup is safe
+/// for long-running Lambda functions (up to 15 minutes) — a buffer won't be cleaned up
+/// while its invocation is still active.
+///
+/// **Sends agent payloads to New Relic before removing** to prevent data loss.
+pub async fn cleanup_old_request_buffers(
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) {
+    let current = current_invocation_count();
+    let threshold: u64 = 5;
 
-    let old_request_ids: Vec<String> = REQUEST_BUFFER_TIMESTAMPS
+    let stale_request_ids: Vec<String> = REQUEST_BUFFER_CREATION_INVOCATION
         .iter()
-        .filter(|entry| now.signed_duration_since(*entry.value()) >= threshold)
+        .filter(|entry| current.saturating_sub(*entry.value()) >= threshold)
         .map(|entry| entry.key().clone())
         .collect();
 
-    if old_request_ids.is_empty() {
+    if stale_request_ids.is_empty() {
         return;
     }
 
     warn!(
-        "Periodic cleanup: Removing {} stale request buffer(s) older than 5 minutes",
-        old_request_ids.len()
+        "Periodic cleanup: Found {} stale request buffer(s) (older than {} invocations) — sending before cleanup",
+        stale_request_ids.len(),
+        threshold
     );
 
-    for request_id in &old_request_ids {
+    for request_id in &stale_request_ids {
+        // Extract and send any unsent agent payloads before removing
+        if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(request_id) {
+            let payloads: Vec<Vec<u8>> = match buffer_ref.lock() {
+                Ok(mut buf) => buf.drain(..).collect(),
+                Err(_) => Vec::new(),
+            };
+
+            if !payloads.is_empty() {
+                // Get the invoked_function_arn from the request context if available
+                let arn = REQUEST_CONTEXTS
+                    .get(request_id)
+                    .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()))
+                    .unwrap_or_else(|| format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name));
+
+                info!(
+                    "Periodic cleanup: Sending {} stale agent payload(s) for request {} before removal",
+                    payloads.len(),
+                    request_id
+                );
+
+                for payload_bytes in &payloads {
+                    if let Err(e) = send_agent_payload_to_newrelic(
+                        payload_bytes,
+                        request_id,
+                        &arn,
+                        &newrelic_client,
+                        &config,
+                        None,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Periodic cleanup: Failed to send stale agent payload for {}: {}",
+                            request_id, e
+                        );
+                    }
+                }
+            }
+        }
+
         cleanup_request_processing_state(request_id);
     }
 }

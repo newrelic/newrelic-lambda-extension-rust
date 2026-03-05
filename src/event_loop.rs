@@ -165,7 +165,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
-                    components.apm_mode_enabled,
                 );
 
                 // Update global log processor's context to this request BEFORE processing logs
@@ -212,7 +211,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
-                let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
                 let apm_app_clone = components.apm_app.clone();
@@ -222,7 +220,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         request_id_clone,
                         invoked_function_arn_clone,
                         is_cold_start,
-                        newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
@@ -261,8 +258,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     tokio::spawn(async move {
                         use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client, config).await;
-                        cleanup_old_request_buffers().await;
+                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        cleanup_old_request_buffers(newrelic_client, config).await;
                         cleanup_old_failed_payloads();
                     });
                 }
@@ -496,6 +493,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             };
 
         event_counter += 1;
+        crate::request::increment_invocation_counter();
         let is_cold_start = event_counter == 1;
 
         match runtime_event {
@@ -547,7 +545,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
-                    components.apm_mode_enabled, // Use actual mode (handles Java override)
                 );
 
                 // Update global log processor's context to this request BEFORE processing logs
@@ -619,8 +616,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     tokio::spawn(async move {
                         use crate::agent::batch::cleanup_old_batch_entries;
                         use crate::request::cleanup_old_request_buffers;
-                        cleanup_old_batch_entries(newrelic_client, config).await;
-                        cleanup_old_request_buffers().await;
+                        cleanup_old_batch_entries(newrelic_client.clone(), config.clone()).await;
+                        cleanup_old_request_buffers(newrelic_client, config).await;
                     });
                 }
             }
@@ -737,7 +734,6 @@ pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
     is_cold_start: bool,
-    newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
@@ -860,8 +856,6 @@ pub async fn process_apm_request(
             agent_payloads.len()
         );
         let request_id_clone = request_id.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-        let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
         let apm_app_clone = apm_app.clone();

@@ -381,14 +381,12 @@ async fn perform_one_time_initialization(
     );
     let config = Arc::new(updated_config);
 
-    let (agent_telemetry_rx_result, newrelic_client, runtime_done_channels) = tokio::join!(
+    let (agent_telemetry_rx_result, newrelic_client) = tokio::join!(
         initialize_agent_telemetry_ipc_channel(),
         async { Arc::new(NewRelicClient::new(&config)) },
-        async { mpsc::unbounded_channel::<()>() }
     );
 
     let agent_telemetry_rx = agent_telemetry_rx_result?;
-    let (runtime_done_tx, _runtime_done_rx) = runtime_done_channels;
 
     debug!(
         "Extension components initialized - ID: {} (license key pre-validated)",
@@ -480,7 +478,6 @@ async fn perform_one_time_initialization(
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
-                Some(runtime_done_tx),
                 config.new_relic.apm_lambda_mode,
             )
             .await?;
@@ -511,7 +508,6 @@ async fn perform_one_time_initialization(
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
-                Some(runtime_done_tx),
                 config.new_relic.apm_lambda_mode,
             )
             .await?;

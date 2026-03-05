@@ -3,20 +3,21 @@
 //! Tests cover:
 //! - TelemetryRecord deserialization
 //! - TELEMETRY_CURRENT_REQUEST_ID updates from platform.start
-//! - RUNTIME_DONE_CHANNELS signaling from platform.runtimeDone
+//! - platform.runtimeDone handling
+//! - platform.report routing (standard + APM mode)
+//! - Race condition: rapid request_id overwriting
 
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
     use crate::telemetry::listener::TelemetryRecord;
-    use crate::request::{TELEMETRY_CURRENT_REQUEST_ID, RUNTIME_DONE_CHANNELS};
+    use crate::request::TELEMETRY_CURRENT_REQUEST_ID;
 
     /// Helper: clear telemetry-related global state
     fn clear_telemetry_state() {
         if let Ok(mut guard) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
             *guard = None;
         }
-        RUNTIME_DONE_CHANNELS.clear();
     }
 
     // ========================================================================
@@ -201,42 +202,6 @@ mod tests {
     }
 
     // ========================================================================
-    // RUNTIME_DONE_CHANNELS signaling tests
-    // ========================================================================
-
-    #[test]
-    #[serial]
-    fn test_runtime_done_signals_channel() {
-        clear_telemetry_state();
-
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        RUNTIME_DONE_CHANNELS.insert("req-done-1".to_string(), tx);
-
-        // Simulate what handler does on platform.runtimeDone
-        if let Some(tx) = RUNTIME_DONE_CHANNELS.get("req-done-1") {
-            let _ = tx.send(());
-        }
-
-        assert!(rx.try_recv().is_ok(), "Channel should receive signal");
-
-        clear_telemetry_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_runtime_done_no_channel_is_safe() {
-        clear_telemetry_state();
-
-        // No channel registered - should not panic
-        {
-            let result = RUNTIME_DONE_CHANNELS.get("nonexistent");
-            assert!(result.is_none());
-        }
-
-        clear_telemetry_state();
-    }
-
-    // ========================================================================
     // HTTP listener integration tests
     // ========================================================================
 
@@ -272,7 +237,7 @@ mod tests {
         (log_processor, platform_processor)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_setup_telemetry_listener_returns_addr() {
         clear_telemetry_state();
@@ -282,7 +247,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -293,7 +257,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_start_via_http() {
         clear_telemetry_state();
@@ -303,7 +267,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -333,7 +296,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_function_and_extension_logs_via_http() {
         clear_telemetry_state();
@@ -343,7 +306,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -367,23 +329,16 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_runtime_done_via_http() {
         clear_telemetry_state();
 
         let (log_processor, platform_processor) = create_test_processors();
 
-        // Set up a runtime done channel
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        RUNTIME_DONE_CHANNELS.insert("runtime-done-req".to_string(), tx);
-
-        let (runtime_done_tx, mut runtime_done_rx) = tokio::sync::mpsc::unbounded_channel();
-
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            Some(runtime_done_tx),
             false,
         )
         .await
@@ -403,19 +358,13 @@ mod tests {
             .await
             .expect("send");
 
+        // platform.runtimeDone should be handled without error
         assert_eq!(resp.status(), 200);
-
-        // Small delay for async processing
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-        // Channel should have been signaled
-        assert!(rx.try_recv().is_ok(), "RUNTIME_DONE_CHANNELS should be signaled");
-        assert!(runtime_done_rx.try_recv().is_ok(), "runtime_done_tx should be signaled");
 
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_standard_mode_pending() {
         clear_telemetry_state();
@@ -425,7 +374,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false, // standard mode
         )
         .await
@@ -469,7 +417,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_matches_batch_buffer() {
         clear_telemetry_state();
@@ -487,7 +435,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -530,7 +477,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_end_via_http() {
         clear_telemetry_state();
@@ -540,7 +487,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -565,7 +511,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_unknown_type_via_http() {
         clear_telemetry_state();
@@ -575,7 +521,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -600,7 +545,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_invalid_json_via_http() {
         clear_telemetry_state();
@@ -610,7 +555,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -632,7 +576,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_mixed_batch_via_http() {
         clear_telemetry_state();
@@ -642,7 +586,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -676,7 +619,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_apm_mode() {
         clear_telemetry_state();
@@ -686,7 +629,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             true, // APM mode
         )
         .await
@@ -728,7 +670,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_empty_request_buffer_stores_pending() {
         clear_telemetry_state();
@@ -742,7 +684,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -785,7 +726,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_empty_telemetry_array() {
         clear_telemetry_state();
@@ -795,7 +736,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -817,7 +757,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_start_without_string_request_id() {
         clear_telemetry_state();
@@ -827,7 +767,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -858,7 +797,7 @@ mod tests {
         clear_telemetry_state();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_matches_request_buffer() {
         clear_telemetry_state();
@@ -880,7 +819,6 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
-            None,
             false,
         )
         .await
@@ -929,6 +867,269 @@ mod tests {
 
         crate::agent::batch::AGENT_BATCH_BUFFER.clear();
         crate::request::REQUEST_CONTEXTS.clear();
+        clear_telemetry_state();
+    }
+
+    // ========================================================================
+    // Race condition and edge case tests
+    // ========================================================================
+
+    /// Rapid platform.start events should always leave the LAST request_id as current
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_rapid_platform_start_overwrites_correctly() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        // Send 10 platform.start events in a single batch (simulates rapid freeze/thaw)
+        let records: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "time": format!("2024-01-01T00:00:{:02}Z", i),
+                    "type": "platform.start",
+                    "record": {"requestId": format!("rapid-req-{}", i), "version": "$LATEST"}
+                })
+            })
+            .collect();
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&records)
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // Last request_id should win
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert_eq!(id, Some("rapid-req-9".to_string()));
+
+        clear_telemetry_state();
+    }
+
+    /// platform.start + function logs in same batch — request_id should be set
+    /// before function logs are processed (order within batch matters)
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_platform_start_before_function_logs_in_batch() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        // platform.start FIRST, then function logs — order matters
+        let body = serde_json::json!([
+            {"time": "2024-01-01T00:00:00Z", "type": "platform.start", "record": {"requestId": "ordered-req"}},
+            {"time": "2024-01-01T00:00:01Z", "type": "function", "record": "Log line from ordered-req"},
+            {"time": "2024-01-01T00:00:02Z", "type": "function", "record": "Another log line"}
+        ]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // TELEMETRY_CURRENT_REQUEST_ID should be set to ordered-req
+        // This ensures function logs get stamped with the correct request_id
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert_eq!(id, Some("ordered-req".to_string()));
+
+        clear_telemetry_state();
+    }
+
+    /// platform.runtimeDone followed by new platform.start in same batch
+    /// (simulates rapid invocation turnaround)
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_runtime_done_then_new_start_in_batch() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        let body = serde_json::json!([
+            {"time": "2024-01-01T00:00:00Z", "type": "platform.runtimeDone", "record": {"requestId": "req-old", "status": "success"}},
+            {"time": "2024-01-01T00:00:01Z", "type": "platform.start", "record": {"requestId": "req-new", "version": "$LATEST"}}
+        ]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // New platform.start should have updated the request_id
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert_eq!(id, Some("req-new".to_string()));
+
+        clear_telemetry_state();
+    }
+
+    /// Concurrent HTTP requests to telemetry listener should not panic
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_concurrent_telemetry_requests() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+
+        // Fire 5 concurrent requests
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let client_clone = client.clone();
+            let url_clone = url.clone();
+            handles.push(tokio::spawn(async move {
+                let body = serde_json::json!([{
+                    "time": "2024-01-01T00:00:00Z",
+                    "type": "platform.start",
+                    "record": {"requestId": format!("concurrent-{}", i)}
+                }]);
+                client_clone
+                    .post(&url_clone)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("send")
+            }));
+        }
+
+        // All should succeed without panics
+        for handle in handles {
+            let resp = handle.await.expect("join");
+            assert_eq!(resp.status(), 200);
+        }
+
+        // TELEMETRY_CURRENT_REQUEST_ID should have ONE of the request_ids (whichever won)
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert!(id.is_some(), "At least one request should have set the ID");
+
+        clear_telemetry_state();
+    }
+
+    /// platform.report without requestId should not panic
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_platform_report_without_request_id() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "metrics": {
+                    "durationMs": 50.0,
+                    "billedDurationMs": 100,
+                    "memorySizeMB": 128,
+                    "maxMemoryUsedMB": 64
+                }
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        // Should not panic — gracefully handles missing requestId
+        assert_eq!(resp.status(), 200);
+
+        clear_telemetry_state();
+    }
+
+    /// platform.runtimeDone without requestId should not panic
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_runtime_done_without_request_id() {
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+
+        let addr = setup_telemetry_listener(
+            log_processor,
+            platform_processor,
+            false,
+        )
+        .await
+        .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.runtimeDone",
+            "record": {"status": "success"}
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        // Should not panic
+        assert_eq!(resp.status(), 200);
+
         clear_telemetry_state();
     }
 }

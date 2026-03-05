@@ -2,7 +2,7 @@ use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS, TELEMETRY_CURRENT_REQUEST_ID},
+    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, TELEMETRY_CURRENT_REQUEST_ID},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,6 @@ pub struct TelemetryRecord {
 pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
-    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     is_apm_mode: bool,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
@@ -45,7 +44,6 @@ pub async fn setup_telemetry_listener(
                 Ok((stream, _)) => {
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
-                    let runtime_done_tx_clone = runtime_done_tx.clone();
                     let is_apm_mode_clone = is_apm_mode;
 
                     tokio::spawn(async move {
@@ -55,7 +53,6 @@ pub async fn setup_telemetry_listener(
                                 req,
                                 log_processor.clone(),
                                 platform_processor.clone(),
-                                runtime_done_tx_clone.clone(),
                                 is_apm_mode_clone,
                             )
                         });
@@ -84,7 +81,6 @@ async fn handle_telemetry_request(
     req: Request<Incoming>,
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
-    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     is_apm_mode: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
@@ -106,7 +102,6 @@ async fn handle_telemetry_request(
 
             
             let mut function_completed = false;
-            let mut runtime_done_request_id: Option<String> = None;
             let mut function_count = 0;
             let mut extension_count = 0;
             let mut platform_count = 0;
@@ -139,13 +134,7 @@ async fn handle_telemetry_request(
                     "platform.runtimeDone" => {
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
-                                runtime_done_request_id = Some(request_id_str.to_string());
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
-
-                                // Signal runtime done via channel (used by event loop for coordination)
-                                if let Some(tx) = RUNTIME_DONE_CHANNELS.get(request_id_str) {
-                                    let _ = tx.send(());
-                                }
                             }
                         }
                         platform_processor.process_record(record);
@@ -262,15 +251,6 @@ async fn handle_telemetry_request(
                
             } else {
                 debug!("No telemetry records processed in this batch");
-            }
-            
-            if let Some(_request_id) = runtime_done_request_id {
-                // Per-request runtime.done signal (used in standard mode for coordination)
-                // Already sent inline in platform.runtimeDone handler above,
-                // so only send the global signal here
-                if let Some(ref tx) = runtime_done_tx {
-                    let _ = tx.send(());
-                }
             }
             
             if function_completed {
