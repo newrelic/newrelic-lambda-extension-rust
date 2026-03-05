@@ -97,10 +97,6 @@ async fn handle_telemetry_request(
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
-            let record_types: Vec<&str> = records.iter().map(|r| r.record_type.as_str()).collect();
-            debug!("Received telemetry batch with {} records: {:?}", records.len(), record_types);
-
-            
             let mut function_completed = false;
             let mut function_count = 0;
             let mut extension_count = 0;
