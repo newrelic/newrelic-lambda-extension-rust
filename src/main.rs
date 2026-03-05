@@ -65,6 +65,21 @@ static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<RwLock<InvocationContext>>> = Lazy::
     }))
 });
 
+/// Get the global fallback ARN from the registration context.
+/// This is always set during extension registration (from account_id + region + function_name)
+/// and updated on every INVOKE event. Returns empty string only if the RwLock is poisoned
+/// (which requires a panic during write — essentially impossible in production).
+pub fn get_global_fallback_arn() -> String {
+    if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
+        if !global_ctx.invoked_function_arn.is_empty() {
+            return global_ctx.invoked_function_arn.clone();
+        }
+    }
+    // This should never happen after registration — log it as critical
+    tracing::error!("CRITICAL: Global fallback ARN unavailable — CURRENT_INVOCATION_CONTEXT is empty or poisoned");
+    String::new()
+}
+
 /// Global flag to track if this is a warm start (for performance optimization)
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));

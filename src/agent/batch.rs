@@ -291,16 +291,16 @@ pub async fn send_all_pending_payloads_on_shutdown(
                 // Get report line if available
                 let report_line = remove_pending_report(&request_id);
 
-                // Get context
+                // Get context — cascade: per-request context → global registration ARN
                 let arn = get_request_context(&request_id)
-                    .map(|ctx_entry| {
+                    .and_then(|ctx_entry| {
                         ctx_entry
                             .lock()
                             .ok()
                             .map(|ctx| ctx.invoked_function_arn.clone())
-                            .unwrap_or_else(|| "unknown".to_string())
+                            .filter(|arn| !arn.is_empty())
                     })
-                    .unwrap_or_else(|| "unknown".to_string());
+                    .unwrap_or_else(crate::get_global_fallback_arn);
 
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {

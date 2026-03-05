@@ -29,7 +29,6 @@ use crate::{
     error_synthesis,
     trace,
     version,
-    CURRENT_INVOCATION_CONTEXT,
     IS_WARM_START,
 };
 
@@ -352,27 +351,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
                                 
                                 let invoked_function_arn = get_request_context(&request_id)
-                                    .map(|ctx_ref| {
+                                    .and_then(|ctx_ref| {
                                         ctx_ref.lock()
                                             .ok()
                                             .map(|ctx| ctx.invoked_function_arn.clone())
-                                            .unwrap_or_else(|| {
-                                                // Fallback to global context ARN (set from registration)
-                                                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                                    global_ctx.invoked_function_arn.clone()
-                                                } else {
-                                                    String::new()
-                                                }
-                                            })
+                                            .filter(|arn| !arn.is_empty())
                                     })
-                                    .unwrap_or_else(|| {
-                                        // Fallback to global context ARN (set from registration)
-                                        if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                            global_ctx.invoked_function_arn.clone()
-                                        } else {
-                                            String::new()
-                                        }
-                                    });
+                                    .unwrap_or_else(crate::get_global_fallback_arn);
                                 
                                 for payload_bytes in payloads {
                                     if let Err(e) = process_and_send_agent_payload(
@@ -1330,28 +1315,13 @@ async fn process_pending_agent_payloads(
                 if !ctx_guard.invoked_function_arn.is_empty() {
                     ctx_guard.invoked_function_arn.clone()
                 } else {
-                    // Use global fallback ARN from registration
-                    if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                        global_ctx.invoked_function_arn.clone()
-                    } else {
-                        String::new()
-                    }
+                    crate::get_global_fallback_arn()
                 }
             } else {
-                // Use global fallback ARN
-                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                    global_ctx.invoked_function_arn.clone()
-                } else {
-                    String::new()
-                }
+                crate::get_global_fallback_arn()
             }
         } else {
-            // Use global fallback ARN
-            if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                global_ctx.invoked_function_arn.clone()
-            } else {
-                String::new()
-            }
+            crate::get_global_fallback_arn()
         };
 
         let payloads = {

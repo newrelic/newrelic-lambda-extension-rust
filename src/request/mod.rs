@@ -288,6 +288,7 @@ pub async fn cleanup_old_request_buffers(
 
     for request_id in &stale_request_ids {
         // Extract and send any unsent agent payloads before removing
+        // Cascade: per-request context → global registration ARN
         let (payloads, arn) = if let Some(entry) = REQUEST_DATA.get(request_id) {
             let payloads: Vec<Vec<u8>> = match entry.agent_buffer.lock() {
                 Ok(mut buf) => buf.drain(..).collect(),
@@ -296,10 +297,11 @@ pub async fn cleanup_old_request_buffers(
             let arn = entry.context.lock()
                 .ok()
                 .map(|c| c.invoked_function_arn.clone())
-                .unwrap_or_else(|| format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name));
+                .filter(|a| !a.is_empty())
+                .unwrap_or_else(crate::get_global_fallback_arn);
             (payloads, arn)
         } else {
-            (Vec::new(), format!("arn:aws:lambda:unknown:unknown:function:{}", config.aws.function_name))
+            (Vec::new(), crate::get_global_fallback_arn())
         };
 
         if !payloads.is_empty() {

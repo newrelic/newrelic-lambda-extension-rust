@@ -682,14 +682,8 @@ impl LogProcessor {
             }
         }
         
-        // Fallback to global context ARN (set during registration)
-        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-            if !global_ctx.invoked_function_arn.is_empty() {
-                return global_ctx.invoked_function_arn.clone();
-            }
-        }
-        
-        String::new()
+        // Fallback to global registration ARN
+        crate::get_global_fallback_arn()
     }
 
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added

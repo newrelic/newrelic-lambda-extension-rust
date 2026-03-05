@@ -180,27 +180,13 @@ async fn handle_telemetry_request(
                                                 debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                                 
                                                 let arn = get_request_context(request_id_str)
-                                                    .map(|ctx_ref| {
+                                                    .and_then(|ctx_ref| {
                                                         ctx_ref.lock()
                                                             .ok()
                                                             .map(|ctx| ctx.invoked_function_arn.clone())
-                                                            .unwrap_or_else(|| {
-                                                                // Fallback to global context ARN (set from registration)
-                                                                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                                    global_ctx.invoked_function_arn.clone()
-                                                                } else {
-                                                                    String::new()
-                                                                }
-                                                            })
+                                                            .filter(|arn| !arn.is_empty())
                                                     })
-                                                    .unwrap_or_else(|| {
-                                                        // Fallback to global context ARN (set from registration)
-                                                        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                            global_ctx.invoked_function_arn.clone()
-                                                        } else {
-                                                            String::new()
-                                                        }
-                                                    });
+                                                    .unwrap_or_else(crate::get_global_fallback_arn);
                                                 
                                                 if let Ok(buffer_guard) = buffer.lock() {
                                                     for payload_bytes in buffer_guard.iter() {
