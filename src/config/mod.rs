@@ -32,6 +32,7 @@ pub struct NewRelicConfig {
     pub apm_lambda_mode: bool,
     pub apm_host: String,
     pub metric_endpoint: String,
+    pub proxy_url: Option<String>,
 }
 
 /// AWS Lambda specific configuration
@@ -102,6 +103,7 @@ impl Default for NewRelicConfig {
             apm_lambda_mode: false,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            proxy_url: None,
         }
     }
 }
@@ -199,7 +201,7 @@ impl ExtensionConfig {
         }
     }
 
-    /// Parse NEW_RELIC_EXTENSION_SEND_LOGS environment variable
+    /// Parse "NEW_RELIC_EXTENSION_SEND_LOGS" environment variable
     /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
     fn parse_send_logs(value: &str) -> (bool, bool, bool) {
         let normalized = value.to_lowercase();
@@ -257,6 +259,21 @@ impl ExtensionConfig {
 
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
+        config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        if let Some(ref url) = config.new_relic.proxy_url {
+            // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
+            // Mask credentials: http://user:pass@host -> http://***:***@host
+            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.find('@')) {
+                format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
+            } else {
+                url.clone()
+            };
+            eprintln!("[NR_EXT] INFO Proxy enabled: {masked}");
+        }
 
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
