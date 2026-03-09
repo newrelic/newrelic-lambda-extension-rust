@@ -12,8 +12,53 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use crate::config::Configuration;
+
+const SYSTEM_BUNDLE_PATHS: &[&str] = &[
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+const MERGED_BUNDLE_PATH: &str = "/tmp/nr_ca_bundle.pem";
+
+/// If `SSL_CERT_FILE` is set, merge the system CA bundle with its contents and
+/// point `SSL_CERT_FILE` at the merged file so all TLS clients (including the
+/// AWS SDK) trust both AWS root CAs and the custom proxy CA.
+fn merge_ca_bundle_if_needed() {
+    let custom_path = match std::env::var("SSL_CERT_FILE") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+
+    let system_bundle = SYSTEM_BUNDLE_PATHS.iter().find_map(|p| std::fs::read(p).ok());
+    let system_bundle = match system_bundle {
+        Some(b) => b,
+        None => { warn!("SSL_CERT_FILE is set but no system CA bundle found; AWS service connections may fail"); return; }
+    };
+
+    let custom_certs = match std::fs::read(&custom_path) {
+        Ok(b) => b,
+        Err(e) => { warn!("SSL_CERT_FILE='{}' could not be read: {}", custom_path, e); return; }
+    };
+
+    let mut merged = system_bundle;
+    merged.push(b'\n');
+    merged.extend_from_slice(&custom_certs);
+
+    match std::fs::write(MERGED_BUNDLE_PATH, &merged) {
+        Ok(()) => {
+            // Safety: called once at extension startup before async tasks are spawned.
+            #[allow(unused_unsafe)]
+            unsafe { std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH); }
+            info!("SSL_CERT_FILE: merged system CA bundle with '{}' into '{}'", custom_path, MERGED_BUNDLE_PATH);
+        }
+        Err(e) => warn!("Failed to write merged CA bundle to '{}': {}", MERGED_BUNDLE_PATH, e),
+    }
+}
 
 /// License key secret structure for JSON parsing
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +159,9 @@ async fn initialize_aws_clients() -> Result<()> {
     if std::env::var("AWS_LAMBDA_RUNTIME_API").is_err() {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
-    
+
+    merge_ca_bundle_if_needed();
+
     let config_future = tokio::spawn(async {
         aws_config::defaults(BehaviorVersion::latest())
             .retry_config(aws_config::retry::RetryConfig::disabled())
