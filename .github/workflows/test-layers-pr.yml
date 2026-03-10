@@ -80,7 +80,7 @@ jobs:
       - name: Install cargo-zigbuild for cross-compilation
         run: |
           pip3 install ziglang
-          cargo install cargo-zigbuild
+          cargo install cargo-zigbuild --force
 
       - name: Add Rust targets
         run: |
@@ -153,8 +153,8 @@ jobs:
           export TEST_MODE="true"
           export LAYER_NAME_PREFIX="NRTestRustExtension"
           export BUCKET_PREFIX="nr-extension-test-layers"
-          export REGIONS_X86_64="us-west-1 ca-central-1"
-          export REGIONS_ARM64="us-west-1 ca-central-1"
+          export REGIONS_X86_64="ca-central-1 us-west-1"
+          export REGIONS_ARM64="ca-central-1 us-west-1"
           export LANGUAGES="extension python nodejs java dotnet ruby"
           
           # Run the unified script

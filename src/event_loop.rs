@@ -735,14 +735,16 @@ pub async fn process_apm_request(
     }
 
     if !is_cold_start {
-        let pending_buffers: Vec<String> = REQUEST_DATA
+        // Atomically drain old request buffers in a single lock to avoid
+        // TOCTOU race between emptiness check and mem::take.
+        let pending_with_payloads: Vec<(String, Vec<Vec<u8>>)> = REQUEST_DATA
             .iter()
             .filter_map(|entry| {
                 let req_id = entry.key();
                 if req_id != &request_id {
-                    if let Ok(buffer) = entry.agent_buffer.lock() {
+                    if let Ok(mut buffer) = entry.agent_buffer.lock() {
                         if !buffer.is_empty() {
-                            return Some(req_id.clone());
+                            return Some((req_id.clone(), std::mem::take(&mut *buffer)));
                         }
                     }
                 }
@@ -750,29 +752,13 @@ pub async fn process_apm_request(
             })
             .collect();
 
-        if !pending_buffers.is_empty() {
+        if !pending_with_payloads.is_empty() {
             debug!(
                 "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
-                pending_buffers.len()
+                pending_with_payloads.len()
             );
 
-            for old_request_id in pending_buffers {
-                debug!(
-                    "Processing late agent payload for request: {}",
-                    old_request_id
-                );
-
-                let late_payloads = if let Some(buffer_ref) =
-                    get_agent_buffer(&old_request_id)
-                {
-                    if let Ok(mut buffer) = buffer_ref.lock() {
-                        std::mem::take(&mut *buffer)
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
+            for (old_request_id, late_payloads) in pending_with_payloads {
 
                 for payload_bytes in late_payloads {
                     debug!(
@@ -1048,15 +1034,17 @@ pub async fn process_request_concurrently(
     // Unified wait timeout for all invocations
     let agent_wait_timeout_ms = 100;
 
-    let payload_already_arrived = {
-        if let Ok(buffer) = state.agent_buffer.lock() {
-            !buffer.is_empty()
+    // Try to take payloads in a single lock. If empty, wait for coordination
+    // signal then take again — avoids a TOCTOU gap between check and drain.
+    let mut agent_payloads = {
+        if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
         } else {
-            false
+            Vec::new()
         }
     };
 
-    if !payload_already_arrived {
+    if agent_payloads.is_empty() {
         debug!(
             "Standard mode: Waiting up to {}ms for agent payload for request: {}",
             agent_wait_timeout_ms, request_id
@@ -1069,20 +1057,18 @@ pub async fn process_request_concurrently(
                 debug!("Agent payload wait timeout ({}ms) for request: {}", agent_wait_timeout_ms, request_id);
             }
         }
+        // After wakeup, drain whatever arrived
+        agent_payloads = if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
+        } else {
+            Vec::new()
+        };
     } else {
         debug!(
             "Agent payload already in buffer for request: {} - no wait needed",
             request_id
         );
     }
-
-    let agent_payloads = {
-        if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        }
-    };
 
     let report_line = remove_pending_report(&request_id).map(|report| {
         debug!(

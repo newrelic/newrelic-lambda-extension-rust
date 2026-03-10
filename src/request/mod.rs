@@ -388,6 +388,10 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         request_id, buffer.len()
                     );
                 }
+                // Signal coordination channel so waiters know a payload arrived
+                if let Some(ref tx) = entry.coordination_tx {
+                    let _ = tx.send(());
+                }
             }
         } else {
             // No requests exist yet - store in orphaned buffer
