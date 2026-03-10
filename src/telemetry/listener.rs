@@ -171,20 +171,19 @@ async fn handle_telemetry_request(
                                             debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
                                         }
                                         else if let Some(buffer) = get_agent_buffer(request_id_str) {
-                                            let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
-                                            if has_agent {
-                                                debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
-                                                
-                                                let arn = get_request_context(request_id_str)
-                                                    .and_then(|ctx_ref| {
-                                                        ctx_ref.lock()
-                                                            .ok()
-                                                            .map(|ctx| ctx.invoked_function_arn.clone())
-                                                            .filter(|arn| !arn.is_empty())
-                                                    })
-                                                    .unwrap_or_else(crate::get_global_fallback_arn);
-                                                
-                                                if let Ok(buffer_guard) = buffer.lock() {
+                                            let arn = get_request_context(request_id_str)
+                                                .and_then(|ctx_ref| {
+                                                    ctx_ref.lock()
+                                                        .ok()
+                                                        .map(|ctx| ctx.invoked_function_arn.clone())
+                                                        .filter(|arn| !arn.is_empty())
+                                                })
+                                                .unwrap_or_else(crate::get_global_fallback_arn);
+                                            let batched = if let Ok(mut buffer_guard) = buffer.lock() {
+                                                if buffer_guard.is_empty() {
+                                                    false
+                                                } else {
+                                                    debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                                     for payload_bytes in buffer_guard.iter() {
                                                         add_to_batch(
                                                             request_id_str.to_string(),
@@ -193,12 +192,14 @@ async fn handle_telemetry_request(
                                                             arn.clone(),
                                                         );
                                                     }
-                                                }
-                                                
-                                                // Clear buffer contents (entry stays in consolidated map)
-                                                if let Ok(mut buffer_guard) = buffer.lock() {
                                                     buffer_guard.clear();
+                                                    true
                                                 }
+                                            } else {
+                                                false
+                                            };
+
+                                            if batched {
                                                 debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
                                             } else {
                                                 set_pending_report(request_id_str, report_line);
