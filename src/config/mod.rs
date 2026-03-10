@@ -1,3 +1,4 @@
+use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};
 use tracing_subscriber::{
@@ -376,6 +377,15 @@ pub fn parse_nr_tags() -> Vec<(String, String)> {
             }
         })
         .collect()
+}
+
+/// Cached NR_TAGS parsed once at cold start. Use `get_nr_tags()` to access.
+static NR_TAGS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Returns cached NR_TAGS, parsing from environment only on first call (cold start).
+/// Subsequent warm-start invocations reuse the cached result with zero allocation.
+pub fn get_nr_tags() -> &'static [(String, String)] {
+    NR_TAGS_CACHE.get_or_init(parse_nr_tags)
 }
 
 /// Global configuration instance

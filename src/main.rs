@@ -44,7 +44,7 @@ use crate::{
         flush::Flush,
     },
     credentials::get_new_relic_license_key,
-    request::{route_payload_to_request_buffer, ProcessorFactory},
+    request::ProcessorFactory,
     event_loop::{
         run_infinite_event_loop, ExtensionComponents,
         cleanup_old_failed_payloads,
@@ -65,6 +65,21 @@ static CURRENT_INVOCATION_CONTEXT: Lazy<Arc<RwLock<InvocationContext>>> = Lazy::
     }))
 });
 
+/// Get the global fallback ARN from the registration context.
+/// This is always set during extension registration (from account_id + region + function_name)
+/// and updated on every INVOKE event. Returns empty string only if the RwLock is poisoned
+/// (which requires a panic during write — essentially impossible in production).
+pub fn get_global_fallback_arn() -> String {
+    if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
+        if !global_ctx.invoked_function_arn.is_empty() {
+            return global_ctx.invoked_function_arn.clone();
+        }
+    }
+    // This should never happen after registration — log it as critical
+    tracing::error!("CRITICAL: Global fallback ARN unavailable — CURRENT_INVOCATION_CONTEXT is empty or poisoned");
+    String::new()
+}
+
 /// Global flag to track if this is a warm start (for performance optimization)
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
@@ -72,6 +87,9 @@ static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
 /// Global APM app instance (for sending platform.report metrics in APM mode)
 static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));
+
+// Request routing uses CURRENT_ACTIVE_REQUEST_ID (2.4.1 approach)
+// Agent payloads are routed to the active request's buffer via request::route_payload_to_request_buffer
 
 /// Main entry point with CRITICAL panic safety to prevent Lambda crashes
 #[tokio::main(flavor = "current_thread")]
@@ -378,14 +396,12 @@ async fn perform_one_time_initialization(
     );
     let config = Arc::new(updated_config);
 
-    let (agent_telemetry_rx_result, newrelic_client, runtime_done_channels) = tokio::join!(
+    let (agent_telemetry_rx_result, newrelic_client) = tokio::join!(
         initialize_agent_telemetry_ipc_channel(),
         async { Arc::new(NewRelicClient::new(&config)) },
-        async { mpsc::unbounded_channel::<()>() }
     );
 
     let agent_telemetry_rx = agent_telemetry_rx_result?;
-    let (runtime_done_tx, _runtime_done_rx) = runtime_done_channels;
 
     debug!(
         "Extension components initialized - ID: {} (license key pre-validated)",
@@ -482,7 +498,6 @@ async fn perform_one_time_initialization(
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
-                Some(runtime_done_tx),
                 config.new_relic.apm_lambda_mode,
             )
             .await?;
@@ -513,7 +528,6 @@ async fn perform_one_time_initialization(
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
-                Some(runtime_done_tx),
                 config.new_relic.apm_lambda_mode,
             )
             .await?;
@@ -719,7 +733,7 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
             payload_count += 1;
 
             debug!(
-                "Received agent payload #{} ({} bytes) - processing immediately",
+                "Received agent payload #{} ({} bytes) - routing to active request",
                 payload_count,
                 payload_bytes.len()
             );
@@ -731,7 +745,8 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 debug!("Agent Payload (complete): {}", sanitized);
             }
 
-            route_payload_to_request_buffer(payload_bytes).await;
+            // Route to currently active request using 2.4.1 approach (simple and reliable)
+            request::route_payload_to_request_buffer(payload_bytes).await;
         }
 
         debug!("Agent payload collector channel closed. No more agent payloads will be received");

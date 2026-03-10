@@ -349,23 +349,18 @@ pub async fn send_lambda_error(
 
     // Ensure ARN is never empty - use global fallback (set from registration)
     let arn = if invoked_function_arn.is_empty() {
-        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-            let global_arn = &global_ctx.invoked_function_arn;
-            if !global_arn.is_empty() {
-                debug!("Using registration fallback ARN for error synthesis (request: {})", request_id);
-                global_arn.clone()
-            } else {
-                error!("CRITICAL: Global context ARN is empty during error synthesis (request: {}) - this should never happen after registration", request_id);
-                // Last resort: construct from config (account_id is always available from AWS Lambda registration)
-                format!("arn:aws:lambda:{}:{}:function:{}",
-                    std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
-                    config.aws.account_id.as_ref()
-                        .expect("Account ID must be available from registration"),
-                    config.aws.function_name)
-            }
+        let fallback = crate::get_global_fallback_arn();
+        if !fallback.is_empty() {
+            debug!("Using registration fallback ARN for error synthesis (request: {})", request_id);
+            fallback
         } else {
-            error!("Failed to read global context during error synthesis for request: {}", request_id);
-            invoked_function_arn.to_string()
+            error!("CRITICAL: Global context ARN is empty during error synthesis (request: {}) - this should never happen after registration", request_id);
+            // Last resort: construct from config (account_id is always available from AWS Lambda registration)
+            format!("arn:aws:lambda:{}:{}:function:{}",
+                std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),
+                config.aws.account_id.as_ref()
+                    .expect("Account ID must be available from registration"),
+                config.aws.function_name)
         }
     } else {
         invoked_function_arn.to_string()

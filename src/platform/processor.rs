@@ -382,12 +382,7 @@ impl PlatformProcessor {
             if !context.invoked_function_arn.is_empty() {
                 context.invoked_function_arn.clone()
             } else {
-                // Use global context ARN set during registration
-                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                    global_ctx.invoked_function_arn.clone()
-                } else {
-                    String::new()
-                }
+                crate::get_global_fallback_arn()
             }
         };
         

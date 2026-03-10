@@ -173,14 +173,30 @@ impl LogProcessor {
    
     pub fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
-            if !context.request_id.is_empty() && context.request_id != "unknown" {
+            // REQUEST_ID: Prefer TELEMETRY_CURRENT_REQUEST_ID over invocation context.
+            //
+            // WHY: The event loop updates invocation context immediately when GET /next returns
+            // with the NEW invoke, but telemetry API delivers function logs asynchronously.
+            // Late logs from request_A can arrive AFTER the context has been updated to request_B.
+            //
+            // platform.start always arrives BEFORE function logs for that request in the telemetry
+            // stream, so TELEMETRY_CURRENT_REQUEST_ID gives us the correct request_id association.
+            // Falls back to invocation context if telemetry tracking hasn't started yet.
+            let effective_request_id = crate::request::TELEMETRY_CURRENT_REQUEST_ID
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| context.request_id.clone());
+
+            if !effective_request_id.is_empty() && effective_request_id != "unknown" {
                 let mut aws_attrs = serde_json::Map::new();
                 aws_attrs.insert("lambda_request_id".to_string(),
-                    serde_json::Value::String(context.request_id.clone()));
+                    serde_json::Value::String(effective_request_id.clone()));
                 log_message.attributes.insert("aws".to_string(),
                     serde_json::Value::Object(aws_attrs));
                 log_message.attributes.insert("faas.execution".to_string(),
-                    serde_json::Value::String(context.request_id.clone()));
+                    serde_json::Value::String(effective_request_id));
             }
 
             // Always use best available ARN (prefer invoked_function_arn, fallback to global context ARN)
@@ -190,7 +206,7 @@ impl LogProcessor {
                 // Use fallback ARN from LogProcessor or global context
                 self.get_best_available_arn()
             };
-            
+
             if !arn.is_empty() {
                 log_message.attributes.insert("faas.arn".to_string(),
                     serde_json::Value::String(arn));
@@ -439,6 +455,28 @@ impl LogProcessor {
                 let context = self.invocation_context.lock().unwrap().clone();
                 let failed_buffer = Arc::clone(&self.failed_logs_buffer);
 
+                // GUARD: Use fallback ARN chain if context ARN is empty
+                let auto_flush_arn = if !context.invoked_function_arn.is_empty() {
+                    context.invoked_function_arn.clone()
+                } else {
+                    let fallback = self.get_best_available_arn();
+                    if fallback.is_empty() {
+                        error!(
+                            "BLOCKED: Auto-flush skipped - no ARN available (request_id: '{}', {} logs returned to batch)",
+                            context.request_id, logs_to_send.len()
+                        );
+                        // Put logs back in batch
+                        if let Ok(mut batch) = self.log_batch.lock() {
+                            batch.extend(logs_to_send);
+                        }
+                        if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+                            *is_flushing = false;
+                        }
+                        return;
+                    }
+                    fallback
+                };
+
                 // Spawn background task with proper retry logic and failed log buffering
                 // Store handle to ensure it completes before function ends
                 let handle = tokio::spawn(async move {
@@ -469,7 +507,7 @@ impl LogProcessor {
                         let mut send_failed = false;
                         
                         loop {
-                            match client.send_logs(&config, chunk.clone(), &context.invoked_function_arn).await {
+                            match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
                                 Ok(()) => {
                                     successful += 1;
                                     break;
@@ -644,14 +682,8 @@ impl LogProcessor {
             }
         }
         
-        // Fallback to global context ARN (set during registration)
-        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-            if !global_ctx.invoked_function_arn.is_empty() {
-                return global_ctx.invoked_function_arn.clone();
-            }
-        }
-        
-        String::new()
+        // Fallback to global registration ARN
+        crate::get_global_fallback_arn()
     }
 
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
@@ -1115,6 +1147,31 @@ impl LogProcessor {
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
         let context = self.invocation_context.lock().unwrap().clone();
+
+        // GUARD: Never send logs without ARN - use fallback chain if context ARN is empty
+        let effective_arn = if !context.invoked_function_arn.is_empty() {
+            context.invoked_function_arn.clone()
+        } else {
+            let fallback = self.get_best_available_arn();
+            if fallback.is_empty() {
+                error!(
+                    "BLOCKED: Refusing to flush {} logs without ARN (request_id: '{}'). \
+                     Neither invocation context nor fallback ARN available.",
+                    deduplicated_batch.len(),
+                    context.request_id
+                );
+                // Put logs back in batch so they can be sent later when ARN is available
+                if let Ok(mut batch) = self.log_batch.lock() {
+                    batch.extend(deduplicated_batch);
+                }
+                return Ok(());
+            }
+            warn!(
+                "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
+                fallback, context.request_id
+            );
+            fallback
+        };
         
         const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
         let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
@@ -1147,7 +1204,7 @@ impl LogProcessor {
         let mut successful_chunks = 0;
         
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &context.invoked_function_arn, chunk_idx).await {
+            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &effective_arn, chunk_idx).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },

@@ -12,12 +12,13 @@ use crate::{
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
     request::{
+        self,
         ProcessorFactory,
         create_request_processing_state,
         cleanup_request_processing_state_internal,
-        wait_for_all_requests_completion,
-        REQUEST_PROCESSORS, REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS,
-        CURRENT_ACTIVE_REQUEST_ID, PENDING_REPORTS,
+        REQUEST_PROCESSORS, REQUEST_DATA,
+        get_agent_buffer, get_request_context, get_pending_report,
+        remove_pending_report, request_data_len,
     },
     agent::batch::{
         add_to_batch, should_send_batch_by_threshold, 
@@ -28,7 +29,6 @@ use crate::{
     error_synthesis,
     trace,
     version,
-    CURRENT_INVOCATION_CONTEXT,
     IS_WARM_START,
 };
 
@@ -110,7 +110,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("Performing emergency shutdown cleanup...");
                     
                     process_pending_agent_payloads(
-                        &components.newrelic_client,
                         &components.config,
                         &components.global_log_processor,
                         &components.apm_app,
@@ -156,22 +155,28 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                // Create request state FIRST so we have the updated context
+                // Set this as the currently active request for agent payload routing
+                if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+                    *active_request = Some(request_id.clone());
+                }
+
+                // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
-                    components.apm_mode_enabled,
                 );
-                
-                // Update LogProcessor's context BEFORE processing any logs
+
+                // Update global log processor's context to this request BEFORE processing logs
                 components
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
+
                 // Process pre-invoke logs FIRST (add metadata and move to batch)
                 components
                     .global_log_processor
                     .process_pre_invoke_logs();
+
                 // THEN process buffered logs (so they don't trigger auto-flush of incomplete logs)
                 components
                     .global_log_processor
@@ -179,7 +184,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                let buffer_count = REQUEST_AGENT_BUFFERS.len();
+                let buffer_count = request_data_len();
                 if buffer_count > 0 {
                     debug!(
                         "APM mode: Found {} request buffer(s) before processing (current: {})",
@@ -188,7 +193,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 let pending_task = Some(tokio::spawn({
-                    let newrelic_client = components.newrelic_client.clone();
                     let config = components.config.clone();
                     let global_log_processor = components.global_log_processor.clone();
                     let apm_app = components.apm_app.clone();
@@ -196,7 +200,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                     async move {
                         process_pending_agent_payloads(
-                            &newrelic_client,
                             &config,
                             &global_log_processor,
                             &apm_app,
@@ -208,8 +211,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
-                let processor_factory_clone = components.processor_factory.clone();
-                let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
                 let apm_app_clone = components.apm_app.clone();
@@ -219,8 +220,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         request_id_clone,
                         invoked_function_arn_clone,
                         is_cold_start,
-                        processor_factory_clone,
-                        newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
@@ -330,7 +329,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
                 
                 // Check all request buffers for unsent payloads
-                let all_request_ids: Vec<String> = REQUEST_AGENT_BUFFERS
+                let all_request_ids: Vec<String> = REQUEST_DATA
                     .iter()
                     .map(|entry| entry.key().clone())
                     .collect();
@@ -339,7 +338,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
                     
                     for request_id in all_request_ids {
-                        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+                        if let Some(buffer) = get_agent_buffer(&request_id) {
                             let payloads = {
                                 if let Ok(mut buf) = buffer.lock() {
                                     std::mem::take(&mut *buf)
@@ -351,29 +350,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             if !payloads.is_empty() {
                                 info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
                                 
-                                let invoked_function_arn = REQUEST_CONTEXTS
-                                    .get(&request_id)
-                                    .map(|ctx_ref| {
+                                let invoked_function_arn = get_request_context(&request_id)
+                                    .and_then(|ctx_ref| {
                                         ctx_ref.lock()
                                             .ok()
                                             .map(|ctx| ctx.invoked_function_arn.clone())
-                                            .unwrap_or_else(|| {
-                                                // Fallback to global context ARN (set from registration)
-                                                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                                    global_ctx.invoked_function_arn.clone()
-                                                } else {
-                                                    String::new()
-                                                }
-                                            })
+                                            .filter(|arn| !arn.is_empty())
                                     })
-                                    .unwrap_or_else(|| {
-                                        // Fallback to global context ARN (set from registration)
-                                        if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                                            global_ctx.invoked_function_arn.clone()
-                                        } else {
-                                            String::new()
-                                        }
-                                    });
+                                    .unwrap_or_else(crate::get_global_fallback_arn);
                                 
                                 for payload_bytes in payloads {
                                     if let Err(e) = process_and_send_agent_payload(
@@ -381,7 +365,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                         &request_id,
                                         &invoked_function_arn,
                                         &components.global_log_processor,
-                                        &components.newrelic_client,
                                         &components.config,
                                         &components.apm_app,
                                     )
@@ -411,9 +394,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 // Process any pending platform.report lines as metrics (APM mode)
-                let all_pending_reports: Vec<(String, String)> = PENDING_REPORTS
+                let all_pending_reports: Vec<(String, String)> = REQUEST_DATA
                     .iter()
-                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .filter_map(|entry| {
+                        entry.pending_report.as_ref().map(|report| {
+                            (entry.key().clone(), report.clone())
+                        })
+                    })
                     .collect();
 
                 if !all_pending_reports.is_empty() {
@@ -430,8 +417,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
                             }
 
-                            // Remove from pending reports after sending
-                            PENDING_REPORTS.remove(&request_id);
+                            // Remove pending report after sending
+                            remove_pending_report(&request_id);
                         }
                     } else {
                         warn!("APM mode shutdown: APM app not initialized - cannot send platform metrics");
@@ -495,6 +482,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             };
 
         event_counter += 1;
+        crate::request::increment_invocation_counter();
         let is_cold_start = event_counter == 1;
 
         match runtime_event {
@@ -532,18 +520,34 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 update_global_invocation_context(&request_id, &invoked_function_arn);
 
-                components
-                    .global_log_processor
-                    .process_buffered_logs_with_request_id(&request_id);
-                
-                // Transfer pre-invoke logs to normal batch with ARN/request_id metadata
-                components
-                    .global_log_processor
-                    .process_pre_invoke_logs();
+                // Set this as the currently active request for agent payload routing
+                if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+                    *active_request = Some(request_id.clone());
+                }
 
                 // SKIP old buffer processing to avoid deadlocks
                 // Late payloads are already handled via the buffer matching on next invocation
                 // The complex locking in this loop was causing 7-second deadlocks
+
+                // Create per-request state (platform_processor, agent_buffer, context)
+                let request_state = create_request_processing_state(
+                    &request_id,
+                    &invoked_function_arn,
+                    &components.processor_factory,
+                );
+
+                // Update global log processor's context to this request BEFORE processing logs
+                components
+                    .global_log_processor
+                    .update_invocation_context(request_state.context.clone());
+
+                // Process buffered logs and pre-invoke logs using global log processor
+                components
+                    .global_log_processor
+                    .process_buffered_logs_with_request_id(&request_id);
+                components
+                    .global_log_processor
+                    .process_pre_invoke_logs();
 
                 // Send batch if threshold is reached after processing late payloads (only with report lines)
                 // CRITICAL: Must await to prevent Lambda from freezing network mid-request
@@ -555,36 +559,21 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     ).await;
                 }
 
-                let request_state = create_request_processing_state(
-                    &request_id,
-                    &invoked_function_arn,
-                    &components.processor_factory,
-                    components.apm_mode_enabled, // Use actual mode (handles Java override)
-                );
-
-                components
-                    .global_log_processor
-                    .update_invocation_context(request_state.context.clone());
-
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
-                let processor_factory_clone = components.processor_factory.clone();
                 let newrelic_client_clone = components.newrelic_client.clone();
                 let config_clone = components.config.clone();
                 let global_log_processor_clone = components.global_log_processor.clone();
-                let apm_app_clone = components.apm_app.clone();
 
                 let processing_handle = tokio::spawn(async move {
                     process_request_concurrently(
                         request_id_clone,
                         invoked_function_arn_clone,
-                        processor_factory_clone,
                         newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
-                        apm_app_clone,
                     )
                     .await;
                 });
@@ -622,7 +611,6 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                let shutdown_start_time = std::time::Instant::now();
                 info!("[NR_EXT] Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
@@ -684,13 +672,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                wait_for_all_requests_completion(
-                    components.newrelic_client.clone(),
-                    components.config.clone(),
-                    components.global_log_processor.clone(),
-                    shutdown_start_time,
-                )
-                .await;
+                // Flush remaining buffered logs
+                if let Err(e) = components.global_log_processor.flush().await {
+                    error!("Standard mode shutdown: Failed to flush logs: {}", e);
+                }
 
                 info!("Standard mode shutdown: All data processed and sent");
                 break;
@@ -738,27 +723,28 @@ pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
     is_cold_start: bool,
-    _processor_factory: Arc<ProcessorFactory>,
-    newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
     if !is_cold_start {
-        let pending_buffers: Vec<String> = REQUEST_AGENT_BUFFERS
+        // Atomically drain old request buffers in a single lock to avoid
+        // TOCTOU race between emptiness check and mem::take.
+        let pending_with_payloads: Vec<(String, Vec<Vec<u8>>)> = REQUEST_DATA
             .iter()
             .filter_map(|entry| {
                 let req_id = entry.key();
                 if req_id != &request_id {
-                    if let Ok(buffer) = entry.value().lock() {
+                    if let Ok(mut buffer) = entry.agent_buffer.lock() {
                         if !buffer.is_empty() {
-                            return Some(req_id.clone());
+                            return Some((req_id.clone(), std::mem::take(&mut *buffer)));
                         }
                     }
                 }
@@ -766,29 +752,13 @@ pub async fn process_apm_request(
             })
             .collect();
 
-        if !pending_buffers.is_empty() {
+        if !pending_with_payloads.is_empty() {
             debug!(
                 "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
-                pending_buffers.len()
+                pending_with_payloads.len()
             );
 
-            for old_request_id in pending_buffers {
-                debug!(
-                    "Processing late agent payload for request: {}",
-                    old_request_id
-                );
-
-                let late_payloads = if let Some(buffer_ref) =
-                    REQUEST_AGENT_BUFFERS.get(&old_request_id)
-                {
-                    if let Ok(mut buffer) = buffer_ref.lock() {
-                        std::mem::take(&mut *buffer)
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
+            for (old_request_id, late_payloads) in pending_with_payloads {
 
                 for payload_bytes in late_payloads {
                     debug!(
@@ -800,9 +770,6 @@ pub async fn process_apm_request(
                     if let Err(e) = send_to_apm_collector(
                         &payload_bytes,
                         &old_request_id,
-                        &invoked_function_arn,
-                        &newrelic_client,
-                        &config,
                         &apm_app,
                     )
                     .await
@@ -864,8 +831,6 @@ pub async fn process_apm_request(
             agent_payloads.len()
         );
         let request_id_clone = request_id.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-        let newrelic_client_clone = newrelic_client.clone();
         let config_clone = config.clone();
         let global_log_processor_clone = global_log_processor.clone();
         let apm_app_clone = apm_app.clone();
@@ -884,9 +849,6 @@ pub async fn process_apm_request(
                 match send_to_apm_collector(
                     payload_bytes,
                     &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &newrelic_client_clone,
-                    &config_clone,
                     &apm_app_clone,
                 )
                 .await
@@ -910,7 +872,7 @@ pub async fn process_apm_request(
                 agent_payloads.len()
             );
             // Put payloads back in buffer to send when run_id arrives
-            if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+            if let Some(buffer_ref) = get_agent_buffer(&request_id) {
                 if let Ok(mut buffer) = buffer_ref.lock() {
                     buffer.extend(agent_payloads);
                 }
@@ -947,10 +909,7 @@ pub async fn process_apm_request(
     }
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode)
-    if let Some(entry) = PENDING_REPORTS.get(&request_id) {
-        let report_line = entry.value().clone();
-        drop(entry); // Release the lock before async operations
-
+    if let Some(report_line) = get_pending_report(&request_id) {
         debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
         let apm_app_guard = apm_app.read().await;
@@ -965,8 +924,8 @@ pub async fn process_apm_request(
         }
         drop(apm_app_guard);
 
-        // Remove from pending reports after sending
-        PENDING_REPORTS.remove(&request_id);
+        // Remove pending report after sending
+        remove_pending_report(&request_id);
     } else {
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
@@ -993,7 +952,9 @@ pub async fn process_apm_request(
 
     cleanup_request_processing_state_internal(&request_id, true);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Keep active request set for late payload routing (agent payloads may arrive after processing)
+    // It will be overwritten when next INVOKE arrives
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
@@ -1007,9 +968,6 @@ pub async fn process_apm_request(
 async fn send_to_apm_collector(
     payload_bytes: &[u8],
     request_id: &str,
-    _invoked_function_arn: &str,
-    _newrelic_client: &Arc<NewRelicClient>,
-    _config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let apm_app_guard = apm_app.read().await;
@@ -1025,7 +983,7 @@ async fn send_to_apm_collector(
             request_id
         );
     } else {
-        // Go-style pattern: APM connection still in progress - buffer will be kept for retry
+        // APM connection still in progress - buffer will be kept for retry
         warn!(
             "APM connection still in progress - payload for {} will be buffered and retried",
             request_id
@@ -1038,22 +996,21 @@ async fn send_to_apm_collector(
 pub async fn process_request_concurrently(
     request_id: String,
     invoked_function_arn: String,
-    _processor_factory: Arc<ProcessorFactory>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
-    _apm_app: crate::apm::SharedApmApp,
 ) {
     debug!(
         "Standard mode: Starting processing for request: {}",
         request_id
     );
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
         *active_request = Some(request_id.clone());
     }
 
-    let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
+    let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
     let Some(mut state) = state else {
         error!("No processing state found for request: {}", request_id);
@@ -1077,15 +1034,17 @@ pub async fn process_request_concurrently(
     // Unified wait timeout for all invocations
     let agent_wait_timeout_ms = 100;
 
-    let payload_already_arrived = {
-        if let Ok(buffer) = state.agent_buffer.lock() {
-            !buffer.is_empty()
+    // Try to take payloads in a single lock. If empty, wait for coordination
+    // signal then take again — avoids a TOCTOU gap between check and drain.
+    let mut agent_payloads = {
+        if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
         } else {
-            false
+            Vec::new()
         }
     };
 
-    if !payload_already_arrived {
+    if agent_payloads.is_empty() {
         debug!(
             "Standard mode: Waiting up to {}ms for agent payload for request: {}",
             agent_wait_timeout_ms, request_id
@@ -1098,6 +1057,12 @@ pub async fn process_request_concurrently(
                 debug!("Agent payload wait timeout ({}ms) for request: {}", agent_wait_timeout_ms, request_id);
             }
         }
+        // After wakeup, drain whatever arrived
+        agent_payloads = if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
+        } else {
+            Vec::new()
+        };
     } else {
         debug!(
             "Agent payload already in buffer for request: {} - no wait needed",
@@ -1105,15 +1070,7 @@ pub async fn process_request_concurrently(
         );
     }
 
-    let agent_payloads = {
-        if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        }
-    };
-
-    let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| {
+    let report_line = remove_pending_report(&request_id).map(|report| {
         debug!(
             "Found pending platform.report for request: {}",
             request_id
@@ -1180,7 +1137,7 @@ pub async fn process_request_concurrently(
         );
 
         // Put payloads back in buffer (they were taken out with mem::take)
-        if let Some(buffer_ref) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+        if let Some(buffer_ref) = get_agent_buffer(&request_id) {
             if let Ok(mut buffer) = buffer_ref.lock() {
                 buffer.extend(agent_payloads);
             }
@@ -1219,8 +1176,10 @@ pub async fn process_request_concurrently(
     // Unified cleanup: Always preserve buffers for late payload handling
     cleanup_request_processing_state_internal(&request_id, true);
 
-    if let Ok(mut active_request) = CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = None;
+    // Keep active request set for late payload routing (agent payloads may arrive after processing)
+    // It will be overwritten when next INVOKE arrives
+    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
+        *active_request = Some(request_id.clone());
     }
 
     debug!(
@@ -1295,16 +1254,15 @@ async fn extract_and_coordinate_trace_id(
 /// Process any pending agent payloads from previous invocation (APM mode only)
 /// Excludes the current request ID to avoid processing empty buffer
 async fn process_pending_agent_payloads(
-    newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
     current_request_id: &str,
 ) {
-    let all_buffers: Vec<(String, usize)> = REQUEST_AGENT_BUFFERS
+    let all_buffers: Vec<(String, usize)> = REQUEST_DATA
         .iter()
         .map(|entry| {
-            let buffer_size = entry.value().lock().map(|b| b.len()).unwrap_or(0);
+            let buffer_size = entry.agent_buffer.lock().map(|b| b.len()).unwrap_or(0);
             (entry.key().clone(), buffer_size)
         })
         .collect();
@@ -1315,10 +1273,10 @@ async fn process_pending_agent_payloads(
         all_buffers
     );
 
-    let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_AGENT_BUFFERS
+    let pending_requests: Vec<(String, Arc<Mutex<Vec<Vec<u8>>>>)> = REQUEST_DATA
         .iter()
         .filter(|entry| entry.key() != current_request_id)
-        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .map(|entry| (entry.key().clone(), entry.agent_buffer.clone()))
         .collect();
 
     if pending_requests.is_empty() {
@@ -1336,35 +1294,20 @@ async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
-        let context = REQUEST_CONTEXTS.get(&request_id).map(|entry| entry.value().clone());
+        let context = get_request_context(&request_id);
 
         let invoked_function_arn = if let Some(ctx) = context {
             if let Ok(ctx_guard) = ctx.lock() {
                 if !ctx_guard.invoked_function_arn.is_empty() {
                     ctx_guard.invoked_function_arn.clone()
                 } else {
-                    // Use global fallback ARN from registration
-                    if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                        global_ctx.invoked_function_arn.clone()
-                    } else {
-                        String::new()
-                    }
+                    crate::get_global_fallback_arn()
                 }
             } else {
-                // Use global fallback ARN
-                if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                    global_ctx.invoked_function_arn.clone()
-                } else {
-                    String::new()
-                }
+                crate::get_global_fallback_arn()
             }
         } else {
-            // Use global fallback ARN
-            if let Ok(global_ctx) = CURRENT_INVOCATION_CONTEXT.read() {
-                global_ctx.invoked_function_arn.clone()
-            } else {
-                String::new()
-            }
+            crate::get_global_fallback_arn()
         };
 
         let payloads = {
@@ -1388,7 +1331,6 @@ async fn process_pending_agent_payloads(
                     &request_id,
                     &invoked_function_arn,
                     global_log_processor,
-                    newrelic_client,
                     config,
                     apm_app,
                 )
@@ -1400,10 +1342,7 @@ async fn process_pending_agent_payloads(
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)
-        if let Some(entry) = PENDING_REPORTS.get(&request_id) {
-            let report_line = entry.value().clone();
-            drop(entry);
-
+        if let Some(report_line) = get_pending_report(&request_id) {
             debug!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
 
             let apm_app_guard = apm_app.read().await;
@@ -1416,8 +1355,8 @@ async fn process_pending_agent_payloads(
             }
             drop(apm_app_guard);
 
-            // Remove from pending reports after sending
-            PENDING_REPORTS.remove(&request_id);
+            // Remove pending report after sending
+            remove_pending_report(&request_id);
         }
 
         cleanup_request_processing_state_internal(&request_id, false);
@@ -1430,7 +1369,6 @@ async fn process_and_send_agent_payload(
     request_id: &str,
     invoked_function_arn: &str,
     log_processor: &Arc<LogProcessor>,
-    _newrelic_client: &Arc<NewRelicClient>,
     config: &Arc<ExtensionConfig>,
     apm_app: &crate::apm::SharedApmApp,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
