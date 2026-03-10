@@ -1,6 +1,6 @@
 [package]
 name = "newrelic-lambda-extension"
-version = "2.4.5"
+version = "2.4.6"
 edition = "2021"
 authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
