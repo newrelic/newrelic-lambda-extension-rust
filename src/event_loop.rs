@@ -146,7 +146,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
+                {
+                    let nr_client = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(async move {
+                        error_synthesis::retry_failed_errors(&nr_client, &cfg).await;
+                    });
+                }
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
@@ -192,48 +198,25 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
-                let pending_task = Some(tokio::spawn({
-                    let config = components.config.clone();
-                    let global_log_processor = components.global_log_processor.clone();
-                    let apm_app = components.apm_app.clone();
-                    let current_request_id = request_id.clone();
+                // Process pending payloads from previous invocations, then current request
+                // Call directly instead of tokio::spawn + tokio::join! (avoids task overhead)
+                process_pending_agent_payloads(
+                    &components.config,
+                    &components.global_log_processor,
+                    &components.apm_app,
+                    &request_id,
+                )
+                .await;
 
-                    async move {
-                        process_pending_agent_payloads(
-                            &config,
-                            &global_log_processor,
-                            &apm_app,
-                            &current_request_id,
-                        )
-                        .await;
-                    }
-                }));
-
-                let request_id_clone = request_id.clone();
-                let invoked_function_arn_clone = invoked_function_arn.clone();
-                let config_clone = components.config.clone();
-                let global_log_processor_clone = components.global_log_processor.clone();
-                let apm_app_clone = components.apm_app.clone();
-
-                let current_task = tokio::spawn(async move {
-                    process_apm_request(
-                        request_id_clone,
-                        invoked_function_arn_clone,
-                        is_cold_start,
-                        config_clone,
-                        global_log_processor_clone,
-                        apm_app_clone,
-                    )
-                    .await;
-                });
-
-                let (current_result, pending_result) = tokio::join!(current_task, pending_task.unwrap());
-                if let Err(e) = current_result {
-                    error!("Error in APM request processing: {}", e);
-                }
-                if let Err(e) = pending_result {
-                    error!("Error in pending payload processing: {}", e);
-                }
+                process_apm_request(
+                    request_id.clone(),
+                    invoked_function_arn.clone(),
+                    is_cold_start,
+                    components.config.clone(),
+                    components.global_log_processor.clone(),
+                    components.apm_app.clone(),
+                )
+                .await;
 
                 let event_time = event_start.elapsed();
                 if is_cold_start {
@@ -432,8 +415,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                // Final flush of logs
-                if let Err(e) = components.global_log_processor.flush().await {
+                // Final flush of logs (awaits pending auto-flush tasks first)
+                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
 
@@ -471,8 +454,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         )
                         .await;
                         
-                        let _ = components.global_log_processor.flush().await;
-                        
+                        let _ = components.global_log_processor.flush_on_shutdown().await;
+
                         info!("Emergency shutdown cleanup completed. Extension exiting.");
                         break;
                     }
@@ -563,14 +546,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .process_pre_invoke_logs();
 
-                // Send batch if threshold is reached after processing late payloads (only with report lines)
-                // CRITICAL: Must await to prevent Lambda from freezing network mid-request
+                // Send batch in background if threshold reached — items stay in buffer until successful send
                 if should_send_batch_by_threshold() {
-                    debug!("Batch threshold reached - sending payloads with report lines only");
-                    send_batched_payloads_with_reports_only(
-                        components.newrelic_client.clone(),
-                        components.config.clone()
-                    ).await;
+                    debug!("Batch threshold reached - sending payloads in background");
+                    let nr_client = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(async move {
+                        send_batched_payloads_with_reports_only(nr_client, cfg).await;
+                    });
                 }
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
@@ -675,8 +658,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                // Flush remaining buffered logs
-                if let Err(e) = components.global_log_processor.flush().await {
+                // Flush remaining buffered logs (awaits pending auto-flush tasks first)
+                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
 
@@ -732,10 +715,7 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
+    // CURRENT_ACTIVE_REQUEST_ID already set in execute_apm_mode_event_loop
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -933,20 +913,16 @@ pub async fn process_apm_request(
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
 
-    // Wait for logs and platform to complete before returning
-    let log_flushing = global_log_processor.flush();
-    let platform_flushing = state.platform_processor.flush();
-
-    let (log_result, platform_result) = tokio::join!(
-        log_flushing,
-        platform_flushing,
-    );
-
-    if let Err(e) = log_result {
-        error!("Failed to flush logs for request {}: {}", request_id, e);
-    }
-    if let Err(e) = platform_result {
-        error!("Failed to flush platform for request {}: {}", request_id, e);
+    // Fire-and-forget: spawn log flush in background instead of blocking
+    // Platform flush is a no-op — skip it entirely
+    {
+        let log_processor = global_log_processor.clone();
+        let rid = request_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = log_processor.flush().await {
+                error!("APM mode: Background log flush failed for request {}: {}", rid, e);
+            }
+        });
     }
 
     // Note: We do NOT wait for runtime.done here because platform.runtimeDone event
@@ -1123,31 +1099,33 @@ pub async fn process_request_concurrently(
         None
     };
 
-    let log_flushing = global_log_processor.flush();
-    let platform_flushing = state.platform_processor.flush();
-    let failed_retry = retry_failed_agent_payloads(&newrelic_client, &config);
-
-    let (log_result, platform_result, _, agent_result) = tokio::join!(
-        log_flushing,
-        platform_flushing,
-        failed_retry,
-        async {
-            if let Some(handle) = send_agent_task {
-                handle.await
-            } else {
-                Ok(())
+    // Fire-and-forget: spawn log flush in background instead of blocking on tokio::join!
+    // Spawned tasks execute while /next blocks waiting for the next event.
+    // Failed logs go to failed_logs_buffer for retry on next invocation.
+    {
+        let log_processor = global_log_processor.clone();
+        let rid = request_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = log_processor.flush().await {
+                error!("Background log flush failed for request {}: {}", rid, e);
             }
-        }
-    );
+        });
+    }
 
-    if let Err(e) = log_result {
-        error!("Failed to flush logs for request {}: {}", request_id, e);
+    // Platform flush is a no-op (returns Ok immediately) — skip it entirely
+
+    // Agent retry runs in background — failures stay in FAILED_AGENT_PAYLOADS for next invocation
+    {
+        let nr_client = newrelic_client.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            retry_failed_agent_payloads(&nr_client, &cfg).await;
+        });
     }
-    if let Err(e) = platform_result {
-        error!("Failed to flush platform for request {}: {}", request_id, e);
-    }
-    if let Err(e) = agent_result {
-        error!("Agent send task failed for request {}: {}", request_id, e);
+
+    // Agent batch send is already a spawned task — let it complete in background
+    if let Some(handle) = send_agent_task {
+        drop(handle); // Tasks continue running; failures keep items in AGENT_BATCH_BUFFER
     }
 
     // Unified cleanup: Always preserve buffers for late payload handling

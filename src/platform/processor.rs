@@ -94,6 +94,7 @@ impl PlatformProcessor {
             timestamp,
             message,
             attributes,
+            log_source: crate::newrelic::payload::LogSource::Platform,
         };
         
         if self.config.extension.send_platform_logs {
@@ -233,7 +234,7 @@ impl PlatformProcessor {
         
         // Check status field - should be error, failure, or timeout
         let status = record.record.get("status").and_then(|v| v.as_str());
-        let has_error = matches!(status, Some("error") | Some("failure") | Some("timeout"));
+        let has_error = matches!(status, Some("error" | "failure" | "timeout"));
         
         if !has_error {
             return;
@@ -444,10 +445,9 @@ impl PlatformProcessor {
                 let after_prefix = &message[start + "REPORT RequestId: ".len()..];
                 if let Some(tab_pos) = after_prefix.find('\t') {
                     return Some(after_prefix[..tab_pos].to_string());
-                } else {
-                    let request_id = after_prefix.split_whitespace().next()?;
-                    return Some(request_id.to_string());
                 }
+                let request_id = after_prefix.split_whitespace().next()?;
+                return Some(request_id.to_string());
             }
         }
         None

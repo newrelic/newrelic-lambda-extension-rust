@@ -91,6 +91,24 @@ fn get_backoff_delay(retry_attempt: usize) -> Duration {
     }
 }
 
+/// Determines whether a failed log should be buffered for retry.
+/// Function logs (customer data) are always retried.
+/// Extension logs are only retried if they are ERROR level.
+/// Platform/Unknown logs are retried to be safe.
+fn should_retry_on_failure(log: &payload::LogMessage) -> bool {
+    match log.log_source {
+        payload::LogSource::Extension => {
+            // Only retry extension ERROR logs — drop info/debug to save memory
+            log.attributes.get("level")
+                .and_then(|v| v.as_str())
+                .map(|level| level == "ERROR")
+                .unwrap_or(false)
+        }
+        // Function (customer data), Platform, Unknown — always retry
+        payload::LogSource::Function | payload::LogSource::Platform | payload::LogSource::Unknown => true,
+    }
+}
+
 /// Extract structured log level from JSON record
 /// Returns the uppercase level string if found in common level field names
 fn get_structured_log_level(record: &serde_json::Value) -> Option<String> {
@@ -517,21 +535,28 @@ impl LogProcessor {
                                         retries += 1;
                                         tokio::time::sleep(get_backoff_delay(retries)).await;
                                         continue;
-                                    } else {
-                                        warn!("Auto-flush failed after {} retries - buffering {} logs", MAX_RETRIES, chunk.len());
-                                        send_failed = true;
-                                        // Buffer failed logs for retry on next invocation
-                                        if let Ok(mut buffer) = failed_buffer.lock() {
-                                            for log in chunk {
+                                    }
+                                    warn!("Auto-flush failed after {} retries - filtering {} logs for retry", MAX_RETRIES, chunk.len());
+                                    send_failed = true;
+                                    // Buffer only retriable logs (function + extension ERROR)
+                                    if let Ok(mut buffer) = failed_buffer.lock() {
+                                        let mut dropped = 0;
+                                        for log in chunk {
+                                            if should_retry_on_failure(&log) {
                                                 buffer.push(FailedLogEntry {
                                                     log_message: log,
                                                     original_request_id: context.request_id.clone(),
                                                     retry_count: 0,
                                                 });
+                                            } else {
+                                                dropped += 1;
                                             }
                                         }
-                                        break;
+                                        if dropped > 0 {
+                                            debug!("Dropped {} non-retriable extension/platform logs", dropped);
+                                        }
                                     }
+                                    break;
                                 }
                             }
                         }
@@ -586,10 +611,18 @@ impl LogProcessor {
         attributes.insert("newrelic.source".to_string(), "api.logs".into());
     
     
+        let log_source = match record.record_type.as_str() {
+            "function" => payload::LogSource::Function,
+            "extension" => payload::LogSource::Extension,
+            t if t.starts_with("platform") => payload::LogSource::Platform,
+            _ => payload::LogSource::Unknown,
+        };
+
         Some(payload::LogMessage {
             timestamp,
             message,
             attributes,
+            log_source,
         })
     }
 
@@ -1071,19 +1104,16 @@ impl LogProcessor {
             return Ok(());
         }
 
-        // First, await all pending auto-flush tasks to ensure they complete
-        // before we do the final flush (prevents logs from being cancelled)
-        let pending_handles = {
-            let mut handles = self.pending_flush_handles.lock().unwrap();
-            std::mem::take(&mut *handles)
-        };
-
-        if !pending_handles.is_empty() {
-            debug!("Waiting for {} pending auto-flush tasks to complete", pending_handles.len());
-            for handle in pending_handles {
-                let _ = handle.await; // Ignore JoinErrors, just ensure task completes
+        // Don't await pending auto-flush handles — they complete in background.
+        // If they fail, their logs are already buffered via failed_logs_buffer.
+        // Use flush_on_shutdown() during SHUTDOWN to await pending handles.
+        {
+            let mut handles = self.pending_flush_handles.lock().unwrap_or_else(|e| e.into_inner());
+            let count = handles.len();
+            handles.clear(); // Drop handles — spawned tasks continue running
+            if count > 0 {
+                debug!("Cleared {} pending auto-flush handles (tasks continue in background)", count);
             }
-            debug!("All pending auto-flush tasks completed");
         }
 
         let batch = {
@@ -1219,18 +1249,29 @@ impl LogProcessor {
             info!("Successfully sent {} log chunks", successful_chunks);
         }
         if !failed_logs.is_empty() {
-            warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
             let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-            
+            let mut buffered = 0;
+            let mut dropped = 0;
             for log in failed_logs {
-                failed_buffer.push(FailedLogEntry {
-                    log_message: log,
-                    original_request_id: context.request_id.clone(),
-                    retry_count: 0,
-                });
+                if should_retry_on_failure(&log) {
+                    failed_buffer.push(FailedLogEntry {
+                        log_message: log,
+                        original_request_id: context.request_id.clone(),
+                        retry_count: 0,
+                    });
+                    buffered += 1;
+                } else {
+                    dropped += 1;
+                }
+            }
+            if buffered > 0 {
+                warn!("Buffering {} retriable failed logs for retry on next invocation", buffered);
+            }
+            if dropped > 0 {
+                debug!("Dropped {} non-retriable extension/platform logs", dropped);
             }
         }
-        
+
         Ok(())
     }
     
@@ -1280,24 +1321,34 @@ impl LogProcessor {
                         let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
-                    } else {
-                        if use_failed_buffer {
-                            warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
-                            let context = self.invocation_context.lock().unwrap().clone();
-                            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                            
-                            for log in chunk {
+                    }
+                    if use_failed_buffer {
+                        let context = self.invocation_context.lock().unwrap().clone();
+                        let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
+                        let mut buffered = 0;
+                        let mut dropped = 0;
+                        for log in chunk {
+                            if should_retry_on_failure(&log) {
                                 failed_buffer.push(FailedLogEntry {
                                     log_message: log,
                                     original_request_id: context.request_id.clone(),
                                     retry_count: 0,
                                 });
+                                buffered += 1;
+                            } else {
+                                dropped += 1;
                             }
-                        } else {
-                            error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
                         }
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                        if buffered > 0 {
+                            warn!("Max retries exceeded - buffering {} retriable logs", buffered);
+                        }
+                        if dropped > 0 {
+                            debug!("Dropped {} non-retriable extension/platform logs", dropped);
+                        }
+                    } else {
+                        error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
                     }
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
                 }
             }
         }
@@ -1348,6 +1399,23 @@ impl LogProcessor {
         }
     }
 
+    /// Shutdown-only flush: awaits all pending auto-flush tasks, then does final flush.
+    /// Use this during SHUTDOWN to ensure all in-flight data is sent before Lambda kills the process.
+    /// During normal invocations, use `flush()` which skips the pending handle wait.
+    pub async fn flush_on_shutdown(&self) -> std::io::Result<()> {
+        let pending_handles = {
+            let mut handles = self.pending_flush_handles.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *handles)
+        };
+        if !pending_handles.is_empty() {
+            debug!("Shutdown: Waiting for {} pending auto-flush tasks", pending_handles.len());
+            for handle in pending_handles {
+                let _ = handle.await;
+            }
+            debug!("Shutdown: All pending auto-flush tasks completed");
+        }
+        self.send_and_clear_batch_simple().await
+    }
 }
 
 #[async_trait]
