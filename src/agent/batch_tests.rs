@@ -19,6 +19,7 @@ mod tests {
     /// Helper: clear all global batch state between tests
     fn clear_batch_state() {
         AGENT_BATCH_BUFFER.clear();
+        reset_batch_reports_count();
         if let Ok(mut meta) = BATCH_META.lock() {
             meta.agent_count = 0;
             meta.oldest_timestamp = None;
@@ -534,7 +535,7 @@ mod tests {
         crate::request::REQUEST_DATA.insert("req-buf-1".to_string(), crate::request::RequestData {
             context: ctx,
             agent_buffer: buffer,
-            coordination_tx: None,
+
             pending_report: Some("REPORT Duration: 50ms".to_string()),
             creation_invocation: 0,
         });

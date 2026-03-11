@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -22,12 +21,8 @@ use crate::{
 #[derive(Debug)]
 pub struct RequestProcessingState {
     pub context: Arc<Mutex<InvocationContext>>,
-    /// Per-request log processor - used internally by PlatformProcessor and kept alive for request lifetime
-    #[allow(dead_code)]
-    pub log_processor: Arc<crate::logs::processor::LogProcessor>,
     pub platform_processor: Arc<PlatformProcessor>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
-    pub coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -88,7 +83,6 @@ pub static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>
 pub struct RequestData {
     pub context: Arc<Mutex<InvocationContext>>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
-    pub coordination_tx: Option<mpsc::UnboundedSender<()>>,
     pub pending_report: Option<String>,
     pub creation_invocation: u64,
 }
@@ -181,6 +175,7 @@ pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
     processor_factory: &Arc<ProcessorFactory>,
+    global_log_processor: &Arc<crate::logs::processor::LogProcessor>,
 ) -> RequestProcessingState {
     let context = Arc::new(Mutex::new(InvocationContext {
         request_id: request_id.to_string(),
@@ -188,10 +183,9 @@ pub fn create_request_processing_state(
         trace_id: None,
     }));
 
-    // Create per-request processors - each request gets isolated processors with their own context
-    // This prevents race conditions in concurrent executions
-    let log_processor = processor_factory.create_log_processor(context.clone());
-    let platform_processor = processor_factory.create_platform_processor(context.clone(), log_processor.clone());
+    // Reuse global_log_processor instead of creating a new one per-request (warm start optimization).
+    // PlatformProcessor is lightweight (4 Arc clones) so still created per-request.
+    let platform_processor = processor_factory.create_platform_processor(context.clone(), global_log_processor.clone());
 
     let agent_buffer = Arc::new(Mutex::new(Vec::new()));
 
@@ -211,26 +205,19 @@ pub fn create_request_processing_state(
         }
     }
 
-    let (payload_tx, payload_rx) = mpsc::unbounded_channel();
-
-    // Insert consolidated request data (replaces 5 separate DashMap inserts)
+    // Insert consolidated request data
     REQUEST_DATA.insert(request_id.to_string(), RequestData {
         context: context.clone(),
         agent_buffer: agent_buffer.clone(),
-        coordination_tx: Some(payload_tx),
         pending_report: None,
         creation_invocation: current_invocation_count(),
     });
 
-    let state = RequestProcessingState {
+    RequestProcessingState {
         context: context.clone(),
-        log_processor: log_processor.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
-        coordination_rx: Some(payload_rx),
-    };
-
-    state
+    }
 }
 
 pub fn cleanup_request_processing_state(request_id: &str) {
@@ -244,9 +231,8 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         // Full cleanup: remove the entire consolidated entry
         REQUEST_DATA.remove(request_id);
     } else {
-        // Partial cleanup: keep context/buffer/creation_invocation, clear coordination + pending_report
+        // Partial cleanup: keep context/buffer/creation_invocation, clear pending_report
         if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
-            entry.coordination_tx = None;
             entry.pending_report = None;
         }
     }
@@ -355,11 +341,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-
-                    // Signal coordination channel that payload arrived
-                    if let Some(ref tx) = entry.coordination_tx {
-                        let _ = tx.send(());
-                    }
                 }
                 Err(e) => {
                     error!(
@@ -387,10 +368,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-                }
-                // Signal coordination channel so waiters know a payload arrived
-                if let Some(ref tx) = entry.coordination_tx {
-                    let _ = tx.send(());
                 }
             }
         } else {

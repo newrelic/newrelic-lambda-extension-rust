@@ -1,7 +1,6 @@
 
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use reqwest::Client;
 use tracing::{debug, error, info, trace, warn};
 
@@ -165,6 +164,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
+                    &components.global_log_processor,
                 );
 
                 // Update global log processor's context to this request BEFORE processing logs
@@ -506,13 +506,26 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
-
-                crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.client,
-                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
-                )
-                .await;
+                // Fire retries as background tasks — don't block current invocation processing.
+                // These are almost always no-ops (empty buffers) but can make HTTP calls on failures.
+                {
+                    let nr_client = components.newrelic_client.clone();
+                    let config = components.config.clone();
+                    tokio::spawn(async move {
+                        error_synthesis::retry_failed_errors(&nr_client, &config).await;
+                    });
+                }
+                {
+                    let client = components.client.clone();
+                    let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
+                    tokio::spawn(async move {
+                        crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                            &client,
+                            &license_key,
+                        )
+                        .await;
+                    });
+                }
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
@@ -534,6 +547,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     &request_id,
                     &invoked_function_arn,
                     &components.processor_factory,
+                    &components.global_log_processor,
                 );
 
                 // Update global log processor's context to this request BEFORE processing logs
@@ -561,26 +575,15 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 REQUEST_PROCESSORS.insert(request_id.clone(), request_state);
 
-                let request_id_clone = request_id.clone();
-                let invoked_function_arn_clone = invoked_function_arn.clone();
-                let newrelic_client_clone = components.newrelic_client.clone();
-                let config_clone = components.config.clone();
-                let global_log_processor_clone = components.global_log_processor.clone();
-
-                let processing_handle = tokio::spawn(async move {
-                    process_request_concurrently(
-                        request_id_clone,
-                        invoked_function_arn_clone,
-                        newrelic_client_clone,
-                        config_clone,
-                        global_log_processor_clone,
-                    )
-                    .await;
-                });
-
-                if let Err(e) = processing_handle.await {
-                    error!("Error in standard mode request processing: {}", e);
-                }
+                // Call directly instead of tokio::spawn + await (avoids task allocation overhead)
+                process_request_concurrently(
+                    request_id.clone(),
+                    invoked_function_arn.clone(),
+                    components.newrelic_client.clone(),
+                    components.config.clone(),
+                    components.global_log_processor.clone(),
+                )
+                .await;
 
                 let event_time = event_start.elapsed();
                 if is_cold_start {
@@ -1005,14 +1008,11 @@ pub async fn process_request_concurrently(
         request_id
     );
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
+    // CURRENT_ACTIVE_REQUEST_ID already set by caller (event loop) — no duplicate lock needed
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
-    let Some(mut state) = state else {
+    let Some(state) = state else {
         error!("No processing state found for request: {}", request_id);
         return;
     };
@@ -1024,19 +1024,10 @@ pub async fn process_request_concurrently(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // Skip runtime.done wait for all invocations (performance optimization)
-    // Late payloads will be processed in next invocation
-    debug!(
-        "Skipping runtime.done wait for request: {} (unified batching approach)",
-        request_id
-    );
-
-    // Unified wait timeout for all invocations
-    let agent_wait_timeout_ms = 100;
-
-    // Try to take payloads in a single lock. If empty, wait for coordination
-    // signal then take again — avoids a TOCTOU gap between check and drain.
-    let mut agent_payloads = {
+    // Warm start optimization: no waiting for agent payloads.
+    // Take whatever is in the buffer immediately. Late payloads will be
+    // caught and sent in the next invocation via the batching logic.
+    let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
         } else {
@@ -1046,27 +1037,13 @@ pub async fn process_request_concurrently(
 
     if agent_payloads.is_empty() {
         debug!(
-            "Standard mode: Waiting up to {}ms for agent payload for request: {}",
-            agent_wait_timeout_ms, request_id
+            "Standard mode: No agent payload in buffer for request: {} - will catch in next invocation",
+            request_id
         );
-        tokio::select! {
-            _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
-                debug!("Agent payload received early for request: {}", request_id);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(agent_wait_timeout_ms)) => {
-                debug!("Agent payload wait timeout ({}ms) for request: {}", agent_wait_timeout_ms, request_id);
-            }
-        }
-        // After wakeup, drain whatever arrived
-        agent_payloads = if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        };
     } else {
         debug!(
-            "Agent payload already in buffer for request: {} - no wait needed",
-            request_id
+            "Standard mode: Found {} agent payload(s) in buffer for request: {}",
+            agent_payloads.len(), request_id
         );
     }
 

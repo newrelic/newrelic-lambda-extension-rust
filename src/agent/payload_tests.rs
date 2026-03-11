@@ -39,7 +39,7 @@ mod tests {
         let arn = "arn:aws:lambda:us-east-1:123456789012:function:my-function";
         let payload = b"test-agent-data";
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             payload,
             "test-request-id",
@@ -59,7 +59,7 @@ mod tests {
         let config = config_with_function_name("fallback-fn");
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"test-agent-data",
             "test-request-id",
@@ -78,7 +78,7 @@ mod tests {
         let config = config_with_function_name("my-fn");
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"test-agent-data",
             "", // empty request_id
@@ -97,7 +97,7 @@ mod tests {
         let config = config_with_function_name("fallback-fn");
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"test-data",
             "",
@@ -272,7 +272,7 @@ mod tests {
 
         let version_info = Arc::new(crate::version::VersionInfo::get_or_detect(None));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"agent-data",
             "req-ver-1",
@@ -296,7 +296,7 @@ mod tests {
 
         let version_info = Arc::new(crate::version::VersionInfo::get_or_detect(None));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"agent-data",
             "req-apm-1",
@@ -318,7 +318,7 @@ mod tests {
         let config = Arc::new(config);
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"agent-data-with-tags",
             "req-tags-1",
@@ -337,7 +337,7 @@ mod tests {
         let config = config_with_function_name("fallback-fn");
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"agent-data",
             "req-malformed",
@@ -356,7 +356,7 @@ mod tests {
         let config = config_with_function_name("fallback-fn");
         let newrelic_client = Arc::new(NewRelicClient::new(&config));
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
         let result = rt.block_on(send_agent_payload_to_newrelic(
             b"agent-data",
             "req-short",

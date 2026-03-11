@@ -10,6 +10,7 @@
 //! - `BATCH_META`: Tracks batch metadata (count, oldest timestamp)
 
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 use tracing::{debug, error, info};
@@ -48,6 +49,9 @@ pub static BATCH_META: Lazy<Arc<Mutex<BatchMetadata>>> =
         oldest_timestamp: None,
     })));
 
+/// Atomic counter for payloads with report lines — avoids iterating the DashMap on every invocation
+static BATCH_WITH_REPORTS_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Add agent payload to batch buffer
 pub fn add_to_batch(
     request_id: String,
@@ -56,6 +60,7 @@ pub fn add_to_batch(
     arn: String,
 ) {
     let timestamp = chrono::Utc::now();
+    let has_report = report_line.is_some();
 
     AGENT_BATCH_BUFFER.insert(
         request_id.clone(),
@@ -68,6 +73,10 @@ pub fn add_to_batch(
         }
     );
 
+    if has_report {
+        BATCH_WITH_REPORTS_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
     if let Ok(mut meta) = BATCH_META.lock() {
         meta.agent_count += 1;
         if meta.oldest_timestamp.is_none() {
@@ -78,19 +87,20 @@ pub fn add_to_batch(
 }
 
 /// Check if batch threshold is reached (3+ payloads WITH report lines)
-/// Only sends payloads with report lines when threshold is hit
+/// Uses atomic counter instead of iterating DashMap for O(1) performance
 pub fn should_send_batch_by_threshold() -> bool {
-    let count_with_reports = AGENT_BATCH_BUFFER
-        .iter()
-        .filter(|entry| entry.value().report_line.is_some())
-        .count();
-
-    if count_with_reports >= 3 {
-        debug!("Batch threshold reached: {} agent payloads with report lines", count_with_reports);
+    let count = BATCH_WITH_REPORTS_COUNT.load(Ordering::Relaxed);
+    if count >= 3 {
+        debug!("Batch threshold reached: {} agent payloads with report lines", count);
         return true;
     }
-
     false
+}
+
+/// Reset the atomic batch-with-reports counter (for tests)
+#[cfg(test)]
+pub fn reset_batch_reports_count() {
+    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// Get all batched payloads and clear the buffer
@@ -101,6 +111,7 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
         .collect();
 
     AGENT_BATCH_BUFFER.clear();
+    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Relaxed);
 
     if let Ok(mut meta) = BATCH_META.lock() {
         meta.agent_count = 0;
@@ -125,9 +136,14 @@ pub fn get_batch_with_reports_only() -> Vec<BatchedAgentPayload> {
 /// Remove successfully sent payloads from buffer and update metadata
 /// Only call this after successful send to prevent data loss
 fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
+    let reports_removed = items.iter().filter(|i| i.report_line.is_some()).count();
     // Remove only items with report lines from buffer
     for item in items {
         AGENT_BATCH_BUFFER.remove(&item.request_id);
+    }
+    // Decrement atomic counter for removed report-bearing payloads
+    if reports_removed > 0 {
+        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
     }
 
     // Update metadata to reflect remaining items
@@ -529,8 +545,12 @@ pub async fn cleanup_old_batch_entries(
     }
 
     // Now remove the old entries from buffer
+    let reports_removed = old_entries.iter().filter(|i| i.report_line.is_some()).count();
     for item in &old_entries {
         AGENT_BATCH_BUFFER.remove(&item.request_id);
+    }
+    if reports_removed > 0 {
+        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
     }
 
     // Update metadata

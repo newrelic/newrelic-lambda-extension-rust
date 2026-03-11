@@ -35,6 +35,16 @@ mod tests {
         }
     }
 
+    /// Helper: create a test log processor for use in create_request_processing_state
+    fn create_test_log_processor(factory: &Arc<ProcessorFactory>) -> Arc<crate::logs::processor::LogProcessor> {
+        let dummy_ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "test".to_string(),
+            invoked_function_arn: "test".to_string(),
+            trace_id: None,
+        }));
+        factory.create_log_processor(dummy_ctx)
+    }
+
     // ========================================================================
     // CURRENT_ACTIVE_REQUEST_ID tests
     // ========================================================================
@@ -189,7 +199,7 @@ mod tests {
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: buffer.clone(),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -220,7 +230,7 @@ mod tests {
         REQUEST_DATA.insert("some-req".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: buffer.clone(),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -255,34 +265,6 @@ mod tests {
 
 
 
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_route_signals_coordination_channel() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-1".to_string());
-        }
-
-        route_payload_to_request_buffer(vec![1]).await;
-
-        // Coordination channel should have been signaled
-        let received = rx.try_recv();
-        assert!(received.is_ok(), "Coordination signal should be sent");
-
-        clear_request_state();
-    }
 
     // ========================================================================
     // cleanup_request_processing_state tests
@@ -298,11 +280,9 @@ mod tests {
             invoked_function_arn: "arn".to_string(),
             trace_id: None,
         }));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: Some(tx),
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
         });
@@ -320,11 +300,9 @@ mod tests {
         clear_request_state();
 
         let ctx = Arc::new(Mutex::new(InvocationContext::default()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: Some(tx),
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
         });
@@ -339,8 +317,6 @@ mod tests {
             // Context, buffer, creation_invocation preserved
             assert!(entry.context.lock().is_ok());
             assert!(entry.agent_buffer.lock().is_ok());
-            // coordination_tx is always cleaned (receiver consumed by process_request_concurrently)
-            assert!(entry.coordination_tx.is_none());
             // pending_report is always cleaned
             assert!(entry.pending_report.is_none());
         }
@@ -375,10 +351,12 @@ mod tests {
         let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
 
+        let log_proc = create_test_log_processor(&factory);
         let state = create_request_processing_state(
             "req-create-1",
             "arn:aws:lambda:us-east-1:123:function:test-fn",
             &factory,
+            &log_proc,
         );
 
         // Verify context was created correctly
@@ -394,15 +372,10 @@ mod tests {
             assert!(buf.is_empty());
         }
 
-        // Verify coordination channel exists
-        assert!(state.coordination_rx.is_some());
-
         // Verify global maps were populated
         {
             let entry = REQUEST_DATA.get("req-create-1");
             assert!(entry.is_some());
-            let entry = entry.unwrap();
-            assert!(entry.coordination_tx.is_some());
         }
 
         clear_request_state();
@@ -425,10 +398,12 @@ mod tests {
         let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
 
+        let log_proc = create_test_log_processor(&factory);
         let state = create_request_processing_state(
             "req-drain-1",
             "arn:test",
             &factory,
+            &log_proc,
         );
 
         // Orphaned payloads should be drained into the request's buffer
@@ -468,7 +443,7 @@ mod tests {
         REQUEST_DATA.insert("recent-req".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: current_invocation_count(),
         });
@@ -496,7 +471,7 @@ mod tests {
         REQUEST_DATA.insert("old-req".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(vec![vec![1, 2, 3]])),
-            coordination_tx: None,
+
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
         });
@@ -523,7 +498,7 @@ mod tests {
         REQUEST_DATA.insert("old-empty".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::<Vec<u8>>::new())),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -554,7 +529,7 @@ mod tests {
         REQUEST_DATA.insert("recent".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: current_invocation_count(),
         });
@@ -562,7 +537,7 @@ mod tests {
         REQUEST_DATA.insert("old".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -616,7 +591,7 @@ mod tests {
         REQUEST_DATA.insert("req-old".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -659,7 +634,8 @@ mod tests {
         let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
 
-        let state = create_request_processing_state("req-drain-all", "arn:test", &factory);
+        let log_proc = create_test_log_processor(&factory);
+        let state = create_request_processing_state("req-drain-all", "arn:test", &factory, &log_proc);
 
         // All 5 should be drained
         {
@@ -670,7 +646,7 @@ mod tests {
         }
 
         // Second request should get empty orphan buffer
-        let state2 = create_request_processing_state("req-drain-none", "arn:test", &factory);
+        let state2 = create_request_processing_state("req-drain-none", "arn:test", &factory, &log_proc);
         {
             let buf = state2.agent_buffer.lock().unwrap();
             assert!(buf.is_empty());
@@ -679,103 +655,6 @@ mod tests {
         clear_request_state();
     }
 
-    /// Payload routing should signal coordination channel exactly once per payload
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_coordination_channel_signaled_per_payload() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-coord".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-coord".to_string());
-        }
-
-        // Send 3 payloads
-        route_payload_to_request_buffer(vec![1]).await;
-        route_payload_to_request_buffer(vec![2]).await;
-        route_payload_to_request_buffer(vec![3]).await;
-
-        // Should receive exactly 3 signals
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err()); // No more
-
-        clear_request_state();
-    }
-
-    /// Cleanup with skip_buffer should still clean coordination_tx
-    /// since the receiver is already consumed by process_request_concurrently
-    #[test]
-    #[serial]
-    fn test_cleanup_skip_buffer_still_cleans_coordination() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-sk".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
-        cleanup_request_processing_state_internal("req-sk", true);
-
-        // Entry preserved with buffer intact
-        {
-            let entry = REQUEST_DATA.get("req-sk");
-            assert!(entry.is_some());
-            // But coordination sender should be cleaned (receiver already consumed)
-            assert!(entry.unwrap().coordination_tx.is_none());
-        }
-
-        clear_request_state();
-    }
-
-    /// Sending to a dropped coordination channel should not panic
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_send_to_dropped_coordination_channel_is_safe() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        // Create channel and immediately drop receiver
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        REQUEST_DATA.insert("req-drop".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer.clone(),
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-        drop(rx);
-
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-drop".to_string());
-        }
-
-        // Should NOT panic even though receiver is dropped
-        route_payload_to_request_buffer(vec![42]).await;
-
-        // Payload should still be in buffer
-        let stored = buffer.lock().unwrap().len();
-        assert_eq!(stored, 1);
-
-        clear_request_state();
-    }
 
     /// TELEMETRY_CURRENT_REQUEST_ID and CURRENT_ACTIVE_REQUEST_ID
     /// can diverge temporarily — this is by design
@@ -820,8 +699,9 @@ mod tests {
         let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
 
-        let state_a = create_request_processing_state("req-A", "arn:a", &factory);
-        let state_b = create_request_processing_state("req-B", "arn:b", &factory);
+        let log_proc = create_test_log_processor(&factory);
+        let state_a = create_request_processing_state("req-A", "arn:a", &factory, &log_proc);
+        let state_b = create_request_processing_state("req-B", "arn:b", &factory, &log_proc);
 
         // Add data to A's buffer
         state_a.agent_buffer.lock().unwrap().push(vec![1, 2, 3]);
@@ -862,14 +742,14 @@ mod tests {
         REQUEST_DATA.insert("req-A".to_string(), RequestData {
             context: ctx_a,
             agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
             context: ctx_b,
             agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -907,14 +787,14 @@ mod tests {
         REQUEST_DATA.insert("req-X".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
         });
@@ -933,65 +813,6 @@ mod tests {
 
 
 
-    /// Coordination channel: payload arriving BEFORE coordination_rx is polled
-    /// should still be received (buffered in unbounded channel)
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_coordination_payload_before_poll() {
-        clear_request_state();
-
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
-        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
-
-        let mut state = create_request_processing_state("coord-req", "arn:test", &factory);
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("coord-req".to_string());
-        }
-
-        // Payload arrives BEFORE anyone polls coordination_rx
-        route_payload_to_request_buffer(vec![11, 22]).await;
-
-        // Now poll coordination_rx — should immediately receive the signal
-        let rx = state.coordination_rx.as_mut().expect("has rx");
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            rx.recv(),
-        ).await;
-
-        assert!(result.is_ok(), "Signal should be available immediately (buffered)");
-        assert!(result.unwrap().is_some(), "Channel should not be closed");
-
-        clear_request_state();
-    }
-
-    /// Coordination channel: timeout when no payload arrives
-    /// (simulates the 100ms wait in process_request_concurrently)
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_coordination_timeout_no_payload() {
-        clear_request_state();
-
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
-        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
-
-        let mut state = create_request_processing_state("timeout-req", "arn:test", &factory);
-
-        // No payload sent — should timeout
-        let rx = state.coordination_rx.as_mut().expect("has rx");
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
-
-        assert!(result.is_err(), "Should timeout since no payload arrived");
-
-        clear_request_state();
-    }
 
 
 

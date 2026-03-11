@@ -373,7 +373,7 @@ mod tests {
         crate::request::REQUEST_DATA.insert("report-req-1".to_string(), crate::request::RequestData {
             context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
             agent_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -637,7 +637,7 @@ mod tests {
         crate::request::REQUEST_DATA.insert("apm-report-req".to_string(), crate::request::RequestData {
             context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
             agent_buffer: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -698,7 +698,7 @@ mod tests {
         crate::request::REQUEST_DATA.insert("empty-buf-req".to_string(), crate::request::RequestData {
             context: std::sync::Arc::new(std::sync::Mutex::new(InvocationContext::default())),
             agent_buffer: buffer,
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
@@ -835,7 +835,7 @@ mod tests {
         crate::request::REQUEST_DATA.insert("buf-report-req".to_string(), crate::request::RequestData {
             context: ctx,
             agent_buffer: buffer,
-            coordination_tx: None,
+
             pending_report: None,
             creation_invocation: 0,
         });
