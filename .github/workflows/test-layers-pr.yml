@@ -153,8 +153,8 @@ jobs:
           export TEST_MODE="true"
           export LAYER_NAME_PREFIX="NRTestRustExtension"
           export BUCKET_PREFIX="nr-extension-test-layers"
-          export REGIONS_X86_64="ca-central-1 us-west-1"
-          export REGIONS_ARM64="ca-central-1 us-west-1"
+          export REGIONS_X86_64="us-west-1"
+          export REGIONS_ARM64="us-west-1"
           export LANGUAGES="extension python nodejs java dotnet ruby"
           
           # Run the unified script
@@ -292,7 +292,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           
           if [ "${{ steps.build_layers.outputs.layers_created }}" == "true" ]; then
-            echo "✅ Test layers successfully built and published to us-west-1 and ca-central-1" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Test layers successfully built and published to us-west-1" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "### Layer ARNs" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
@@ -315,8 +315,8 @@ jobs:
       contents: read
 
     env:
-      AWS_REGION: ca-central-1
-      AWS_DEFAULT_REGION: ca-central-1
+      AWS_REGION: us-west-1
+      AWS_DEFAULT_REGION: us-west-1
 
     strategy:
       matrix:
@@ -363,8 +363,8 @@ jobs:
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
           # Set correct AWS region
-          export AWS_DEFAULT_REGION=ca-central-1
-          export AWS_REGION=ca-central-1
+          export AWS_DEFAULT_REGION=us-west-1
+          export AWS_REGION=us-west-1
 
           echo "🧪 Running COLD start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
           echo "Region: $AWS_REGION"
@@ -405,8 +405,8 @@ jobs:
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
           # Set correct AWS region
-          export AWS_DEFAULT_REGION=ca-central-1
-          export AWS_REGION=ca-central-1
+          export AWS_DEFAULT_REGION=us-west-1
+          export AWS_REGION=us-west-1
 
           echo "🔥 Running WARM start test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
           echo "Region: $AWS_REGION"
@@ -445,8 +445,8 @@ jobs:
           API_KEY: ${{ secrets.LAMBDA_PERF_TEST_API_KEY }}
         run: |
           # Set correct AWS region
-          export AWS_DEFAULT_REGION=ca-central-1
-          export AWS_REGION=ca-central-1
+          export AWS_DEFAULT_REGION=us-west-1
+          export AWS_REGION=us-west-1
 
           echo "📝 Running LOGS test for ${{ matrix.runtime }} in ${{ matrix.test_mode }} mode"
           echo "Region: $AWS_REGION"
