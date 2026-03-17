@@ -266,7 +266,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("[NR_EXT] APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -437,9 +437,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
 
-                let shutdown_duration = shutdown_start_time.elapsed();
-                info!("APM mode shutdown: All data processed and sent");
-                info!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
+                info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
             }
         }
@@ -611,7 +609,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
-                info!("[NR_EXT] Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                let shutdown_start_time = std::time::Instant::now();
+                info!("Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -677,7 +676,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
 
-                info!("Standard mode shutdown: All data processed and sent");
+                info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
             }
         }
