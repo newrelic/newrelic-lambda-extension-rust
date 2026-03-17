@@ -18,6 +18,7 @@ mod runtime;
 mod request;
 mod event_loop;
 mod error_synthesis;
+mod util;
 
 
 use std::{
@@ -79,8 +80,9 @@ pub fn get_global_fallback_arn() -> String {
 }
 
 /// Global flag to track if this is a warm start (for performance optimization)
-static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
-    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+/// Plain static AtomicBool — no Arc/Lazy needed since statics are already 'static
+static IS_WARM_START: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Global APM app instance (for sending platform.report metrics in APM mode)
 static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =

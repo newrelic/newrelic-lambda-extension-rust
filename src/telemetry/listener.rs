@@ -98,7 +98,7 @@ async fn handle_telemetry_request(
             let mut function_completed = false;
             let mut function_count = 0;
             let mut extension_count = 0;
-            let mut platform_count = 0;
+            let mut unknown_record_count = 0;
 
             for record in records {
                 match record.record_type.as_str() {
@@ -220,13 +220,13 @@ async fn handle_telemetry_request(
                         function_completed = true;
                     }
                     _ => {
-                        platform_count += 1;
+                        unknown_record_count += 1;
                         platform_processor.process_record(record);
                     }
                 }
             }
             
-            if function_count > 0 || extension_count > 0 || platform_count > 0 {
+            if function_count > 0 || extension_count > 0 || unknown_record_count > 0 {
                 let is_cold_start = !crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
                 if is_cold_start && function_count > 0 {
                     debug!("COLD START: Successfully received {} function logs via telemetry API!", function_count);

@@ -25,6 +25,7 @@ pub struct ApmApp {
     pub license_key: String,
     pub metric_endpoint: String,
     pub client: Client,
+    pub function_name: String,
 }
 
 impl ApmApp {
@@ -176,6 +177,7 @@ impl ApmApp {
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
             client: client.clone(),
+            function_name: function_name.to_string(),
         })
     }
 
@@ -291,6 +293,8 @@ impl ApmApp {
                         request_id,
                         run_id,
                         collector_host,
+                        client.clone(),
+                        license_key.clone(),
                     );
                 }
             });
@@ -325,10 +329,7 @@ impl ApmApp {
             metrics_data.max_memory_used
         );
 
-        let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or_else(|_| "unknown".to_string());
-
-        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
+        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &self.function_name);
         
         debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
@@ -712,6 +713,7 @@ mod tests {
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             client,
+            function_name: "test_function".to_string(),
         };
 
         assert_eq!(app.run_id, "test_run_id");

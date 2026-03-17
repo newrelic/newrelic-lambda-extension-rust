@@ -26,19 +26,32 @@ pub struct FailedTelemetry {
 pub static FAILED_TELEMETRY_BUFFER: Lazy<Arc<Mutex<VecDeque<FailedTelemetry>>>> =
     Lazy::new(|| Arc::new(Mutex::new(VecDeque::new())));
 
-/// Add failed telemetry to buffer
+/// Add failed telemetry to buffer.
+/// When the buffer is at capacity, the oldest entry is popped and sent to NR
+/// in a background task rather than being silently discarded.
 pub fn buffer_failed_telemetry(
     telemetry_type: String,
     data: Vec<Value>,
     request_id: String,
     run_id: String,
     collector_host: String,
+    client: reqwest::Client,
+    license_key: String,
 ) {
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
         const MAX_BUFFERED_TELEMETRY: usize = 50;
         if buffer.len() >= MAX_BUFFERED_TELEMETRY {
-            warn!("APM mode: Telemetry buffer at capacity ({}) - dropping oldest entry", MAX_BUFFERED_TELEMETRY);
-            buffer.pop_front();
+            if let Some(evicted) = buffer.pop_front() {
+                warn!(
+                    "APM mode: Telemetry buffer at capacity ({}) - sending oldest entry ({} for request {}) to NR in background",
+                    MAX_BUFFERED_TELEMETRY, evicted.telemetry_type, evicted.request_id
+                );
+                let evicted_client = client.clone();
+                let evicted_license_key = license_key.clone();
+                tokio::spawn(async move {
+                    send_evicted_telemetry(evicted, &evicted_client, &evicted_license_key).await;
+                });
+            }
         }
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
@@ -187,4 +200,66 @@ pub fn get_buffer_count() -> usize {
         .lock()
         .map(|buffer| buffer.len())
         .unwrap_or(0)
+}
+
+/// Send an evicted telemetry item to NR as a last-chance attempt before it's lost
+async fn send_evicted_telemetry(
+    item: FailedTelemetry,
+    client: &reqwest::Client,
+    license_key: &str,
+) {
+    debug!(
+        "Attempting last-chance send of evicted {} for request {}",
+        item.telemetry_type, item.request_id
+    );
+
+    let result = if item.telemetry_type == "error_event_data" {
+        super::collector::send_error_events(
+            client,
+            license_key,
+            &item.collector_host,
+            &item.run_id,
+            &item.data,
+        )
+        .await
+    } else {
+        let command = match item.telemetry_type.as_str() {
+            "metric_data" => super::collector::CMD_METRICS,
+            "span_event_data" => super::collector::CMD_SPAN_EVENTS,
+            "error_data" => super::collector::CMD_ERROR_DATA,
+            "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
+            "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
+            "log_event_data" => super::collector::CMD_LOG_EVENTS,
+            "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
+            _ => {
+                warn!("Unknown evicted telemetry type: {} - discarding", item.telemetry_type);
+                return;
+            }
+        };
+
+        super::collector::send_apm_telemetry(
+            client,
+            license_key,
+            &item.collector_host,
+            &item.run_id,
+            command,
+            &item.data,
+        )
+        .await
+    };
+
+    match result {
+        Ok(()) => {
+            debug!(
+                "Successfully sent evicted {} for request {}",
+                item.telemetry_type, item.request_id
+            );
+        }
+        Err(e) => {
+            error!(
+                "Failed last-chance send of evicted {} for request {}: {} - data lost",
+                item.telemetry_type, item.request_id, e
+            );
+        }
+    }
 }

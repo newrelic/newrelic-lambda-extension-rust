@@ -2,7 +2,7 @@ use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
 use anyhow::anyhow;
 use reqwest::{header, Client, NoProxy, Proxy};
 use serde::Serialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Error type for New Relic client operations.
 /// Wraps both reqwest transport errors and HTTP status errors.
@@ -22,12 +22,14 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
 /// `http://user:pass@proxy:8080` -> `http://***:***@proxy:8080`
 pub fn mask_proxy_url(url: &str) -> String {
     // Try to find the `@` that separates credentials from host
-    // Pattern: scheme://user:pass@host...
+    // Pattern: scheme://user:pass@host... or scheme://user@host...
     if let Some(at_pos) = url.find('@') {
         if let Some(scheme_end) = url.find("://") {
             let prefix = &url[..scheme_end + 3]; // "http://" or "https://"
+            let creds = &url[scheme_end + 3..at_pos];
             let suffix = &url[at_pos..];          // "@proxy:8080/..."
-            return format!("{prefix}***:***{suffix}");
+            let masked = if creds.contains(':') { "***:***" } else { "***" };
+            return format!("{prefix}{masked}{suffix}");
         }
     }
     url.to_string()
@@ -91,10 +93,14 @@ impl NewRelicClient {
         let license_key = config.new_relic.license_key.as_deref().unwrap_or_default();
 
         let mut headers = header::HeaderMap::new();
-        headers.insert(
-            "Api-Key",
-            header::HeaderValue::from_str(license_key).unwrap(),
-        );
+        let api_key_header = match header::HeaderValue::from_str(license_key) {
+            Ok(val) => val,
+            Err(e) => {
+                error!("Invalid license key characters for HTTP header: {} - using empty fallback", e);
+                header::HeaderValue::from_static("")
+            }
+        };
+        headers.insert("Api-Key", api_key_header);
         headers.insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_static("application/json"),
@@ -401,6 +407,14 @@ mod tests {
         assert_eq!(
             mask_proxy_url("http://u:p@proxy:8080/path"),
             "http://***:***@proxy:8080/path"
+        );
+    }
+
+    #[test]
+    fn test_mask_proxy_url_username_only() {
+        assert_eq!(
+            mask_proxy_url("http://user@proxy:8080"),
+            "http://***@proxy:8080"
         );
     }
 

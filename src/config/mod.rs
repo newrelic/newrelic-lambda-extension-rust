@@ -213,25 +213,26 @@ impl ExtensionConfig {
     /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
     fn parse_send_logs(value: &str) -> (bool, bool, bool) {
         let normalized = value.to_lowercase();
-        let parts: Vec<&str> = normalized.split(',').map(|s| s.trim()).collect();
-        
-        // NEW: Check for empty string
+
         if normalized.is_empty() {
             eprintln!("NEW_RELIC_EXTENSION_SEND_LOGS is empty. No logs will be sent");
             return (false, false, false);
         }
-        // Check for "all" first
-        if parts.contains(&"all") {
-           if parts.len() > 1 {
+
+        // Iterator-based parsing — no Vec allocation needed
+        let items = || normalized.split(',').map(|s| s.trim());
+
+        if items().any(|s| s == "all") {
+            if items().count() > 1 {
                 eprintln!("[NR_EXT] INFO: 'all' specified in SEND_LOGS;defaulting to 'all'");
             }
             return (true, true, true);
         }
-        
-        let send_function = parts.contains(&"function");
-        let send_extension = parts.contains(&"extension");
-        let send_platform = parts.contains(&"platform");
-        
+
+        let send_function = items().any(|s| s == "function");
+        let send_extension = items().any(|s| s == "extension");
+        let send_platform = items().any(|s| s == "platform");
+
         (send_function, send_extension, send_platform)
     }
 

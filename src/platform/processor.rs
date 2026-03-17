@@ -3,6 +3,7 @@ use crate::{
     context::InvocationContext,
     newrelic::{client::NewRelicClient, flush::Flush},
     telemetry::listener::TelemetryRecord,
+    util::SafeMutexOps,
 };
 use async_trait::async_trait;
 use std::{
@@ -255,12 +256,12 @@ impl PlatformProcessor {
                     .map(|s| format!("init-{}", &s[..8.min(s.len())]))
                     .unwrap_or_else(|| {
                         // Last resort: use context or generate ID
-                        let context = self.invocation_context.lock().unwrap();
-                        if !context.request_id.is_empty() && context.request_id != "temp" {
-                            context.request_id.clone()
-                        } else {
-                            format!("init-{}", chrono::Utc::now().timestamp())
+                        if let Some(context) = self.invocation_context.safe_lock() {
+                            if !context.request_id.is_empty() && context.request_id != "temp" {
+                                return context.request_id.clone();
+                            }
                         }
+                        format!("init-{}", chrono::Utc::now().timestamp())
                     })
             }
         } else {
@@ -270,12 +271,12 @@ impl PlatformProcessor {
                 .map(|s| format!("init-{}", &s[..8.min(s.len())]))
                 .unwrap_or_else(|| {
                     // Last resort: use context or generate ID
-                    let context = self.invocation_context.lock().unwrap();
-                    if !context.request_id.is_empty() && context.request_id != "temp" {
-                        context.request_id.clone()
-                    } else {
-                        format!("init-{}", chrono::Utc::now().timestamp())
+                    if let Some(context) = self.invocation_context.safe_lock() {
+                        if !context.request_id.is_empty() && context.request_id != "temp" {
+                            return context.request_id.clone();
+                        }
                     }
+                    format!("init-{}", chrono::Utc::now().timestamp())
                 })
         };
         
@@ -378,13 +379,14 @@ impl PlatformProcessor {
         };
         
         // Get invoked function ARN from context, use global fallback if empty
-        let invoked_function_arn = {
-            let context = self.invocation_context.lock().unwrap();
+        let invoked_function_arn = if let Some(context) = self.invocation_context.safe_lock() {
             if !context.invoked_function_arn.is_empty() {
                 context.invoked_function_arn.clone()
             } else {
                 crate::get_global_fallback_arn()
             }
+        } else {
+            crate::get_global_fallback_arn()
         };
         
         // Map platform error to appropriate Lambda error type
@@ -436,54 +438,11 @@ impl PlatformProcessor {
         );
     }
  
-    /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
-    /// but the compiler cannot detect it in certain build configurations
-    #[allow(dead_code)]
-    fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
-        if message.starts_with("REPORT RequestId: ") {
-            if let Some(start) = message.find("REPORT RequestId: ") {
-                let after_prefix = &message[start + "REPORT RequestId: ".len()..];
-                if let Some(tab_pos) = after_prefix.find('\t') {
-                    return Some(after_prefix[..tab_pos].to_string());
-                }
-                let request_id = after_prefix.split_whitespace().next()?;
-                return Some(request_id.to_string());
-            }
-        }
-        None
-    }
-
-    /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
-    /// but the compiler cannot detect it in certain build configurations
-    #[allow(dead_code)]
-    fn extract_log_level_from_message(&self, message: &str) -> &'static str {
-        let message_upper = message.to_uppercase();
-        
-        if message_upper.contains("ERROR") || 
-           message_upper.contains("FAIL") ||
-           message_upper.contains("EXCEPTION") {
-            "ERROR"
-        } 
-        else if message_upper.contains("WARN") || 
-                message_upper.contains("WARNING") {
-            "WARNING"
-        }
-        else if message_upper.contains("DEBUG") {
-            "DEBUG"
-        }
-        else if message_upper.contains("TRACE") {
-            "TRACE"
-        }
-        else {
-            "INFO"
-        }
-    }
-
-   
     pub fn process_invoke_event(&self, request_id: &str, invoked_function_arn: &str) {
-        let mut context = self.invocation_context.lock().unwrap();
-        context.request_id = request_id.to_string();
-        context.invoked_function_arn = invoked_function_arn.to_string();
+        if let Some(mut context) = self.invocation_context.safe_lock() {
+            context.request_id = request_id.to_string();
+            context.invoked_function_arn = invoked_function_arn.to_string();
+        }
     }
 }
     

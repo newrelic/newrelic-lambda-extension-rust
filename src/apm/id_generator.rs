@@ -6,6 +6,7 @@
 use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use std::sync::Mutex;
+use crate::util::SafeMutexOps;
 
 const TRACE_ID_BYTE_LEN: usize = 16;
 const SPAN_ID_BYTE_LEN: usize = 8;
@@ -26,8 +27,11 @@ impl TraceIDGenerator {
 
     /// Generate a random float32
     pub fn float32(&self) -> f32 {
-        let mut rng = self.rng.lock().unwrap();
-        rng.random()
+        if let Some(mut rng) = self.rng.safe_lock() {
+            rng.random()
+        } else {
+            0.0
+        }
     }
 
     /// Generate a 32-character hex trace ID
@@ -42,16 +46,19 @@ impl TraceIDGenerator {
 
     /// Generate an ID of specified byte length as hex string
     fn generate_id(&self, byte_len: usize) -> String {
-        let mut rng = self.rng.lock().unwrap();
-        let mut bytes = vec![0u8; byte_len];
-        rng.fill(&mut bytes[..]);
+        if let Some(mut rng) = self.rng.safe_lock() {
+            let mut bytes = vec![0u8; byte_len];
+            rng.fill(&mut bytes[..]);
 
-        let mut hex = String::with_capacity(byte_len * 2);
-        for byte in bytes {
-            hex.push(HEX_TABLE[(byte >> 4) as usize] as char);
-            hex.push(HEX_TABLE[(byte & 0x0f) as usize] as char);
+            let mut hex = String::with_capacity(byte_len * 2);
+            for byte in bytes {
+                hex.push(HEX_TABLE[(byte >> 4) as usize] as char);
+                hex.push(HEX_TABLE[(byte & 0x0f) as usize] as char);
+            }
+
+            hex
+        } else {
+            "0000000000000000".to_string()
         }
-
-        hex
     }
 }

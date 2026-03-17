@@ -54,24 +54,36 @@ pub fn add_to_batch(
             .min_by_key(|entry| entry.value().timestamp)
             .map(|entry| entry.key().clone())
         {
+            // Decrement counter if evicted entry had a report line
+            if let Some((_, evicted)) = AGENT_BATCH_BUFFER.remove(&oldest_key) {
+                if evicted.report_line.is_some() {
+                    BATCH_WITH_REPORTS_COUNT.fetch_sub(1, Ordering::Release);
+                }
+            }
             warn!("AGENT_BATCH_BUFFER at capacity ({}) - dropping oldest entry", MAX_BATCH_BUFFER_SIZE);
-            AGENT_BATCH_BUFFER.remove(&oldest_key);
         }
     }
 
-    AGENT_BATCH_BUFFER.insert(
-        request_id.clone(),
-        BatchedAgentPayload {
-            request_id,
-            agent_payload_bytes: Arc::new(agent_bytes),
-            report_line,
-            invoked_function_arn: arn,
-            timestamp,
-        }
-    );
+    let new_payload = BatchedAgentPayload {
+        request_id: request_id.clone(),
+        agent_payload_bytes: Arc::new(agent_bytes),
+        report_line,
+        invoked_function_arn: arn,
+        timestamp,
+    };
 
-    if has_report {
-        BATCH_WITH_REPORTS_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Check for overwrite to keep counter in sync
+    let old_had_report = AGENT_BATCH_BUFFER.get(&request_id)
+        .map(|entry| entry.report_line.is_some())
+        .unwrap_or(false);
+
+    AGENT_BATCH_BUFFER.insert(request_id, new_payload);
+
+    // Adjust counter based on old vs new report state
+    match (old_had_report, has_report) {
+        (false, true) => { BATCH_WITH_REPORTS_COUNT.fetch_add(1, Ordering::Release); }
+        (true, false) => { BATCH_WITH_REPORTS_COUNT.fetch_sub(1, Ordering::Release); }
+        _ => {} // both had report or neither — no change
     }
 
     debug!("Added agent payload to batch (total buffered: {})", AGENT_BATCH_BUFFER.len());
@@ -80,7 +92,7 @@ pub fn add_to_batch(
 /// Check if batch threshold is reached (3+ payloads WITH report lines)
 /// Uses atomic counter instead of iterating DashMap for O(1) performance
 pub fn should_send_batch_by_threshold() -> bool {
-    let count = BATCH_WITH_REPORTS_COUNT.load(Ordering::Relaxed);
+    let count = BATCH_WITH_REPORTS_COUNT.load(Ordering::Acquire);
     if count >= 3 {
         debug!("Batch threshold reached: {} agent payloads with report lines", count);
         return true;
@@ -91,7 +103,7 @@ pub fn should_send_batch_by_threshold() -> bool {
 /// Reset the atomic batch-with-reports counter (for tests)
 #[cfg(test)]
 pub fn reset_batch_reports_count() {
-    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Relaxed);
+    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Release);
 }
 
 /// Get all batched payloads and clear the buffer
@@ -102,7 +114,7 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
         .collect();
 
     AGENT_BATCH_BUFFER.clear();
-    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Relaxed);
+    BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Release);
 
     items
 }
@@ -129,7 +141,7 @@ fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
     }
     // Decrement atomic counter for removed report-bearing payloads
     if reports_removed > 0 {
-        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
+        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Release);
     }
 
     debug!(
@@ -520,7 +532,7 @@ pub async fn cleanup_old_batch_entries(
         AGENT_BATCH_BUFFER.remove(&item.request_id);
     }
     if reports_removed > 0 {
-        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
+        BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Release);
     }
 
     debug!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), AGENT_BATCH_BUFFER.len());

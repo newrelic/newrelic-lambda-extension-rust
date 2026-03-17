@@ -5,7 +5,7 @@
 
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use crate::{
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
@@ -40,6 +40,9 @@ pub struct FailedError {
     pub invoked_function_arn: String,
     pub error_class: String,
 }
+
+/// Maximum number of failed errors to buffer (prevents unbounded memory growth)
+const MAX_FAILED_ERRORS: usize = 50;
 
 pub static FAILED_ERRORS: Lazy<Arc<Mutex<Vec<FailedError>>>> =
     Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
@@ -238,6 +241,10 @@ pub async fn send_timeout_error(
             error!("Failed to send timeout error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                if failed_errors.len() >= MAX_FAILED_ERRORS {
+                    warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
+                    failed_errors.remove(0);
+                }
                 failed_errors.push(FailedError {
                     request_id: request_id.to_string(),
                     error_type: "LambdaTimeout".to_string(),
@@ -317,6 +324,10 @@ pub async fn send_platform_fault_error(
             error!("Failed to send platform fault error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                if failed_errors.len() >= MAX_FAILED_ERRORS {
+                    warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
+                    failed_errors.remove(0);
+                }
                 failed_errors.push(FailedError {
                     request_id: request_id.to_string(),
                     error_type: "LambdaPlatformFault".to_string(),
@@ -390,6 +401,10 @@ pub async fn send_lambda_error(
             error!("Failed to send Lambda error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
+                if failed_errors.len() >= MAX_FAILED_ERRORS {
+                    warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
+                    failed_errors.remove(0);
+                }
                 failed_errors.push(FailedError {
                     request_id: request_id.to_string(),
                     error_type: error_type.to_string(),
