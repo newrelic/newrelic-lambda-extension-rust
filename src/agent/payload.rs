@@ -112,7 +112,7 @@ pub async fn send_agent_payload_to_newrelic(
                 "Failed to send agent payload for request {}: {}",
                 request_id, e
             );
-            Err(Box::new(e))
+            Err(e.into())
         }
     }
 }

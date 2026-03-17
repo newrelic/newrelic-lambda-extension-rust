@@ -1,7 +1,12 @@
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
-use reqwest::{header, Client, Error, NoProxy, Proxy};
+use anyhow::anyhow;
+use reqwest::{header, Client, NoProxy, Proxy};
 use serde::Serialize;
 use tracing::{debug, info, warn};
+
+/// Error type for New Relic client operations.
+/// Wraps both reqwest transport errors and HTTP status errors.
+pub type SendError = anyhow::Error;
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -58,12 +63,17 @@ pub fn build_proxy(proxy_url: &str) -> Option<Proxy> {
 ///   so `HTTPS_PROXY` still works for users who rely on it.
 /// - Localhost/loopback is always excluded from proxying via `NoProxy`.
 pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
+    // Short pool_idle_timeout prevents stale connections after Lambda freeze/thaw:
+    // Instant::now() uses CLOCK_MONOTONIC which advances during cgroup freeze,
+    // so connections idle >2s are correctly evicted at checkout after thaw.
+    // Within the same invocation, connections are reused (APM sends 6-8 requests).
+    // reqwest/hyper does NOT auto-retry on stale connections (unlike Go's net/http),
+    // so we rely on short idle timeout to discard dead connections before reuse.
     let mut builder = Client::builder()
         .timeout(std::time::Duration::from_millis(2400))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(10)
-        .tcp_keepalive(std::time::Duration::from_secs(30));
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .pool_idle_timeout(std::time::Duration::from_secs(2))
+        .pool_max_idle_per_host(10);
 
     if let Some(url) = proxy_url {
         if let Some(proxy) = build_proxy(url) {
@@ -99,13 +109,16 @@ impl NewRelicClient {
             header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
         );
 
+        // Short pool_idle_timeout prevents stale connections after Lambda freeze/thaw:
+        // Instant::now() uses CLOCK_MONOTONIC which advances during cgroup freeze,
+        // so connections idle >2s are correctly evicted at checkout after thaw.
+        // Within the same invocation, connections are reused (APM sends 6-8 requests).
         let mut builder = Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_millis(2400))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(10)
-            .tcp_keepalive(std::time::Duration::from_secs(30));
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .pool_idle_timeout(std::time::Duration::from_secs(2))
+            .pool_max_idle_per_host(10);
 
         if let Some(ref proxy_url) = config.new_relic.proxy_url {
             if let Some(proxy) = build_proxy(proxy_url) {
@@ -141,7 +154,7 @@ impl NewRelicClient {
         config: &ExtensionConfig,
         batch: Vec<payload::LogMessage>,
         function_arn: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), SendError> {
         if batch.is_empty() {
             warn!("Attempted to send empty log batch");
             return Ok(());
@@ -191,7 +204,7 @@ impl NewRelicClient {
         &self,
         config: &ExtensionConfig,
         payload_json: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), SendError> {
         if config.new_relic.license_key.is_none() {
             warn!("[agentsend] New Relic license key is not set, skipping agent payload send");
             return Ok(());
@@ -203,45 +216,45 @@ impl NewRelicClient {
         
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
+        // Pre-allocate body once outside the retry loop to avoid re-allocation per attempt
+        let body: bytes::Bytes = payload_json.to_string().into();
 
         loop {
-            
             let res = self.client
                 .post(&config.new_relic.telemetry_endpoint)
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(payload_json.to_string())
+                .body(body.clone()) // Bytes::clone is cheap (reference-counted)
                 .send()
                 .await;
 
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    
+
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         debug!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         return Ok(());
-                    } else {
-                        let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        if retries == 0 {
-                            warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
-                        }
-                        
-                        if status.is_client_error() {
-                            warn!("[agentsend] Client error (4xx), not retrying");
-                            return Ok(());
-                        }
-                        
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            let delay = get_backoff_delay(retries);
-                            tokio::time::sleep(delay).await;
-                        } else {
-                            warn!("[agentsend] Max retries exceeded");
-                            return Ok(());
-                        }
                     }
+                    let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
+                    if retries == 0 {
+                        warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
+                    }
+
+                    if status.is_client_error() {
+                        warn!("[agentsend] Client error (4xx), not retrying");
+                        return Ok(());
+                    }
+
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        let delay = get_backoff_delay(retries);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    warn!("[agentsend] Max retries exceeded for status {}", status);
+                    return Err(anyhow!("[agentsend] HTTP {} after {} retries", status, MAX_RETRIES));
                 }
                 Err(e) => {
                     if retries == 0 {
@@ -259,19 +272,19 @@ impl NewRelicClient {
                         retries += 1;
                         let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
-                    } else {
-                        warn!("[agentsend] Max network retries exceeded");
-                        return Err(e);
+                        continue;
                     }
+                    warn!("[agentsend] Max network retries exceeded");
+                    return Err(e.into());
                 }
             }
         }
     }
 
     /// Sends a JSON payload to a specified endpoint.
-    async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T, log_count: Option<usize>) -> Result<(), Error> {
+    async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T, log_count: Option<usize>) -> Result<(), SendError> {
         let start_time = std::time::Instant::now();
-        let body = match serde_json::to_string(payload) {
+        let body_str = match serde_json::to_string(payload) {
             Ok(json) => json,
             Err(e) => {
                 warn!("Failed to serialize payload to JSON: {}", e);
@@ -279,14 +292,15 @@ impl NewRelicClient {
             }
         };
 
-        let payload_size = body.len();
+        let payload_size = body_str.len();
         debug!("Sending payload to NR endpoint: {} bytes", payload_size);
 
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
-        
+        // Pre-allocate as Bytes once — Bytes::clone is cheap (reference-counted)
+        let body: bytes::Bytes = body_str.into();
+
         loop {
-            
             let res = self.client
                 .post(endpoint)
                 .header("Content-Type", "application/json")
@@ -297,7 +311,7 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    
+
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         if let Some(count) = log_count {
@@ -306,27 +320,25 @@ impl NewRelicClient {
                             debug!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
                         }
                         return Ok(());
-                    } else {
-                        let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
-                        if retries == 0 {
-                            warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
-                        }
-                        
-                        if status.is_client_error() {
-                            warn!("Client error (4xx), not retrying");
-                            return Ok(());
-                        }
-                        
-                        if retries < MAX_RETRIES {
-                            retries += 1;
-                            let delay = get_backoff_delay(retries);
-                            tokio::time::sleep(delay).await;
-                            continue;
-                        } else {
-                            warn!("Max retries exceeded");
-                            return Ok(());
-                        }
                     }
+                    let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
+                    if retries == 0 {
+                        warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
+                    }
+
+                    if status.is_client_error() {
+                        warn!("Client error (4xx), not retrying");
+                        return Ok(());
+                    }
+
+                    if retries < MAX_RETRIES {
+                        retries += 1;
+                        let delay = get_backoff_delay(retries);
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    warn!("Max retries exceeded for status {}", status);
+                    return Err(anyhow!("HTTP {} after {} retries", status, MAX_RETRIES));
                 }
                 Err(e) => {
                     if retries == 0 {
@@ -345,10 +357,9 @@ impl NewRelicClient {
                         let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
-                    } else {
-                        warn!("Max network retries exceeded");
-                        return Err(e);
                     }
+                    warn!("Max network retries exceeded");
+                    return Err(e.into());
                 }
             }
         }

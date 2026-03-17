@@ -1389,6 +1389,11 @@ fn buffer_failed_agent_payload(
     };
 
     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+        const MAX_FAILED_PAYLOADS: usize = 20;
+        if failed_payloads.len() >= MAX_FAILED_PAYLOADS {
+            warn!("FAILED_AGENT_PAYLOADS at capacity ({}) - dropping oldest entry", MAX_FAILED_PAYLOADS);
+            failed_payloads.remove(0);
+        }
         failed_payloads.push(failed_payload);
         debug!(
             "Buffered failed agent payload for request {} (total failed: {})",
@@ -1491,16 +1496,14 @@ async fn retry_failed_agent_payloads(
     }
 }
 
-/// Clean up old failed payloads (older than 24 hours)
+/// Clean up old failed payloads that have exceeded max retry count.
+/// Hard cap on buffer size is enforced at insertion time (buffer_failed_agent_payload).
 pub fn cleanup_old_failed_payloads() {
     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
         let initial_count = failed_payloads.len();
-        let now = chrono::Utc::now();
 
-        failed_payloads.retain(|payload| {
-            let age = now.signed_duration_since(payload.failed_at);
-            age.num_hours() <= 24
-        });
+        // Remove entries that have exceeded retry limit (5 retries)
+        failed_payloads.retain(|payload| payload.retry_count <= 5);
 
         let removed_count = initial_count - failed_payloads.len();
         if removed_count > 0 {

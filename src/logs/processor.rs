@@ -91,6 +91,29 @@ fn get_backoff_delay(retry_attempt: usize) -> Duration {
     }
 }
 
+/// Maximum number of failed logs to buffer for retry.
+/// Prevents unbounded memory growth during sustained send failures.
+const MAX_FAILED_LOGS: usize = 200;
+
+/// Estimate log message size in bytes without full JSON serialization.
+/// Uses byte counting on attribute keys/values instead of serde_json::to_string.
+fn estimate_log_size(log: &payload::LogMessage) -> usize {
+    // Base overhead: timestamp (8 bytes) + JSON structure (~20 bytes)
+    let mut size = 28 + log.message.len();
+    for (key, value) in &log.attributes {
+        size += key.len() + 4; // key + quotes + colon + comma
+        size += match value {
+            serde_json::Value::String(s) => s.len() + 2,
+            serde_json::Value::Null => 4,
+            serde_json::Value::Bool(_) => 5,
+            serde_json::Value::Number(n) => n.to_string().len(),
+            // For nested objects, use to_string as fallback (rare in hot path)
+            other => other.to_string().len(),
+        };
+    }
+    size
+}
+
 /// Determines whether a failed log should be buffered for retry.
 /// Function logs (customer data) are always retried.
 /// Extension logs are only retried if they are ERROR level.
@@ -290,7 +313,7 @@ impl LogProcessor {
             }
         };
     
-        if let Some(log_message) = self.to_log_message(record.clone()) {
+        if let Some(log_message) = self.to_log_message(&record) {
             // Route to pre_invoke_buffer if ARN is empty (INIT phase before first INVOKE)
             let has_arn = {
                 let context = self.invocation_context.lock().unwrap();
@@ -504,8 +527,7 @@ impl LogProcessor {
                     let mut current_size = 0;
 
                     for log in logs_to_send {
-                        let log_size = 8 + log.message.len() +
-                                      serde_json::to_string(&log.attributes).unwrap_or_default().len();
+                        let log_size = estimate_log_size(&log);
 
                         if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
                             chunks.push(std::mem::take(&mut current_chunk));
@@ -543,6 +565,10 @@ impl LogProcessor {
                                         let mut dropped = 0;
                                         for log in chunk {
                                             if should_retry_on_failure(&log) {
+                                                if buffer.len() >= MAX_FAILED_LOGS {
+                                                    warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
+                                                    buffer.remove(0);
+                                                }
                                                 buffer.push(FailedLogEntry {
                                                     log_message: log,
                                                     original_request_id: context.request_id.clone(),
@@ -586,7 +612,7 @@ impl LogProcessor {
     }
 
    
-    fn to_log_message(&self, record: TelemetryRecord) -> Option<payload::LogMessage> {
+    fn to_log_message(&self, record: &TelemetryRecord) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
         
         let message = if let Some(message_value) = record.record.get("message") {
@@ -1131,8 +1157,8 @@ impl LogProcessor {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
             
-            let mut seen = HashMap::new();
-            let mut unique_logs = Vec::new();
+            let mut seen = HashMap::with_capacity(batch.len());
+            let mut unique_logs = Vec::with_capacity(batch.len());
             let mut duplicate_count = 0;
             
             for log in batch {
@@ -1209,9 +1235,8 @@ impl LogProcessor {
         let mut current_size = 0;
         
         for log in deduplicated_batch {
-            let log_size = 8 + log.message.len() + 
-                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
-            
+            let log_size = estimate_log_size(&log);
+
             if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
                 chunks.push(std::mem::take(&mut current_chunk));
                 current_size = 0;
@@ -1230,7 +1255,7 @@ impl LogProcessor {
                   chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
         }
         
-        let mut failed_logs = Vec::new();
+        let mut failed_logs: Vec<payload::LogMessage> = Vec::new(); // Only allocated on failure path
         let mut successful_chunks = 0;
         
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
@@ -1254,6 +1279,10 @@ impl LogProcessor {
             let mut dropped = 0;
             for log in failed_logs {
                 if should_retry_on_failure(&log) {
+                    if failed_buffer.len() >= MAX_FAILED_LOGS {
+                        warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
+                        failed_buffer.remove(0);
+                    }
                     failed_buffer.push(FailedLogEntry {
                         log_message: log,
                         original_request_id: context.request_id.clone(),
@@ -1329,6 +1358,10 @@ impl LogProcessor {
                         let mut dropped = 0;
                         for log in chunk {
                             if should_retry_on_failure(&log) {
+                                if failed_buffer.len() >= MAX_FAILED_LOGS {
+                                    warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
+                                    failed_buffer.remove(0);
+                                }
                                 failed_buffer.push(FailedLogEntry {
                                     log_message: log,
                                     original_request_id: context.request_id.clone(),
@@ -1372,8 +1405,7 @@ impl LogProcessor {
         let mut current_size = 0;
 
         for log in logs {
-            let log_size = 8 + log.message.len() +
-                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+            let log_size = estimate_log_size(&log);
 
             if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
                 chunks.push(std::mem::take(&mut current_chunk));

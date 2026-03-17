@@ -62,6 +62,18 @@ pub fn add_to_batch(
     let timestamp = chrono::Utc::now();
     let has_report = report_line.is_some();
 
+    const MAX_BATCH_BUFFER_SIZE: usize = 50;
+    if AGENT_BATCH_BUFFER.len() >= MAX_BATCH_BUFFER_SIZE {
+        // Drop oldest entry by timestamp to prevent unbounded growth
+        if let Some(oldest_key) = AGENT_BATCH_BUFFER.iter()
+            .min_by_key(|entry| entry.value().timestamp)
+            .map(|entry| entry.key().clone())
+        {
+            warn!("AGENT_BATCH_BUFFER at capacity ({}) - dropping oldest entry", MAX_BATCH_BUFFER_SIZE);
+            AGENT_BATCH_BUFFER.remove(&oldest_key);
+        }
+    }
+
     AGENT_BATCH_BUFFER.insert(
         request_id.clone(),
         BatchedAgentPayload {

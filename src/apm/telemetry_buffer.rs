@@ -44,6 +44,11 @@ pub fn buffer_failed_telemetry(
     };
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+        const MAX_BUFFERED_TELEMETRY: usize = 50;
+        if buffer.len() >= MAX_BUFFERED_TELEMETRY {
+            warn!("APM mode: Telemetry buffer at capacity ({}) - dropping oldest entry", MAX_BUFFERED_TELEMETRY);
+            buffer.remove(0);
+        }
         buffer.push(failed_telemetry);
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
