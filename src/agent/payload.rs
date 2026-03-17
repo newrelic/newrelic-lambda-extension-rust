@@ -28,35 +28,45 @@ fn extract_function_name_from_arn<'a>(arn: &'a str, config_function_name: &'a st
         return config_function_name;
     }
 
-    let parts: Vec<&str> = arn.split(':').collect();
-    
     // Standard ARN format: arn:aws:lambda:region:account:function:name[:version]
     // Positions:              0   1    2      3      4        5        6      7(optional)
-    if parts.len() >= 7 && parts[0] == "arn" && parts[2] == "lambda" && parts[5] == "function" {
-        debug!("Extracted function name '{}' from valid ARN", parts[6]);
-        return parts[6];
+    // Zero-alloc: use iterator with skip instead of collecting into Vec
+    let mut parts = arn.splitn(8, ':');
+    let prefix = parts.next().unwrap_or("");  // 0: "arn"
+    let _ = parts.next();                     // 1: "aws"
+    let service = parts.next().unwrap_or(""); // 2: "lambda"
+    let _ = (parts.next(), parts.next());     // 3: region, 4: account
+    let resource_type = parts.next().unwrap_or(""); // 5: "function"
+    let resource_name = parts.next();         // 6: function name
+
+    if let Some(function_name) = resource_name {
+        if prefix == "arn" && service == "lambda" && resource_type == "function" {
+            debug!("Extracted function name '{}' from valid ARN", function_name);
+            return function_name;
+        }
     }
-    
+
     // Fallback: try to use last segment ONLY if it looks like a valid function name (for malformed ARNs)
-    if let Some(last_segment) = parts.last() {
+    let part_count = arn.matches(':').count() + 1;
+    if let Some(last_segment) = arn.rsplit(':').next() {
         // Must be non-empty, not a keyword, and at least 3 chars long to be a plausible function name
-        if !last_segment.is_empty() 
-            && *last_segment != "function" 
-            && *last_segment != "arn"
-            && *last_segment != "aws"
-            && *last_segment != "lambda"
+        if !last_segment.is_empty()
+            && last_segment != "function"
+            && last_segment != "arn"
+            && last_segment != "aws"
+            && last_segment != "lambda"
             && last_segment.len() >= 3
         {
             warn!(
                 "ARN format validation failed (expected 7+ parts, got {}). Using last segment '{}' as function name. Full ARN: {}",
-                parts.len(),
+                part_count,
                 last_segment,
                 arn
             );
             return last_segment;
         }
     }
-    
+
     // Ultimate fallback: use config
     error!(
         "Failed to extract function name from malformed ARN '{}'. Using fallback from config: {}",

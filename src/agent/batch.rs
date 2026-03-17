@@ -7,13 +7,12 @@
 //!
 //! Global state:
 //! - `AGENT_BATCH_BUFFER`: Stores batched agent payloads with optional `platform.report`
-//! - `BATCH_META`: Tracks batch metadata (count, oldest timestamp)
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ExtensionConfig,
@@ -31,23 +30,9 @@ pub struct BatchedAgentPayload {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-/// Batch metadata for tracking thresholds
-#[derive(Debug)]
-pub struct BatchMetadata {
-    pub agent_count: usize,
-    pub oldest_timestamp: Option<chrono::DateTime<chrono::Utc>>,
-}
-
 /// Global batch buffer for agent payloads with optional report lines (warm starts only)
 pub static AGENT_BATCH_BUFFER: Lazy<Arc<DashMap<String, BatchedAgentPayload>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
-
-/// Global batch metadata for tracking thresholds
-pub static BATCH_META: Lazy<Arc<Mutex<BatchMetadata>>> =
-    Lazy::new(|| Arc::new(Mutex::new(BatchMetadata {
-        agent_count: 0,
-        oldest_timestamp: None,
-    })));
 
 /// Atomic counter for payloads with report lines — avoids iterating the DashMap on every invocation
 static BATCH_WITH_REPORTS_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -89,13 +74,7 @@ pub fn add_to_batch(
         BATCH_WITH_REPORTS_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    if let Ok(mut meta) = BATCH_META.lock() {
-        meta.agent_count += 1;
-        if meta.oldest_timestamp.is_none() {
-            meta.oldest_timestamp = Some(timestamp);
-        }
-        debug!("Added agent payload to batch (total buffered: {})", meta.agent_count);
-    }
+    debug!("Added agent payload to batch (total buffered: {})", AGENT_BATCH_BUFFER.len());
 }
 
 /// Check if batch threshold is reached (3+ payloads WITH report lines)
@@ -125,11 +104,6 @@ pub fn get_and_clear_batch() -> Vec<BatchedAgentPayload> {
     AGENT_BATCH_BUFFER.clear();
     BATCH_WITH_REPORTS_COUNT.store(0, Ordering::Relaxed);
 
-    if let Ok(mut meta) = BATCH_META.lock() {
-        meta.agent_count = 0;
-        meta.oldest_timestamp = None;
-    }
-
     items
 }
 
@@ -158,27 +132,11 @@ fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
         BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
     }
 
-    // Update metadata to reflect remaining items
-    if let Ok(mut meta) = BATCH_META.lock() {
-        let remaining_count = AGENT_BATCH_BUFFER.len();
-        meta.agent_count = remaining_count;
-
-        // Update oldest timestamp to the oldest remaining item
-        if remaining_count == 0 {
-            meta.oldest_timestamp = None;
-        } else {
-            meta.oldest_timestamp = AGENT_BATCH_BUFFER
-                .iter()
-                .map(|entry| entry.value().timestamp)
-                .min();
-        }
-
-        debug!(
-            "Removed {} payloads with report lines from batch (remaining in buffer: {})",
-            items.len(),
-            remaining_count
-        );
-    }
+    debug!(
+        "Removed {} payloads with report lines from batch (remaining in buffer: {})",
+        items.len(),
+        AGENT_BATCH_BUFFER.len()
+    );
 }
 
 /// Send only batched agent payloads WITH report lines (when threshold is hit)
@@ -565,15 +523,5 @@ pub async fn cleanup_old_batch_entries(
         BATCH_WITH_REPORTS_COUNT.fetch_sub(reports_removed, Ordering::Relaxed);
     }
 
-    // Update metadata
-    if let Ok(mut meta) = BATCH_META.lock() {
-        let final_count = AGENT_BATCH_BUFFER.len();
-        meta.agent_count = final_count;
-        meta.oldest_timestamp = if final_count == 0 {
-            None
-        } else {
-            AGENT_BATCH_BUFFER.iter().map(|entry| entry.value().timestamp).min()
-        };
-        debug!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), final_count);
-    }
+    debug!("Periodic cleanup: Removed {} old entries (remaining in buffer: {})", old_entries.len(), AGENT_BATCH_BUFFER.len());
 }

@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, warn};
 
@@ -22,8 +23,8 @@ pub struct FailedTelemetry {
 }
 
 /// Global buffer for failed telemetry (APM mode only)
-pub static FAILED_TELEMETRY_BUFFER: Lazy<Arc<Mutex<Vec<FailedTelemetry>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+pub static FAILED_TELEMETRY_BUFFER: Lazy<Arc<Mutex<VecDeque<FailedTelemetry>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(VecDeque::new())));
 
 /// Add failed telemetry to buffer
 pub fn buffer_failed_telemetry(
@@ -33,29 +34,27 @@ pub fn buffer_failed_telemetry(
     run_id: String,
     collector_host: String,
 ) {
-    let failed_telemetry = FailedTelemetry {
-        telemetry_type: telemetry_type.clone(),
-        data,
-        request_id: request_id.clone(),
-        run_id,
-        collector_host,
-        failed_at: Utc::now(),
-        retry_count: 0,
-    };
-
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
         const MAX_BUFFERED_TELEMETRY: usize = 50;
         if buffer.len() >= MAX_BUFFERED_TELEMETRY {
             warn!("APM mode: Telemetry buffer at capacity ({}) - dropping oldest entry", MAX_BUFFERED_TELEMETRY);
-            buffer.remove(0);
+            buffer.pop_front();
         }
-        buffer.push(failed_telemetry);
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
             telemetry_type,
             request_id,
-            buffer.len()
+            buffer.len() + 1
         );
+        buffer.push_back(FailedTelemetry {
+            telemetry_type,
+            data,
+            request_id,
+            run_id,
+            collector_host,
+            failed_at: Utc::now(),
+            retry_count: 0,
+        });
     } else {
         error!("Failed to lock telemetry buffer - data lost!");
     }
@@ -162,7 +161,7 @@ pub async fn retry_buffered_telemetry(
                 // Put back in buffer for next retry (unless too many attempts)
                 if item.retry_count < 10 {
                     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-                        buffer.push(item);
+                        buffer.push_back(item);
                     }
                 } else {
                     error!(

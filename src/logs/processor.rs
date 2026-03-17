@@ -58,7 +58,7 @@ pub struct LogProcessor {
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
 
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
-    failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
+    failed_logs_buffer: Arc<Mutex<std::collections::VecDeque<FailedLogEntry>>>,
 
     /// Track pending auto-flush tasks to ensure they complete before function ends
     pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -69,7 +69,7 @@ pub struct LogProcessor {
     /// Fallback ARN constructed from registration response (function_name + account_id + AWS_REGION)
     fallback_function_arn: Arc<Mutex<Option<String>>>,
 
-    is_auto_flushing: Arc<Mutex<bool>>,
+    is_auto_flushing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,12 +175,12 @@ impl LogProcessor {
             trace_extraction_state,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
-            failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+            failed_logs_buffer: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             apm_app,
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
             fallback_function_arn: Arc::new(Mutex::new(None)),
-            is_auto_flushing: Arc::new(Mutex::new(false)),
+            is_auto_flushing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -477,13 +477,10 @@ impl LogProcessor {
 
             if should_flush {
                 // Check if already flushing to prevent infinite recursion
-                let mut is_flushing = self.is_auto_flushing.lock().unwrap();
-                if *is_flushing {
+                if self.is_auto_flushing.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     debug!("Auto-flush already in progress - skipping to prevent infinite loop");
                     return;
                 }
-                *is_flushing = true;
-                drop(is_flushing);
                 
                 let logs_to_send = std::mem::take(&mut *batch);
                 drop(batch);
@@ -510,9 +507,7 @@ impl LogProcessor {
                         if let Ok(mut batch) = self.log_batch.lock() {
                             batch.extend(logs_to_send);
                         }
-                        if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                            *is_flushing = false;
-                        }
+                        self.is_auto_flushing.store(false, std::sync::atomic::Ordering::Release);
                         return;
                     }
                     fallback
@@ -567,9 +562,9 @@ impl LogProcessor {
                                             if should_retry_on_failure(&log) {
                                                 if buffer.len() >= MAX_FAILED_LOGS {
                                                     warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                                                    buffer.remove(0);
+                                                    buffer.pop_front();
                                                 }
-                                                buffer.push(FailedLogEntry {
+                                                buffer.push_back(FailedLogEntry {
                                                     log_message: log,
                                                     original_request_id: context.request_id.clone(),
                                                     retry_count: 0,
@@ -602,9 +597,7 @@ impl LogProcessor {
                     handles.push(handle);
                 }
                 // Reset the flushing flag after spawning background task
-                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                    *is_flushing = false;
-                }
+                self.is_auto_flushing.store(false, std::sync::atomic::Ordering::Release);
             }
         } else {
             warn!("Failed to convert telemetry record to log message");
@@ -1281,9 +1274,9 @@ impl LogProcessor {
                 if should_retry_on_failure(&log) {
                     if failed_buffer.len() >= MAX_FAILED_LOGS {
                         warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                        failed_buffer.remove(0);
+                        failed_buffer.pop_front();
                     }
-                    failed_buffer.push(FailedLogEntry {
+                    failed_buffer.push_back(FailedLogEntry {
                         log_message: log,
                         original_request_id: context.request_id.clone(),
                         retry_count: 0,
@@ -1360,9 +1353,9 @@ impl LogProcessor {
                             if should_retry_on_failure(&log) {
                                 if failed_buffer.len() >= MAX_FAILED_LOGS {
                                     warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                                    failed_buffer.remove(0);
+                                    failed_buffer.pop_front();
                                 }
-                                failed_buffer.push(FailedLogEntry {
+                                failed_buffer.push_back(FailedLogEntry {
                                     log_message: log,
                                     original_request_id: context.request_id.clone(),
                                     retry_count: 0,

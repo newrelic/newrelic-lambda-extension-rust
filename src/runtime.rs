@@ -6,6 +6,17 @@ use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
+/// Cached Lambda Runtime API address — immutable for container lifetime, avoids
+/// per-invocation env::var lookup + String allocation in the hot polling loop.
+static RUNTIME_API: once_cell::sync::OnceCell<String> = once_cell::sync::OnceCell::new();
+
+fn get_runtime_api() -> Result<&'static str, Box<dyn std::error::Error + Send + Sync>> {
+    RUNTIME_API
+        .get_or_try_init(|| env::var("AWS_LAMBDA_RUNTIME_API"))
+        .map(|s| s.as_str())
+        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set".into())
+}
+
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
@@ -69,8 +80,7 @@ pub async fn register_extension(
     client: &Client,
     extension_name: &str,
 ) -> Result<(ExtensionRegistrationResponse, String), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
+    let runtime_api = get_runtime_api()?;
 
     let url = format!("http://{}/2020-01-01/extension/register", runtime_api);
     
@@ -111,8 +121,7 @@ pub async fn subscribe_to_telemetry(
     ext_id: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
+    let runtime_api = get_runtime_api()?;
 
     let url = format!("http://{}/2022-07-01/telemetry", runtime_api);
     
@@ -152,8 +161,7 @@ pub async fn fetch_next_event(
     client: &Client,
     ext_id: &str,
 ) -> Result<LambdaRuntimeEvent, Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
+    let runtime_api = get_runtime_api()?;
 
     let url = format!("http://{}/2020-01-01/extension/event/next", runtime_api);
 

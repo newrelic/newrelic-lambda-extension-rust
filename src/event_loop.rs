@@ -53,8 +53,8 @@ pub struct FailedAgentPayload {
     pub failed_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
-    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<std::collections::VecDeque<FailedAgentPayload>>>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
 
 /// Track last processed request for error synthesis on shutdown
 pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String, String)>>>> =
@@ -94,8 +94,11 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
+    let mut apm_task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
+        // Prune completed task handles to prevent unbounded growth
+        apm_task_handles.retain(|h| !h.is_finished());
         debug!("APM mode: waiting for next lambda invocation event...");
 
         let runtime_event = match runtime::fetch_next_event(&components.client, &components.extension_id).await
@@ -198,25 +201,37 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
-                // Process pending payloads from previous invocations, then current request
-                // Call directly instead of tokio::spawn + tokio::join! (avoids task overhead)
-                process_pending_agent_payloads(
-                    &components.config,
-                    &components.global_log_processor,
-                    &components.apm_app,
-                    &request_id,
-                )
-                .await;
+                // Spawn APM processing as background tasks so the extension can call /next
+                // immediately, avoiding adding send latency to billed duration.
+                // Tasks complete while the next function invocation runs.
+                {
+                    let config = components.config.clone();
+                    let log_proc = components.global_log_processor.clone();
+                    let apm_app = components.apm_app.clone();
+                    let req_id = request_id.clone();
+                    let pending_handle = tokio::spawn(async move {
+                        process_pending_agent_payloads(
+                            &config,
+                            &log_proc,
+                            &apm_app,
+                            &req_id,
+                        )
+                        .await;
+                    });
+                    apm_task_handles.push(pending_handle);
+                }
 
-                process_apm_request(
-                    request_id.clone(),
-                    invoked_function_arn.clone(),
-                    is_cold_start,
-                    components.config.clone(),
-                    components.global_log_processor.clone(),
-                    components.apm_app.clone(),
-                )
-                .await;
+                {
+                    let handle = tokio::spawn(process_apm_request(
+                        request_id.clone(),
+                        invoked_function_arn.clone(),
+                        is_cold_start,
+                        components.config.clone(),
+                        components.global_log_processor.clone(),
+                        components.apm_app.clone(),
+                    ));
+                    apm_task_handles.push(handle);
+                }
 
                 let event_time = event_start.elapsed();
                 if is_cold_start {
@@ -250,6 +265,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
                 info!("[NR_EXT] APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+
+                // Await all in-flight APM background tasks before shutdown cleanup
+                for handle in apm_task_handles.drain(..) {
+                    let _ = handle.await;
+                }
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -366,7 +386,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
                 debug!("APM mode shutdown: Retrying all buffered telemetry");
                 crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.client,
+                    components.newrelic_client.outbound_client(),
                     components.config.new_relic.license_key.as_deref().unwrap_or(""),
                 )
                 .await;
@@ -499,11 +519,11 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     });
                 }
                 {
-                    let client = components.client.clone();
+                    let nr_client = components.newrelic_client.clone();
                     let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
                     tokio::spawn(async move {
                         crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                            &client,
+                            nr_client.outbound_client(),
                             &license_key,
                         )
                         .await;
@@ -1392,9 +1412,9 @@ fn buffer_failed_agent_payload(
         const MAX_FAILED_PAYLOADS: usize = 20;
         if failed_payloads.len() >= MAX_FAILED_PAYLOADS {
             warn!("FAILED_AGENT_PAYLOADS at capacity ({}) - dropping oldest entry", MAX_FAILED_PAYLOADS);
-            failed_payloads.remove(0);
+            failed_payloads.pop_front();
         }
-        failed_payloads.push(failed_payload);
+        failed_payloads.push_back(failed_payload);
         debug!(
             "Buffered failed agent payload for request {} (total failed: {})",
             request_id,
@@ -1481,7 +1501,12 @@ async fn retry_failed_agent_payloads(
 
                 if failed_payload.retry_count <= 5 {
                     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
-                        failed_payloads.push(failed_payload);
+                        const MAX_FAILED_PAYLOADS: usize = 20;
+                        if failed_payloads.len() < MAX_FAILED_PAYLOADS {
+                            failed_payloads.push_back(failed_payload);
+                        } else {
+                            warn!("FAILED_AGENT_PAYLOADS at capacity during retry - dropping payload");
+                        }
                     }
                 }
             }

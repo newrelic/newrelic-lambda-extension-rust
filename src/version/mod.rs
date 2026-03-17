@@ -577,10 +577,15 @@ pub async fn detect_layer_version_async(layer_version_from_config: Option<String
     }
 }
 
+/// Cached runtime name — AWS_EXECUTION_ENV is immutable for container lifetime.
+static RUNTIME_NAME_CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// Get detected runtime name (nodejs, python, ruby, etc.)
-/// Checks AWS_EXECUTION_ENV dynamically to handle late environment variable initialization
+/// Result is cached after first call since AWS_EXECUTION_ENV never changes.
 pub fn get_runtime_name() -> String {
-    detect_runtime_internal()
+    RUNTIME_NAME_CACHE
+        .get_or_init(detect_runtime_internal)
+        .clone()
 }
 
 /// Get runtime version. Priority: platform.initStart cache, AWS_EXECUTION_ENV, runtime name

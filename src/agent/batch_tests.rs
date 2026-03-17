@@ -20,10 +20,6 @@ mod tests {
     fn clear_batch_state() {
         AGENT_BATCH_BUFFER.clear();
         reset_batch_reports_count();
-        if let Ok(mut meta) = BATCH_META.lock() {
-            meta.agent_count = 0;
-            meta.oldest_timestamp = None;
-        }
     }
 
     // ========================================================================
@@ -60,17 +56,14 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_add_to_batch_updates_metadata() {
+    fn test_add_to_batch_updates_buffer_count() {
         clear_batch_state();
 
         add_to_batch("req-1".into(), vec![1], None, "arn".into());
         add_to_batch("req-2".into(), vec![2], None, "arn".into());
 
-        let meta = BATCH_META.lock().expect("lock");
-        assert_eq!(meta.agent_count, 2);
-        assert!(meta.oldest_timestamp.is_some());
+        assert_eq!(AGENT_BATCH_BUFFER.len(), 2);
 
-        drop(meta);
         clear_batch_state();
     }
 
@@ -205,11 +198,6 @@ mod tests {
         // Buffer should be empty after clearing
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);
 
-        let meta = BATCH_META.lock().expect("lock");
-        assert_eq!(meta.agent_count, 0);
-        assert!(meta.oldest_timestamp.is_none());
-
-        drop(meta);
         clear_batch_state();
     }
 
@@ -442,12 +430,6 @@ mod tests {
             assert!(remaining.report_line.is_none());
         }
 
-        // Metadata should reflect remaining count
-        {
-            let meta = BATCH_META.lock().expect("lock");
-            assert_eq!(meta.agent_count, 1);
-        }
-
         clear_batch_state();
     }
 
@@ -608,12 +590,6 @@ mod tests {
             assert_eq!(remaining.request_id, "new-req");
         }
 
-        // Metadata should be updated
-        {
-            let meta = BATCH_META.lock().expect("lock");
-            assert_eq!(meta.agent_count, 1);
-        }
-
         clear_batch_state();
     }
 
@@ -651,12 +627,6 @@ mod tests {
 
         // All old entries removed
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);
-
-        {
-            let meta = BATCH_META.lock().expect("lock");
-            assert_eq!(meta.agent_count, 0);
-            assert!(meta.oldest_timestamp.is_none());
-        }
 
         clear_batch_state();
     }

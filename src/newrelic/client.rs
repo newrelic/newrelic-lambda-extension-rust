@@ -8,12 +8,7 @@ use tracing::{debug, info, warn};
 /// Wraps both reqwest transport errors and HTTP status errors.
 pub type SendError = anyhow::Error;
 
-const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
-const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn get_extension_name_with_version() -> String {
-    format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
-}
+const EXTENSION_NAME_WITH_VERSION: &str = concat!(env!("CARGO_PKG_NAME"), ":", env!("CARGO_PKG_VERSION"));
 
 fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
     match retry_attempt {
@@ -106,7 +101,7 @@ impl NewRelicClient {
         );
         headers.insert(
             "User-Agent",
-            header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
+            header::HeaderValue::from_static(EXTENSION_NAME_WITH_VERSION),
         );
 
         // Short pool_idle_timeout prevents stale connections after Lambda freeze/thaw:
@@ -133,6 +128,13 @@ impl NewRelicClient {
             client,
             cached_version_attrs: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Returns a reference to the underlying reqwest Client for use in APM telemetry retry.
+    /// This ensures retry calls use the same outbound client (with correct proxy/timeout settings)
+    /// rather than the Lambda runtime API client.
+    pub fn outbound_client(&self) -> &Client {
+        &self.client
     }
 
     /// Creates a no-op New Relic client for disabled mode.
@@ -168,7 +170,7 @@ impl NewRelicClient {
         debug!("Sending {} log messages to NR", batch.len());
 
         let mut common_attributes = serde_json::Map::new();
-        common_attributes.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
+        common_attributes.insert("plugin".to_string(), serde_json::json!(EXTENSION_NAME_WITH_VERSION));
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
         common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
 

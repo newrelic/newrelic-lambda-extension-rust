@@ -124,6 +124,7 @@ pub fn clear_sent_errors_for_request(request_id: &str) {
     if let Ok(mut sent_errors) = SENT_ERRORS.lock() {
         let prev_count = sent_errors.len();
         sent_errors.clear();
+        sent_errors.shrink_to(0);
         if prev_count > 0 {
             debug!("Cleared {} sent error(s) for new invocation (request: {})", prev_count, request_id);
         }

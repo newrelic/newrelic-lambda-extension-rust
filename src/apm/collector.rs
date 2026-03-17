@@ -20,11 +20,7 @@ pub const CMD_TRANSACTION_SAMPLES: &str = "transaction_sample_data";
 pub const CMD_LOG_EVENTS: &str = "log_event_data";
 
 const PROTOCOL_VERSION: u8 = 17;
-const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn get_user_agent() -> String {
-    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
-}
+const USER_AGENT: &str = concat!("NewRelic-Rust-Lambda-Extension/", env!("CARGO_PKG_VERSION"));
 
 /// APM collector error types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +88,7 @@ pub async fn send_error_events(
         .header("NR-Session", run_id)
         .header("Accept-Encoding", "identity, deflate")
         .header("Content-Type", "application/octet-stream")
-        .header("User-Agent", get_user_agent())
+        .header("User-Agent", USER_AGENT)
         .header("Content-Encoding", "gzip")
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))
@@ -181,7 +177,7 @@ pub async fn send_apm_telemetry(
         .header("NR-Session", run_id)
         .header("Accept-Encoding", "identity, deflate")
         .header("Content-Type", "application/octet-stream")
-        .header("User-Agent", get_user_agent())
+        .header("User-Agent", USER_AGENT)
         .header("Content-Encoding", "gzip")
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))

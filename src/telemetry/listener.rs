@@ -93,9 +93,7 @@ async fn handle_telemetry_request(
         }
     };
     
-    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap_or_default();
-
-    match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
+    match serde_json::from_slice::<Vec<TelemetryRecord>>(&body_bytes) {
         Ok(records) => {
             let mut function_completed = false;
             let mut function_count = 0;
