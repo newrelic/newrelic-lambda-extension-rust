@@ -345,48 +345,57 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
+                    return; // Successfully routed, exit early
                 }
                 Err(e) => {
                     error!(
-                        "Failed to lock request buffer for {}: {} - payload lost!",
+                        "Failed to lock request buffer for {}: {} - falling back to alternate routing",
                         request_id, e
                     );
                 }
             }
         } else {
-            warn!("No buffer found for request: {} - payload lost!", request_id);
-        }
-    } else {
-        // No active request - try to route to any existing buffer (late payload scenario)
-        let any_request_id = REQUEST_DATA.iter().next().map(|entry| entry.key().clone());
-
-        if let Some(request_id) = any_request_id {
             warn!(
-                "No active request - routing late agent payload to buffer: {}",
+                "No buffer found for active request: {} - attempting fallback routing (timing issue)",
                 request_id
             );
-            if let Some(entry) = REQUEST_DATA.get(&request_id) {
-                if let Ok(mut buffer) = entry.agent_buffer.lock() {
-                    buffer.push(payload_bytes);
-                    debug!(
-                        "Stored late agent payload in buffer for {} (buffer size: {})",
-                        request_id, buffer.len()
-                    );
-                }
-            }
-        } else {
-            // No requests exist yet - store in orphaned buffer
-            // Will be drained into the first request's buffer in create_request_processing_state()
-            if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
-                orphaned.push(payload_bytes);
-                info!(
-                    "No active requests - stored agent payload in orphaned buffer (size: {})",
-                    orphaned.len()
+        }
+
+    }
+
+    // FALLBACK LOGIC: Handle cases where primary routing failed or no active request exists
+    
+
+    // Try to route to any existing buffer (late payload scenario)
+    let any_request_id = REQUEST_DATA.iter().next().map(|entry| entry.key().clone());
+
+    if let Some(fallback_request_id) = any_request_id {
+        warn!(
+            "Fallback routing: agent payload to any available buffer: {}",
+            fallback_request_id
+        );
+        if let Some(entry) = REQUEST_DATA.get(&fallback_request_id) {
+            if let Ok(mut buffer) = entry.agent_buffer.lock() {
+                buffer.push(payload_bytes);
+                debug!(
+                    "Stored fallback agent payload in buffer for {} (buffer size: {})",
+                    fallback_request_id, buffer.len()
                 );
-            } else {
-                warn!("Failed to lock orphaned buffer - agent payload lost!");
+                return; // Successfully routed to fallback
             }
         }
+    }
+
+    // Last resort: No requests exist yet - store in orphaned buffer
+    // Will be drained into the first request's buffer in create_request_processing_state()
+    if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+        orphaned.push(payload_bytes);
+        info!(
+            "No request buffers available - stored agent payload in orphaned buffer (size: {})",
+            orphaned.len()
+        );
+    } else {
+        warn!("CRITICAL: Failed to lock orphaned buffer - agent payload lost!");
     }
 }
 

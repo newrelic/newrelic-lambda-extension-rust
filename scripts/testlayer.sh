@@ -14,8 +14,8 @@ cd "$ROOT_DIR"
 LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NRTestRustExtension"}
 
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-1"}
-REGIONS_ARM64=${REGIONS_ARM64:-"us-west-1"}
+REGIONS_X86_64=${REGIONS_X86_64:-"us-east-1"}
+REGIONS_ARM64=${REGIONS_ARM64:-"us-east-1"}
 
 BIN_NAME="newrelic-lambda-extension"
 DIST_DIR="$ROOT_DIR/dist"
