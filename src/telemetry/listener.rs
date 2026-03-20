@@ -191,6 +191,7 @@ async fn handle_telemetry_request(
                                                         );
                                                     }
                                                     buffer_guard.clear();
+                                                    buffer_guard.shrink_to_fit();
                                                     true
                                                 }
                                             } else {

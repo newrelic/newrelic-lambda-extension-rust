@@ -33,7 +33,9 @@ impl LogProcessor {
 
         let mut pre_invoke_logs = {
             if let Some(mut buf) = self.pre_invoke_buffer.safe_lock() {
-                std::mem::take(&mut *buf)
+                let taken = std::mem::take(&mut *buf);
+                buf.shrink_to_fit();
+                taken
             } else {
                 return;
             }
@@ -93,7 +95,9 @@ impl LogProcessor {
     pub async fn flush_pre_invoke_buffer_on_shutdown(&self) -> std::io::Result<()> {
         let mut pre_invoke_logs = {
             if let Some(mut buf) = self.pre_invoke_buffer.safe_lock() {
-                std::mem::take(&mut *buf)
+                let taken = std::mem::take(&mut *buf);
+                buf.shrink_to_fit();
+                taken
             } else {
                 warn!("Failed to acquire pre_invoke_buffer lock on shutdown");
                 return Ok(());
@@ -242,6 +246,14 @@ impl LogProcessor {
                             continue;
                         }
 
+                        // Backoff based on retry count before re-attempting
+                        let backoff = match entry.retry_count {
+                            1 => std::time::Duration::from_millis(200),
+                            2 => std::time::Duration::from_millis(400),
+                            _ => std::time::Duration::from_millis(900),
+                        };
+                        tokio::time::sleep(backoff).await;
+
                         let logs_to_send = vec![entry.log_message.clone()];
                         match client.send_logs(&config, logs_to_send, "retry").await {
                             Ok(()) => {
@@ -268,7 +280,9 @@ impl LogProcessor {
 
         let buffered_logs = {
             if let Some(mut buffer) = self.request_id_buffer.safe_lock() {
-                std::mem::take(&mut *buffer)
+                let taken = std::mem::take(&mut *buffer);
+                buffer.shrink_to_fit();
+                taken
             } else {
                 return;
             }

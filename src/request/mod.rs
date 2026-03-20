@@ -277,7 +277,11 @@ pub async fn cleanup_old_request_buffers(
         // Cascade: per-request context → global registration ARN
         let (payloads, arn) = if let Some(entry) = REQUEST_DATA.get(request_id) {
             let payloads: Vec<Vec<u8>> = match entry.agent_buffer.lock() {
-                Ok(mut buf) => buf.drain(..).collect(),
+                Ok(mut buf) => {
+                    let drained: Vec<Vec<u8>> = buf.drain(..).collect();
+                    buf.shrink_to_fit();
+                    drained
+                }
                 Err(_) => Vec::new(),
             };
             let arn = entry.context.lock()

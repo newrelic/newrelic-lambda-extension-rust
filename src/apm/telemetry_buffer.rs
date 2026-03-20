@@ -80,7 +80,9 @@ pub async fn retry_buffered_telemetry(
 ) {
     let failed_telemetry = {
         if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-            std::mem::take(&mut *buffer)
+            let taken = std::mem::take(&mut *buffer);
+            buffer.shrink_to_fit();
+            taken
         } else {
             error!("Failed to lock telemetry buffer for retry");
             return;

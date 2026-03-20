@@ -14,7 +14,7 @@ use crate::util::SafeMutexOps;
 
 use super::retry::{
     estimate_log_size, should_retry_on_failure, FailedLogEntry,
-    MAX_FAILED_LOGS, MAX_RETRIES, get_backoff_delay,
+    MAX_FAILED_LOGS,
 };
 
 /// State of trace ID extraction for the current invocation
@@ -419,6 +419,7 @@ impl LogProcessor {
                 }
 
                 let logs_to_send = std::mem::take(&mut *batch);
+                batch.shrink_to_fit();
                 drop(batch);
 
                 debug!("Auto-flushing batch of {} logs (threshold={})",
@@ -481,54 +482,39 @@ impl LogProcessor {
                     if !current_chunk.is_empty() {
                         chunks.push(current_chunk);
                     }
+                    // client.send_logs() already retries 3 times internally with backoff.
+                    // No caller-side retry needed — on failure, buffer for cross-invocation retry.
                     let mut successful = 0;
                     for chunk in chunks {
-                        let mut retries = 0;
-                        let mut send_failed = false;
-
-                        loop {
-                            match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
-                                Ok(()) => {
-                                    successful += 1;
-                                    break;
-                                },
-                                Err(_e) => {
-                                    if retries < MAX_RETRIES {
-                                        retries += 1;
-                                        tokio::time::sleep(get_backoff_delay(retries)).await;
-                                        continue;
-                                    }
-                                    warn!("Auto-flush failed after {} retries - filtering {} logs for retry", MAX_RETRIES, chunk.len());
-                                    send_failed = true;
-                                    // Buffer only retriable logs (function + extension ERROR)
-                                    if let Ok(mut buffer) = failed_buffer.lock() {
-                                        let mut dropped = 0;
-                                        for log in chunk {
-                                            if should_retry_on_failure(&log) {
-                                                if buffer.len() >= MAX_FAILED_LOGS {
-                                                    warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                                                    buffer.pop_front();
-                                                }
-                                                buffer.push_back(FailedLogEntry {
-                                                    log_message: log,
-                                                    original_request_id: context.request_id.clone(),
-                                                    retry_count: 0,
-                                                });
-                                            } else {
-                                                dropped += 1;
+                        let backup = chunk.clone(); // Clone once for failed buffer path
+                        match client.send_logs(&config, chunk, &auto_flush_arn).await {
+                            Ok(()) => {
+                                successful += 1;
+                            },
+                            Err(_e) => {
+                                warn!("Auto-flush send failed after client retries - buffering {} logs", backup.len());
+                                if let Ok(mut buffer) = failed_buffer.lock() {
+                                    let mut dropped = 0;
+                                    for log in backup {
+                                        if should_retry_on_failure(&log) {
+                                            if buffer.len() >= MAX_FAILED_LOGS {
+                                                buffer.pop_front();
                                             }
-                                        }
-                                        if dropped > 0 {
-                                            debug!("Dropped {} non-retriable extension/platform logs", dropped);
+                                            buffer.push_back(FailedLogEntry {
+                                                log_message: log,
+                                                original_request_id: context.request_id.clone(),
+                                                retry_count: 0,
+                                            });
+                                        } else {
+                                            dropped += 1;
                                         }
                                     }
-                                    break;
+                                    if dropped > 0 {
+                                        debug!("Dropped {} non-retriable extension/platform logs", dropped);
+                                    }
                                 }
+                                break; // Stop trying other chunks if one failed
                             }
-                        }
-
-                        if send_failed {
-                            break; // Stop trying other chunks if one failed
                         }
                     }
 

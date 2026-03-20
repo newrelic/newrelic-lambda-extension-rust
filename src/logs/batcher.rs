@@ -9,7 +9,7 @@ use crate::util::SafeMutexOps;
 use super::processor::LogProcessor;
 use super::retry::{
     estimate_log_size, should_retry_on_failure, FailedLogEntry,
-    MAX_FAILED_LOGS, MAX_RETRIES, get_backoff_delay,
+    MAX_FAILED_LOGS,
 };
 
 impl LogProcessor {
@@ -37,6 +37,7 @@ impl LogProcessor {
             let mut handles = self.pending_flush_handles.lock().unwrap_or_else(|e| e.into_inner());
             let count = handles.len();
             handles.clear(); // Drop handles -- spawned tasks continue running
+            handles.shrink_to_fit();
             if count > 0 {
                 debug!("Cleared {} pending auto-flush handles (tasks continue in background)", count);
             }
@@ -44,7 +45,9 @@ impl LogProcessor {
 
         let batch = {
             if let Some(mut batch_guard) = self.log_batch.safe_lock() {
-                std::mem::take(&mut *batch_guard)
+                let taken = std::mem::take(&mut *batch_guard);
+                batch_guard.shrink_to_fit();
+                taken
             } else {
                 warn!("Failed to acquire log_batch lock for final flush");
                 return Ok(());
@@ -167,17 +170,17 @@ impl LogProcessor {
                   chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
         }
 
-        let mut failed_logs: Vec<payload::LogMessage> = Vec::new(); // Only allocated on failure path
         let mut successful_chunks = 0;
+        let mut failed_chunks = 0;
 
-        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &effective_arn, chunk_idx).await {
+        for chunk in chunks {
+            // send_chunk handles buffering failed logs internally for cross-invocation retry
+            match self.send_chunk(&client, &config, chunk, &effective_arn).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },
-                Err(e) => {
-                    error!("Log batch send failed: {}", e);
-                    failed_logs.extend(chunk);
+                Err(_) => {
+                    failed_chunks += 1;
                 }
             }
         }
@@ -185,35 +188,8 @@ impl LogProcessor {
         if successful_chunks > 0 {
             info!("Successfully sent {} log chunks", successful_chunks);
         }
-        if !failed_logs.is_empty() {
-            if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-                let mut buffered = 0;
-                let mut dropped = 0;
-                for log in failed_logs {
-                    if should_retry_on_failure(&log) {
-                        if failed_buffer.len() >= MAX_FAILED_LOGS {
-                            warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                            failed_buffer.pop_front();
-                        }
-                        failed_buffer.push_back(FailedLogEntry {
-                            log_message: log,
-                            original_request_id: context.request_id.clone(),
-                            retry_count: 0,
-                        });
-                        buffered += 1;
-                    } else {
-                        dropped += 1;
-                    }
-                }
-                if buffered > 0 {
-                    warn!("Buffering {} retriable failed logs for retry on next invocation", buffered);
-                }
-                if dropped > 0 {
-                    debug!("Dropped {} non-retriable extension/platform logs", dropped);
-                }
-            } else {
-                warn!("Failed to buffer {} failed logs - mutex poisoned", failed_logs.len());
-            }
+        if failed_chunks > 0 {
+            warn!("{} log chunks failed (buffered for retry on next invocation)", failed_chunks);
         }
 
         Ok(())
@@ -263,18 +239,20 @@ impl LogProcessor {
         }
     }
 
-    async fn send_chunk_with_retry(
+    /// Send a log chunk to New Relic. client.send_logs() already retries 3 times
+    /// with exponential backoff internally — no caller-side retry needed.
+    /// On failure, buffers retriable logs for cross-invocation retry on next warm start.
+    async fn send_chunk(
         &self,
         client: &NewRelicClient,
         config: &ExtensionConfig,
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
-        _chunk_idx: usize,
     ) -> std::io::Result<()> {
-        self.send_chunk_with_retry_internal(client, config, chunk, function_arn, true).await
+        self.send_chunk_internal(client, config, chunk, function_arn, true).await
     }
 
-    pub(crate) async fn send_chunk_with_retry_internal(
+    pub(crate) async fn send_chunk_internal(
         &self,
         client: &NewRelicClient,
         config: &ExtensionConfig,
@@ -282,71 +260,57 @@ impl LogProcessor {
         function_arn: &str,
         use_failed_buffer: bool,
     ) -> std::io::Result<()> {
-        let mut retries = 0;
+        // client.send_logs() internally retries 3 times with 200/400/900ms backoff.
+        // No caller-side retry loop — if all 3 internal retries fail, buffer for
+        // cross-invocation retry on next warm start instead of blocking this invocation.
+        //
+        // Clone once for the failed buffer path (send_logs takes ownership).
+        // Old code cloned on every retry attempt (up to 3x); this clones at most once.
+        let backup = if use_failed_buffer { Some(chunk.clone()) } else { None };
 
-        loop {
-            match client.send_logs(config, chunk.clone(), function_arn).await {
-                Ok(()) => {
-                    return Ok(());
-                },
-                Err(e) => {
-                    if retries == 0 {
-                        warn!("Log send failed: {}", e);
-                    }
+        match client.send_logs(config, chunk, function_arn).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Log send failed after client retries: {}", e);
 
-                    if e.to_string().contains("413") || e.to_string().contains("Payload Too Large") {
-                        error!("Payload too large even after chunking - dropping {} logs", chunk.len());
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Payload too large even after chunking"
-                        ));
-                    }
-
-                    if retries < MAX_RETRIES {
-                        retries += 1;
-                        let delay = get_backoff_delay(retries);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    if use_failed_buffer {
-                        let request_id = if let Some(ctx) = self.invocation_context.safe_lock() {
-                            ctx.request_id.clone()
-                        } else {
-                            String::from("unknown")
-                        };
-                        if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
-                            let mut buffered = 0;
-                            let mut dropped = 0;
-                            for log in chunk {
-                                if should_retry_on_failure(&log) {
-                                    if failed_buffer.len() >= MAX_FAILED_LOGS {
-                                        warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
-                                        failed_buffer.pop_front();
-                                    }
-                                    failed_buffer.push_back(FailedLogEntry {
-                                        log_message: log,
-                                        original_request_id: request_id.clone(),
-                                        retry_count: 0,
-                                    });
-                                    buffered += 1;
-                                } else {
-                                    dropped += 1;
+                if let Some(failed_chunk) = backup {
+                    let request_id = if let Some(ctx) = self.invocation_context.safe_lock() {
+                        ctx.request_id.clone()
+                    } else {
+                        String::from("unknown")
+                    };
+                    if let Some(mut failed_buffer) = self.failed_logs_buffer.safe_lock() {
+                        let mut buffered = 0;
+                        let mut dropped = 0;
+                        for log in failed_chunk {
+                            if should_retry_on_failure(&log) {
+                                if failed_buffer.len() >= MAX_FAILED_LOGS {
+                                    warn!("Failed logs buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_LOGS);
+                                    failed_buffer.pop_front();
                                 }
+                                failed_buffer.push_back(FailedLogEntry {
+                                    log_message: log,
+                                    original_request_id: request_id.clone(),
+                                    retry_count: 0,
+                                });
+                                buffered += 1;
+                            } else {
+                                dropped += 1;
                             }
-                            if buffered > 0 {
-                                warn!("Max retries exceeded - buffering {} retriable logs", buffered);
-                            }
-                            if dropped > 0 {
-                                debug!("Dropped {} non-retriable extension/platform logs", dropped);
-                            }
-                        } else {
-                            error!("Failed to buffer {} logs after max retries - mutex poisoned", chunk.len());
+                        }
+                        if buffered > 0 {
+                            warn!("Buffering {} retriable logs for cross-invocation retry", buffered);
+                        }
+                        if dropped > 0 {
+                            debug!("Dropped {} non-retriable extension/platform logs", dropped);
                         }
                     } else {
-                        error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
+                        error!("Failed to buffer logs - mutex poisoned");
                     }
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                } else {
+                    error!("Buffered log retry failed - dropping logs");
                 }
+                Err(std::io::Error::new(std::io::ErrorKind::Other, e))
             }
         }
     }

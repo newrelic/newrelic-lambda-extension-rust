@@ -3,6 +3,10 @@
 #![deny(clippy::unwrap_used)]
 #![deny(missing_debug_implementations)]
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod config;
 mod telemetry;
 mod logs;

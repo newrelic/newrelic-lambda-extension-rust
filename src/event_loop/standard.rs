@@ -184,7 +184,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
                 cleanup_counter += 1;
-                if cleanup_counter >= 10 {
+                if cleanup_counter >= 5 {
                     cleanup_counter = 0;
                     let newrelic_client = components.newrelic_client.clone();
                     let config = components.config.clone();

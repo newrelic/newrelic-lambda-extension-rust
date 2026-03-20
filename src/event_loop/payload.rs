@@ -312,6 +312,9 @@ pub async fn process_request_concurrently(
     }
 
     // Smart batching: Only send complete payloads (with report)
+    // Track whether payloads were put back in buffer (needs REQUEST_DATA kept alive)
+    let mut payloads_kept_in_buffer = false;
+
     let send_agent_task = if agent_payloads.is_empty() {
         debug!("Standard mode: No agent payload for request: {}", request_id);
         None
@@ -359,6 +362,7 @@ pub async fn process_request_concurrently(
                 buffer.extend(agent_payloads);
             }
         }
+        payloads_kept_in_buffer = true;
 
         None
     };
@@ -392,8 +396,9 @@ pub async fn process_request_concurrently(
         drop(handle); // Tasks continue running; failures keep items in AGENT_BATCH_BUFFER
     }
 
-    // Unified cleanup: Always preserve buffers for late payload handling
-    cleanup_request_processing_state_internal(&request_id, true);
+    // Clean up REQUEST_DATA immediately when buffer is empty (payloads moved to batch or none arrived).
+    // Only keep the entry when payloads were put back in buffer (waiting for platform.report).
+    cleanup_request_processing_state_internal(&request_id, payloads_kept_in_buffer);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
     // It will be overwritten when next INVOKE arrives
@@ -508,6 +513,9 @@ pub async fn process_apm_request(
 
     let got_payload = !agent_payloads.is_empty();
 
+    // Track whether payloads were put back in buffer (needs REQUEST_DATA kept alive)
+    let mut payloads_kept_in_buffer = false;
+
     // Flow 1: If run_id exists and payload arrived, send it immediately
     // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
@@ -563,6 +571,7 @@ pub async fn process_apm_request(
                     buffer.extend(agent_payloads);
                 }
             }
+            payloads_kept_in_buffer = true;
         } else if has_run_id && !got_payload {
             debug!(
                 "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
@@ -632,7 +641,9 @@ pub async fn process_apm_request(
     // arrives during the NEXT invocation in APM mode, not the current one.
     // Agent payloads that arrive late will be caught by warm start logic.
 
-    cleanup_request_processing_state_internal(&request_id, true);
+    // Clean up REQUEST_DATA immediately when buffer is empty (payloads sent or none arrived).
+    // Only keep the entry when payloads were put back in buffer (waiting for run_id).
+    cleanup_request_processing_state_internal(&request_id, payloads_kept_in_buffer);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
     // It will be overwritten when next INVOKE arrives
@@ -646,7 +657,8 @@ pub async fn process_apm_request(
     );
 }
 
-/// Buffer failed agent payload for retry across invocations
+/// Buffer failed agent payload for retry across invocations.
+/// Count-capped at 10 entries. No byte-size limit — payloads can be 1MB+ each.
 pub fn buffer_failed_agent_payload(
     payload_bytes: &[u8],
     request_id: &str,
@@ -661,7 +673,7 @@ pub fn buffer_failed_agent_payload(
     };
 
     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
-        const MAX_FAILED_PAYLOADS: usize = 20;
+        const MAX_FAILED_PAYLOADS: usize = 10;
         if failed_payloads.len() >= MAX_FAILED_PAYLOADS {
             warn!("FAILED_AGENT_PAYLOADS at capacity ({}) - dropping oldest entry", MAX_FAILED_PAYLOADS);
             failed_payloads.pop_front();
@@ -687,7 +699,9 @@ pub async fn retry_failed_agent_payloads(
 
     let failed_payloads = {
         if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
-            std::mem::take(&mut *failed_payloads)
+            let taken = std::mem::take(&mut *failed_payloads);
+            failed_payloads.shrink_to_fit();
+            taken
         } else {
             error!("Failed to lock FAILED_AGENT_PAYLOADS for retry");
             return;
@@ -725,9 +739,17 @@ pub async fn retry_failed_agent_payloads(
             continue;
         }
 
+        // Backoff based on retry count before re-attempting
+        let backoff = match failed_payload.retry_count {
+            1 => std::time::Duration::from_millis(200),
+            2 => std::time::Duration::from_millis(400),
+            _ => std::time::Duration::from_millis(900),
+        };
+        tokio::time::sleep(backoff).await;
+
         debug!(
-            "Retrying agent payload for request {} (attempt {})",
-            failed_payload.request_id, failed_payload.retry_count
+            "Retrying agent payload for request {} (attempt {}, backoff {}ms)",
+            failed_payload.request_id, failed_payload.retry_count, backoff.as_millis()
         );
 
         match send_agent_payload_to_newrelic(
@@ -753,7 +775,7 @@ pub async fn retry_failed_agent_payloads(
 
                 if failed_payload.retry_count <= 5 {
                     if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
-                        const MAX_FAILED_PAYLOADS: usize = 20;
+                        const MAX_FAILED_PAYLOADS: usize = 10;
                         if failed_payloads.len() < MAX_FAILED_PAYLOADS {
                             failed_payloads.push_back(failed_payload);
                         } else {
@@ -781,6 +803,7 @@ pub fn cleanup_old_failed_payloads() {
 
         // Remove entries that have exceeded retry limit (5 retries)
         failed_payloads.retain(|payload| payload.retry_count <= 5);
+        failed_payloads.shrink_to_fit();
 
         let removed_count = initial_count - failed_payloads.len();
         if removed_count > 0 {

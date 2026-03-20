@@ -1,7 +1,6 @@
 
 use tracing::{debug, error, warn};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::newrelic::payload;
 use crate::util::SafeMutexOps;
@@ -20,17 +19,10 @@ pub(crate) struct FailedLogEntry {
 pub(crate) const MAX_BATCH_SIZE: usize = 100;
 pub(crate) const MAX_RETRIES: usize = 3;
 
-/// Maximum number of failed logs to buffer for retry.
-/// Prevents unbounded memory growth during sustained send failures.
-pub(crate) const MAX_FAILED_LOGS: usize = 200;
-
-pub(crate) fn get_backoff_delay(retry_attempt: usize) -> Duration {
-    match retry_attempt {
-        1 => Duration::from_millis(200),
-        2 => Duration::from_millis(400),
-        _ => Duration::from_millis(900),
-    }
-}
+/// Maximum number of failed logs to buffer for cross-invocation retry.
+/// Production data shows these buffers are rarely used (inline retries
+/// succeed). 100 entries caps worst-case memory at ~200KB.
+pub(crate) const MAX_FAILED_LOGS: usize = 100;
 
 /// Estimate log message size in bytes without full JSON serialization.
 /// Uses byte counting on attribute keys/values instead of serde_json::to_string.
@@ -96,8 +88,8 @@ impl LogProcessor {
         let mut failed_count = 0;
         let mut successful_chunks = 0;
 
-        for (_chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            match self.send_chunk_with_retry_internal(&client, &config, chunk.clone(), &context.invoked_function_arn, false).await {
+        for chunk in chunks {
+            match self.send_chunk_internal(&client, &config, chunk.clone(), &context.invoked_function_arn, false).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },

@@ -44,8 +44,8 @@ pub struct FailedError {
 /// Maximum number of failed errors to buffer (prevents unbounded memory growth)
 const MAX_FAILED_ERRORS: usize = 50;
 
-pub static FAILED_ERRORS: Lazy<Arc<Mutex<Vec<FailedError>>>> =
-    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+pub static FAILED_ERRORS: Lazy<Arc<Mutex<std::collections::VecDeque<FailedError>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(std::collections::VecDeque::new())));
 
 /// Store the last detected error from function logs for more detailed platform fault messages
 #[derive(Debug, Clone)]
@@ -69,6 +69,7 @@ pub async fn retry_failed_errors(
         }
         let errors = guard.clone();
         guard.clear(); // Clear immediately to avoid duplicate retries
+        guard.shrink_to_fit();
         errors
     } else {
         return false;
@@ -243,9 +244,9 @@ pub async fn send_timeout_error(
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 if failed_errors.len() >= MAX_FAILED_ERRORS {
                     warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
-                    failed_errors.remove(0);
+                    failed_errors.pop_front();
                 }
-                failed_errors.push(FailedError {
+                failed_errors.push_back(FailedError {
                     request_id: request_id.to_string(),
                     error_type: "LambdaTimeout".to_string(),
                     error_message: timeout_msg,
@@ -326,9 +327,9 @@ pub async fn send_platform_fault_error(
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 if failed_errors.len() >= MAX_FAILED_ERRORS {
                     warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
-                    failed_errors.remove(0);
+                    failed_errors.pop_front();
                 }
-                failed_errors.push(FailedError {
+                failed_errors.push_back(FailedError {
                     request_id: request_id.to_string(),
                     error_type: "LambdaPlatformFault".to_string(),
                     error_message: fault_msg,
@@ -403,9 +404,9 @@ pub async fn send_lambda_error(
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 if failed_errors.len() >= MAX_FAILED_ERRORS {
                     warn!("FAILED_ERRORS buffer at capacity ({}) - dropping oldest entry", MAX_FAILED_ERRORS);
-                    failed_errors.remove(0);
+                    failed_errors.pop_front();
                 }
-                failed_errors.push(FailedError {
+                failed_errors.push_back(FailedError {
                     request_id: request_id.to_string(),
                     error_type: error_type.to_string(),
                     error_message: error_message.to_string(),
