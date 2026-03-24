@@ -207,7 +207,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("[NR_EXT] APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Await all in-flight APM background tasks before shutdown cleanup
                 for handle in apm_task_handles.drain(..) {
@@ -383,9 +383,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
 
-                let shutdown_duration = shutdown_start_time.elapsed();
-                info!("APM mode shutdown: All data processed and sent");
-                info!("[NR_EXT] Shutdown completed - Duration: {}ms", shutdown_duration.as_millis());
+                info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
             }
         }
