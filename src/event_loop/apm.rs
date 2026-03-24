@@ -207,7 +207,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
 
                 // Await all in-flight APM background tasks before shutdown cleanup
                 for handle in apm_task_handles.drain(..) {
@@ -273,6 +273,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
+                let mut agent_payloads_sent: usize = 0;
+                let mut platform_reports_sent: usize = 0;
 
                 // Drain orphaned payloads into last request's buffer — release lock first
                 let orphaned_payloads: Vec<Vec<u8>> = crate::request::ORPHANED_PAYLOADS
@@ -291,7 +293,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     let remaining = if let Some(ref rid) = last_rid {
                         if let Some(buffer) = get_agent_buffer(rid) {
                             if let Ok(mut buf) = buffer.lock() {
-                                info!("APM mode shutdown: Drained {} orphaned payload(s) into buffer: {}", orphaned_payloads.len(), rid);
+                                debug!("APM mode shutdown: Drained {} orphaned payload(s) into buffer: {}", orphaned_payloads.len(), rid);
                                 buf.extend(orphaned_payloads);
                                 Vec::new() // all routed
                             } else {
@@ -315,6 +317,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         for payload_bytes in &remaining {
                             if let Err(e) = process_and_send_agent_payload(payload_bytes, rid, &arn, &components.global_log_processor, &components.config, &components.apm_app).await {
                                 warn!("APM mode shutdown: Failed to send orphaned payload: {}", e);
+                            } else {
+                                agent_payloads_sent += 1;
                             }
                         }
                     }
@@ -340,7 +344,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             };
 
                             if !payloads.is_empty() {
-                                info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
+                                debug!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
 
                                 let invoked_function_arn = get_request_context(&request_id)
                                     .and_then(|ctx_ref| {
@@ -364,7 +368,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     {
                                         warn!("APM mode shutdown: Failed to send payload for {}: {}", request_id, e);
                                     } else {
-                                        info!("APM mode shutdown: Successfully sent payload for request: {}", request_id);
+                                        agent_payloads_sent += 1;
+                                        debug!("APM mode shutdown: Successfully sent payload for request: {}", request_id);
                                     }
                                 }
                             }
@@ -406,7 +411,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             if let Err(e) = app.send_platform_report_metrics(&report_line).await {
                                 error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
                             } else {
-                                info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
+                                platform_reports_sent += 1;
+                                debug!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
                             }
 
                             // Remove pending report after sending
@@ -429,7 +435,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
 
-                info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                let duration_ms = shutdown_start_time.elapsed().as_millis();
+                let summary = format!(
+                    "APM mode shutdown: {} agent payload(s), {} platform report(s) sent in {}ms",
+                    agent_payloads_sent, platform_reports_sent, duration_ms
+                );
+                // Always print summary — even when extension logs are disabled
+                if components.config.extension.extension_logs_enabled {
+                    info!("{}", summary);
+                } else {
+                    eprintln!("[NR_EXT] {}", summary);
+                }
                 break;
             }
         }

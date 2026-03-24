@@ -258,7 +258,7 @@ pub async fn send_batched_payloads_with_reports_only(
 pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
-) {
+) -> usize {
     use crate::request::{REQUEST_DATA, ORPHANED_PAYLOADS, get_request_context, remove_pending_report};
 
     debug!("Shutdown: Collecting all pending telemetry payloads");
@@ -288,7 +288,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
             // Route into last request's buffer — step 3 will pick them up with proper report
             if let Some(buffer) = crate::request::get_agent_buffer(rid) {
                 if let Ok(mut buf) = buffer.lock() {
-                    info!(
+                    debug!(
                         "Shutdown: Drained {} orphaned payload(s) into request buffer: {}",
                         orphaned_payloads.len(), rid
                     );
@@ -316,7 +316,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
                     .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()).filter(|a| !a.is_empty()))
                     .unwrap_or_else(crate::get_global_fallback_arn);
                 let report = remove_pending_report(rid);
-                info!(
+                debug!(
                     "Shutdown: No buffer for {} — sending {} orphaned payload(s) directly (report: {})",
                     rid, orphaned_payloads.len(), report.is_some()
                 );
@@ -332,7 +332,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
             }
         } else {
             // No last request context (shutdown before first INVOKE)
-            info!("Shutdown: No request context — sending {} orphaned payload(s) with fallback ARN", orphaned_payloads.len());
+            debug!("Shutdown: No request context — sending {} orphaned payload(s) with fallback ARN", orphaned_payloads.len());
             for payload_bytes in orphaned_payloads {
                 all_payloads.push(BatchedAgentPayload {
                     request_id: "init-orphaned".to_string(),
@@ -391,10 +391,11 @@ pub async fn send_all_pending_payloads_on_shutdown(
 
     if all_payloads.is_empty() {
         debug!("Shutdown: No pending payloads to send");
-        return;
+        return 0;
     }
 
-    debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
+    let total_payloads = all_payloads.len();
+    debug!("Shutdown: Total {} payload(s) to send", total_payloads);
 
     // 4. Split into 1MB chunks while keeping each payload + report together
     const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB
@@ -453,11 +454,12 @@ pub async fn send_all_pending_payloads_on_shutdown(
         if let Err(e) = newrelic_client.send_agent_payload(&config, &payload_json).await {
             error!("Shutdown: Failed to send chunk {}: {}", idx + 1, e);
         } else {
-            info!("Shutdown: Successfully sent chunk {} with {} payload(s)", idx + 1, chunk_items.len());
+            debug!("Shutdown: Successfully sent chunk {} with {} payload(s)", idx + 1, chunk_items.len());
         }
     }
 
-    info!("Shutdown: Completed sending all pending payloads");
+    debug!("Shutdown: Completed sending all pending payloads");
+    total_payloads
 }
 
 /// Split payloads into chunks of max_size, keeping each payload + report together

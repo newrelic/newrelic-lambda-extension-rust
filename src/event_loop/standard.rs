@@ -198,7 +198,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("Standard mode: Extension shutting down with reason: {}", shutdown_reason);
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -248,7 +248,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
-                send_all_pending_payloads_on_shutdown(
+                let payloads_sent = send_all_pending_payloads_on_shutdown(
                     components.newrelic_client.clone(),
                     components.config.clone(),
                 )
@@ -264,7 +264,16 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
 
-                info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                let duration_ms = shutdown_start_time.elapsed().as_millis();
+                let summary = format!(
+                    "Standard mode shutdown: {} agent payload(s) sent in {}ms",
+                    payloads_sent, duration_ms
+                );
+                if components.config.extension.extension_logs_enabled {
+                    info!("{}", summary);
+                } else {
+                    eprintln!("[NR_EXT] {}", summary);
+                }
                 break;
             }
         }

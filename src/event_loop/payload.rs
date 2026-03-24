@@ -52,7 +52,7 @@ pub async fn send_to_apm_collector(
             payload_bytes.len()
         );
         app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
-        info!(
+        debug!(
             "APM mode: Agent payload sent successfully for request: {}",
             request_id
         );
@@ -99,7 +99,7 @@ pub async fn process_and_send_agent_payload(
         );
         match app.process_agent_payload(payload_bytes.to_vec(), request_id).await {
             Ok(()) => {
-                info!("APM mode: Agent payload sent successfully for request: {}", request_id);
+                debug!("APM mode: Agent payload sent successfully for request: {}", request_id);
             }
             Err(e) => {
                 error!("APM mode: Failed to send agent payload to APM collector: {}", e);
@@ -222,7 +222,7 @@ pub async fn process_pending_agent_payloads(
                 if let Err(e) = app.send_platform_report_metrics(&report_line).await {
                     error!("APM mode: Failed to send platform report metrics for previous request {}: {}", request_id, e);
                 } else {
-                    info!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);
+                    debug!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);
                 }
             }
             drop(apm_app_guard);
@@ -542,7 +542,7 @@ pub async fn process_apm_request(
                 .await
                 {
                     Ok(()) => {
-                        info!("APM mode: Agent payload sent successfully");
+                        debug!("APM mode: Agent payload sent successfully");
                     }
                     Err(e) => {
                         error!("Failed to send agent payload to APM collector: {}", e);
@@ -605,7 +605,7 @@ pub async fn process_apm_request(
             if let Err(e) = app.send_platform_report_metrics(&report_line).await {
                 error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
             } else {
-                info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
+                debug!("APM mode: Successfully sent platform report metrics for request {}", request_id);
             }
         } else {
             warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);

@@ -194,7 +194,7 @@ pub fn create_request_processing_state(
     if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
         if !orphaned.is_empty() {
             let drained: Vec<Vec<u8>> = orphaned.drain(..).collect();
-            tracing::info!(
+            tracing::debug!(
                 "Draining {} orphaned agent payload(s) into request buffer for: {}",
                 drained.len(),
                 request_id
@@ -326,7 +326,7 @@ pub async fn cleanup_old_request_buffers(
 /// Agent payloads come from named pipe without request_id, so we route to the active request
 /// This is the same logic as 2.4.1 which worked correctly
 pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    use tracing::{debug, error, info, warn};
+    use tracing::{debug, error, warn};
 
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
         .lock()
@@ -388,7 +388,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     // Will be drained into the first request's buffer in create_request_processing_state()
     if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
         orphaned.push(payload_bytes);
-        info!(
+        debug!(
             "No request buffers available - stored agent payload in orphaned buffer (size: {})",
             orphaned.len()
         );
