@@ -459,7 +459,7 @@ impl LogProcessor {
                     fallback
                 };
 
-                // Spawn background task with proper retry logic and failed log buffering
+                // Spawn background task with proper retry logic & failed log buffering
                 // Store handle to ensure it completes before function ends
                 let handle = tokio::spawn(async move {
                     const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB

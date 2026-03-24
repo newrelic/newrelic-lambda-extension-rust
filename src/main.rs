@@ -240,7 +240,6 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     perform_extension_shutdown_cleanup(
         total_events_processed,
         harvester_handle,
-        extension_startup_time,
     )
     .await;
 
@@ -788,7 +787,6 @@ fn start_harvester_background_task(
 async fn perform_extension_shutdown_cleanup(
     total_events_processed: u32,
     harvester_handle: tokio::task::JoinHandle<()>,
-    extension_startup_time: std::time::Instant,
 ) {
     info!(
         "New Relic Extension shutting down after {} events",
@@ -796,11 +794,4 @@ async fn perform_extension_shutdown_cleanup(
     );
 
     harvester_handle.abort();
-
-    let shutdown_at = std::time::Instant::now();
-    let total_runtime = shutdown_at.duration_since(extension_startup_time);
-    info!(
-        "Extension shutdown after {}ms",
-        total_runtime.as_millis()
-    );
 }
