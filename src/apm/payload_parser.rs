@@ -21,6 +21,7 @@ pub struct LambdaData {
     pub error_event_data: Vec<Value>,
     pub error_data: Vec<Value>,
     pub span_event_data: Vec<Value>,
+    pub sql_trace_data: Vec<Value>,
     pub transaction_sample_data: Vec<Value>,
 }
 
@@ -135,6 +136,9 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     if !data.span_event_data.is_empty() {
         map.insert("span_event_data".to_string(), data.span_event_data);
     }
+    if !data.sql_trace_data.is_empty() {
+        map.insert("sql_trace_data".to_string(), data.sql_trace_data);
+    }
     if !data.transaction_sample_data.is_empty() {
         map.insert("transaction_sample_data".to_string(), data.transaction_sample_data);
     }
@@ -168,6 +172,7 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             error_event_data: get_field(&raw_map, "error_event_data", "errorEventData"),
             error_data: get_field(&raw_map, "error_data", "errorData"),
             span_event_data: get_field(&raw_map, "span_event_data", "spanEventData"),
+            sql_trace_data: get_field(&raw_map, "sql_trace_data", "sqlTraceData"),
             transaction_sample_data: get_field(&raw_map, "transaction_sample_data", "transactionSampleData"),
         })
     }

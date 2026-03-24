@@ -3,9 +3,9 @@
 //! Based on internal_app.go NewApp(), connectRoutine(), doHarvest()
 
 use super::collector::{
-    send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS, 
-    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_LOG_EVENTS, CMD_METRICS, CMD_SPAN_EVENTS, 
-    CMD_TRANSACTION_SAMPLES,
+    send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS,
+    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
+    CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
 use super::connection::{connect, preconnect};
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
@@ -266,6 +266,7 @@ impl ApmApp {
                         "custom_event_data" => CMD_CUSTOM_EVENTS,
                         "log_event_data" => CMD_LOG_EVENTS,
                         "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
+                        "sql_trace_data" => CMD_SLOW_SQLS,
                         _ => {
                             warn!("Unknown telemetry type: {}", telemetry_type);
                             return;

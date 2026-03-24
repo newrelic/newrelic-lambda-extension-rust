@@ -18,6 +18,7 @@ pub const CMD_ANALYTIC_EVENTS: &str = "analytic_event_data";
 pub const CMD_CUSTOM_EVENTS: &str = "custom_event_data";
 pub const CMD_TRANSACTION_SAMPLES: &str = "transaction_sample_data";
 pub const CMD_LOG_EVENTS: &str = "log_event_data";
+pub const CMD_SLOW_SQLS: &str = "sql_trace_data";
 
 const PROTOCOL_VERSION: u8 = 17;
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -142,7 +143,14 @@ pub async fn send_apm_telemetry(
 ) -> Result<()> {
     let mut processed_data = data.to_vec();
     if !processed_data.is_empty() {
-        processed_data[0] = serde_json::json!(run_id);
+        if processed_data[0].is_null() {
+            // Normal path: agent put null as run_id placeholder, replace with actual run_id
+            processed_data[0] = serde_json::json!(run_id);
+        } else {
+            // sql_trace_data: agent sends no null placeholder, traces are at index 0
+            // Prepend run_id so collector gets [run_id, [[traces...]]]
+            processed_data.insert(0, serde_json::json!(run_id));
+        }
     }
 
     let url = format!(
