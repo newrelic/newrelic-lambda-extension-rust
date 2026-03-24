@@ -317,8 +317,8 @@ mod tests {
             // Context, buffer, creation_invocation preserved
             assert!(entry.context.lock().is_ok());
             assert!(entry.agent_buffer.lock().is_ok());
-            // pending_report is always cleaned
-            assert!(entry.pending_report.is_none());
+            // pending_report is preserved (not cleared) for late platform.report matching
+            assert_eq!(entry.pending_report.as_deref(), Some("r"));
         }
 
         clear_request_state();

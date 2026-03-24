@@ -312,8 +312,6 @@ pub async fn process_request_concurrently(
     }
 
     // Smart batching: Only send complete payloads (with report)
-    // Track whether payloads were put back in buffer (needs REQUEST_DATA kept alive)
-    let mut payloads_kept_in_buffer = false;
 
     let send_agent_task = if agent_payloads.is_empty() {
         debug!("Standard mode: No agent payload for request: {}", request_id);
@@ -362,8 +360,6 @@ pub async fn process_request_concurrently(
                 buffer.extend(agent_payloads);
             }
         }
-        payloads_kept_in_buffer = true;
-
         None
     };
 
@@ -396,9 +392,10 @@ pub async fn process_request_concurrently(
         drop(handle); // Tasks continue running; failures keep items in AGENT_BATCH_BUFFER
     }
 
-    // Clean up REQUEST_DATA immediately when buffer is empty (payloads moved to batch or none arrived).
-    // Only keep the entry when payloads were put back in buffer (waiting for platform.report).
-    cleanup_request_processing_state_internal(&request_id, payloads_kept_in_buffer);
+    // Always keep REQUEST_DATA alive for late payload routing after Lambda freeze/thaw.
+    // Late agent payloads and platform.report may arrive after processing completes.
+    // Periodic cleanup_old_request_buffers (every 5 invocations) prevents memory growth.
+    cleanup_request_processing_state_internal(&request_id, true);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
     // It will be overwritten when next INVOKE arrives
@@ -513,9 +510,6 @@ pub async fn process_apm_request(
 
     let got_payload = !agent_payloads.is_empty();
 
-    // Track whether payloads were put back in buffer (needs REQUEST_DATA kept alive)
-    let mut payloads_kept_in_buffer = false;
-
     // Flow 1: If run_id exists and payload arrived, send it immediately
     // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
@@ -571,7 +565,6 @@ pub async fn process_apm_request(
                     buffer.extend(agent_payloads);
                 }
             }
-            payloads_kept_in_buffer = true;
         } else if has_run_id && !got_payload {
             debug!(
                 "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
@@ -641,9 +634,9 @@ pub async fn process_apm_request(
     // arrives during the NEXT invocation in APM mode, not the current one.
     // Agent payloads that arrive late will be caught by warm start logic.
 
-    // Clean up REQUEST_DATA immediately when buffer is empty (payloads sent or none arrived).
-    // Only keep the entry when payloads were put back in buffer (waiting for run_id).
-    cleanup_request_processing_state_internal(&request_id, payloads_kept_in_buffer);
+    // Always keep REQUEST_DATA alive for late payload routing after Lambda freeze/thaw.
+    // Periodic cleanup_old_request_buffers (every 5 invocations) prevents memory growth.
+    cleanup_request_processing_state_internal(&request_id, true);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
     // It will be overwritten when next INVOKE arrives

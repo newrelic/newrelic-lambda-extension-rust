@@ -230,12 +230,10 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
     if !skip_buffer_cleanup {
         // Full cleanup: remove the entire consolidated entry
         REQUEST_DATA.remove(request_id);
-    } else {
-        // Partial cleanup: keep context/buffer/creation_invocation, clear pending_report
-        if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
-            entry.pending_report = None;
-        }
     }
+    // When skip_buffer_cleanup=true: keep entire entry intact (buffer, context, pending_report).
+    // Late agent payloads and platform.report may arrive after Lambda freeze/thaw.
+    // Stale entries are cleaned up by cleanup_old_request_buffers (every 5 invocations).
 }
 
 /// Periodic cleanup of stale request buffers that have survived more than 5 invocations

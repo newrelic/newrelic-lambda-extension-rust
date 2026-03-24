@@ -252,13 +252,14 @@ pub async fn send_batched_payloads_with_reports_only(
 }
 
 /// Send all pending payloads on shutdown with 1MB chunking
-/// Collects from: AGENT_BATCH_BUFFER, REQUEST_DATA (agent buffers + pending reports)
+/// Collects from: AGENT_BATCH_BUFFER, ORPHANED_PAYLOADS (routed into last request buffer),
+/// REQUEST_DATA (agent buffers + pending reports)
 /// Splits into 1MB chunks while keeping each payload + report together
 pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
 ) {
-    use crate::request::{REQUEST_DATA, get_request_context, remove_pending_report};
+    use crate::request::{REQUEST_DATA, ORPHANED_PAYLOADS, get_request_context, remove_pending_report};
 
     debug!("Shutdown: Collecting all pending telemetry payloads");
 
@@ -269,7 +270,82 @@ pub async fn send_all_pending_payloads_on_shutdown(
     debug!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
     all_payloads.extend(batched_items);
 
-    // 2. Collect from REQUEST_DATA (late/unbatched payloads)
+    // 2. Drain ORPHANED_PAYLOADS into the last request's buffer for proper report matching.
+    //    Drain into a local Vec first to release the lock before acquiring other locks.
+    let orphaned_payloads: Vec<Vec<u8>> = ORPHANED_PAYLOADS
+        .lock()
+        .ok()
+        .map(|mut orphaned| orphaned.drain(..).collect())
+        .unwrap_or_default();
+
+    if !orphaned_payloads.is_empty() {
+        let last_rid = crate::event_loop::LAST_REQUEST_CONTEXT
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(id, _)| id.clone()));
+
+        if let Some(ref rid) = last_rid {
+            // Route into last request's buffer — step 3 will pick them up with proper report
+            if let Some(buffer) = crate::request::get_agent_buffer(rid) {
+                if let Ok(mut buf) = buffer.lock() {
+                    info!(
+                        "Shutdown: Drained {} orphaned payload(s) into request buffer: {}",
+                        orphaned_payloads.len(), rid
+                    );
+                    buf.extend(orphaned_payloads);
+                } else {
+                    // Buffer lock poisoned — push directly to all_payloads as fallback
+                    error!("Shutdown: Buffer lock poisoned for {} — sending orphans directly", rid);
+                    let arn = get_request_context(rid)
+                        .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()).filter(|a| !a.is_empty()))
+                        .unwrap_or_else(crate::get_global_fallback_arn);
+                    let report = remove_pending_report(rid);
+                    for payload_bytes in orphaned_payloads {
+                        all_payloads.push(BatchedAgentPayload {
+                            request_id: rid.clone(),
+                            agent_payload_bytes: Arc::new(payload_bytes),
+                            report_line: report.clone(),
+                            invoked_function_arn: arn.clone(),
+                            timestamp: chrono::Utc::now(),
+                        });
+                    }
+                }
+            } else {
+                // No buffer for last request — push directly to all_payloads
+                let arn = get_request_context(rid)
+                    .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()).filter(|a| !a.is_empty()))
+                    .unwrap_or_else(crate::get_global_fallback_arn);
+                let report = remove_pending_report(rid);
+                info!(
+                    "Shutdown: No buffer for {} — sending {} orphaned payload(s) directly (report: {})",
+                    rid, orphaned_payloads.len(), report.is_some()
+                );
+                for payload_bytes in orphaned_payloads {
+                    all_payloads.push(BatchedAgentPayload {
+                        request_id: rid.clone(),
+                        agent_payload_bytes: Arc::new(payload_bytes),
+                        report_line: report.clone(),
+                        invoked_function_arn: arn.clone(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                }
+            }
+        } else {
+            // No last request context (shutdown before first INVOKE)
+            info!("Shutdown: No request context — sending {} orphaned payload(s) with fallback ARN", orphaned_payloads.len());
+            for payload_bytes in orphaned_payloads {
+                all_payloads.push(BatchedAgentPayload {
+                    request_id: "init-orphaned".to_string(),
+                    agent_payload_bytes: Arc::new(payload_bytes),
+                    report_line: None,
+                    invoked_function_arn: crate::get_global_fallback_arn(),
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+        }
+    }
+
+    // 3. Collect from REQUEST_DATA (late/unbatched payloads)
     let all_buffer_requests: Vec<String> = REQUEST_DATA
         .iter()
         .map(|entry| entry.key().clone())
@@ -320,14 +396,14 @@ pub async fn send_all_pending_payloads_on_shutdown(
 
     debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
 
-    // 3. Split into 1MB chunks while keeping each payload + report together
+    // 4. Split into 1MB chunks while keeping each payload + report together
     const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB
 
     let chunks = split_into_chunks(all_payloads, MAX_CHUNK_SIZE, &config);
 
     debug!("Shutdown: Sending {} chunk(s)", chunks.len());
 
-    // 4. Send each chunk
+    // 5. Send each chunk
     for (idx, chunk_items) in chunks.iter().enumerate() {
         debug!("Shutdown: Sending chunk {} with {} payload(s)", idx + 1, chunk_items.len());
 

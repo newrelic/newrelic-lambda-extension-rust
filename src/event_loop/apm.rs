@@ -274,6 +274,52 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
 
+                // Drain orphaned payloads into last request's buffer — release lock first
+                let orphaned_payloads: Vec<Vec<u8>> = crate::request::ORPHANED_PAYLOADS
+                    .lock()
+                    .ok()
+                    .map(|mut orphaned| orphaned.drain(..).collect())
+                    .unwrap_or_default();
+
+                if !orphaned_payloads.is_empty() {
+                    let last_rid = LAST_REQUEST_CONTEXT
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|(id, _)| id.clone()));
+
+                    // Try to route into last request's buffer (drop lock before any .await)
+                    let remaining = if let Some(ref rid) = last_rid {
+                        if let Some(buffer) = get_agent_buffer(rid) {
+                            if let Ok(mut buf) = buffer.lock() {
+                                info!("APM mode shutdown: Drained {} orphaned payload(s) into buffer: {}", orphaned_payloads.len(), rid);
+                                buf.extend(orphaned_payloads);
+                                Vec::new() // all routed
+                            } else {
+                                orphaned_payloads // lock poisoned
+                            }
+                        } else {
+                            orphaned_payloads // no buffer
+                        }
+                    } else {
+                        orphaned_payloads // no last request
+                    };
+
+                    if !remaining.is_empty() {
+                        // Fallback: send directly to APM collector
+                        let arn = last_rid.as_ref()
+                            .and_then(|rid| get_request_context(rid))
+                            .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()).filter(|a| !a.is_empty()))
+                            .unwrap_or_else(crate::get_global_fallback_arn);
+                        let rid = last_rid.as_deref().unwrap_or("init-orphaned");
+                        warn!("APM mode shutdown: Buffer unavailable — sending {} orphans directly for {}", remaining.len(), rid);
+                        for payload_bytes in &remaining {
+                            if let Err(e) = process_and_send_agent_payload(payload_bytes, rid, &arn, &components.global_log_processor, &components.config, &components.apm_app).await {
+                                warn!("APM mode shutdown: Failed to send orphaned payload: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 // Check all request buffers for unsent payloads
                 let all_request_ids: Vec<String> = REQUEST_DATA
                     .iter()
