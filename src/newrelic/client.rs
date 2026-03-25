@@ -60,17 +60,16 @@ pub fn build_proxy(proxy_url: &str) -> Option<Proxy> {
 ///   so `HTTPS_PROXY` still works for users who rely on it.
 /// - Localhost/loopback is always excluded from proxying via `NoProxy`.
 pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
-    // Short pool_idle_timeout prevents stale connections after Lambda freeze/thaw:
-    // Instant::now() uses CLOCK_MONOTONIC which advances during cgroup freeze,
-    // so connections idle >2s are correctly evicted at checkout after thaw.
+    // pool_idle_timeout=90s keeps connections alive across Lambda freeze/thaw,
+    // avoiding expensive TLS re-handshakes on warm starts.
+    // tcp_keepalive=30s detects dead connections during freeze.
     // Within the same invocation, connections are reused (APM sends 6-8 requests).
-    // reqwest/hyper does NOT auto-retry on stale connections (unlike Go's net/http),
-    // so we rely on short idle timeout to discard dead connections before reuse.
     let mut builder = Client::builder()
         .timeout(std::time::Duration::from_millis(2400))
-        .connect_timeout(std::time::Duration::from_secs(2))
-        .pool_idle_timeout(std::time::Duration::from_secs(2))
-        .pool_max_idle_per_host(10);
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .tcp_keepalive(std::time::Duration::from_secs(30));
 
     if let Some(url) = proxy_url {
         if let Some(proxy) = build_proxy(url) {
@@ -110,16 +109,17 @@ impl NewRelicClient {
             header::HeaderValue::from_static(EXTENSION_NAME_WITH_VERSION),
         );
 
-        // Short pool_idle_timeout prevents stale connections after Lambda freeze/thaw:
-        // Instant::now() uses CLOCK_MONOTONIC which advances during cgroup freeze,
-        // so connections idle >2s are correctly evicted at checkout after thaw.
+        // pool_idle_timeout=90s keeps connections alive across Lambda freeze/thaw,
+        // avoiding expensive TLS re-handshakes on warm starts.
+        // tcp_keepalive=30s detects dead connections during freeze.
         // Within the same invocation, connections are reused (APM sends 6-8 requests).
         let mut builder = Client::builder()
             .default_headers(headers)
             .timeout(std::time::Duration::from_millis(2400))
-            .connect_timeout(std::time::Duration::from_secs(2))
-            .pool_idle_timeout(std::time::Duration::from_secs(2))
-            .pool_max_idle_per_host(10);
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .tcp_keepalive(std::time::Duration::from_secs(30));
 
         if let Some(ref proxy_url) = config.new_relic.proxy_url {
             if let Some(proxy) = build_proxy(proxy_url) {
