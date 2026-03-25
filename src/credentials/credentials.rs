@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 use crate::config::Configuration;
 
-const SYSTEM_BUNDLE_PATHS: &[&str] = &[
+pub(crate) const SYSTEM_BUNDLE_PATHS: &[&str] = &[
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/ssl/ca-bundle.pem",
@@ -23,12 +23,12 @@ const SYSTEM_BUNDLE_PATHS: &[&str] = &[
     "/etc/ssl/cert.pem",
 ];
 
-const MERGED_BUNDLE_PATH: &str = "/tmp/nr_ca_bundle.pem";
+pub(crate) const MERGED_BUNDLE_PATH: &str = "/tmp/nr_ca_bundle.pem";
 
 /// If `SSL_CERT_FILE` is set, merge the system CA bundle with its contents and
 /// point `SSL_CERT_FILE` at the merged file so all TLS clients (including the
 /// AWS SDK) trust both AWS root CAs and the custom proxy CA.
-fn merge_ca_bundle_if_needed() {
+pub(crate) fn merge_ca_bundle_if_needed() {
     let custom_path = match std::env::var("SSL_CERT_FILE") {
         Ok(v) if !v.is_empty() => v,
         _ => return,
@@ -37,12 +37,22 @@ fn merge_ca_bundle_if_needed() {
     let system_bundle = SYSTEM_BUNDLE_PATHS.iter().find_map(|p| std::fs::read(p).ok());
     let system_bundle = match system_bundle {
         Some(b) => b,
-        None => { warn!("SSL_CERT_FILE is set but no system CA bundle found; AWS service connections may fail"); return; }
+        None => {
+            warn!("SSL_CERT_FILE is set but no system CA bundle found; unsetting SSL_CERT_FILE so AWS SDK uses default resolver");
+            #[allow(unused_unsafe)]
+            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+            return;
+        }
     };
 
     let custom_certs = match std::fs::read(&custom_path) {
         Ok(b) => b,
-        Err(e) => { warn!("SSL_CERT_FILE='{}' could not be read: {}", custom_path, e); return; }
+        Err(e) => {
+            warn!("SSL_CERT_FILE='{}' could not be read: {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", custom_path, e);
+            #[allow(unused_unsafe)]
+            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+            return;
+        }
     };
 
     let mut merged = system_bundle;
