@@ -26,11 +26,8 @@ use super::payload::{
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
-    let mut apm_task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
-        // Prune completed task handles to prevent unbounded growth
-        apm_task_handles.retain(|h| !h.is_finished());
         debug!("APM mode: waiting for next lambda invocation event...");
 
         let runtime_event = match runtime::fetch_next_event(&components.client, &components.extension_id).await
@@ -144,15 +141,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
-                // Spawn APM processing as background tasks so the extension can call /next
-                // immediately, avoiding adding send latency to billed duration.
-                // Tasks complete while the next function invocation runs.
-                {
+                // APM mode: await both tasks before returning to /next.
+                // Unlike standard mode (which batches), APM sends directly to collector.
+                // Lambda freezes the environment after /next returns, so background tasks
+                // may not complete. We must await them here to ensure delivery.
+                let pending_task = tokio::spawn({
                     let config = components.config.clone();
                     let log_proc = components.global_log_processor.clone();
                     let apm_app = components.apm_app.clone();
                     let req_id = request_id.clone();
-                    let pending_handle = tokio::spawn(async move {
+                    async move {
                         process_pending_agent_payloads(
                             &config,
                             &log_proc,
@@ -160,20 +158,24 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             &req_id,
                         )
                         .await;
-                    });
-                    apm_task_handles.push(pending_handle);
-                }
+                    }
+                });
 
-                {
-                    let handle = tokio::spawn(process_apm_request(
-                        request_id.clone(),
-                        invoked_function_arn.clone(),
-                        is_cold_start,
-                        components.config.clone(),
-                        components.global_log_processor.clone(),
-                        components.apm_app.clone(),
-                    ));
-                    apm_task_handles.push(handle);
+                let current_task = tokio::spawn(process_apm_request(
+                    request_id.clone(),
+                    invoked_function_arn.clone(),
+                    is_cold_start,
+                    components.config.clone(),
+                    components.global_log_processor.clone(),
+                    components.apm_app.clone(),
+                ));
+
+                let (current_result, pending_result) = tokio::join!(current_task, pending_task);
+                if let Err(e) = current_result {
+                    error!("Error in APM request processing: {}", e);
+                }
+                if let Err(e) = pending_result {
+                    error!("Error in pending payload processing: {}", e);
                 }
 
                 let event_time = event_start.elapsed();
@@ -208,11 +210,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
                 info!("APM mode: Extension shutting down with reason: {}", shutdown_reason);
-
-                // Await all in-flight APM background tasks before shutdown cleanup
-                for handle in apm_task_handles.drain(..) {
-                    let _ = handle.await;
-                }
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
