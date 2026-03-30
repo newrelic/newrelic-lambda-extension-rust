@@ -10,10 +10,7 @@ mod tests {
     }
 
     fn cleanup() {
-        #[allow(unused_unsafe)]
-        unsafe {
-            std::env::remove_var("SSL_CERT_FILE");
-        }
+        std::env::remove_var("SSL_CERT_FILE");
         let _ = std::fs::remove_file(MERGED_BUNDLE_PATH);
     }
 
@@ -36,8 +33,7 @@ mod tests {
     #[serial]
     fn test_no_op_when_ssl_cert_file_empty() {
         cleanup();
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", ""); }
+        std::env::set_var("SSL_CERT_FILE", "");
         merge_ca_bundle_if_needed();
         assert_ne!(
             std::env::var("SSL_CERT_FILE").unwrap_or_default(),
@@ -56,16 +52,12 @@ mod tests {
     #[serial]
     fn test_idempotent_when_already_pointing_at_merged_path() {
         cleanup();
-        // Simulate a previous successful merge
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH); }
+        std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH);
         std::fs::write(MERGED_BUNDLE_PATH, b"already merged content").unwrap();
 
         merge_ca_bundle_if_needed();
 
-        // SSL_CERT_FILE must still point at merged path
         assert_eq!(std::env::var("SSL_CERT_FILE").unwrap(), MERGED_BUNDLE_PATH);
-        // File content must not have changed
         let content = std::fs::read(MERGED_BUNDLE_PATH).unwrap();
         assert_eq!(content, b"already merged content");
         cleanup();
@@ -81,8 +73,7 @@ mod tests {
     #[serial]
     fn test_unsets_ssl_cert_file_when_cert_file_missing() {
         cleanup();
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", "/nonexistent/path/proxy_ca.pem"); }
+        std::env::set_var("SSL_CERT_FILE", "/nonexistent/path/proxy_ca.pem");
         merge_ca_bundle_if_needed();
         assert!(
             std::env::var("SSL_CERT_FILE").is_err(),
@@ -107,18 +98,15 @@ mod tests {
         cleanup();
         let fake_cert_path = "/tmp/nr_test_fake_cert.bin";
         std::fs::write(fake_cert_path, b"this is not a certificate, just binary garbage").unwrap();
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", fake_cert_path); }
+        std::env::set_var("SSL_CERT_FILE", fake_cert_path);
 
         merge_ca_bundle_if_needed();
 
-        // SSL_CERT_FILE must still point at the original non-PEM file, not the merged path
         assert_eq!(
             std::env::var("SSL_CERT_FILE").unwrap(),
             fake_cert_path,
             "SSL_CERT_FILE should remain unchanged when file is not PEM"
         );
-        // Merged bundle must not have been created
         assert!(
             !std::path::Path::new(MERGED_BUNDLE_PATH).exists(),
             "Merged bundle must not be created for non-PEM input"
@@ -147,8 +135,7 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\nMIIFakeCertContentHere\n-----END CERTIFICATE-----\n",
         )
         .unwrap();
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", fake_pem_path); }
+        std::env::set_var("SSL_CERT_FILE", fake_pem_path);
 
         merge_ca_bundle_if_needed();
 
@@ -178,21 +165,17 @@ mod tests {
         let fake_pem_path = "/tmp/nr_test_proxy_ca2.pem";
         let custom_cert = b"-----BEGIN CERTIFICATE-----\nMIICustomCertData\n-----END CERTIFICATE-----\n";
         std::fs::write(fake_pem_path, custom_cert).unwrap();
-        #[allow(unused_unsafe)]
-        unsafe { std::env::set_var("SSL_CERT_FILE", fake_pem_path); }
+        std::env::set_var("SSL_CERT_FILE", fake_pem_path);
 
         merge_ca_bundle_if_needed();
 
         let merged = std::fs::read(MERGED_BUNDLE_PATH).expect("merged bundle must exist");
         let merged_str = String::from_utf8_lossy(&merged);
 
-        // The custom cert content must appear in the merged file
         assert!(
             merged_str.contains("MIICustomCertData"),
             "Merged bundle must contain custom cert content"
         );
-
-        // There must be a double newline before the custom cert's BEGIN marker
         assert!(
             merged_str.contains("\n\n-----BEGIN CERTIFICATE-----"),
             "Merged bundle must have double newline before custom cert BEGIN marker"

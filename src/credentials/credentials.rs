@@ -44,8 +44,7 @@ pub(crate) fn merge_ca_bundle_if_needed() {
         Some(b) => b,
         None => {
             warn!("SSL_CERT_FILE is set but no system CA bundle found; unsetting SSL_CERT_FILE so AWS SDK uses default resolver");
-            #[allow(unused_unsafe)]
-            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+            std::env::remove_var("SSL_CERT_FILE");
             return;
         }
     };
@@ -54,8 +53,7 @@ pub(crate) fn merge_ca_bundle_if_needed() {
         Ok(b) => b,
         Err(e) => {
             warn!("SSL_CERT_FILE='{}' could not be read: {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", custom_path, e);
-            #[allow(unused_unsafe)]
-            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+            std::env::remove_var("SSL_CERT_FILE");
             return;
         }
     };
@@ -71,15 +69,12 @@ pub(crate) fn merge_ca_bundle_if_needed() {
 
     match std::fs::write(MERGED_BUNDLE_PATH, &merged) {
         Ok(()) => {
-            // Safety: called once at extension startup before async tasks are spawned.
-            #[allow(unused_unsafe)]
-            unsafe { std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH); }
+            std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH);
             info!("SSL_CERT_FILE: merged system CA bundle with '{}' into '{}'", custom_path, MERGED_BUNDLE_PATH);
         }
         Err(e) => {
             warn!("Failed to write merged CA bundle to '{}': {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", MERGED_BUNDLE_PATH, e);
-            #[allow(unused_unsafe)]
-            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+            std::env::remove_var("SSL_CERT_FILE");
         }
     }
 }
