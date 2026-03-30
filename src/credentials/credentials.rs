@@ -34,6 +34,11 @@ pub(crate) fn merge_ca_bundle_if_needed() {
         _ => return,
     };
 
+    // Idempotency: already merged on a previous call
+    if custom_path == MERGED_BUNDLE_PATH {
+        return;
+    }
+
     let system_bundle = SYSTEM_BUNDLE_PATHS.iter().find_map(|p| std::fs::read(p).ok());
     let system_bundle = match system_bundle {
         Some(b) => b,
@@ -55,8 +60,13 @@ pub(crate) fn merge_ca_bundle_if_needed() {
         }
     };
 
+    if !custom_certs.windows(27).any(|w| w == b"-----BEGIN CERTIFICATE-----") {
+        warn!("SSL_CERT_FILE='{}' doesn't look like PEM — skipping merge", custom_path);
+        return;
+    }
+
     let mut merged = system_bundle;
-    merged.push(b'\n');
+    merged.extend_from_slice(b"\n\n");
     merged.extend_from_slice(&custom_certs);
 
     match std::fs::write(MERGED_BUNDLE_PATH, &merged) {
@@ -66,7 +76,11 @@ pub(crate) fn merge_ca_bundle_if_needed() {
             unsafe { std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH); }
             info!("SSL_CERT_FILE: merged system CA bundle with '{}' into '{}'", custom_path, MERGED_BUNDLE_PATH);
         }
-        Err(e) => warn!("Failed to write merged CA bundle to '{}': {}", MERGED_BUNDLE_PATH, e),
+        Err(e) => {
+            warn!("Failed to write merged CA bundle to '{}': {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", MERGED_BUNDLE_PATH, e);
+            #[allow(unused_unsafe)]
+            unsafe { std::env::remove_var("SSL_CERT_FILE"); }
+        }
     }
 }
 
