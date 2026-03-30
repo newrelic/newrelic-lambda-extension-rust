@@ -122,6 +122,7 @@ pub async fn retry_buffered_telemetry(
                 "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
                 "log_event_data" => super::collector::CMD_LOG_EVENTS,
                 "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
+                "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
                 _ => {
                     warn!("Unknown telemetry type: {}", item.telemetry_type);
                     continue;
