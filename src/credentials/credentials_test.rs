@@ -60,7 +60,6 @@ mod tests {
         assert_eq!(std::env::var("SSL_CERT_FILE").unwrap(), MERGED_BUNDLE_PATH);
         let content = std::fs::read(MERGED_BUNDLE_PATH).unwrap();
         assert_eq!(content, b"already merged content");
-        cleanup();
     }
 
     // -------------------------------------------------------------------------
@@ -102,17 +101,15 @@ mod tests {
 
         merge_ca_bundle_if_needed();
 
-        assert_eq!(
-            std::env::var("SSL_CERT_FILE").unwrap(),
-            fake_cert_path,
-            "SSL_CERT_FILE should remain unchanged when file is not PEM"
+        assert!(
+            std::env::var("SSL_CERT_FILE").is_err(),
+            "SSL_CERT_FILE should be unset when file is not PEM"
         );
         assert!(
             !std::path::Path::new(MERGED_BUNDLE_PATH).exists(),
             "Merged bundle must not be created for non-PEM input"
         );
         let _ = std::fs::remove_file(fake_cert_path);
-        cleanup();
     }
 
     // -------------------------------------------------------------------------
@@ -149,7 +146,6 @@ mod tests {
             "Merged bundle file must exist"
         );
         let _ = std::fs::remove_file(fake_pem_path);
-        cleanup();
     }
 
     /// Merged bundle must contain the custom cert content appended after the system bundle,
@@ -182,6 +178,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(fake_pem_path);
-        cleanup();
     }
 }
