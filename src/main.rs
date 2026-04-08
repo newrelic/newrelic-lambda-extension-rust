@@ -411,8 +411,6 @@ async fn perform_one_time_initialization(
 
     cleanup_old_failed_payloads();
 
-    // Override APM mode for Java runtime (not supported)
-    let config = apply_runtime_overrides(config);
 
     // Smart conditional parallelization: only use tokio::join! when APM enabled
     // This avoids async overhead for standard mode (most common case)
@@ -618,28 +616,6 @@ async fn handle_no_license_key(
     })
 }
 
-/// Apply runtime-specific overrides to the configuration
-/// For example, Java runtime doesn't support APM mode, so we force serverless mode
-fn apply_runtime_overrides(config: Arc<ExtensionConfig>) -> Arc<ExtensionConfig> {
-    let detected_runtime = crate::version::get_runtime_name();
-    
-    // Java runtime doesn't support APM mode - force serverless mode
-    if config.new_relic.apm_lambda_mode && detected_runtime == "java" {
-        warn!(
-            "APM mode is not supported for Java runtime. Redirecting to serverless mode. Detected runtime: {}",
-            detected_runtime
-        );
-        
-        // Clone the config and modify the APM mode flag
-        let mut updated_config = (*config).clone();
-        updated_config.new_relic.apm_lambda_mode = false;
-        
-        return Arc::new(updated_config);
-    }
-    
-    // No override needed
-    config
-}
 
 async fn resolve_license_key_with_aws_fallback(
     config: &Arc<config::ExtensionConfig>,
