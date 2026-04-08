@@ -104,20 +104,12 @@ pub async fn retry_buffered_telemetry(
         );
 
         // Retry sending
-        let result = if item.telemetry_type == "error_event_data" {
-            super::collector::send_error_events(
-                client,
-                license_key,
-                &item.collector_host,
-                &item.run_id,
-                &item.data,
-            )
-            .await
-        } else {
+        let result = {
             let command = match item.telemetry_type.as_str() {
                 "metric_data" => super::collector::CMD_METRICS,
                 "span_event_data" => super::collector::CMD_SPAN_EVENTS,
                 "error_data" => super::collector::CMD_ERROR_DATA,
+                "error_event_data" => super::collector::CMD_ERROR_EVENTS,
                 "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
                 "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
                 "log_event_data" => super::collector::CMD_LOG_EVENTS,

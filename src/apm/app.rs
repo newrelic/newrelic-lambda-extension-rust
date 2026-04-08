@@ -4,7 +4,7 @@
 
 use super::collector::{
     send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS,
-    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
+    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
     CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
 use super::connection::{connect, preconnect};
@@ -248,20 +248,12 @@ impl ApmApp {
 
             let task = tokio::spawn(async move {
                 let request_id = request_id_owned;
-                let send_result = if telemetry_type == "error_event_data" {
-                    send_error_events(
-                        &client,
-                        &license_key,
-                        &collector_host,
-                        &run_id,
-                        &data,
-                    )
-                    .await
-                } else {
+                let send_result = {
                     let command = match telemetry_type.as_str() {
                         "metric_data" => CMD_METRICS,
                         "span_event_data" => CMD_SPAN_EVENTS,
                         "error_data" => CMD_ERROR_DATA,
+                        "error_event_data" => CMD_ERROR_EVENTS,
                         "analytic_event_data" => CMD_ANALYTIC_EVENTS,
                         "custom_event_data" => CMD_CUSTOM_EVENTS,
                         "log_event_data" => CMD_LOG_EVENTS,
