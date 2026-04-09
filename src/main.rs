@@ -35,7 +35,6 @@ use tracing::{debug, error, info, warn};
 use reqwest::Client;
 
 use crate::{
-    config::ExtensionConfig,
     context::InvocationContext,
     telemetry::listener::setup_telemetry_listener,
     newrelic::{
@@ -242,13 +241,53 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     Ok(())
 }
 
+/// Override config settings based on runtime environment.
+/// For Java runtimes: APM mode requires the Java agent layer to be present.
+/// If `/opt/newrelic/java-agent-version.txt` exists and is non-empty, the Java agent
+/// layer is installed and APM mode is allowed. Otherwise, APM mode is disabled.
+fn apply_runtime_overrides(config: Arc<config::ExtensionConfig>) -> Arc<config::ExtensionConfig> {
+    let runtime = version::get_runtime_name();
+
+    if runtime == "java" && config.new_relic.apm_lambda_mode {
+        const JAVA_AGENT_VERSION_FILE: &str = "/opt/newrelic/java-agent-version.txt";
+        match std::fs::read_to_string(JAVA_AGENT_VERSION_FILE) {
+            Ok(version) if !version.trim().is_empty() => {
+                info!(
+                    "Java agent layer detected (version: {}) — APM mode allowed for Java runtime",
+                    version.trim()
+                );
+                config
+            }
+            Ok(_) => {
+                warn!(
+                    "Java runtime detected but {} is empty — disabling APM mode (Java agent layer not properly installed)",
+                    JAVA_AGENT_VERSION_FILE
+                );
+                let mut updated = (*config).clone();
+                updated.new_relic.apm_lambda_mode = false;
+                Arc::new(updated)
+            }
+            Err(_) => {
+                warn!(
+                    "Java runtime detected but {} not found — disabling APM mode (install the New Relic Java agent layer to enable APM mode)",
+                    JAVA_AGENT_VERSION_FILE
+                );
+                let mut updated = (*config).clone();
+                updated.new_relic.apm_lambda_mode = false;
+                Arc::new(updated)
+            }
+        }
+    } else {
+        config
+    }
+}
+
 /// Perform all one-time initialization - called only once per container
 async fn perform_one_time_initialization(
 ) -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
     let config = config::init_config().clone();
     let config = Arc::new(config);
-
-   
+    let config = apply_runtime_overrides(config);
 
     if !config.new_relic.extension_enabled {
         debug!("Extension telemetry processing disabled - entering no-op mode");
