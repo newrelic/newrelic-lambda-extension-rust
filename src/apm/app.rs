@@ -248,33 +248,30 @@ impl ApmApp {
 
             let task = tokio::spawn(async move {
                 let request_id = request_id_owned;
-                let send_result = {
-                    let command = match telemetry_type.as_str() {
-                        "metric_data" => CMD_METRICS,
-                        "span_event_data" => CMD_SPAN_EVENTS,
-                        "error_data" => CMD_ERROR_DATA,
-                        "error_event_data" => CMD_ERROR_EVENTS,
-                        "analytic_event_data" => CMD_ANALYTIC_EVENTS,
-                        "custom_event_data" => CMD_CUSTOM_EVENTS,
-                        "log_event_data" => CMD_LOG_EVENTS,
-                        "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
-                        "sql_trace_data" => CMD_SLOW_SQLS,
-                        _ => {
-                            warn!("Unknown telemetry type: {}", telemetry_type);
-                            return;
-                        }
-                    };
-
-                    send_apm_telemetry(
-                        &client,
-                        &license_key,
-                        &collector_host,
-                        &run_id,
-                        command,
-                        &data,
-                    )
-                    .await
+                let command = match telemetry_type.as_str() {
+                    "metric_data" => CMD_METRICS,
+                    "span_event_data" => CMD_SPAN_EVENTS,
+                    "error_data" => CMD_ERROR_DATA,
+                    "error_event_data" => CMD_ERROR_EVENTS,
+                    "analytic_event_data" => CMD_ANALYTIC_EVENTS,
+                    "custom_event_data" => CMD_CUSTOM_EVENTS,
+                    "log_event_data" => CMD_LOG_EVENTS,
+                    "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
+                    "sql_trace_data" => CMD_SLOW_SQLS,
+                    _ => {
+                        warn!("Unknown telemetry type: {}", telemetry_type);
+                        return;
+                    }
                 };
+                let send_result = send_apm_telemetry(
+                    &client,
+                    &license_key,
+                    &collector_host,
+                    &run_id,
+                    command,
+                    &data,
+                )
+                .await;
 
                 if let Err(e) = send_result {
                     warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);

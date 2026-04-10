@@ -260,7 +260,7 @@ fn apply_runtime_overrides(config: Arc<config::ExtensionConfig>) -> Arc<config::
             }
             Ok(_) => {
                 warn!(
-                    "Java runtime detected but {} is empty — disabling APM mode (Java agent layer not properly installed)",
+                    "Java runtime detected but {} is empty — disabling APM mode, reverting to serverless mode. To use APM mode, choose a java-agent layer from https://layers.newrelic-external.com/",
                     JAVA_AGENT_VERSION_FILE
                 );
                 let mut updated = (*config).clone();
@@ -269,7 +269,7 @@ fn apply_runtime_overrides(config: Arc<config::ExtensionConfig>) -> Arc<config::
             }
             Err(_) => {
                 warn!(
-                    "Java runtime detected but {} not found — disabling APM mode (install the New Relic Java agent layer to enable APM mode)",
+                    "Java runtime detected but {} not found — disabling APM mode, reverting to serverless mode. To use APM mode, choose a java-agent layer from https://layers.newrelic-external.com/",
                     JAVA_AGENT_VERSION_FILE
                 );
                 let mut updated = (*config).clone();
