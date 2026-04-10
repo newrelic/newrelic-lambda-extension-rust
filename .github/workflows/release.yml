@@ -1,34 +1,29 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      bump:
-        description: "Version bump type"
-        required: true
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
+  push:
+    branches:
+      - main
 
-permissions:
-  contents: write
-
-env:
-  CARGO_TERM_COLOR: always
-  BIN_NAME: newrelic-lambda-extension
-
+# Only runs when the prepare-release PR is merged (identified by commit message)
 jobs:
   release:
-    name: Bump version, build & release
+    name: Build and publish release
     runs-on: ubuntu-latest
+    if: "startsWith(github.event.head_commit.message, 'chore: bump version to')"
+
+    permissions:
+      contents: write
+
+    env:
+      CARGO_TERM_COLOR: always
+      BIN_NAME: newrelic-lambda-extension
 
     steps:
       - name: Checkout main
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history needed for changelog
+          fetch-depth: 0
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -40,78 +35,38 @@ jobs:
           pip3 install ziglang
           cargo install cargo-zigbuild
 
-      # ── Version bump ────────────────────────────────────────────────────────
+      # ── Extract version ─────────────────────────────────────────────────────
 
-      - name: Compute new version
+      - name: Extract version from Cargo.toml
         id: version
         run: |
-          CURRENT=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
-          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
-          MINOR=$(echo "$CURRENT" | cut -d. -f2)
-          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+          VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+          echo "new=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION}"
 
-          case "${{ github.event.inputs.bump }}" in
-            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
-            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
-            patch) PATCH=$((PATCH + 1)) ;;
-          esac
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
-          echo "new=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Bumping $CURRENT → $NEW_VERSION (${{ github.event.inputs.bump }})"
-
-      - name: Update version in Cargo.toml
-        run: |
-          sed -i "0,/^version = \"${{ steps.version.outputs.current }}\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
-
-      - name: Update Cargo.lock
-        run: cargo update --workspace
-
-      - name: Commit version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
-          git push origin main
-
-      # ── Changelog ───────────────────────────────────────────────────────────
+      # ── Generate changelog ──────────────────────────────────────────────────
 
       - name: Generate changelog
-        id: changelog
         run: |
           PREV_TAG=$(git tag --sort=-version:refname | head -1)
-          echo "Generating changelog since $PREV_TAG"
+          echo "Generating changelog since ${PREV_TAG}"
 
-          # Group commits by type
+          FEATURES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- feat(\(.+\))?:" | sed -E 's/^- feat(\([^)]*\))?: /- /' || true)
+          FIXES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- fix(\(.+\))?:" | sed -E 's/^- fix(\([^)]*\))?: /- /' || true)
+          CHORES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- (chore|build|ci|docs|perf|refactor)(\(.+\))?:" | sed -E 's/^- [a-z]+(\([^)]*\))?: /- /' || true)
+
           CHANGELOG=""
+          [ -n "$FEATURES" ] && CHANGELOG="${CHANGELOG}### Features\n${FEATURES}\n\n"
+          [ -n "$FIXES" ]    && CHANGELOG="${CHANGELOG}### Bug Fixes\n${FIXES}\n\n"
+          [ -n "$CHORES" ]   && CHANGELOG="${CHANGELOG}### Other Changes\n${CHORES}\n\n"
+          [ -z "$CHANGELOG" ] && CHANGELOG="No significant changes.\n"
 
-          FEATURES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- feat(\(.+\))?:" | sed 's/^- feat\(\(.*\)\)\?: /- /' | sed 's/^- feat: /- /' || true)
-          FIXES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- fix(\(.+\))?:" | sed 's/^- fix\(\(.*\)\)\?: /- /' | sed 's/^- fix: /- /' || true)
-          CHORES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- (chore|build|ci|docs|perf|refactor)(\(.+\))?:" | sed 's/^- [a-z]*\(\(.*\)\)\?: /- /' || true)
-
-          if [ -n "$FEATURES" ]; then
-            CHANGELOG="${CHANGELOG}### Features\n${FEATURES}\n\n"
-          fi
-          if [ -n "$FIXES" ]; then
-            CHANGELOG="${CHANGELOG}### Bug Fixes\n${FIXES}\n\n"
-          fi
-          if [ -n "$CHORES" ]; then
-            CHANGELOG="${CHANGELOG}### Other Changes\n${CHORES}\n\n"
-          fi
-
-          if [ -z "$CHANGELOG" ]; then
-            CHANGELOG="No significant changes.\n"
-          fi
-
-          # Write to file (avoids multiline env var issues)
           printf "${CHANGELOG}" > /tmp/changelog.md
-          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "--- Changelog ---"
           cat /tmp/changelog.md
 
-      # ── Build ────────────────────────────────────────────────────────────────
+      # ── Build ───────────────────────────────────────────────────────────────
 
       - name: Build release artifacts
         run: |
@@ -124,10 +79,12 @@ jobs:
           test -f "release/${BIN_NAME}.x86_64.zip" || (echo "Missing x86_64 zip" && exit 1)
           test -f "release/${BIN_NAME}.arm64.zip"  || (echo "Missing arm64 zip"  && exit 1)
 
-      # ── GitHub Release ───────────────────────────────────────────────────────
+      # ── Tag and release ─────────────────────────────────────────────────────
 
       - name: Create tag
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
