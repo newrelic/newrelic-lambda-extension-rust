@@ -35,7 +35,6 @@ use tracing::{debug, error, info, warn};
 use reqwest::Client;
 
 use crate::{
-    config::ExtensionConfig,
     context::InvocationContext,
     telemetry::listener::setup_telemetry_listener,
     newrelic::{
@@ -242,13 +241,53 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     Ok(())
 }
 
+/// Override config settings based on runtime environment.
+/// For Java runtimes: APM mode requires the Java agent layer to be present.
+/// If `/opt/newrelic/java-agent-version.txt` exists and is non-empty, the Java agent
+/// layer is installed and APM mode is allowed. Otherwise, APM mode is disabled.
+fn apply_runtime_overrides(config: Arc<config::ExtensionConfig>) -> Arc<config::ExtensionConfig> {
+    let runtime = version::get_runtime_name();
+
+    if runtime == "java" && config.new_relic.apm_lambda_mode {
+        const JAVA_AGENT_VERSION_FILE: &str = "/opt/newrelic/java-agent-version.txt";
+        match std::fs::read_to_string(JAVA_AGENT_VERSION_FILE) {
+            Ok(version) if !version.trim().is_empty() => {
+                info!(
+                    "Java agent layer detected (version: {}) — APM mode allowed for Java runtime",
+                    version.trim()
+                );
+                config
+            }
+            Ok(_) => {
+                warn!(
+                    "Java runtime detected but {} is empty — disabling APM mode, reverting to serverless mode. To use APM mode, choose a java-agent layer from https://layers.newrelic-external.com/",
+                    JAVA_AGENT_VERSION_FILE
+                );
+                let mut updated = (*config).clone();
+                updated.new_relic.apm_lambda_mode = false;
+                Arc::new(updated)
+            }
+            Err(_) => {
+                warn!(
+                    "Java runtime detected but {} not found — disabling APM mode, reverting to serverless mode. To use APM mode, choose a java-agent layer from https://layers.newrelic-external.com/",
+                    JAVA_AGENT_VERSION_FILE
+                );
+                let mut updated = (*config).clone();
+                updated.new_relic.apm_lambda_mode = false;
+                Arc::new(updated)
+            }
+        }
+    } else {
+        config
+    }
+}
+
 /// Perform all one-time initialization - called only once per container
 async fn perform_one_time_initialization(
 ) -> Result<ExtensionComponents, Box<dyn std::error::Error + Send + Sync>> {
     let config = config::init_config().clone();
     let config = Arc::new(config);
-
-   
+    let config = apply_runtime_overrides(config);
 
     if !config.new_relic.extension_enabled {
         debug!("Extension telemetry processing disabled - entering no-op mode");
@@ -411,8 +450,6 @@ async fn perform_one_time_initialization(
 
     cleanup_old_failed_payloads();
 
-    // Override APM mode for Java runtime (not supported)
-    let config = apply_runtime_overrides(config);
 
     // Smart conditional parallelization: only use tokio::join! when APM enabled
     // This avoids async overhead for standard mode (most common case)
@@ -618,28 +655,6 @@ async fn handle_no_license_key(
     })
 }
 
-/// Apply runtime-specific overrides to the configuration
-/// For example, Java runtime doesn't support APM mode, so we force serverless mode
-fn apply_runtime_overrides(config: Arc<ExtensionConfig>) -> Arc<ExtensionConfig> {
-    let detected_runtime = crate::version::get_runtime_name();
-    
-    // Java runtime doesn't support APM mode - force serverless mode
-    if config.new_relic.apm_lambda_mode && detected_runtime == "java" {
-        warn!(
-            "APM mode is not supported for Java runtime. Redirecting to serverless mode. Detected runtime: {}",
-            detected_runtime
-        );
-        
-        // Clone the config and modify the APM mode flag
-        let mut updated_config = (*config).clone();
-        updated_config.new_relic.apm_lambda_mode = false;
-        
-        return Arc::new(updated_config);
-    }
-    
-    // No override needed
-    config
-}
 
 async fn resolve_license_key_with_aws_fallback(
     config: &Arc<config::ExtensionConfig>,

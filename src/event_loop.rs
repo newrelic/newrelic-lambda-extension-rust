@@ -139,6 +139,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     let mut updated_config = (*components.config).clone();
                     updated_config.aws.extract_and_update_account_id_from_arn(&invoked_function_arn);
                     components.config = Arc::new(updated_config);
+
+                    match std::fs::read_to_string("/opt/newrelic/java-agent-version.txt") {
+                        Ok(version) => info!("Java agent version: {}", version.trim()),
+                        Err(e) => info!("Java agent version file not found at /opt/newrelic/java-agent-version.txt: {}", e),
+                    }
                 }
 
                 if let Ok(mut guard) = LAST_REQUEST_CONTEXT.lock() {

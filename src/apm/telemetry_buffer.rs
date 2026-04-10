@@ -104,41 +104,30 @@ pub async fn retry_buffered_telemetry(
         );
 
         // Retry sending
-        let result = if item.telemetry_type == "error_event_data" {
-            super::collector::send_error_events(
-                client,
-                license_key,
-                &item.collector_host,
-                &item.run_id,
-                &item.data,
-            )
-            .await
-        } else {
-            let command = match item.telemetry_type.as_str() {
-                "metric_data" => super::collector::CMD_METRICS,
-                "span_event_data" => super::collector::CMD_SPAN_EVENTS,
-                "error_data" => super::collector::CMD_ERROR_DATA,
-                "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
-                "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
-                "log_event_data" => super::collector::CMD_LOG_EVENTS,
-                "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
-                "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
-                _ => {
-                    warn!("Unknown telemetry type: {}", item.telemetry_type);
-                    continue;
-                }
-            };
-
-            super::collector::send_apm_telemetry(
-                client,
-                license_key,
-                &item.collector_host,
-                &item.run_id,
-                command,
-                &item.data,
-            )
-            .await
+        let command = match item.telemetry_type.as_str() {
+            "metric_data" => super::collector::CMD_METRICS,
+            "span_event_data" => super::collector::CMD_SPAN_EVENTS,
+            "error_data" => super::collector::CMD_ERROR_DATA,
+            "error_event_data" => super::collector::CMD_ERROR_EVENTS,
+            "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
+            "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
+            "log_event_data" => super::collector::CMD_LOG_EVENTS,
+            "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
+            "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
+            _ => {
+                warn!("Unknown telemetry type: {}", item.telemetry_type);
+                continue;
+            }
         };
+        let result = super::collector::send_apm_telemetry(
+            client,
+            license_key,
+            &item.collector_host,
+            &item.run_id,
+            command,
+            &item.data,
+        )
+        .await;
 
         match result {
             Ok(()) => {
