@@ -613,7 +613,10 @@ impl LogProcessor {
         // The earliest keyword match wins, because log level prefixes (e.g. [INFO], ERROR:)
         // appear at the start of the line, before any message body that might contain
         // level-like words (e.g. "No error detected").
-        let search_limit = message.len().min(150);
+        let search_limit = (0..=message.len().min(150))
+            .rev()
+            .find(|&i| message.is_char_boundary(i))
+            .unwrap_or(0);
         let search_area = &message[..search_limit];
         let lower = search_area.to_lowercase();
 
