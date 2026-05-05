@@ -349,6 +349,77 @@ where
     }
 }
 
+/// Identifies which New Relic datacenter a license key targets.
+/// EU keys start with "eu"; JP keys start with "jpx"; everything else is US.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Datacenter {
+    Us,
+    Eu,
+    Jp,
+}
+
+impl Datacenter {
+    pub fn from_license_key(key: &str) -> Self {
+        if key.starts_with("eu") {
+            Self::Eu
+        } else if key.starts_with("jpx") {
+            Self::Jp
+        } else {
+            Self::Us
+        }
+    }
+
+    pub fn apm_host(&self) -> &'static str {
+        match self {
+            Self::Us => "collector.newrelic.com",
+            Self::Eu => "collector.eu01.nr-data.net",
+            Self::Jp => "collector.jp01.nr-data.net",
+        }
+    }
+
+    pub fn metric_endpoint(&self) -> &'static str {
+        match self {
+            Self::Us => "https://metric-api.newrelic.com/metric/v1",
+            Self::Eu => "https://metric-api.eu.newrelic.com/metric/v1",
+            Self::Jp => "https://metric-api.jp.newrelic.com/metric/v1",
+        }
+    }
+
+    pub fn telemetry_endpoint(&self) -> &'static str {
+        match self {
+            Self::Us => "https://cloud-collector.newrelic.com/aws/lambda/v1",
+            Self::Eu => "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1",
+            Self::Jp => "https://cloud-collector.jp.nr-data.net/aws/lambda/v1",
+        }
+    }
+
+    pub fn log_endpoint(&self) -> &'static str {
+        match self {
+            Self::Us => "https://log-api.newrelic.com/log/v1",
+            Self::Eu => "https://log-api.eu.newrelic.com/log/v1",
+            Self::Jp => "https://log-api.jp.newrelic.com/log/v1",
+        }
+    }
+}
+
+/// Applies datacenter-specific endpoints to `config` based on the license key.
+/// Env var overrides take precedence over the license key prefix.
+pub fn apply_datacenter_endpoints(license_key: &str, config: &mut NewRelicConfig) {
+    let dc = Datacenter::from_license_key(license_key);
+
+    config.apm_host = env::var("NEW_RELIC_HOST")
+        .unwrap_or_else(|_| dc.apm_host().to_string());
+
+    config.metric_endpoint = env::var("NEW_RELIC_METRIC_ENDPOINT")
+        .unwrap_or_else(|_| dc.metric_endpoint().to_string());
+
+    config.telemetry_endpoint = env::var("NEW_RELIC_TELEMETRY_ENDPOINT")
+        .unwrap_or_else(|_| dc.telemetry_endpoint().to_string());
+
+    config.log_endpoint = env::var("NEW_RELIC_LOG_ENDPOINT")
+        .unwrap_or_else(|_| dc.log_endpoint().to_string());
+}
+
 /// Parse NR_TAGS environment variable into key-value pairs
 /// Format: "key1:value1;key2:value2" (delimiter can be customized via NR_ENV_DELIMITER)
 /// 

@@ -60,6 +60,10 @@ where
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
+        "NEW_RELIC_HOST",
+        "NEW_RELIC_METRIC_ENDPOINT",
+        "NEW_RELIC_TELEMETRY_ENDPOINT",
+        "NEW_RELIC_LOG_ENDPOINT",
     ];
     
     // Save original values
@@ -1359,6 +1363,143 @@ fn test_from_env_proxy_startup_log_never_leaks_credentials() {
             "Startup log would leak password: {}", masked);
         assert!(masked.contains("***:***@proxy.internal:8080"),
             "Masked output should preserve host: {}", masked);
+    });
+}
+
+// ============================================================================
+// Datacenter Endpoint Routing
+// ============================================================================
+
+#[test]
+fn test_datacenter_from_license_key_us() {
+    assert_eq!(Datacenter::from_license_key("abc123"), Datacenter::Us);
+    assert_eq!(Datacenter::from_license_key(""), Datacenter::Us);
+    assert_eq!(Datacenter::from_license_key("US123456"), Datacenter::Us);
+}
+
+#[test]
+fn test_datacenter_from_license_key_eu() {
+    assert_eq!(Datacenter::from_license_key("eu01abc123"), Datacenter::Eu);
+    assert_eq!(Datacenter::from_license_key("euXXXXXXXX"), Datacenter::Eu);
+}
+
+#[test]
+fn test_datacenter_from_license_key_jp() {
+    assert_eq!(Datacenter::from_license_key("jpx01abc123"), Datacenter::Jp);
+    assert_eq!(Datacenter::from_license_key("jpxXXXXXXXX"), Datacenter::Jp);
+}
+
+#[test]
+fn test_datacenter_from_license_key_jpx_not_matched_as_eu() {
+    // "jpx" starts with "jp", not "eu" — must not fall into EU branch
+    let dc = Datacenter::from_license_key("jpx01abc");
+    assert_ne!(dc, Datacenter::Eu);
+    assert_eq!(dc, Datacenter::Jp);
+}
+
+#[test]
+fn test_datacenter_us_endpoints() {
+    let dc = Datacenter::Us;
+    assert_eq!(dc.apm_host(), "collector.newrelic.com");
+    assert_eq!(dc.metric_endpoint(), "https://metric-api.newrelic.com/metric/v1");
+    assert_eq!(dc.telemetry_endpoint(), "https://cloud-collector.newrelic.com/aws/lambda/v1");
+    assert_eq!(dc.log_endpoint(), "https://log-api.newrelic.com/log/v1");
+}
+
+#[test]
+fn test_datacenter_eu_endpoints() {
+    let dc = Datacenter::Eu;
+    assert_eq!(dc.apm_host(), "collector.eu01.nr-data.net");
+    assert_eq!(dc.metric_endpoint(), "https://metric-api.eu.newrelic.com/metric/v1");
+    assert_eq!(dc.telemetry_endpoint(), "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1");
+    assert_eq!(dc.log_endpoint(), "https://log-api.eu.newrelic.com/log/v1");
+}
+
+#[test]
+fn test_datacenter_jp_endpoints() {
+    let dc = Datacenter::Jp;
+    assert_eq!(dc.apm_host(), "collector.jp01.nr-data.net");
+    assert_eq!(dc.metric_endpoint(), "https://metric-api.jp.newrelic.com/metric/v1");
+    assert_eq!(dc.telemetry_endpoint(), "https://cloud-collector.jp.nr-data.net/aws/lambda/v1");
+    assert_eq!(dc.log_endpoint(), "https://log-api.jp.newrelic.com/log/v1");
+}
+
+#[test]
+#[serial]
+fn test_apply_datacenter_endpoints_us_key() {
+    with_full_clean_env(|| {
+        let mut config = NewRelicConfig::default();
+        apply_datacenter_endpoints("us_abc123", &mut config);
+
+        assert_eq!(config.apm_host, "collector.newrelic.com");
+        assert_eq!(config.metric_endpoint, "https://metric-api.newrelic.com/metric/v1");
+        assert_eq!(config.telemetry_endpoint, "https://cloud-collector.newrelic.com/aws/lambda/v1");
+        assert_eq!(config.log_endpoint, "https://log-api.newrelic.com/log/v1");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apply_datacenter_endpoints_eu_key() {
+    with_full_clean_env(|| {
+        let mut config = NewRelicConfig::default();
+        apply_datacenter_endpoints("eu01abc123", &mut config);
+
+        assert_eq!(config.apm_host, "collector.eu01.nr-data.net");
+        assert_eq!(config.metric_endpoint, "https://metric-api.eu.newrelic.com/metric/v1");
+        assert_eq!(config.telemetry_endpoint, "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1");
+        assert_eq!(config.log_endpoint, "https://log-api.eu.newrelic.com/log/v1");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apply_datacenter_endpoints_jp_key() {
+    with_full_clean_env(|| {
+        let mut config = NewRelicConfig::default();
+        apply_datacenter_endpoints("jpx01abc123", &mut config);
+
+        assert_eq!(config.apm_host, "collector.jp01.nr-data.net");
+        assert_eq!(config.metric_endpoint, "https://metric-api.jp.newrelic.com/metric/v1");
+        assert_eq!(config.telemetry_endpoint, "https://cloud-collector.jp.nr-data.net/aws/lambda/v1");
+        assert_eq!(config.log_endpoint, "https://log-api.jp.newrelic.com/log/v1");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apply_datacenter_endpoints_env_override_wins() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_HOST", "custom.host.example.com");
+        env::set_var("NEW_RELIC_METRIC_ENDPOINT", "https://custom-metric.example.com/v1");
+        env::set_var("NEW_RELIC_TELEMETRY_ENDPOINT", "https://custom-telemetry.example.com/v1");
+        env::set_var("NEW_RELIC_LOG_ENDPOINT", "https://custom-log.example.com/v1");
+
+        // Even with a JP key, env vars win
+        let mut config = NewRelicConfig::default();
+        apply_datacenter_endpoints("jpx01abc123", &mut config);
+
+        assert_eq!(config.apm_host, "custom.host.example.com");
+        assert_eq!(config.metric_endpoint, "https://custom-metric.example.com/v1");
+        assert_eq!(config.telemetry_endpoint, "https://custom-telemetry.example.com/v1");
+        assert_eq!(config.log_endpoint, "https://custom-log.example.com/v1");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apply_datacenter_endpoints_partial_env_override() {
+    with_full_clean_env(|| {
+        // Only override one endpoint — others should still follow the key prefix
+        env::set_var("NEW_RELIC_HOST", "custom.host.example.com");
+
+        let mut config = NewRelicConfig::default();
+        apply_datacenter_endpoints("eu01abc123", &mut config);
+
+        assert_eq!(config.apm_host, "custom.host.example.com");
+        assert_eq!(config.metric_endpoint, "https://metric-api.eu.newrelic.com/metric/v1");
+        assert_eq!(config.telemetry_endpoint, "https://cloud-collector.eu01.nr-data.net/aws/lambda/v1");
+        assert_eq!(config.log_endpoint, "https://log-api.eu.newrelic.com/log/v1");
     });
 }
 
