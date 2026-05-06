@@ -1418,7 +1418,7 @@ fn test_datacenter_eu_endpoints() {
 #[test]
 fn test_datacenter_jp_endpoints() {
     let dc = Datacenter::Jp;
-    assert_eq!(dc.apm_host(), "collector.jp01.nr-data.net");
+    assert_eq!(dc.apm_host(), "collector.jp.nr-data.net");
     assert_eq!(dc.metric_endpoint(), "https://metric-api.jp.newrelic.com/metric/v1");
     assert_eq!(dc.telemetry_endpoint(), "https://cloud-collector.jp.nr-data.net/aws/lambda/v1");
     assert_eq!(dc.log_endpoint(), "https://log-api.jp.newrelic.com/log/v1");
@@ -1459,7 +1459,7 @@ fn test_apply_datacenter_endpoints_jp_key() {
         let mut config = NewRelicConfig::default();
         apply_datacenter_endpoints("jpx01abc123", &mut config);
 
-        assert_eq!(config.apm_host, "collector.jp01.nr-data.net");
+        assert_eq!(config.apm_host, "collector.jp.nr-data.net");
         assert_eq!(config.metric_endpoint, "https://metric-api.jp.newrelic.com/metric/v1");
         assert_eq!(config.telemetry_endpoint, "https://cloud-collector.jp.nr-data.net/aws/lambda/v1");
         assert_eq!(config.log_endpoint, "https://log-api.jp.newrelic.com/log/v1");

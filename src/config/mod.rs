@@ -373,7 +373,7 @@ impl Datacenter {
         match self {
             Self::Us => "collector.newrelic.com",
             Self::Eu => "collector.eu01.nr-data.net",
-            Self::Jp => "collector.jp01.nr-data.net",
+            Self::Jp => "collector.jp.nr-data.net",
         }
     }
 
