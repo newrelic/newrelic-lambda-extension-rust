@@ -143,12 +143,11 @@ pub async fn send_apm_telemetry(
 ) -> Result<()> {
     let mut processed_data = data.to_vec();
     if !processed_data.is_empty() {
-        if processed_data[0].is_null() {
-            // Normal path: agent put null as run_id placeholder, replace with actual run_id
+        if processed_data[0].is_null() || processed_data[0].as_str() == Some("") {
+            // null = Python/Node/.NET/Ruby placeholder; "" = Go placeholder — both replaced with actual run_id
             processed_data[0] = serde_json::json!(run_id);
         } else {
-            // sql_trace_data: agent sends no null placeholder, traces are at index 0
-            // Prepend run_id so collector gets [run_id, [[traces...]]]
+            // sql_trace_data: no placeholder at index 0 — prepend run_id
             processed_data.insert(0, serde_json::json!(run_id));
         }
     }
