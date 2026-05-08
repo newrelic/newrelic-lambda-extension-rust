@@ -2,7 +2,10 @@ use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{get_agent_buffer, get_request_context, set_pending_report, TELEMETRY_CURRENT_REQUEST_ID},
+    request::{
+        get_agent_buffer, get_request_context, get_runtime_done_notify, set_pending_report,
+        TELEMETRY_CURRENT_REQUEST_ID,
+    },
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -131,6 +134,12 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
+                                // Wake the event loop's end-of-invocation flush waiter so it
+                                // drains logs now instead of racing late telemetry POSTs.
+                                // Notify is idempotent: signalling before a waiter arrives is fine.
+                                if let Some(notify) = get_runtime_done_notify(request_id_str) {
+                                    notify.notify_one();
+                                }
                             }
                         }
                         platform_processor.process_record(record);

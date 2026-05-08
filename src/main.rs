@@ -37,11 +37,7 @@ use reqwest::Client;
 use crate::{
     context::InvocationContext,
     telemetry::listener::setup_telemetry_listener,
-    newrelic::{
-        client::NewRelicClient,
-        harvester::Harvester,
-        flush::Flush,
-    },
+    newrelic::client::NewRelicClient,
     credentials::get_new_relic_license_key,
     request::ProcessorFactory,
     event_loop::{
@@ -167,6 +163,7 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
             Ok(runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn: _,
+                deadline_ms: _,
             }) => {
                 debug!(
                     "No-op mode: Received INVOKE event for request {}, doing nothing",
@@ -229,14 +226,9 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         extension_startup_time.elapsed()
     );
 
-    let (total_events_processed, harvester_handle) =
-        run_infinite_event_loop(extension_components).await;
+    let total_events_processed = run_infinite_event_loop(extension_components).await;
 
-    perform_extension_shutdown_cleanup(
-        total_events_processed,
-        harvester_handle,
-    )
-    .await;
+    perform_extension_shutdown_cleanup(total_events_processed).await;
 
     Ok(())
 }
@@ -317,7 +309,6 @@ async fn perform_one_time_initialization(
             processor_factory: noop_processor_factory,
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
-            harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
             apm_mode_enabled: false,
@@ -574,27 +565,10 @@ async fn perform_one_time_initialization(
     runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
         .await?;
 
-    // Harvester enabled for periodic log flushing to reduce memory usage
-    // Flushes function logs (if NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=true),
-    // extension logs (if NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS=true),
-    // and platform logs (if NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS=true)
-    let harvest_interval_secs = std::env::var("NEW_RELIC_HARVEST_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5); // Default: 5 seconds for frequent log flushing
-    
-    debug!("Starting log harvester with {}s interval (function_logs={}, extension_logs={}, platform_logs={})",
-        harvest_interval_secs,
-        config.extension.send_function_logs,
-        config.extension.send_extension_logs,
-        config.extension.send_platform_logs
-    );
-    
-    let (_harvester, harvester_handle) = start_harvester_background_task(
-        vec![], // No processors - only log/platform flushing
-        Duration::from_secs(harvest_interval_secs),
-        &processor_factory,
-    );
+    // Log flushing is event-driven: size-based auto-flush inside LogProcessor, plus
+    // end-of-execution flush in the event loop gated on platform.runtimeDone, plus
+    // shutdown flushes. No periodic wall-clock harvester (the sandbox freezes
+    // between invocations so tokio interval timers cannot fire).
 
     Ok(ExtensionComponents {
         client,
@@ -602,7 +576,6 @@ async fn perform_one_time_initialization(
         processor_factory,
         newrelic_client,
         config: config.clone(),
-        harvester_handle,
         global_log_processor: temp_log_processor,
         apm_app,
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
@@ -648,7 +621,6 @@ async fn handle_no_license_key(
         processor_factory: noop_processor_factory,
         newrelic_client: noop_newrelic_client,
         config: config.clone(),
-        harvester_handle: tokio::spawn(async {}),
         global_log_processor: noop_log_processor,
         apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         apm_mode_enabled: false,
@@ -767,42 +739,10 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
     });
 }
 
-/// Start harvester as background task
-fn start_harvester_background_task(
-    processors: Vec<Arc<dyn Flush>>,
-    harvest_interval: Duration,
-    processor_factory: &Arc<ProcessorFactory>,
-) -> (Arc<Harvester>, tokio::task::JoinHandle<()>) {
-    let dummy_context = Arc::new(Mutex::new(InvocationContext {
-        request_id: "harvester".to_string(),
-        invoked_function_arn: "harvester".to_string(),
-        trace_id: None,
-    }));
-    let dummy_log_processor = processor_factory.create_log_processor(dummy_context.clone());
-    let dummy_platform_processor = processor_factory.create_platform_processor(dummy_context, dummy_log_processor.clone());
-
-    let harvester = Arc::new(Harvester::new(
-        processors,
-        harvest_interval,
-        dummy_log_processor,
-        dummy_platform_processor,
-    ));
-    let harvester_clone = Arc::clone(&harvester);
-    let handle = tokio::spawn(async move {
-        harvester_clone.run().await;
-    });
-    (harvester, handle)
-}
-
 /// Perform extension shutdown cleanup
-async fn perform_extension_shutdown_cleanup(
-    total_events_processed: u32,
-    harvester_handle: tokio::task::JoinHandle<()>,
-) {
+async fn perform_extension_shutdown_cleanup(total_events_processed: u32) {
     info!(
         "New Relic Extension shutting down after {} events",
         total_events_processed
     );
-
-    harvester_handle.abort();
 }

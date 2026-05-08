@@ -8,15 +8,22 @@ use crate::{
 };
 use async_trait::async_trait;
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use crate::apm::app::ApmApp;
 
-/// Safe mutex operations that won't panic and allow graceful degradation
+/// Safe mutex operations that won't panic and allow graceful degradation.
+///
+/// Convention for this file:
+///   - Use `safe_lock()` on mutexes that guard *external-facing state* (invocation context,
+///     invocation start time) where a poisoned lock should degrade gracefully rather than crash.
+///   - Use `.unwrap()` on mutexes that guard *internal pipeline state* (log_batch,
+///     failed_logs_buffer, pending_flush_handles, etc.) where poisoning indicates a bug
+///     that has already corrupted the pipeline — panicking is the safer choice.
 trait SafeMutexOps<T> {
-   
     fn safe_lock(&self) -> Option<std::sync::MutexGuard<'_, T>>;
 }
 
@@ -35,10 +42,27 @@ impl<T> SafeMutexOps<T> for Mutex<T> {
 /// State of trace ID extraction for the current invocation
 #[derive(Debug, Clone, PartialEq)]
 enum TraceIdExtractionState {
-   
+
     Waiting,
-   
+
     Extracted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogType {
+    Function,
+    Platform,
+    Extension,
+}
+
+impl LogType {
+    fn from_record_type(s: &str) -> Self {
+        match s {
+            "platform"  => Self::Platform,
+            "extension" => Self::Extension,
+            _           => Self::Function,
+        }
+    }
 }
 
 /// The LogProcessor is responsible for handling and transforming function and extension logs.
@@ -58,7 +82,7 @@ pub struct LogProcessor {
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
 
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
-    failed_logs_buffer: Arc<Mutex<Vec<FailedLogEntry>>>,
+    failed_logs_buffer: Arc<Mutex<VecDeque<FailedLogEntry>>>,
 
     /// Track pending auto-flush tasks to ensure they complete before function ends
     pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -70,6 +94,9 @@ pub struct LogProcessor {
     fallback_function_arn: Arc<Mutex<Option<String>>>,
 
     is_auto_flushing: Arc<Mutex<bool>>,
+
+    /// Handle for the start-of-invocation retry task; awaited in flush() before GET /next
+    invocation_retry_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,11 +104,13 @@ struct FailedLogEntry {
     log_message: payload::LogMessage,
     original_request_id: String,
     retry_count: usize,
+    log_type: LogType,
 }
 
 /// Configuration constants for batching and retry logic
-const MAX_BATCH_SIZE: usize = 100;
 const MAX_RETRIES: usize = 3;
+const MAX_FAILED_BUFFER: usize = 300;
+const MAX_TRACE_BUFFER: usize = 200;
 
 fn get_backoff_delay(retry_attempt: usize) -> Duration {
     match retry_attempt {
@@ -134,12 +163,13 @@ impl LogProcessor {
             trace_extraction_state,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
-            failed_logs_buffer: Arc::new(Mutex::new(Vec::new())),
+            failed_logs_buffer: Arc::new(Mutex::new(VecDeque::new())),
             apm_app,
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
             fallback_function_arn: Arc::new(Mutex::new(None)),
             is_auto_flushing: Arc::new(Mutex::new(false)),
+            invocation_retry_handle: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -149,6 +179,20 @@ impl LogProcessor {
         if let Ok(mut batch) = self.log_batch.lock() {
             batch.push(log_message);
         }
+    }
+
+    /// Returns true when there is nothing pending to flush: log_batch is empty AND no
+    /// auto-flush tasks are still in-flight. Used by the event loop to decide whether
+    /// to add a grace period after runtime.done — if everything is already drained,
+    /// the grace period is unnecessary.
+    pub fn is_drained(&self) -> bool {
+        let batch_empty = self.log_batch.lock().map(|b| b.is_empty()).unwrap_or(false);
+        let no_pending = self
+            .pending_flush_handles
+            .lock()
+            .map(|h| h.iter().all(|handle| handle.is_finished()))
+            .unwrap_or(false);
+        batch_empty && no_pending
     }
 
    
@@ -420,8 +464,13 @@ impl LogProcessor {
                 if *state == TraceIdExtractionState::Waiting && !has_trace_id {
                     drop(state);
                     let mut buffered = buffered_logs.lock().unwrap();
-                    buffered.push(log_message);
-                    return;
+                    if buffered.len() < MAX_TRACE_BUFFER {
+                        buffered.push(log_message);
+                        return;
+                    }
+                    drop(buffered);
+                    debug!("buffered_logs overflow ({} cap) — routing log to log_batch without trace.id", MAX_TRACE_BUFFER);
+                    // fall through to log_batch push + auto-flush below
                 }
             }
             
@@ -429,9 +478,9 @@ impl LogProcessor {
             batch.push(log_message);
             let batch_size = batch.len();
 
-            // Auto-flush threshold: 25 logs for faster delivery
-            // End-of-request flush ensures completeness of remaining logs
-            const FLUSH_THRESHOLD: usize = 25;
+            // Auto-flush threshold: 10 logs for faster delivery on high-volume bursts.
+            // End-of-invocation flush (gated on platform.runtimeDone) ensures the tail is sent.
+            const FLUSH_THRESHOLD: usize = 10;
             let should_flush = batch_size >= FLUSH_THRESHOLD;
 
             if should_flush {
@@ -453,7 +502,7 @@ impl LogProcessor {
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 let context = self.invocation_context.lock().unwrap().clone();
-                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
+                let processor_clone = self.clone();
 
                 // GUARD: Use fallback ARN chain if context ARN is empty
                 let auto_flush_arn = if !context.invoked_function_arn.is_empty() {
@@ -504,8 +553,6 @@ impl LogProcessor {
                     let mut successful = 0;
                     for chunk in chunks {
                         let mut retries = 0;
-                        let mut send_failed = false;
-                        
                         loop {
                             match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
                                 Ok(()) => {
@@ -519,28 +566,22 @@ impl LogProcessor {
                                         continue;
                                     } else {
                                         warn!("Auto-flush failed after {} retries - buffering {} logs", MAX_RETRIES, chunk.len());
-                                        send_failed = true;
-                                        // Buffer failed logs for retry on next invocation
-                                        if let Ok(mut buffer) = failed_buffer.lock() {
-                                            for log in chunk {
-                                                buffer.push(FailedLogEntry {
-                                                    log_message: log,
-                                                    original_request_id: context.request_id.clone(),
-                                                    retry_count: 0,
-                                                });
-                                            }
+                                        for log in chunk {
+                                            let lt = LogProcessor::log_type_from_message(&log);
+                                            processor_clone.push_to_failed_buffer(FailedLogEntry {
+                                                log_message: log,
+                                                original_request_id: context.request_id.clone(),
+                                                retry_count: 0,
+                                                log_type: lt,
+                                            });
                                         }
                                         break;
                                     }
                                 }
                             }
                         }
-                        
-                        if send_failed {
-                            break; // Stop trying other chunks if one failed
-                        }
                     }
-                    
+
                     if successful > 0 {
                         debug!("Auto-flush sent {} chunk(s) successfully", successful);
                     }
@@ -584,8 +625,12 @@ impl LogProcessor {
         attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
         
         attributes.insert("newrelic.source".to_string(), "api.logs".into());
-    
-    
+
+        attributes.insert(
+            "_nr.logType".to_string(),
+            serde_json::Value::String(record.record_type.clone()),
+        );
+
         Some(payload::LogMessage {
             timestamp,
             message,
@@ -593,10 +638,19 @@ impl LogProcessor {
         })
     }
 
+    /// Derive LogType from the _nr.logType attribute stamped by to_log_message.
+    /// Safe default is Function (never drop).
+    fn log_type_from_message(msg: &payload::LogMessage) -> LogType {
+        msg.attributes
+            .get("_nr.logType")
+            .and_then(|v| v.as_str())
+            .map(LogType::from_record_type)
+            .unwrap_or(LogType::Function)
+    }
+
     /// Extract log level from structured JSON or unstructured message string
     /// Priority: 1) Structured JSON fields, 2) Keyword patterns with word boundaries
-    /// Made pub(crate) for unit testing
-    pub(crate) fn extract_log_level(&self, record: &serde_json::Value, message: &str) -> &'static str {
+    fn extract_log_level(&self, record: &serde_json::Value, message: &str) -> &'static str {
         // FIRST: Check for structured level field in JSON record
         if let Some(structured_level) = get_structured_log_level(record) {
             return match structured_level.as_str() {
@@ -687,6 +741,157 @@ impl LogProcessor {
         
         // Fallback to global registration ARN
         crate::get_global_fallback_arn()
+    }
+
+    /// Add a failed log entry to the buffer with priority-aware overflow eviction.
+    /// Extension logs are evicted first, then Platform, Function logs are never evicted.
+    /// When all entries are Function and the buffer is full, FIFO eviction applies.
+    fn push_to_failed_buffer(&self, entry: FailedLogEntry) {
+        let mut buf = self.failed_logs_buffer.lock().unwrap();
+
+        if buf.len() < MAX_FAILED_BUFFER {
+            buf.push_back(entry);
+            return;
+        }
+
+        // Buffer full — evict by priority: Extension first, then Platform, never Function
+        if let Some(idx) = buf.iter().position(|e| e.log_type == LogType::Extension) {
+            buf.remove(idx);
+            buf.push_back(entry);
+            return;
+        }
+
+        if entry.log_type == LogType::Extension {
+            warn!(
+                "Failed buffer at capacity ({} Function/Platform) — dropping incoming Extension log",
+                MAX_FAILED_BUFFER
+            );
+            return;
+        }
+
+        if let Some(idx) = buf.iter().position(|e| e.log_type == LogType::Platform) {
+            buf.remove(idx);
+            buf.push_back(entry);
+            return;
+        }
+
+        if entry.log_type == LogType::Platform {
+            warn!(
+                "Failed buffer at capacity ({} Function) — dropping incoming Platform log",
+                MAX_FAILED_BUFFER
+            );
+            return;
+        }
+
+        // Buffer is all Function logs and incoming is Function — FIFO evict oldest
+        warn!(
+            "Failed buffer at capacity ({} Function) — evicting oldest Function log (FIFO)",
+            MAX_FAILED_BUFFER
+        );
+        buf.pop_front();
+        buf.push_back(entry);
+    }
+
+    /// Drain the failed-log buffer and spawn a tracked retry task.
+    /// The task runs concurrently with the Lambda function; flush() awaits it before GET /next.
+    ///
+    /// Must be called exactly once per invocation, before flush().
+    /// Calling twice without an intervening flush() aborts the prior retry task and may lose in-flight logs.
+    pub fn start_invocation_retry(&self) {
+        // Drain atomically — release lock before any async work
+        let entries: VecDeque<FailedLogEntry> = {
+            let mut buf = self.failed_logs_buffer.lock().unwrap();
+            std::mem::take(&mut *buf)
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        // Partition: high priority (Function + Platform) sent before low (Extension)
+        let (high_pri, low_pri): (Vec<_>, Vec<_>) =
+            entries.into_iter().partition(|e| e.log_type != LogType::Extension);
+
+        let prepare = |group: Vec<FailedLogEntry>| -> Vec<FailedLogEntry> {
+            group.into_iter()
+                .filter(|e| e.retry_count < MAX_RETRIES)
+                .map(|mut e| { e.retry_count += 1; e })
+                .collect()
+        };
+        let high_pri = prepare(high_pri);
+        let low_pri  = prepare(low_pri);
+
+        if high_pri.is_empty() && low_pri.is_empty() {
+            debug!("start_invocation_retry: all entries exceeded MAX_RETRIES, nothing to send");
+            return;
+        }
+
+        let client     = Arc::clone(&self.newrelic_client);
+        let config     = Arc::clone(&self.config);
+        let proc_clone = self.clone();
+        let arn        = self.get_best_available_arn();
+
+        let handle = tokio::spawn(async move {
+            async fn send_with_rebuffer(
+                entries: Vec<FailedLogEntry>,
+                client: &NewRelicClient,
+                config: &ExtensionConfig,
+                arn: &str,
+                proc: &LogProcessor,
+            ) {
+                if entries.is_empty() { return; }
+
+                const MAX_PAYLOAD_SIZE: usize = 1_000_000;
+                let mut chunks: Vec<Vec<FailedLogEntry>> = Vec::new();
+                let mut current: Vec<FailedLogEntry> = Vec::new();
+                let mut current_size = 0usize;
+
+                for entry in entries {
+                    let sz = 8 + entry.log_message.message.len()
+                        + serde_json::to_string(&entry.log_message.attributes)
+                            .unwrap_or_default().len();
+                    if current_size + sz > MAX_PAYLOAD_SIZE && !current.is_empty() {
+                        chunks.push(std::mem::take(&mut current));
+                        current_size = 0;
+                    }
+                    current_size += sz;
+                    current.push(entry);
+                }
+                if !current.is_empty() { chunks.push(current); }
+
+                for chunk in chunks {
+                    let batch: Vec<_> = chunk.iter().map(|e| e.log_message.clone()).collect();
+                    let origin_req = chunk.first()
+                        .map(|e| e.original_request_id.as_str())
+                        .unwrap_or("?");
+                    match client.send_logs(config, batch, arn).await {
+                        Ok(()) => {
+                            info!("Invocation retry: sent {} logs successfully (origin req: {})", chunk.len(), origin_req);
+                        }
+                        Err(e) => {
+                            warn!("Invocation retry send failed: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
+                            for entry in chunk {
+                                proc.push_to_failed_buffer(entry);
+                            }
+                        }
+                    }
+                }
+            }
+
+            send_with_rebuffer(high_pri, &client, &config, &arn, &proc_clone).await;
+            send_with_rebuffer(low_pri,  &client, &config, &arn, &proc_clone).await;
+        });
+
+        let mut slot = self.invocation_retry_handle.lock().unwrap();
+        if let Some(prev) = slot.take() {
+            if !prev.is_finished() {
+                debug_assert!(false, "start_invocation_retry called with prior handle still running — flush() must be called between invocations");
+                // flush() was not awaited between two consecutive start_invocation_retry calls.
+                // The in-flight logs carried by that task are lost; warn so operators can investigate.
+                warn!("Aborting previous in-flight invocation retry task — flush() was not called between invocations; some logs may be lost");
+            }
+            prev.abort();
+        }
+        *slot = Some(handle);
     }
 
     /// Transfer logs from pre_invoke_buffer to log_batch with ARN/request_id added
@@ -898,76 +1103,70 @@ impl LogProcessor {
         if buffered_logs.is_empty() {
             return Ok(());
         }
-        
-        debug!("Applied trace ID to {} buffered logs", buffered_logs.len());
-        
+
+        debug!("Applied trace ID to {} buffered logs; routing to log_batch", buffered_logs.len());
+
+        let entity_guid_opt: Option<String> = self.apm_app.as_ref().and_then(|arc| {
+            match arc.try_read() {
+                Ok(guard) => guard.as_ref().map(|app| app.get_entity_guid().to_string()).filter(|g| !g.is_empty()),
+                Err(_) => {
+                    debug!("on_trace_id_extracted: entity.guid unavailable (apm_app write lock held); logs routed without it");
+                    None
+                }
+            }
+        });
+
         for log in &mut buffered_logs {
             log.attributes.insert("trace.id".to_string(), trace_id.into());
+            if let Some(ref guid) = entity_guid_opt {
+                log.attributes.insert("entity.guid".to_string(),
+                    serde_json::Value::String(guid.clone()));
+            }
         }
-        
-        self.send_buffered_logs_with_retry(buffered_logs).await
+
+        // Route through log_batch so ARN fallback chain and deduplication apply
+        self.log_batch.lock().unwrap().extend(buffered_logs);
+        Ok(())
     }
 
    
     pub fn reset_trace_id_state(&self) {
-        if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) {
+        if let (Some(ref extraction_state), Some(ref buffered_logs)) =
+            (&self.trace_extraction_state, &self.buffered_logs)
+        {
             *extraction_state.lock().unwrap() = TraceIdExtractionState::Waiting;
-            buffered_logs.lock().unwrap().clear();
+            let mut rescued: Vec<_> = {
+                let mut buf = buffered_logs.lock().unwrap();
+                std::mem::take(&mut *buf)
+            };
+            if !rescued.is_empty() {
+                debug!("reset_trace_id_state: rescuing {} trace-waiting logs into log_batch", rescued.len());
+                let entity_guid_opt: Option<String> = self.apm_app.as_ref().and_then(|arc| {
+                    match arc.try_read() {
+                        Ok(guard) => guard.as_ref().map(|app| app.get_entity_guid().to_string()).filter(|g| !g.is_empty()),
+                        Err(_) => {
+                            debug!("reset_trace_id_state: entity.guid unavailable (apm_app write lock held); logs rescued without it");
+                            None
+                        }
+                    }
+                });
+                if let Some(ref guid) = entity_guid_opt {
+                    for log in &mut rescued {
+                        log.attributes.insert("entity.guid".to_string(),
+                            serde_json::Value::String(guid.clone()));
+                    }
+                }
+                self.log_batch.lock().unwrap().extend(rescued);
+            }
         }
     }
 
    
    
     pub fn process_buffered_logs_with_request_id(&self, request_id: &str) {
-        let is_warm_start = crate::IS_WARM_START.load(std::sync::atomic::Ordering::Relaxed);
-        
-        if is_warm_start {
-            let failed_logs = {
-                let mut buffer = self.failed_logs_buffer.lock().unwrap();
-                std::mem::take(&mut *buffer)
-            };
-            
-            if !failed_logs.is_empty() {
-                debug!("Retrying {} failed logs from previous invocation", failed_logs.len());
-                
-                let client = Arc::clone(&self.newrelic_client);
-                let config = Arc::clone(&self.config);
-                let failed_buffer = Arc::clone(&self.failed_logs_buffer);
-                
-                tokio::spawn(async move {
-                    let mut still_failed = Vec::new();
-                    
-                    for mut entry in failed_logs {
-                        entry.retry_count += 1;
-                        
-                        if entry.retry_count > MAX_RETRIES {
-                            warn!("Dropping log after {} retries (original request: {})", 
-                                  entry.retry_count, entry.original_request_id);
-                            continue;
-                        }
-                        
-                        let logs_to_send = vec![entry.log_message.clone()];
-                        match client.send_logs(&config, logs_to_send, "retry").await {
-                            Ok(()) => {
-                                debug!("Successfully retried failed log");
-                            }
-                            Err(e) => {
-                                debug!("Failed log retry failed again: {}", e);
-                                still_failed.push(entry);
-                            }
-                        }
-                    }
-                    
-                    if !still_failed.is_empty() {
-                        let mut buffer = failed_buffer.lock().unwrap();
-                        buffer.extend(still_failed);
-                        debug!("Re-buffered {} logs that failed retry", buffer.len());
-                    }
-                });
-            }
-        }
-        
+        // Failed-log retry is now handled by start_invocation_retry() which spawns a tracked
+        // task that is awaited in flush() before GET /next. Nothing to do here.
+
         let buffered_logs = {
             let mut buffer = self.request_id_buffer.lock().unwrap();
             std::mem::take(&mut *buffer)
@@ -976,6 +1175,17 @@ impl LogProcessor {
         if !buffered_logs.is_empty() {
             debug!("Processing {} buffered logs with new request_id: {}", buffered_logs.len(), request_id);
             
+            // Capture ARN once outside the loop — context is stable at this point.
+            let buffered_arn = {
+                let ctx = self.invocation_context.lock().unwrap();
+                if !ctx.invoked_function_arn.is_empty() {
+                    ctx.invoked_function_arn.clone()
+                } else {
+                    drop(ctx);
+                    self.get_best_available_arn()
+                }
+            };
+
             for mut log_message in buffered_logs {
                 // New Relic expects nested structure: {"aws": {"lambda_request_id": "..."}}
                 let mut aws_attrs = serde_json::Map::new();
@@ -983,79 +1193,60 @@ impl LogProcessor {
                     serde_json::Value::String(request_id.to_string()));
                 log_message.attributes.insert("aws".to_string(),
                     serde_json::Value::Object(aws_attrs));
-                log_message.attributes.insert("faas.execution".to_string(), 
-                                serde_json::Value::String(request_id.to_string()));
+                log_message.attributes.insert("faas.execution".to_string(),
+                    serde_json::Value::String(request_id.to_string()));
+                if !buffered_arn.is_empty() {
+                    log_message.attributes.insert("faas.arn".to_string(),
+                        serde_json::Value::String(buffered_arn.clone()));
+                }
                 
-                if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
+                if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) =
                     (&self.trace_extraction_state, &self.buffered_logs) {
-                    
+
                     let state = extraction_state.lock().unwrap();
-                    let has_trace_id = {
+                    let trace_id_opt = {
                         let context = self.invocation_context.lock().unwrap();
-                        context.trace_id.is_some()
+                        context.trace_id.clone()
                     };
-                    
-                    if *state == TraceIdExtractionState::Waiting && !has_trace_id {
+
+                    if *state == TraceIdExtractionState::Waiting && trace_id_opt.is_none() {
                         drop(state);
                         let mut buffered = buffered_logs_arc.lock().unwrap();
                         buffered.push(log_message);
                         continue;
                     }
+                    drop(state);
+
+                    // We're going to log_batch directly — stamp trace.id if already known.
+                    if let Some(ref trace_id) = trace_id_opt {
+                        log_message.attributes.insert("trace.id".to_string(),
+                            serde_json::Value::String(trace_id.clone()));
+                    }
                 }
-                
+
+                // Stamp entity.guid for APM mode (same pattern as pre-invoke and shutdown paths).
+                if let Some(ref apm_app_arc) = self.apm_app {
+                    match apm_app_arc.try_read() {
+                        Ok(apm_guard) => {
+                            if let Some(ref app) = *apm_guard {
+                                let entity_guid = app.get_entity_guid();
+                                if !entity_guid.is_empty() {
+                                    log_message.attributes.insert("entity.guid".to_string(),
+                                        serde_json::Value::String(entity_guid.to_string()));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            debug!("process_buffered_logs: entity.guid unavailable (apm_app write lock held); log routed without it");
+                        }
+                    }
+                }
+
                 let mut batch = self.log_batch.lock().unwrap();
                 batch.push(log_message);
             }
         }
     }
-
-
-
-   
-   
-    async fn send_buffered_logs_with_retry(&self, logs: Vec<payload::LogMessage>) -> std::io::Result<()> {
-        if logs.is_empty() {
-            return Ok(());
-        }
-        
-        let client = Arc::clone(&self.newrelic_client);
-        let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
-        
-        let chunks: Vec<Vec<payload::LogMessage>> = logs
-            .chunks(MAX_BATCH_SIZE)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-        
-        if chunks.len() > 1 {
-            debug!("Chunking {} buffered logs into {} batches", logs.len(), chunks.len());
-        }
-        
-        let mut failed_count = 0;
-        let mut successful_chunks = 0;
-        
-        for (_chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            match self.send_chunk_with_retry_internal(&client, &config, chunk.clone(), &context.invoked_function_arn, false).await {
-                Ok(()) => {
-                    successful_chunks += 1;
-                },
-                Err(e) => {
-                    error!("Buffered logs send failed: {}", e);
-                    failed_count += chunk.len();
-                }
-            }
-        }
-        
-        if successful_chunks > 0 {
-            debug!("Successfully sent {} buffered log chunks", successful_chunks);
-        }
-        if failed_count > 0 {
-            warn!("Dropped {} buffered logs due to send failures", failed_count);
-        }
-        
-        Ok(())
-    }
-
 
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
         // FIRST: Try to stamp any remaining pre-invoke logs before final flush
@@ -1074,19 +1265,28 @@ impl LogProcessor {
             return Ok(());
         }
 
-        // First, await all pending auto-flush tasks to ensure they complete
-        // before we do the final flush (prevents logs from being cancelled)
-        let pending_handles = {
-            let mut handles = self.pending_flush_handles.lock().unwrap();
-            std::mem::take(&mut *handles)
-        };
-
-        if !pending_handles.is_empty() {
-            debug!("Waiting for {} pending auto-flush tasks to complete", pending_handles.len());
-            for handle in pending_handles {
-                let _ = handle.await; // Ignore JoinErrors, just ensure task completes
+        // Drain all pending auto-flush tasks. Loop in case awaiting a handle causes
+        // a new one to be pushed (e.g., overflow chunk triggering another flush).
+        // Cap at 10 rounds to surface any future infinite-spawn regression.
+        const MAX_DRAIN_ROUNDS: usize = 10;
+        let mut round = 0usize;
+        loop {
+            if round >= MAX_DRAIN_ROUNDS {
+                error!("pending_flush_handles drain exceeded {} rounds — possible infinite spawn loop; aborting drain", MAX_DRAIN_ROUNDS);
+                break;
             }
-            debug!("All pending auto-flush tasks completed");
+            let handles = {
+                let mut guard = self.pending_flush_handles.lock().unwrap();
+                std::mem::take(&mut *guard)
+            };
+            if handles.is_empty() {
+                break;
+            }
+            debug!("Waiting for {} pending auto-flush tasks (round {})", handles.len(), round + 1);
+            for handle in handles {
+                let _ = handle.await;
+            }
+            round += 1;
         }
 
         let batch = {
@@ -1103,7 +1303,12 @@ impl LogProcessor {
             use std::collections::HashMap;
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
-            
+
+            // DefaultHasher is acceptable here: the `seen` map is local to this single flush call
+            // (not persisted, not cross-version), so hash instability across Rust releases is
+            // irrelevant. Collision probability for the 4-field tuple
+            // (message, timestamp, _nr.logType, lambda_request_id) over a typical batch of
+            // ≤1000 logs is negligible (~batch²/2⁶⁴ ≈ 5×10⁻¹⁴).
             let mut seen = HashMap::new();
             let mut unique_logs = Vec::new();
             let mut duplicate_count = 0;
@@ -1112,7 +1317,13 @@ impl LogProcessor {
                 let mut hasher = DefaultHasher::new();
                 log.message.hash(&mut hasher);
                 log.timestamp.hash(&mut hasher);
-                
+
+                // Include log source type so function/platform/extension logs with the
+                // same text and timestamp are never collapsed into one.
+                if let Some(log_type) = log.attributes.get("_nr.logType").and_then(|v| v.as_str()) {
+                    log_type.hash(&mut hasher);
+                }
+
                 // Check nested AWS structure for request_id
                 if let Some(aws_value) = log.attributes.get("aws") {
                     if let Some(aws_obj) = aws_value.as_object() {
@@ -1123,7 +1334,7 @@ impl LogProcessor {
                         }
                     }
                 }
-                
+
                 let log_hash = hasher.finish();
                 
                 if seen.insert(log_hash, log.timestamp).is_none() {
@@ -1206,8 +1417,8 @@ impl LogProcessor {
         let mut failed_logs = Vec::new();
         let mut successful_chunks = 0;
         
-        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            match self.send_chunk_with_retry(&client, &config, chunk.clone(), &effective_arn, chunk_idx).await {
+        for chunk in chunks {
+            match self.send_chunk_with_retry_internal(&client, &config, chunk.clone(), &effective_arn).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },
@@ -1223,13 +1434,13 @@ impl LogProcessor {
         }
         if !failed_logs.is_empty() {
             warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
-            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-            
             for log in failed_logs {
-                failed_buffer.push(FailedLogEntry {
+                let lt = Self::log_type_from_message(&log);
+                self.push_to_failed_buffer(FailedLogEntry {
                     log_message: log,
                     original_request_id: context.request_id.clone(),
                     retry_count: 0,
+                    log_type: lt,
                 });
             }
         }
@@ -1238,28 +1449,15 @@ impl LogProcessor {
     }
     
    
-    async fn send_chunk_with_retry(
-        &self,
-        client: &NewRelicClient,
-        config: &ExtensionConfig,
-        chunk: Vec<payload::LogMessage>,
-        function_arn: &str,
-        _chunk_idx: usize,
-    ) -> std::io::Result<()> {
-        self.send_chunk_with_retry_internal(client, config, chunk, function_arn, true).await
-    }
-
-   
     async fn send_chunk_with_retry_internal(
         &self,
         client: &NewRelicClient,
         config: &ExtensionConfig,
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
-        use_failed_buffer: bool,
     ) -> std::io::Result<()> {
         let mut retries = 0;
-        
+
         loop {
             match client.send_logs(config, chunk.clone(), function_arn).await {
                 Ok(()) => {
@@ -1269,36 +1467,22 @@ impl LogProcessor {
                     if retries == 0 {
                         warn!("Log send failed: {}", e);
                     }
-                    
+
                     if e.to_string().contains("413") || e.to_string().contains("Payload Too Large") {
                         error!("Payload too large even after chunking - dropping {} logs", chunk.len());
                         return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData, 
+                            std::io::ErrorKind::InvalidData,
                             "Payload too large even after chunking"
                         ));
                     }
-                    
+
                     if retries < MAX_RETRIES {
                         retries += 1;
                         let delay = get_backoff_delay(retries);
                         tokio::time::sleep(delay).await;
                         continue;
                     } else {
-                        if use_failed_buffer {
-                            warn!("Max retries exceeded - buffering {} logs for retry on next invocation", chunk.len());
-                            let context = self.invocation_context.lock().unwrap().clone();
-                            let mut failed_buffer = self.failed_logs_buffer.lock().unwrap();
-                            
-                            for log in chunk {
-                                failed_buffer.push(FailedLogEntry {
-                                    log_message: log,
-                                    original_request_id: context.request_id.clone(),
-                                    retry_count: 0,
-                                });
-                            }
-                        } else {
-                            error!("Failed log retry exceeded max retries - dropping {} logs", chunk.len());
-                        }
+                        // Callers decide whether to re-buffer; this function only signals failure.
                         return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
                     }
                 }
@@ -1345,8 +1529,9 @@ impl LogProcessor {
         }
 
         for chunk in chunks {
+            let dropped = chunk.len();
             if let Err(e) = client.send_logs(config, chunk, function_arn).await {
-                error!("Failed to send log chunk: {}", e);
+                error!("Failed to send log chunk on shutdown — {} logs permanently dropped: {}", dropped, e);
             }
         }
     }
@@ -1356,6 +1541,26 @@ impl LogProcessor {
 #[async_trait]
 impl Flush for LogProcessor {
     async fn flush(&self) -> std::io::Result<()> {
-        self.send_and_clear_batch_simple().await
+        // Take the handle before the join to avoid holding the Mutex across an await
+        let retry_handle = self.invocation_retry_handle.lock().unwrap().take();
+
+        // Invariant: retry task and main batch send operate on disjoint sets of logs.
+        // Retry drains failed_logs_buffer at start_invocation_retry() time (before function runs).
+        // Main send drains log_batch at flush() time. No log appears in both.
+        let (send_result, _) = tokio::join!(
+            self.send_and_clear_batch_simple(),
+            async move {
+                if let Some(h) = retry_handle {
+                    if let Err(e) = h.await {
+                        warn!("Invocation retry task panicked or was cancelled: {}", e);
+                    }
+                }
+            }
+        );
+        send_result
     }
 }
+
+#[cfg(test)]
+#[path = "processor_tests.rs"]
+mod processor_tests;

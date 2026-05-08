@@ -192,6 +192,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         {
@@ -223,6 +224,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         route_payload_to_request_buffer(vec![99]).await;
@@ -268,6 +270,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         {
@@ -305,6 +308,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         cleanup_request_processing_state("req-1");
@@ -327,6 +331,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         cleanup_request_processing_state_internal("req-1", true);
@@ -471,6 +476,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (client, config) = make_test_client_and_config();
@@ -499,6 +505,7 @@ mod tests {
             coordination_tx: None,
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         // Advance counter to invocation 10
         for _ in 0..10 {
@@ -526,6 +533,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         for _ in 0..10 {
             increment_invocation_counter();
@@ -557,6 +565,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
         REQUEST_DATA.insert("old".to_string(), RequestData {
@@ -565,6 +574,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (client, config) = make_test_client_and_config();
@@ -619,6 +629,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Now clear active (simulating cleanup between invocations)
@@ -693,6 +704,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         {
@@ -729,6 +741,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         cleanup_request_processing_state_internal("req-sk", true);
@@ -759,6 +772,7 @@ mod tests {
             coordination_tx: Some(tx),
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         drop(rx);
 
@@ -865,6 +879,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
             context: ctx_b,
@@ -872,6 +887,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Clean only A
@@ -910,6 +926,7 @@ mod tests {
             coordination_tx: None,
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
@@ -917,6 +934,7 @@ mod tests {
             coordination_tx: None,
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         // Each request has its own report

@@ -39,7 +39,6 @@ pub struct ExtensionComponents {
     pub processor_factory: Arc<ProcessorFactory>,
     pub newrelic_client: Arc<NewRelicClient>,
     pub config: Arc<ExtensionConfig>,
-    pub harvester_handle: tokio::task::JoinHandle<()>,
     pub global_log_processor: Arc<LogProcessor>,
     pub apm_app: crate::apm::SharedApmApp,
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
@@ -64,18 +63,17 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
 /// Event loop: handles cold start (first invoke) and warm starts (subsequent invokes)
 pub async fn run_infinite_event_loop(
     mut extension_components: ExtensionComponents,
-) -> (u32, tokio::task::JoinHandle<()>) {
+) -> u32 {
     if !extension_components.config.new_relic.extension_enabled
         || extension_components.config.new_relic.license_key.is_none()
     {
         info!("Running in no-op mode");
         execute_noop_event_loop(&extension_components.client, &extension_components.extension_id)
             .await;
-        return (0, extension_components.harvester_handle);
+        return 0;
     }
 
-    let total_events = execute_main_telemetry_processing_loop(&mut extension_components).await;
-    (total_events, extension_components.harvester_handle)
+    execute_main_telemetry_processing_loop(&mut extension_components).await
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
@@ -132,6 +130,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn,
+                deadline_ms: _,
             } => {
                 let event_start = std::time::Instant::now();
 
@@ -176,6 +175,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 components
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
+
+                // Kick off tracked retry of failed logs — runs during Lambda execution,
+                // awaited in flush() before GET /next (freeze-safe)
+                components
+                    .global_log_processor
+                    .start_invocation_retry();
 
                 // Process pre-invoke logs FIRST (add metadata and move to batch)
                 components
@@ -437,6 +442,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
+                // Drain failed-logs buffer so any queued retries get one last shot before flush awaits them.
+                // flush() joins with the retry handle set here, preserving the single-owner rule.
+                components.global_log_processor.start_invocation_retry();
+
                 // Final flush of logs
                 if let Err(e) = components.global_log_processor.flush().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
@@ -492,6 +501,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn,
+                deadline_ms,
             } => {
                 let event_start = std::time::Instant::now();
 
@@ -544,6 +554,12 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
+                // Kick off tracked retry of failed logs — runs during Lambda execution,
+                // awaited in flush() before GET /next (freeze-safe)
+                components
+                    .global_log_processor
+                    .start_invocation_retry();
+
                 // Process buffered logs and pre-invoke logs using global log processor
                 components
                     .global_log_processor
@@ -577,6 +593,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         newrelic_client_clone,
                         config_clone,
                         global_log_processor_clone,
+                        deadline_ms,
                     )
                     .await;
                 });
@@ -676,6 +693,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
+                // Drain failed-logs buffer so any queued retries get one last shot before flush awaits them.
+                // flush() joins with the retry handle set here, preserving the single-owner rule.
+                components.global_log_processor.start_invocation_retry();
+
                 // Flush remaining buffered logs
                 if let Err(e) = components.global_log_processor.flush().await {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
@@ -703,6 +724,7 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
             Ok(runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn: _,
+                deadline_ms: _,
             }) => {
                 trace!(
                     "No-op mode invocation processed in {:?} (request_id: {})",
@@ -1003,6 +1025,7 @@ pub async fn process_request_concurrently(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
+    deadline_ms: i64,
 ) {
     debug!(
         "Standard mode: Starting processing for request: {}",
@@ -1027,13 +1050,6 @@ pub async fn process_request_concurrently(
     state
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
-
-    // Skip runtime.done wait for all invocations (performance optimization)
-    // Late payloads will be processed in next invocation
-    debug!(
-        "Skipping runtime.done wait for request: {} (unified batching approach)",
-        request_id
-    );
 
     // Unified wait timeout for all invocations
     let agent_wait_timeout_ms = 100;
@@ -1149,6 +1165,63 @@ pub async fn process_request_concurrently(
 
         None
     };
+
+    // Wait for platform.runtimeDone, then give a short grace period for late-arriving
+    // function/extension logs to land in log_batch before flushing.
+    //
+    // Bounds:
+    //   - Upper bound on the runtime.done wait = function's own deadline (deadlineMs
+    //     from the INVOKE event). We never wait longer than the function could run.
+    //   - Grace after runtime.done = NEW_RELIC_RUNTIME_DONE_GRACE_MS (default 500 ms,
+    //     clamped to [0, 2000]). Skipped entirely if the log batch is already drained
+    //     and no auto-flush tasks are in flight.
+    //
+    // Notify is pre-armable: if runtime.done fired before we reach this point,
+    // notified() returns immediately.
+    if config.extension.send_function_logs {
+        if let Some(notify) = request::get_runtime_done_notify(&request_id) {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let remaining_ms = (deadline_ms - now_ms).max(100) as u64;
+
+            let signal = tokio::select! {
+                _ = notify.notified() => true,
+                _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => false,
+            };
+
+            if signal {
+                debug!(
+                    "runtime.done signal received for request: {} (after {}ms)",
+                    request_id,
+                    chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
+                );
+
+                if !global_log_processor.is_drained() {
+                    let grace_ms: u64 = std::env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(500)
+                        .min(2000);
+                    if grace_ms > 0 {
+                        debug!(
+                            "runtime.done: batch not drained - waiting {}ms grace for trailing telemetry (request: {})",
+                            grace_ms, request_id
+                        );
+                        tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+                    }
+                } else {
+                    debug!(
+                        "runtime.done: batch already drained for request: {} - skipping grace",
+                        request_id
+                    );
+                }
+            } else {
+                debug!(
+                    "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
+                    remaining_ms, request_id
+                );
+            }
+        }
+    }
 
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();

@@ -376,6 +376,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (log_processor, platform_processor) = create_test_processors();
@@ -640,6 +641,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (log_processor, platform_processor) = create_test_processors();
@@ -701,6 +703,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (log_processor, platform_processor) = create_test_processors();
@@ -838,6 +841,7 @@ mod tests {
             coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         let (log_processor, platform_processor) = create_test_processors();

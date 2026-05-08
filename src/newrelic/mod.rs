@@ -2,6 +2,5 @@
 //! including the client for sending data, payload definitions, and the harvesting logic.
 
 pub mod client;
-pub mod harvester;
 pub mod payload;
 pub mod flush;
