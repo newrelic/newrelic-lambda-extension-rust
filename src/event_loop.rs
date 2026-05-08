@@ -130,7 +130,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn,
-                deadline_ms: _,
+                deadline_ms,
             } => {
                 let event_start = std::time::Instant::now();
 
@@ -233,6 +233,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
+                        deadline_ms,
                     )
                     .await;
                 });
@@ -442,12 +443,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                // Drain failed-logs buffer so any queued retries get one last shot before flush awaits them.
-                // flush() joins with the retry handle set here, preserving the single-owner rule.
-                components.global_log_processor.start_invocation_retry();
-
-                // Final flush of logs
-                if let Err(e) = components.global_log_processor.flush().await {
+                // Shutdown drain: flush + re-flush any entries pushed back into
+                // failed_logs_buffer by send failures in the flush itself. Bounded by
+                // MAX_RETRIES (via per-entry retry_count filter in start_invocation_retry).
+                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
 
@@ -693,12 +692,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
 
-                // Drain failed-logs buffer so any queued retries get one last shot before flush awaits them.
-                // flush() joins with the retry handle set here, preserving the single-owner rule.
-                components.global_log_processor.start_invocation_retry();
-
-                // Flush remaining buffered logs
-                if let Err(e) = components.global_log_processor.flush().await {
+                // Shutdown drain: flush + re-flush any entries pushed back into
+                // failed_logs_buffer by send failures in the flush itself. Bounded by
+                // MAX_RETRIES (via per-entry retry_count filter in start_invocation_retry).
+                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
 
@@ -752,6 +749,7 @@ pub async fn process_apm_request(
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
+    deadline_ms: i64,
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
@@ -956,6 +954,14 @@ pub async fn process_apm_request(
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
 
+    wait_for_runtime_done_with_grace(
+        &request_id,
+        deadline_ms,
+        &config,
+        &global_log_processor,
+    )
+    .await;
+
     // Wait for logs and platform to complete before returning
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
@@ -1017,6 +1023,80 @@ async fn send_to_apm_collector(
         return Err("APM connection not ready yet - payload buffered for retry".into());
     }
     Ok(())
+}
+
+/// Wait for `platform.runtimeDone` for this request, then give a short grace for
+/// trailing telemetry, then return. Used by both standard mode and APM mode before
+/// the end-of-invocation flush so late logs land in `log_batch` before it drains.
+///
+/// Bounds:
+/// - Upper bound on the runtime.done wait = function's own deadline (`deadlineMs`
+///   from the INVOKE event), clamped to Lambda's 15 min ceiling. Never outlives
+///   the function. Falls back to 5 s if `deadline_ms` is missing/stale.
+/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 150 ms,
+///   clamp `[0, 2000]`). Skipped entirely when `log_processor.is_drained()` is true.
+///
+/// Notify is pre-armable: if `runtime.done` fired before we reach this point,
+/// `notified()` returns immediately.
+async fn wait_for_runtime_done_with_grace(
+    request_id: &str,
+    deadline_ms: i64,
+    config: &ExtensionConfig,
+    log_processor: &Arc<LogProcessor>,
+) {
+    if !config.extension.send_function_logs {
+        return;
+    }
+    let Some(notify) = request::get_runtime_done_notify(request_id) else {
+        return;
+    };
+
+    const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
+    const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let remaining_ms: u64 = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).min(MAX_RUNTIME_DONE_WAIT_MS)
+    } else {
+        warn!(
+            "INVOKE for request {} missing/stale deadlineMs ({}); using {}ms fallback for runtime.done wait",
+            request_id, deadline_ms, FALLBACK_RUNTIME_DONE_WAIT_MS
+        );
+        FALLBACK_RUNTIME_DONE_WAIT_MS
+    };
+
+    let signal = tokio::select! {
+        _ = notify.notified() => true,
+        _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => false,
+    };
+
+    if signal {
+        debug!(
+            "runtime.done signal received for request: {} (after {}ms)",
+            request_id,
+            chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
+        );
+        if !log_processor.is_drained() {
+            let grace_ms = config.extension.runtime_done_grace_ms;
+            if grace_ms > 0 {
+                debug!(
+                    "runtime.done: batch not drained - waiting {}ms grace for trailing telemetry (request: {})",
+                    grace_ms, request_id
+                );
+                tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+            }
+        } else {
+            debug!(
+                "runtime.done: batch already drained for request: {} - skipping grace",
+                request_id
+            );
+        }
+    } else {
+        debug!(
+            "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
+            remaining_ms, request_id
+        );
+    }
 }
 
 pub async fn process_request_concurrently(
@@ -1166,62 +1246,13 @@ pub async fn process_request_concurrently(
         None
     };
 
-    // Wait for platform.runtimeDone, then give a short grace period for late-arriving
-    // function/extension logs to land in log_batch before flushing.
-    //
-    // Bounds:
-    //   - Upper bound on the runtime.done wait = function's own deadline (deadlineMs
-    //     from the INVOKE event). We never wait longer than the function could run.
-    //   - Grace after runtime.done = NEW_RELIC_RUNTIME_DONE_GRACE_MS (default 150 ms,
-    //     clamped to [0, 2000]). Skipped entirely if the log batch is already drained
-    //     and no auto-flush tasks are in flight.
-    //
-    // Notify is pre-armable: if runtime.done fired before we reach this point,
-    // notified() returns immediately.
-    if config.extension.send_function_logs {
-        if let Some(notify) = request::get_runtime_done_notify(&request_id) {
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let remaining_ms = (deadline_ms - now_ms).max(100) as u64;
-
-            let signal = tokio::select! {
-                _ = notify.notified() => true,
-                _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => false,
-            };
-
-            if signal {
-                debug!(
-                    "runtime.done signal received for request: {} (after {}ms)",
-                    request_id,
-                    chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
-                );
-
-                if !global_log_processor.is_drained() {
-                    let grace_ms: u64 = std::env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
-                        .ok()
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(150)
-                        .min(2000);
-                    if grace_ms > 0 {
-                        debug!(
-                            "runtime.done: batch not drained - waiting {}ms grace for trailing telemetry (request: {})",
-                            grace_ms, request_id
-                        );
-                        tokio::time::sleep(Duration::from_millis(grace_ms)).await;
-                    }
-                } else {
-                    debug!(
-                        "runtime.done: batch already drained for request: {} - skipping grace",
-                        request_id
-                    );
-                }
-            } else {
-                debug!(
-                    "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
-                    remaining_ms, request_id
-                );
-            }
-        }
-    }
+    wait_for_runtime_done_with_grace(
+        &request_id,
+        deadline_ms,
+        &config,
+        &global_log_processor,
+    )
+    .await;
 
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();

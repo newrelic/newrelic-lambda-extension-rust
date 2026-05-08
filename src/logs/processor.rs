@@ -9,9 +9,38 @@ use crate::{
 use async_trait::async_trait;
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
+
+/// Estimate a log message's serialized size in bytes. Uses the attributes'
+/// JSON length when we can serialize, otherwise returns a conservative upper
+/// bound (1 MB) so the log is forced into its own chunk rather than silently
+/// sized to 0 bytes (which would pack too many logs into one chunk and 413).
+fn estimate_log_size(log: &payload::LogMessage) -> usize {
+    const PER_LOG_OVERHEAD: usize = 8;
+    const FALLBACK_UPPER_BOUND: usize = 1_000_000;
+    match serde_json::to_string(&log.attributes) {
+        Ok(s) => PER_LOG_OVERHEAD + log.message.len() + s.len(),
+        Err(e) => {
+            error!(
+                "estimate_log_size: serde_json failed on attributes ({}); using {}B upper bound to isolate this log",
+                e, FALLBACK_UPPER_BOUND
+            );
+            FALLBACK_UPPER_BOUND
+        }
+    }
+}
+
+/// Counts how often `start_invocation_retry` was called while a prior retry task
+/// was still in flight (i.e. `flush()` was not awaited between invocations). The
+/// new call lets the previous task finish in the background instead of aborting
+/// it — this counter makes the invariant violation observable without losing logs.
+/// Tests in the child `processor_tests` module read/reset it directly.
+static RETRY_INVARIANT_VIOLATIONS: AtomicU64 = AtomicU64::new(0);
 
 use crate::apm::app::ApmApp;
 
@@ -82,7 +111,7 @@ pub struct LogProcessor {
     invocation_start_time: Arc<Mutex<chrono::DateTime<chrono::Utc>>>,
 
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
-    failed_logs_buffer: Arc<Mutex<VecDeque<FailedLogEntry>>>,
+    failed_logs_buffer: Arc<Mutex<FailedBuffer>>,
 
     /// Track pending auto-flush tasks to ensure they complete before function ends
     pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
@@ -109,8 +138,102 @@ struct FailedLogEntry {
 
 /// Configuration constants for batching and retry logic
 const MAX_RETRIES: usize = 3;
-const MAX_FAILED_BUFFER: usize = 300;
+/// Per-LogType capacity. Each of Function/Platform/Extension has its own queue,
+/// so the overall cap equals `MAX_FAILED_BUFFER_PER_TYPE * 3 = 300` — preserving
+/// the original total. With per-type queues, eviction is O(1) (pop_front on the
+/// type's own VecDeque) instead of O(n) scan across a shared buffer.
+const MAX_FAILED_BUFFER_PER_TYPE: usize = 100;
 const MAX_TRACE_BUFFER: usize = 200;
+
+/// Per-LogType failed-send retry queues. Splitting by type gives O(1) eviction
+/// on overflow (FIFO per queue) and guarantees that a flood of one type's
+/// failures can't crowd out the others — Function failures never evict
+/// Platform or Extension failures, and vice versa.
+#[derive(Debug)]
+struct FailedBuffer {
+    function: VecDeque<FailedLogEntry>,
+    platform: VecDeque<FailedLogEntry>,
+    extension: VecDeque<FailedLogEntry>,
+}
+
+impl FailedBuffer {
+    fn new() -> Self {
+        Self {
+            function: VecDeque::new(),
+            platform: VecDeque::new(),
+            extension: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.function.len() + self.platform.len() + self.extension.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.function.is_empty() && self.platform.is_empty() && self.extension.is_empty()
+    }
+
+    /// Push a new entry. On overflow, FIFO-evict the oldest entry of the same
+    /// type (O(1)). Operators see a warn once per eviction so runaway failures
+    /// remain visible.
+    fn push(&mut self, entry: FailedLogEntry) {
+        let log_type = entry.log_type;
+        let queue = match log_type {
+            LogType::Function => &mut self.function,
+            LogType::Platform => &mut self.platform,
+            LogType::Extension => &mut self.extension,
+        };
+        if queue.len() >= MAX_FAILED_BUFFER_PER_TYPE {
+            queue.pop_front();
+            warn!(
+                "failed_buffer[{:?}] at capacity ({}) — evicting oldest (FIFO)",
+                log_type, MAX_FAILED_BUFFER_PER_TYPE
+            );
+        }
+        queue.push_back(entry);
+    }
+
+    /// Drain all entries, returning `(high_priority, low_priority)` matching the
+    /// existing `start_invocation_retry` partition: Function + Platform first,
+    /// then Extension.
+    fn drain_partitioned(&mut self) -> (Vec<FailedLogEntry>, Vec<FailedLogEntry>) {
+        let mut high: Vec<FailedLogEntry> =
+            Vec::with_capacity(self.function.len() + self.platform.len());
+        high.extend(self.function.drain(..));
+        high.extend(self.platform.drain(..));
+        let low: Vec<FailedLogEntry> = self.extension.drain(..).collect();
+        (high, low)
+    }
+
+    /// Iterate all entries in priority order (Function, Platform, Extension).
+    #[cfg(test)]
+    fn iter_all(&self) -> impl Iterator<Item = &FailedLogEntry> {
+        self.function
+            .iter()
+            .chain(self.platform.iter())
+            .chain(self.extension.iter())
+    }
+
+    /// First-queued entry of a specific type (for FIFO eviction tests).
+    #[cfg(test)]
+    fn front_of(&self, log_type: LogType) -> Option<&FailedLogEntry> {
+        match log_type {
+            LogType::Function => self.function.front(),
+            LogType::Platform => self.platform.front(),
+            LogType::Extension => self.extension.front(),
+        }
+    }
+
+    /// Count entries of a specific type.
+    #[cfg(test)]
+    fn len_of(&self, log_type: LogType) -> usize {
+        match log_type {
+            LogType::Function => self.function.len(),
+            LogType::Platform => self.platform.len(),
+            LogType::Extension => self.extension.len(),
+        }
+    }
+}
 
 fn get_backoff_delay(retry_attempt: usize) -> Duration {
     match retry_attempt {
@@ -163,7 +286,7 @@ impl LogProcessor {
             trace_extraction_state,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
-            failed_logs_buffer: Arc::new(Mutex::new(VecDeque::new())),
+            failed_logs_buffer: Arc::new(Mutex::new(FailedBuffer::new())),
             apm_app,
             pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
@@ -181,18 +304,215 @@ impl LogProcessor {
         }
     }
 
-    /// Returns true when there is nothing pending to flush: log_batch is empty AND no
-    /// auto-flush tasks are still in-flight. Used by the event loop to decide whether
-    /// to add a grace period after runtime.done — if everything is already drained,
-    /// the grace period is unnecessary.
+    /// Remove finished handles from `pending_flush_handles` so the vec doesn't grow
+    /// unbounded over a long-lived warm container. Called from the auto-flush spawn
+    /// path (before registering a new handle) and from `is_drained()`.
+    fn reap_finished_flush_handles(&self) {
+        if let Ok(mut handles) = self.pending_flush_handles.lock() {
+            handles.retain(|handle| !handle.is_finished());
+        }
+    }
+
+    /// If `log_batch` has reached the auto-flush threshold, drain it and spawn a
+    /// background task that ships the drained logs in 1 MB chunks with per-chunk
+    /// retry. Shared by `process_record` (per-log push) and by bulk-insert paths
+    /// (`on_trace_id_extracted`, `reset_trace_id_state`) so trace-buffer drains
+    /// don't silently let the batch grow past the threshold.
+    ///
+    /// No-op when another auto-flush is already in flight (`is_auto_flushing`
+    /// mutex). Returns with the batch untouched when no ARN is available.
+    fn try_spawn_auto_flush(&self) {
+        /// Auto-flush threshold: 10 logs for faster delivery on high-volume bursts.
+        /// End-of-invocation flush (gated on platform.runtimeDone) ensures the tail is sent.
+        const FLUSH_THRESHOLD: usize = 10;
+
+        let logs_to_send = {
+            let mut batch = self.log_batch.lock().unwrap();
+            if batch.len() < FLUSH_THRESHOLD {
+                return;
+            }
+            let mut is_flushing = self.is_auto_flushing.lock().unwrap();
+            if *is_flushing {
+                debug!("Auto-flush already in progress - skipping to prevent infinite loop");
+                return;
+            }
+            *is_flushing = true;
+            std::mem::take(&mut *batch)
+        };
+
+        debug!(
+            "Auto-flushing batch of {} logs (threshold={})",
+            logs_to_send.len(),
+            FLUSH_THRESHOLD
+        );
+
+        let client = Arc::clone(&self.newrelic_client);
+        let config = Arc::clone(&self.config);
+        let context = self.invocation_context.lock().unwrap().clone();
+        let processor_clone = self.clone();
+
+        let auto_flush_arn = if !context.invoked_function_arn.is_empty() {
+            context.invoked_function_arn.clone()
+        } else {
+            let fallback = self.get_best_available_arn();
+            if fallback.is_empty() {
+                error!(
+                    "BLOCKED: Auto-flush skipped - no ARN available (request_id: '{}', {} logs returned to batch)",
+                    context.request_id,
+                    logs_to_send.len()
+                );
+                if let Ok(mut batch) = self.log_batch.lock() {
+                    batch.extend(logs_to_send);
+                }
+                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+                    *is_flushing = false;
+                }
+                return;
+            }
+            fallback
+        };
+
+        let handle = tokio::spawn(async move {
+            const MAX_PAYLOAD_SIZE: usize = 1_000_000;
+            let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
+            let mut current_chunk = Vec::new();
+            let mut current_size = 0;
+
+            for log in logs_to_send {
+                let log_size = estimate_log_size(&log);
+                if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
+                    chunks.push(std::mem::take(&mut current_chunk));
+                    current_size = 0;
+                }
+                current_chunk.push(log);
+                current_size += log_size;
+            }
+            if !current_chunk.is_empty() {
+                chunks.push(current_chunk);
+            }
+
+            let mut successful = 0;
+            for chunk in chunks {
+                let mut retries = 0;
+                loop {
+                    match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
+                        Ok(()) => {
+                            successful += 1;
+                            break;
+                        }
+                        Err(_e) => {
+                            if retries < MAX_RETRIES {
+                                retries += 1;
+                                tokio::time::sleep(get_backoff_delay(retries)).await;
+                                continue;
+                            } else {
+                                warn!(
+                                    "Auto-flush failed after {} retries - buffering {} logs",
+                                    MAX_RETRIES,
+                                    chunk.len()
+                                );
+                                for log in chunk {
+                                    let lt = LogProcessor::log_type_from_message(&log);
+                                    processor_clone.push_to_failed_buffer(FailedLogEntry {
+                                        log_message: log,
+                                        original_request_id: context.request_id.clone(),
+                                        retry_count: 0,
+                                        log_type: lt,
+                                    });
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if successful > 0 {
+                debug!("Auto-flush sent {} chunk(s) successfully", successful);
+            }
+        });
+
+        self.reap_finished_flush_handles();
+        if let Ok(mut handles) = self.pending_flush_handles.lock() {
+            handles.push(handle);
+        }
+        if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
+            *is_flushing = false;
+        }
+    }
+
+    /// Current count of entries waiting in `failed_logs_buffer`. Used by the shutdown
+    /// drain loop to decide whether another retry pass is worth running.
+    pub fn failed_logs_buffer_len(&self) -> usize {
+        self.failed_logs_buffer.lock().map(|b| b.len()).unwrap_or(0)
+    }
+
+    /// Shutdown-only flush that handles the "flush fails → entry re-queued → never
+    /// retried" gap. Normal `flush()` awaits the retry handle set up by the last
+    /// `start_invocation_retry()` call, but any chunk failures during that flush push
+    /// entries back into `failed_logs_buffer`. On a normal invocation the next INVOKE
+    /// picks them up; during SHUTDOWN there IS no next INVOKE, so those entries would
+    /// be stranded.
+    ///
+    /// Loops `start_invocation_retry` + `flush` up to `MAX_RETRIES` extra times. The
+    /// per-entry `retry_count` filter inside `start_invocation_retry` guarantees this
+    /// terminates — entries that have already exceeded `MAX_RETRIES` are dropped with
+    /// a warn from `push_to_failed_buffer` rather than retried forever.
+    pub async fn flush_on_shutdown(&self) -> std::io::Result<()> {
+        let first_result = self.flush().await;
+
+        for attempt in 1..=MAX_RETRIES {
+            let remaining = self.failed_logs_buffer_len();
+            if remaining == 0 {
+                return first_result;
+            }
+            debug!(
+                "Shutdown drain: pass {} with {} log(s) still in failed_logs_buffer",
+                attempt, remaining
+            );
+            self.start_invocation_retry();
+            if let Err(e) = self.flush().await {
+                warn!("Shutdown drain pass {} failed: {}", attempt, e);
+                return Err(e);
+            }
+        }
+
+        let final_remaining = self.failed_logs_buffer_len();
+        if final_remaining > 0 {
+            error!(
+                "Shutdown: {} log(s) remained in failed_logs_buffer after {} retry passes — dropped",
+                final_remaining, MAX_RETRIES
+            );
+        }
+        first_result
+    }
+
+    /// Returns true when there is nothing pending to flush: no auto-flush is mid-spawn,
+    /// log_batch is empty, and no auto-flush tasks are still in-flight.
+    ///
+    /// Gating on `is_auto_flushing` closes a TOCTOU window in the auto-flush spawn path:
+    /// between `mem::take(log_batch)` and `pending_flush_handles.push(handle)` the batch
+    /// is empty AND the handle isn't registered yet. Without this check the event loop
+    /// would falsely conclude the batch is drained and skip the post-runtime.done grace
+    /// period, dropping trailing logs that Lambda is still POSTing.
+    ///
+    /// Returns false on lock poisoning (conservative — prefer waiting the grace period
+    /// over skipping it on an inconsistent state).
     pub fn is_drained(&self) -> bool {
+        // Prune finished handles so the vec can't grow unbounded while we're checking.
+        self.reap_finished_flush_handles();
+
+        let not_flushing = self
+            .is_auto_flushing
+            .lock()
+            .map(|f| !*f)
+            .unwrap_or(false);
         let batch_empty = self.log_batch.lock().map(|b| b.is_empty()).unwrap_or(false);
         let no_pending = self
             .pending_flush_handles
             .lock()
-            .map(|h| h.iter().all(|handle| handle.is_finished()))
+            .map(|h| h.is_empty())
             .unwrap_or(false);
-        batch_empty && no_pending
+        not_flushing && batch_empty && no_pending
     }
 
    
@@ -474,128 +794,11 @@ impl LogProcessor {
                 }
             }
             
-            let mut batch = self.log_batch.lock().unwrap();
-            batch.push(log_message);
-            let batch_size = batch.len();
-
-            // Auto-flush threshold: 10 logs for faster delivery on high-volume bursts.
-            // End-of-invocation flush (gated on platform.runtimeDone) ensures the tail is sent.
-            const FLUSH_THRESHOLD: usize = 10;
-            let should_flush = batch_size >= FLUSH_THRESHOLD;
-
-            if should_flush {
-                // Check if already flushing to prevent infinite recursion
-                let mut is_flushing = self.is_auto_flushing.lock().unwrap();
-                if *is_flushing {
-                    debug!("Auto-flush already in progress - skipping to prevent infinite loop");
-                    return;
-                }
-                *is_flushing = true;
-                drop(is_flushing);
-                
-                let logs_to_send = std::mem::take(&mut *batch);
-                drop(batch);
-
-                debug!("Auto-flushing batch of {} logs (threshold={})",
-                       logs_to_send.len(), FLUSH_THRESHOLD);
-
-                let client = Arc::clone(&self.newrelic_client);
-                let config = Arc::clone(&self.config);
-                let context = self.invocation_context.lock().unwrap().clone();
-                let processor_clone = self.clone();
-
-                // GUARD: Use fallback ARN chain if context ARN is empty
-                let auto_flush_arn = if !context.invoked_function_arn.is_empty() {
-                    context.invoked_function_arn.clone()
-                } else {
-                    let fallback = self.get_best_available_arn();
-                    if fallback.is_empty() {
-                        error!(
-                            "BLOCKED: Auto-flush skipped - no ARN available (request_id: '{}', {} logs returned to batch)",
-                            context.request_id, logs_to_send.len()
-                        );
-                        // Put logs back in batch
-                        if let Ok(mut batch) = self.log_batch.lock() {
-                            batch.extend(logs_to_send);
-                        }
-                        if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                            *is_flushing = false;
-                        }
-                        return;
-                    }
-                    fallback
-                };
-
-                // Spawn background task with proper retry logic & failed log buffering
-                // Store handle to ensure it completes before function ends
-                let handle = tokio::spawn(async move {
-                    const MAX_PAYLOAD_SIZE: usize = 1_000_000; // 1MB
-                    let mut chunks: Vec<Vec<payload::LogMessage>> = Vec::new();
-                    let mut current_chunk = Vec::new();
-                    let mut current_size = 0;
-
-                    for log in logs_to_send {
-                        let log_size = 8 + log.message.len() +
-                                      serde_json::to_string(&log.attributes).unwrap_or_default().len();
-
-                        if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
-                            chunks.push(std::mem::take(&mut current_chunk));
-                            current_size = 0;
-                        }
-
-                        current_chunk.push(log);
-                        current_size += log_size;
-                    }
-
-                    if !current_chunk.is_empty() {
-                        chunks.push(current_chunk);
-                    }
-                    let mut successful = 0;
-                    for chunk in chunks {
-                        let mut retries = 0;
-                        loop {
-                            match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
-                                Ok(()) => {
-                                    successful += 1;
-                                    break;
-                                },
-                                Err(_e) => {
-                                    if retries < MAX_RETRIES {
-                                        retries += 1;
-                                        tokio::time::sleep(get_backoff_delay(retries)).await;
-                                        continue;
-                                    } else {
-                                        warn!("Auto-flush failed after {} retries - buffering {} logs", MAX_RETRIES, chunk.len());
-                                        for log in chunk {
-                                            let lt = LogProcessor::log_type_from_message(&log);
-                                            processor_clone.push_to_failed_buffer(FailedLogEntry {
-                                                log_message: log,
-                                                original_request_id: context.request_id.clone(),
-                                                retry_count: 0,
-                                                log_type: lt,
-                                            });
-                                        }
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if successful > 0 {
-                        debug!("Auto-flush sent {} chunk(s) successfully", successful);
-                    }
-                });
-
-                // Track this handle so end-of-request flush can await it
-                if let Ok(mut handles) = self.pending_flush_handles.lock() {
-                    handles.push(handle);
-                }
-                // Reset the flushing flag after spawning background task
-                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                    *is_flushing = false;
-                }
+            {
+                let mut batch = self.log_batch.lock().unwrap();
+                batch.push(log_message);
             }
+            self.try_spawn_auto_flush();
         } else {
             warn!("Failed to convert telemetry record to log message");
         }
@@ -743,53 +946,13 @@ impl LogProcessor {
         crate::get_global_fallback_arn()
     }
 
-    /// Add a failed log entry to the buffer with priority-aware overflow eviction.
-    /// Extension logs are evicted first, then Platform, Function logs are never evicted.
-    /// When all entries are Function and the buffer is full, FIFO eviction applies.
+    /// Add a failed log entry to its per-type queue (O(1) eviction via FailedBuffer).
+    /// Function/Platform/Extension each have their own `MAX_FAILED_BUFFER_PER_TYPE`
+    /// cap, so one type's flood can no longer crowd out the others.
     fn push_to_failed_buffer(&self, entry: FailedLogEntry) {
-        let mut buf = self.failed_logs_buffer.lock().unwrap();
-
-        if buf.len() < MAX_FAILED_BUFFER {
-            buf.push_back(entry);
-            return;
+        if let Ok(mut buf) = self.failed_logs_buffer.lock() {
+            buf.push(entry);
         }
-
-        // Buffer full — evict by priority: Extension first, then Platform, never Function
-        if let Some(idx) = buf.iter().position(|e| e.log_type == LogType::Extension) {
-            buf.remove(idx);
-            buf.push_back(entry);
-            return;
-        }
-
-        if entry.log_type == LogType::Extension {
-            warn!(
-                "Failed buffer at capacity ({} Function/Platform) — dropping incoming Extension log",
-                MAX_FAILED_BUFFER
-            );
-            return;
-        }
-
-        if let Some(idx) = buf.iter().position(|e| e.log_type == LogType::Platform) {
-            buf.remove(idx);
-            buf.push_back(entry);
-            return;
-        }
-
-        if entry.log_type == LogType::Platform {
-            warn!(
-                "Failed buffer at capacity ({} Function) — dropping incoming Platform log",
-                MAX_FAILED_BUFFER
-            );
-            return;
-        }
-
-        // Buffer is all Function logs and incoming is Function — FIFO evict oldest
-        warn!(
-            "Failed buffer at capacity ({} Function) — evicting oldest Function log (FIFO)",
-            MAX_FAILED_BUFFER
-        );
-        buf.pop_front();
-        buf.push_back(entry);
     }
 
     /// Drain the failed-log buffer and spawn a tracked retry task.
@@ -798,18 +961,15 @@ impl LogProcessor {
     /// Must be called exactly once per invocation, before flush().
     /// Calling twice without an intervening flush() aborts the prior retry task and may lose in-flight logs.
     pub fn start_invocation_retry(&self) {
-        // Drain atomically — release lock before any async work
-        let entries: VecDeque<FailedLogEntry> = {
+        // Drain atomically per-type — release lock before any async work.
+        // drain_partitioned returns (Function+Platform, Extension) already split.
+        let (high_pri, low_pri): (Vec<_>, Vec<_>) = {
             let mut buf = self.failed_logs_buffer.lock().unwrap();
-            std::mem::take(&mut *buf)
+            if buf.is_empty() {
+                return;
+            }
+            buf.drain_partitioned()
         };
-        if entries.is_empty() {
-            return;
-        }
-
-        // Partition: high priority (Function + Platform) sent before low (Extension)
-        let (high_pri, low_pri): (Vec<_>, Vec<_>) =
-            entries.into_iter().partition(|e| e.log_type != LogType::Extension);
 
         let prepare = |group: Vec<FailedLogEntry>| -> Vec<FailedLogEntry> {
             group.into_iter()
@@ -846,9 +1006,7 @@ impl LogProcessor {
                 let mut current_size = 0usize;
 
                 for entry in entries {
-                    let sz = 8 + entry.log_message.message.len()
-                        + serde_json::to_string(&entry.log_message.attributes)
-                            .unwrap_or_default().len();
+                    let sz = estimate_log_size(&entry.log_message);
                     if current_size + sz > MAX_PAYLOAD_SIZE && !current.is_empty() {
                         chunks.push(std::mem::take(&mut current));
                         current_size = 0;
@@ -863,12 +1021,15 @@ impl LogProcessor {
                     let origin_req = chunk.first()
                         .map(|e| e.original_request_id.as_str())
                         .unwrap_or("?");
-                    match client.send_logs(config, batch, arn).await {
+                    // Use send_chunk_with_retry_internal so a single transient network
+                    // blip doesn't consume an entire invocation-retry slot. That helper
+                    // applies MAX_RETRIES retries with exponential backoff per chunk.
+                    match proc.send_chunk_with_retry_internal(client, config, batch, arn).await {
                         Ok(()) => {
                             info!("Invocation retry: sent {} logs successfully (origin req: {})", chunk.len(), origin_req);
                         }
                         Err(e) => {
-                            warn!("Invocation retry send failed: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
+                            warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
                             for entry in chunk {
                                 proc.push_to_failed_buffer(entry);
                             }
@@ -884,12 +1045,27 @@ impl LogProcessor {
         let mut slot = self.invocation_retry_handle.lock().unwrap();
         if let Some(prev) = slot.take() {
             if !prev.is_finished() {
-                debug_assert!(false, "start_invocation_retry called with prior handle still running — flush() must be called between invocations");
-                // flush() was not awaited between two consecutive start_invocation_retry calls.
-                // The in-flight logs carried by that task are lost; warn so operators can investigate.
-                warn!("Aborting previous in-flight invocation retry task — flush() was not called between invocations; some logs may be lost");
+                // Invariant: flush() should have been awaited between two
+                // start_invocation_retry calls. When it wasn't, abort()ing the prior
+                // task would drop whatever logs it was sending. Instead spawn a
+                // background await so the old task completes in parallel with the new
+                // one; they operate on disjoint drains of failed_logs_buffer (the old
+                // task already captured its entries at spawn time).
+                let n = RETRY_INVARIANT_VIOLATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+                warn!(
+                    "start_invocation_retry called with prior task still running \
+                     (total invariant violations: {}); awaiting prior in background",
+                    n
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = prev.await {
+                        warn!("Prior invocation retry task ended with error: {}", e);
+                    }
+                });
+            } else {
+                // Prior task already finished; just drop its handle.
+                drop(prev);
             }
-            prev.abort();
         }
         *slot = Some(handle);
     }
@@ -1126,6 +1302,10 @@ impl LogProcessor {
 
         // Route through log_batch so ARN fallback chain and deduplication apply
         self.log_batch.lock().unwrap().extend(buffered_logs);
+        // Bulk push can push the batch past FLUSH_THRESHOLD without triggering the
+        // per-record auto-flush path; explicitly check so the trace-buffer drain
+        // doesn't silently inflate batch-in-memory peak.
+        self.try_spawn_auto_flush();
         Ok(())
     }
 
@@ -1157,6 +1337,9 @@ impl LogProcessor {
                     }
                 }
                 self.log_batch.lock().unwrap().extend(rescued);
+                // Same rationale as on_trace_id_extracted: bulk push can exceed the
+                // auto-flush threshold, so probe after extending.
+                self.try_spawn_auto_flush();
             }
         }
     }
@@ -1393,9 +1576,8 @@ impl LogProcessor {
         let mut current_size = 0;
         
         for log in deduplicated_batch {
-            let log_size = 8 + log.message.len() + 
-                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
-            
+            let log_size = estimate_log_size(&log);
+
             if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
                 chunks.push(std::mem::take(&mut current_chunk));
                 current_size = 0;
@@ -1508,8 +1690,7 @@ impl LogProcessor {
         let mut current_size = 0;
 
         for log in logs {
-            let log_size = 8 + log.message.len() +
-                          serde_json::to_string(&log.attributes).unwrap_or_default().len();
+            let log_size = estimate_log_size(&log);
 
             if current_size + log_size > MAX_PAYLOAD_SIZE && !current_chunk.is_empty() {
                 chunks.push(std::mem::take(&mut current_chunk));

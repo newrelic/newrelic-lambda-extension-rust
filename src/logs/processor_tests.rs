@@ -653,54 +653,53 @@ mod tests {
     #[test]
     fn test_overflow_evicts_extension_first() {
         
+        // M5: per-type caps mean Function overflow no longer evicts Extension.
+        // Instead each type has its own independent 100-cap queue.
         let p = create_test_processor();
-        for _ in 0..299 {
+        // Fill Function queue to exactly its cap.
+        for _ in 0..100 {
             p.push_to_failed_buffer(make_entry(LogType::Function, 0));
         }
+        // Add one Extension — lives in its own queue, does not affect Function.
         p.push_to_failed_buffer(make_entry(LogType::Extension, 0));
-        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 300);
-        // push one more Function — Extension should be evicted
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len_of(LogType::Function), 100);
+        assert_eq!(buf.len_of(LogType::Extension), 1);
+        drop(buf);
+        // Push one more Function — evicts OLDEST Function (FIFO within type),
+        // does NOT touch Extension.
         p.push_to_failed_buffer(make_entry(LogType::Function, 0));
         let buf = p.failed_logs_buffer.lock().unwrap();
-        assert_eq!(buf.len(), 300);
-        assert!(buf.iter().all(|e| e.log_type != LogType::Extension),
-            "Extension log should have been evicted");
+        assert_eq!(buf.len_of(LogType::Function), 100, "Function stays at its cap");
+        assert_eq!(buf.len_of(LogType::Extension), 1, "Extension queue untouched");
     }
 
     #[test]
-    fn test_overflow_drops_incoming_extension_when_no_extension_in_buf() {
-        
+    fn test_per_type_caps_isolate_floods() {
+        // M5: a flood of Function failures must not crowd out Extension/Platform.
         let p = create_test_processor();
-        for _ in 0..300 {
+        for _ in 0..500 {
             p.push_to_failed_buffer(make_entry(LogType::Function, 0));
         }
-        p.push_to_failed_buffer(make_entry(LogType::Extension, 0));
         let buf = p.failed_logs_buffer.lock().unwrap();
-        assert_eq!(buf.len(), 300);
-        assert!(buf.iter().all(|e| e.log_type == LogType::Function),
-            "Incoming Extension must be dropped when buffer is all Function");
-    }
-
-    #[test]
-    fn test_overflow_drops_incoming_platform_when_buf_all_function() {
-        
-        let p = create_test_processor();
-        for _ in 0..300 {
-            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        assert_eq!(buf.len_of(LogType::Function), 100, "Function capped at per-type limit");
+        drop(buf);
+        // Extension still has its full 100-entry headroom.
+        for _ in 0..100 {
+            p.push_to_failed_buffer(make_entry(LogType::Extension, 0));
         }
-        p.push_to_failed_buffer(make_entry(LogType::Platform, 0));
         let buf = p.failed_logs_buffer.lock().unwrap();
-        assert_eq!(buf.len(), 300);
-        assert!(buf.iter().all(|e| e.log_type == LogType::Function),
-            "Incoming Platform must be dropped when buffer is all Function");
+        assert_eq!(buf.len_of(LogType::Extension), 100);
+        assert_eq!(buf.len(), 200, "Function + Extension = 200 (each at per-type cap)");
     }
 
     #[test]
     fn test_overflow_function_fifo_evicts_oldest() {
-        
+        // M5: per-type FIFO semantics preserved.
         use serde_json::Map;
         let p = create_test_processor();
-        for i in 0u64..300 {
+        // Fill Function queue to its per-type cap (100).
+        for i in 0u64..100 {
             let entry = FailedLogEntry {
                 log_message: crate::newrelic::payload::LogMessage {
                     timestamp: i as i64,
@@ -713,11 +712,14 @@ mod tests {
             };
             p.push_to_failed_buffer(entry);
         }
-        let oldest_ts = p.failed_logs_buffer.lock().unwrap().front().unwrap().log_message.timestamp;
+        let oldest_ts = p.failed_logs_buffer.lock().unwrap()
+            .front_of(LogType::Function).unwrap().log_message.timestamp;
         assert_eq!(oldest_ts, 0);
+        // One more Function — oldest (ts=0) evicted.
         p.push_to_failed_buffer(make_entry(LogType::Function, 0));
-        let new_front_ts = p.failed_logs_buffer.lock().unwrap().front().unwrap().log_message.timestamp;
-        assert_eq!(new_front_ts, 1, "FIFO: oldest (ts=0) should be evicted");
+        let new_front_ts = p.failed_logs_buffer.lock().unwrap()
+            .front_of(LogType::Function).unwrap().log_message.timestamp;
+        assert_eq!(new_front_ts, 1, "FIFO within Function: oldest (ts=0) evicted");
     }
 
     // ========================================================================
@@ -967,7 +969,7 @@ mod tests {
         assert!(p.invocation_retry_handle.lock().unwrap().is_none(),
             "flush() must await the retry handle set by start_invocation_retry()");
         let buf = p.failed_logs_buffer.lock().unwrap();
-        for entry in buf.iter() {
+        for entry in buf.iter_all() {
             assert!(entry.retry_count >= 1,
                 "rebuffered entries must have advanced retry_count");
         }
@@ -990,6 +992,224 @@ mod tests {
         let _ = p.flush().await;
         assert_eq!(p.log_batch.lock().unwrap().len(), 0,
             "flush() must drain log_batch via mem::take");
+    }
+
+    // C1 regression — is_drained() must return false while is_auto_flushing==true,
+    // even if log_batch is empty and pending_flush_handles has no in-flight handles.
+    // Simulates the TOCTOU window between mem::take(batch) and pending_flush_handles.push().
+    #[tokio::test]
+    async fn test_is_drained_false_during_auto_flush_spawn_window() {
+        let p = create_test_processor();
+        // Simulate the spawn-window state:
+        //   - batch: empty (after mem::take)
+        //   - pending_flush_handles: still empty (handle not registered yet)
+        //   - is_auto_flushing: true (set before mem::take, cleared after push)
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        assert!(p.pending_flush_handles.lock().unwrap().is_empty());
+        *p.is_auto_flushing.lock().unwrap() = true;
+
+        assert!(!p.is_drained(),
+            "is_drained() must be false while is_auto_flushing==true, even if batch is empty and no handles are tracked");
+
+        // After the flag clears, we're genuinely drained.
+        *p.is_auto_flushing.lock().unwrap() = false;
+        assert!(p.is_drained(),
+            "is_drained() must be true when not flushing, batch empty, no handles tracked");
+    }
+
+    // L4 — runtime_done_notify pre-arm semantics: notify_one() called BEFORE notified()
+    // makes notified() return immediately (no delay). This is the assumption the
+    // event loop depends on — if runtime.done arrives before we reach the wait point,
+    // we must not block for the full deadline.
+    #[tokio::test]
+    async fn test_tokio_notify_pre_arm_returns_immediately() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        let n = Arc::new(Notify::new());
+        n.notify_one(); // fire before anyone awaits
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_millis(50), n.notified())
+            .await
+            .expect("pre-armed Notify must return immediately");
+        assert!(start.elapsed() < std::time::Duration::from_millis(10),
+            "pre-armed notify().notified() took {:?}, expected <10ms", start.elapsed());
+    }
+
+    // L4 — is_drained race safety: fire process_record-shaped pushes from many
+    // concurrent tasks while another task polls is_drained(). At no point should
+    // is_drained() return true while log_batch has entries (would indicate the
+    // TOCTOU fix regressed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_is_drained_consistent_under_concurrent_pushes() {
+        use std::sync::Arc;
+        let p = Arc::new(create_test_processor());
+
+        // Start a poller task that watches for invariant violations.
+        let pp = Arc::clone(&p);
+        let invariant_broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broken = Arc::clone(&invariant_broken);
+        let poller = tokio::spawn(async move {
+            for _ in 0..500 {
+                let drained = pp.is_drained();
+                let batch_len = pp.log_batch.lock().unwrap().len();
+                // Invariant: if is_drained()==true, batch must be empty AND no
+                // auto-flush is mid-spawn. We can at least check batch_len.
+                if drained && batch_len > 0 {
+                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Producer: push 200 logs into the batch via direct insertion (matches
+        // what process_record does after its threshold probe).
+        for i in 0..200 {
+            p.log_batch.lock().unwrap().push(make_log_msg(&format!("m-{}", i)));
+            if i % 10 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let _ = poller.await;
+        assert!(!invariant_broken.load(std::sync::atomic::Ordering::SeqCst),
+            "is_drained() returned true while log_batch had entries (TOCTOU regression)");
+    }
+
+    // M2 regression — estimate_log_size must never return 0 for a non-empty message.
+    // Previously the codebase called serde_json::to_string(&attrs).unwrap_or_default().len()
+    // which silently undersized on serialization error, causing oversized chunks → 413.
+    #[test]
+    fn test_estimate_log_size_nonzero_for_real_message() {
+        let msg = make_log_msg("hello-world");
+        let sz = super::super::estimate_log_size(&msg);
+        assert!(sz > "hello-world".len(),
+            "estimate_log_size({}) must exceed raw message length", sz);
+    }
+
+    // H2 regression — calling start_invocation_retry twice without flush() between
+    // must NOT abort the prior task (data loss). Instead the counter ticks and a
+    // background task awaits the prior handle.
+    #[tokio::test]
+    async fn test_start_invocation_retry_double_call_does_not_abort_prev() {
+        use std::sync::atomic::Ordering;
+        // Direct access to the private RETRY_INVARIANT_VIOLATIONS static — the test
+        // module is a child of `processor`, so private items are visible via super::.
+        super::super::RETRY_INVARIANT_VIOLATIONS.store(0, Ordering::Relaxed);
+
+        let p = create_test_processor();
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some(),
+            "first call should set a handle");
+
+        // Second call without flush() in between — invariant violation path.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+
+        // Counter ticked.
+        assert_eq!(
+            super::super::RETRY_INVARIANT_VIOLATIONS.load(Ordering::Relaxed),
+            1,
+            "invariant violation counter must increment on double-call"
+        );
+        // New handle is set (replacing the old one in the slot).
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some(),
+            "second call should install a new handle");
+
+        // Clean up the background await task by letting it run.
+        tokio::task::yield_now().await;
+    }
+
+    // H1 regression — flush_on_shutdown must exhaust failed_logs_buffer via repeated
+    // start_invocation_retry + flush passes, up to the per-entry MAX_RETRIES cap. The
+    // loop must terminate (no infinite spin) and zero log is stranded if the per-entry
+    // budget can accommodate the retries.
+    #[tokio::test]
+    async fn test_flush_on_shutdown_drains_failed_buffer() {
+        let p = create_test_processor();
+        // Seed the failed buffer with an entry whose retry_count is already at MAX
+        // so it is filtered out immediately by start_invocation_retry. The drain
+        // loop should terminate without spinning.
+        // MAX_RETRIES is private to the processor module; 3 is the current value and
+        // entries at or above it are filtered out by start_invocation_retry.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 3));
+        assert_eq!(p.failed_logs_buffer_len(), 1);
+
+        let _ = p.flush_on_shutdown().await;
+        assert_eq!(p.failed_logs_buffer_len(), 0,
+            "flush_on_shutdown should drain entries that are past their retry budget");
+    }
+
+    #[tokio::test]
+    async fn test_flush_on_shutdown_terminates_on_persistent_failure() {
+        // Deterministic assertion: the loop MUST terminate within a fixed wall-clock
+        // budget regardless of whether sends succeed or fail. We wrap the call in
+        // a 5s tokio timeout; any hang (infinite retry loop, deadlock, etc.) fails
+        // the test explicitly rather than relying on implicit "no network" behavior.
+        let p = create_test_processor();
+        for _ in 0..5 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        assert_eq!(p.failed_logs_buffer_len(), 5);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            p.flush_on_shutdown(),
+        )
+        .await;
+        assert!(result.is_ok(), "flush_on_shutdown must terminate within 5s");
+
+        // The loop must have terminated. Whether sends actually succeeded or failed
+        // in the test environment is not the point — the point is termination.
+        let after = p.failed_logs_buffer_len();
+        assert!(after <= 5,
+            "flush_on_shutdown should never grow the failed buffer (was 5, now {})", after);
+    }
+
+    // C2 regression — finished JoinHandles must be reaped so the vec doesn't leak
+    // across a long-lived warm container. After yielding, any completed-task handles
+    // should be gone when is_drained() runs.
+    #[tokio::test]
+    async fn test_pending_flush_handles_reaped_when_finished() {
+        let p = create_test_processor();
+        // Push a mix of handles: 50 that complete immediately, 1 that never does.
+        for _ in 0..50 {
+            let h = tokio::spawn(async {});
+            p.pending_flush_handles.lock().unwrap().push(h);
+        }
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        p.pending_flush_handles.lock().unwrap().push(slow);
+
+        // Let the 50 fast tasks complete.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // is_drained() triggers the reap; the slow task keeps it false.
+        *p.is_auto_flushing.lock().unwrap() = false;
+        let _drained = p.is_drained();
+
+        let remaining = p.pending_flush_handles.lock().unwrap().len();
+        assert_eq!(remaining, 1,
+            "is_drained() must reap finished handles (expected 1 unfinished, got {})", remaining);
+    }
+
+    #[tokio::test]
+    async fn test_is_drained_false_with_unfinished_handle() {
+        let p = create_test_processor();
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        *p.is_auto_flushing.lock().unwrap() = false;
+
+        // Push a handle that will never finish within the test window.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        p.pending_flush_handles.lock().unwrap().push(handle);
+
+        assert!(!p.is_drained(),
+            "is_drained() must be false when at least one pending_flush_handle is still running");
     }
 
     // ========================================================================

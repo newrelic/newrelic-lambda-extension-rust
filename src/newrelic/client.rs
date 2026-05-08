@@ -281,16 +281,24 @@ impl NewRelicClient {
 
         let uncompressed_size = body.len();
 
-        let (send_bytes, use_gzip): (Vec<u8>, bool) = {
+        let (send_bytes, use_gzip): (bytes::Bytes, bool) = {
             use flate2::write::GzEncoder;
             use flate2::Compression;
             use std::io::Write;
             let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
             match enc.write_all(body.as_bytes()).and_then(|_| enc.finish()) {
-                Ok(compressed) => (compressed, true),
+                Ok(compressed) => (bytes::Bytes::from(compressed), true),
                 Err(e) => {
-                    warn!("gzip compression failed ({}); sending uncompressed", e);
-                    (body.into_bytes(), false)
+                    // Log warn once per process; subsequent failures downgrade to debug
+                    // so a persistent gzip failure can't flood operator CloudWatch.
+                    static WARN_ONCE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARN_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!("gzip compression failed ({}); sending uncompressed (further failures will be logged at debug)", e);
+                    } else {
+                        debug!("gzip compression failed ({}); sending uncompressed", e);
+                    }
+                    (bytes::Bytes::from(body.into_bytes()), false)
                 }
             }
         };
@@ -309,6 +317,7 @@ impl NewRelicClient {
             if use_gzip {
                 request = request.header("Content-Encoding", "gzip");
             }
+            // bytes::Bytes clone is a cheap Arc refcount bump, not a full Vec copy.
             let res = request
                 .body(send_bytes.clone())
                 .send()
