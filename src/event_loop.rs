@@ -1172,7 +1172,7 @@ pub async fn process_request_concurrently(
     // Bounds:
     //   - Upper bound on the runtime.done wait = function's own deadline (deadlineMs
     //     from the INVOKE event). We never wait longer than the function could run.
-    //   - Grace after runtime.done = NEW_RELIC_RUNTIME_DONE_GRACE_MS (default 500 ms,
+    //   - Grace after runtime.done = NEW_RELIC_RUNTIME_DONE_GRACE_MS (default 150 ms,
     //     clamped to [0, 2000]). Skipped entirely if the log batch is already drained
     //     and no auto-flush tasks are in flight.
     //
@@ -1199,7 +1199,7 @@ pub async fn process_request_concurrently(
                     let grace_ms: u64 = std::env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
                         .ok()
                         .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or(500)
+                        .unwrap_or(150)
                         .min(2000);
                     if grace_ms > 0 {
                         debug!(
