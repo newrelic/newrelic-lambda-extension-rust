@@ -537,6 +537,7 @@ mod tests {
             coordination_tx: None,
             pending_report: Some("REPORT Duration: 50ms".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
         });
 
         send_all_pending_payloads_on_shutdown(newrelic_client, config).await;

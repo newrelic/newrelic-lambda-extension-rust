@@ -57,6 +57,11 @@ pub struct ExtensionSettings {
     /// Default: true (logs enabled)
     /// If false, suppresses all [NR_EXT] prefixed logs from appearing in CloudWatch
     pub extension_logs_enabled: bool,
+    /// NEW_RELIC_RUNTIME_DONE_GRACE_MS — grace period (ms) added AFTER
+    /// `platform.runtimeDone` before the end-of-invocation flush, only when
+    /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
+    /// 150, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
+    pub runtime_done_grace_ms: u64,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -185,6 +190,7 @@ impl Default for ExtensionSettings {
             send_platform_logs: false,
             log_level: "info".to_string(),
             extension_logs_enabled: true,
+            runtime_done_grace_ms: 150,
         }
     }
 }
@@ -300,6 +306,15 @@ impl ExtensionConfig {
 
         let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
+
+        // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
+        // Default 150 ms covers the Telemetry API buffering window (25 ms) plus a
+        // generous margin without meaningfully regressing short-invocation billing.
+        config.extension.runtime_done_grace_ms = env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(150)
+            .min(2000);
 
         config
     }

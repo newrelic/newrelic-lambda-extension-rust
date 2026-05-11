@@ -1091,6 +1091,7 @@ fn test_extension_settings_all_fields() {
         send_platform_logs: true,
         log_level: "debug".to_string(),
         extension_logs_enabled: false,
+        runtime_done_grace_ms: 250,
     };
     
     assert!(settings.send_function_logs);

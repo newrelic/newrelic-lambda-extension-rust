@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
 
 use crate::{
@@ -91,6 +91,10 @@ pub struct RequestData {
     pub coordination_tx: Option<mpsc::UnboundedSender<()>>,
     pub pending_report: Option<String>,
     pub creation_invocation: u64,
+    /// Fired by the telemetry listener when platform.runtimeDone arrives for this request.
+    /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
+    /// so logs emitted late in the invocation are captured.
+    pub runtime_done_notify: Arc<Notify>,
 }
 
 pub static REQUEST_DATA: Lazy<Arc<DashMap<String, RequestData>>> =
@@ -125,6 +129,12 @@ pub fn set_pending_report(request_id: &str, report: String) {
 /// Remove and return the pending platform.report for a request.
 pub fn remove_pending_report(request_id: &str) -> Option<String> {
     REQUEST_DATA.get_mut(request_id).and_then(|mut entry| entry.pending_report.take())
+}
+
+/// Get the runtime-done notify for a request (used by the event loop to wait, and by the
+/// telemetry listener to signal). Returns None if the request is not registered.
+pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
 }
 
 /// Get the number of entries in REQUEST_DATA (used for debug logging).
@@ -220,6 +230,7 @@ pub fn create_request_processing_state(
         coordination_tx: Some(payload_tx),
         pending_report: None,
         creation_invocation: current_invocation_count(),
+        runtime_done_notify: Arc::new(Notify::new()),
     });
 
     let state = RequestProcessingState {

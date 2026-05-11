@@ -198,8 +198,8 @@ impl NewRelicClient {
         }
         
         let start_time = std::time::Instant::now();
-        let payload_size = payload_json.len();
-        debug!("Sending agent payload to NR: {} bytes", payload_size);
+        let uncompressed_size = payload_json.len();
+        debug!("Sending agent payload to NR: {} bytes", uncompressed_size);
         
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
@@ -220,7 +220,7 @@ impl NewRelicClient {
                     
                     if status.is_success() {
                         let duration = start_time.elapsed();
-                        debug!("Agent payload sent: {} bytes, duration: {:?}", payload_size, duration);
+                        debug!("Agent payload sent: {} bytes, duration: {:?}", uncompressed_size, duration);
                         return Ok(());
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
@@ -279,18 +279,47 @@ impl NewRelicClient {
             }
         };
 
-        let payload_size = body.len();
-        debug!("Sending payload to NR endpoint: {} bytes", payload_size);
+        let uncompressed_size = body.len();
+
+        let (send_bytes, use_gzip): (bytes::Bytes, bool) = {
+            use flate2::write::GzEncoder;
+            use flate2::Compression;
+            use std::io::Write;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+            match enc.write_all(body.as_bytes()).and_then(|_| enc.finish()) {
+                Ok(compressed) => (bytes::Bytes::from(compressed), true),
+                Err(e) => {
+                    // Log warn once per process; subsequent failures downgrade to debug
+                    // so a persistent gzip failure can't flood operator CloudWatch.
+                    static WARN_ONCE: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !WARN_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        warn!("gzip compression failed ({}); sending uncompressed (further failures will be logged at debug)", e);
+                    } else {
+                        debug!("gzip compression failed ({}); sending uncompressed", e);
+                    }
+                    (bytes::Bytes::from(body.into_bytes()), false)
+                }
+            }
+        };
+
+        debug!("Sending payload to NR endpoint: {} bytes{}",
+            send_bytes.len(),
+            if use_gzip { format!(" (gzip, uncompressed: {})", uncompressed_size) } else { String::new() });
 
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
-        
+
         loop {
-            
-            let res = self.client
+            let mut request = self.client
                 .post(endpoint)
-                .header("Content-Type", "application/json")
-                .body(body.clone())
+                .header("Content-Type", "application/json");
+            if use_gzip {
+                request = request.header("Content-Encoding", "gzip");
+            }
+            // bytes::Bytes clone is a cheap Arc refcount bump, not a full Vec copy.
+            let res = request
+                .body(send_bytes.clone())
                 .send()
                 .await;
 
@@ -301,9 +330,9 @@ impl NewRelicClient {
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         if let Some(count) = log_count {
-                            debug!("Logs sent: {} logs, {} bytes, duration: {:?}", count, payload_size, duration);
+                            debug!("Logs sent: {} logs, {} bytes, duration: {:?}", count, uncompressed_size, duration);
                         } else {
-                            debug!("Payload sent: {} bytes, duration: {:?}", payload_size, duration);
+                            debug!("Payload sent: {} bytes, duration: {:?}", uncompressed_size, duration);
                         }
                         return Ok(());
                     } else {
@@ -334,7 +363,7 @@ impl NewRelicClient {
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("Connection issue (will retry): {}", e);
                         } else if e.is_timeout() {
-                            warn!("Request timeout after 2.4s (will retry): {}", e);
+                            warn!("Request timeout (will retry): {}", e);
                         } else {
                             warn!("Network error: {}", e);
                         }

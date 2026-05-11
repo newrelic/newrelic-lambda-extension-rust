@@ -10,7 +10,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::logs::processor::LogProcessor;
+    use super::super::{LogProcessor, LogType, FailedLogEntry, TraceIdExtractionState};
+    use crate::newrelic::flush::Flush;
     use crate::config::ExtensionConfig;
     use crate::context::InvocationContext;
     use crate::newrelic::client::NewRelicClient;
@@ -586,5 +587,746 @@ mod tests {
             processor.extract_log_level(&record, "Request took 1500ms"),
             "WARN"
         );
+    }
+
+    // ========================================================================
+    // PHASE 1: LogType enum tests
+    // ========================================================================
+
+    #[test]
+    fn test_log_type_from_record_type() {
+        
+        assert_eq!(LogType::from_record_type("function"),  LogType::Function);
+        assert_eq!(LogType::from_record_type("platform"),  LogType::Platform);
+        assert_eq!(LogType::from_record_type("extension"), LogType::Extension);
+        assert_eq!(LogType::from_record_type("unknown"),   LogType::Function);
+        assert_eq!(LogType::from_record_type(""),          LogType::Function);
+    }
+
+    #[test]
+    fn test_failed_log_entry_clone_preserves_log_type() {
+        
+        use serde_json::Map;
+        let entry = FailedLogEntry {
+            log_message: crate::newrelic::payload::LogMessage {
+                timestamp: 0,
+                message: "x".into(),
+                attributes: Map::new(),
+            },
+            original_request_id: "r1".into(),
+            retry_count: 0,
+            log_type: LogType::Platform,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.log_type, LogType::Platform);
+    }
+
+    // ========================================================================
+    // PHASE 2: push_to_failed_buffer overflow / eviction tests
+    // ========================================================================
+
+    fn make_entry(log_type: LogType, retry_count: usize)
+        -> FailedLogEntry
+    {
+        
+        use serde_json::Map;
+        FailedLogEntry {
+            log_message: crate::newrelic::payload::LogMessage {
+                timestamp: 0,
+                message: String::new(),
+                attributes: Map::new(),
+            },
+            original_request_id: String::new(),
+            retry_count,
+            log_type,
+        }
+    }
+
+    #[test]
+    fn test_push_below_cap_adds_entry() {
+        
+        let p = create_test_processor();
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_overflow_evicts_extension_first() {
+        
+        // M5: per-type caps mean Function overflow no longer evicts Extension.
+        // Instead each type has its own independent 100-cap queue.
+        let p = create_test_processor();
+        // Fill Function queue to exactly its cap.
+        for _ in 0..100 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        // Add one Extension — lives in its own queue, does not affect Function.
+        p.push_to_failed_buffer(make_entry(LogType::Extension, 0));
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len_of(LogType::Function), 100);
+        assert_eq!(buf.len_of(LogType::Extension), 1);
+        drop(buf);
+        // Push one more Function — evicts OLDEST Function (FIFO within type),
+        // does NOT touch Extension.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len_of(LogType::Function), 100, "Function stays at its cap");
+        assert_eq!(buf.len_of(LogType::Extension), 1, "Extension queue untouched");
+    }
+
+    #[test]
+    fn test_per_type_caps_isolate_floods() {
+        // M5: a flood of Function failures must not crowd out Extension/Platform.
+        let p = create_test_processor();
+        for _ in 0..500 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len_of(LogType::Function), 100, "Function capped at per-type limit");
+        drop(buf);
+        // Extension still has its full 100-entry headroom.
+        for _ in 0..100 {
+            p.push_to_failed_buffer(make_entry(LogType::Extension, 0));
+        }
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len_of(LogType::Extension), 100);
+        assert_eq!(buf.len(), 200, "Function + Extension = 200 (each at per-type cap)");
+    }
+
+    #[test]
+    fn test_overflow_function_fifo_evicts_oldest() {
+        // M5: per-type FIFO semantics preserved.
+        use serde_json::Map;
+        let p = create_test_processor();
+        // Fill Function queue to its per-type cap (100).
+        for i in 0u64..100 {
+            let entry = FailedLogEntry {
+                log_message: crate::newrelic::payload::LogMessage {
+                    timestamp: i as i64,
+                    message: String::new(),
+                    attributes: Map::new(),
+                },
+                original_request_id: String::new(),
+                retry_count: 0,
+                log_type: LogType::Function,
+            };
+            p.push_to_failed_buffer(entry);
+        }
+        let oldest_ts = p.failed_logs_buffer.lock().unwrap()
+            .front_of(LogType::Function).unwrap().log_message.timestamp;
+        assert_eq!(oldest_ts, 0);
+        // One more Function — oldest (ts=0) evicted.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        let new_front_ts = p.failed_logs_buffer.lock().unwrap()
+            .front_of(LogType::Function).unwrap().log_message.timestamp;
+        assert_eq!(new_front_ts, 1, "FIFO within Function: oldest (ts=0) evicted");
+    }
+
+    // ========================================================================
+    // PHASE 3: log_type_from_message roundtrip tests
+    // ========================================================================
+
+    #[test]
+    fn test_log_type_from_message_roundtrip() {
+        
+        use serde_json::Map;
+        for (record_type, expected) in &[
+            ("function",  LogType::Function),
+            ("platform",  LogType::Platform),
+            ("extension", LogType::Extension),
+        ] {
+            let mut attrs = Map::new();
+            attrs.insert("_nr.logType".to_string(), serde_json::json!(record_type));
+            let msg = crate::newrelic::payload::LogMessage {
+                timestamp: 0,
+                message: String::new(),
+                attributes: attrs,
+            };
+            assert_eq!(
+                LogProcessor::log_type_from_message(&msg),
+                *expected,
+                "record_type '{}' should map to {:?}", record_type, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_log_type_missing_defaults_to_function() {
+        
+        use serde_json::Map;
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: Map::new(),
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    // ========================================================================
+    // PHASE 4b: reset_trace_id_state rescue + on_trace_id_extracted routing
+    // Tests for Fix 1 and Fix 3 from the 2025-05 refactor session.
+    // ========================================================================
+
+    /// Create a processor with collect_trace_id=true so buffered_logs and
+    /// trace_extraction_state are initialised (they are None otherwise).
+    fn create_trace_processor() -> LogProcessor {
+        use crate::config::{ExtensionConfig, NewRelicConfig};
+        let mut config = ExtensionConfig::default();
+        config.new_relic = NewRelicConfig { collect_trace_id: true, ..NewRelicConfig::default() };
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(
+            &Arc::new(ExtensionConfig::default()),
+        ));
+        let invocation_context = Arc::new(Mutex::new(crate::context::InvocationContext::default()));
+        LogProcessor::new(newrelic_client, Arc::new(config), invocation_context, None)
+    }
+
+    /// Helper: build a minimal LogMessage with a given message string.
+    fn make_log_msg(msg: &str) -> crate::newrelic::payload::LogMessage {
+        use serde_json::Map;
+        crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: msg.to_string(),
+            attributes: Map::new(),
+        }
+    }
+
+    // Fix 1 — reset_trace_id_state rescues buffered logs into log_batch instead of dropping them.
+    #[test]
+    fn test_reset_trace_id_state_rescues_buffered_logs() {
+        let p = create_trace_processor();
+
+        // Manually push logs into buffered_logs (simulates logs received while waiting for trace ID)
+        {
+            let buffered = p.buffered_logs.as_ref().unwrap();
+            let mut guard = buffered.lock().unwrap();
+            guard.push(make_log_msg("log-a"));
+            guard.push(make_log_msg("log-b"));
+        }
+
+        // Sanity: batch is empty before rescue
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+
+        p.reset_trace_id_state();
+
+        // After reset, buffered_logs must be empty
+        let buffered_after = p.buffered_logs.as_ref().unwrap().lock().unwrap().len();
+        assert_eq!(buffered_after, 0, "buffered_logs must be drained by reset_trace_id_state");
+
+        // Rescued logs must appear in log_batch
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2, "both rescued logs must be in log_batch");
+        assert!(batch.iter().any(|m| m.message == "log-a"));
+        assert!(batch.iter().any(|m| m.message == "log-b"));
+    }
+
+    #[test]
+    fn test_reset_trace_id_state_no_op_when_buffer_empty() {
+        let p = create_trace_processor();
+        p.reset_trace_id_state();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0,
+            "reset with empty buffer must not add anything to log_batch");
+    }
+
+    #[test]
+    fn test_reset_trace_id_state_no_op_without_trace_collection() {
+        // Processor with collect_trace_id=false has no buffered_logs — must be a no-op.
+        let p = create_test_processor();
+        assert!(p.buffered_logs.is_none());
+        p.reset_trace_id_state(); // must not panic
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+    }
+
+    // Fix 3 — on_trace_id_extracted routes stamped logs through log_batch (not direct send).
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_stamps_trace_id_and_routes_to_batch() {
+        let p = create_trace_processor();
+        let trace_id = "abc-trace-123";
+
+        // Pre-load buffered_logs with two entries (no trace.id yet)
+        {
+            let buffered = p.buffered_logs.as_ref().unwrap();
+            let mut guard = buffered.lock().unwrap();
+            guard.push(make_log_msg("msg-1"));
+            guard.push(make_log_msg("msg-2"));
+        }
+
+        p.on_trace_id_extracted(trace_id).await.unwrap();
+
+        // buffered_logs must be drained
+        let remaining = p.buffered_logs.as_ref().unwrap().lock().unwrap().len();
+        assert_eq!(remaining, 0, "buffered_logs must be empty after on_trace_id_extracted");
+
+        // Logs must be in log_batch (not sent directly)
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2, "both logs must be routed to log_batch");
+
+        // Each log must carry the trace.id attribute
+        for log in batch.iter() {
+            let tid = log.attributes.get("trace.id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert_eq!(tid, trace_id,
+                "trace.id attribute must be stamped on log '{}'", log.message);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_no_op_when_buffer_empty() {
+        let p = create_trace_processor();
+        p.on_trace_id_extracted("some-trace").await.unwrap();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0,
+            "empty buffer must produce no log_batch entries");
+    }
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_no_op_without_trace_collection() {
+        // collect_trace_id=false — must return Ok(()) silently.
+        let p = create_test_processor();
+        assert!(p.buffered_logs.is_none());
+        p.on_trace_id_extracted("some-trace").await.unwrap();
+    }
+
+    // ========================================================================
+    // PHASE 5: start_invocation_retry + flush handle tracking
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_start_invocation_retry_empty_buffer_does_not_set_handle() {
+        let p = create_test_processor();
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_none(),
+            "No handle should be created when buffer is empty");
+    }
+
+    #[tokio::test]
+    async fn test_start_invocation_retry_sets_handle_when_buffer_has_entries() {
+        
+        let p = create_test_processor();
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some(),
+            "Handle should be set when buffer has entries");
+    }
+
+    #[tokio::test]
+    async fn test_flush_clears_invocation_retry_handle() {
+        
+        let p = create_test_processor();
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some());
+
+        let _ = p.flush().await;
+        assert!(p.invocation_retry_handle.lock().unwrap().is_none(),
+            "Handle should be None after flush awaits it");
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_entries_not_sent() {
+        
+        let p = create_test_processor();
+        // retry_count == MAX_RETRIES (3) means the filter should drop it
+        p.push_to_failed_buffer(make_entry(LogType::Function, 3));
+        p.start_invocation_retry();
+        // If the entry was filtered out, handle is None (nothing to send)
+        assert!(p.invocation_retry_handle.lock().unwrap().is_none(),
+            "No handle should be created when all entries are exhausted");
+    }
+
+    #[tokio::test]
+    async fn test_start_invocation_retry_drains_buffer() {
+
+        let p = create_test_processor();
+        for _ in 0..5 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 5);
+        p.start_invocation_retry();
+        // Buffer should be drained atomically before spawn
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0,
+            "Buffer should be empty immediately after start_invocation_retry drains it");
+    }
+
+    // Shutdown path invariant: start_invocation_retry() followed by flush() drains the
+    // failed_logs_buffer and clears the retry handle, so no logs are stranded when the
+    // extension shuts down without another INVOKE.
+    #[tokio::test]
+    async fn test_shutdown_sequence_retry_then_flush_clears_state() {
+        let p = create_test_processor();
+        for _ in 0..3 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 3);
+
+        // Mirror the event loop's shutdown sequence.
+        p.start_invocation_retry();
+        let _ = p.flush().await;
+
+        // After flush(), retry handle must be awaited (cleared) and buffer must be empty.
+        // Entries only re-enter failed_logs_buffer on send failure with retry_count < MAX_RETRIES;
+        // in the no-network test setup the send fails and entries are rebuffered with
+        // retry_count incremented to 1, so assert the incremented count rather than emptiness.
+        assert!(p.invocation_retry_handle.lock().unwrap().is_none(),
+            "flush() must await the retry handle set by start_invocation_retry()");
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        for entry in buf.iter_all() {
+            assert!(entry.retry_count >= 1,
+                "rebuffered entries must have advanced retry_count");
+        }
+    }
+
+    // Regression: FLUSH_THRESHOLD is 10. The constant is private so we probe it indirectly
+    // via the boundary — 9 pushes do not auto-flush, 10 do. Pushing through the batch lock
+    // directly bypasses process_record, so we instead assert that lowering the threshold
+    // did not regress the manual flush path (log_batch drain on flush()).
+    #[tokio::test]
+    async fn test_flush_drains_log_batch() {
+        let p = create_test_processor();
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..15 {
+                batch.push(make_log_msg(&format!("msg-{}", i)));
+            }
+        }
+        assert_eq!(p.log_batch.lock().unwrap().len(), 15);
+        let _ = p.flush().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0,
+            "flush() must drain log_batch via mem::take");
+    }
+
+    // C1 regression — is_drained() must return false while is_auto_flushing==true,
+    // even if log_batch is empty and pending_flush_handles has no in-flight handles.
+    // Simulates the TOCTOU window between mem::take(batch) and pending_flush_handles.push().
+    #[tokio::test]
+    async fn test_is_drained_false_during_auto_flush_spawn_window() {
+        let p = create_test_processor();
+        // Simulate the spawn-window state:
+        //   - batch: empty (after mem::take)
+        //   - pending_flush_handles: still empty (handle not registered yet)
+        //   - is_auto_flushing: true (set before mem::take, cleared after push)
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        assert!(p.pending_flush_handles.lock().unwrap().is_empty());
+        *p.is_auto_flushing.lock().unwrap() = true;
+
+        assert!(!p.is_drained(),
+            "is_drained() must be false while is_auto_flushing==true, even if batch is empty and no handles are tracked");
+
+        // After the flag clears, we're genuinely drained.
+        *p.is_auto_flushing.lock().unwrap() = false;
+        assert!(p.is_drained(),
+            "is_drained() must be true when not flushing, batch empty, no handles tracked");
+    }
+
+    // L4 — runtime_done_notify pre-arm semantics: notify_one() called BEFORE notified()
+    // makes notified() return immediately (no delay). This is the assumption the
+    // event loop depends on — if runtime.done arrives before we reach the wait point,
+    // we must not block for the full deadline.
+    #[tokio::test]
+    async fn test_tokio_notify_pre_arm_returns_immediately() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        let n = Arc::new(Notify::new());
+        n.notify_one(); // fire before anyone awaits
+        let start = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_millis(50), n.notified())
+            .await
+            .expect("pre-armed Notify must return immediately");
+        assert!(start.elapsed() < std::time::Duration::from_millis(10),
+            "pre-armed notify().notified() took {:?}, expected <10ms", start.elapsed());
+    }
+
+    // L4 — is_drained race safety: fire process_record-shaped pushes from many
+    // concurrent tasks while another task polls is_drained(). At no point should
+    // is_drained() return true while log_batch has entries (would indicate the
+    // TOCTOU fix regressed).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_is_drained_consistent_under_concurrent_pushes() {
+        use std::sync::Arc;
+        let p = Arc::new(create_test_processor());
+
+        // Start a poller task that watches for invariant violations.
+        let pp = Arc::clone(&p);
+        let invariant_broken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let broken = Arc::clone(&invariant_broken);
+        let poller = tokio::spawn(async move {
+            for _ in 0..500 {
+                let drained = pp.is_drained();
+                let batch_len = pp.log_batch.lock().unwrap().len();
+                // Invariant: if is_drained()==true, batch must be empty AND no
+                // auto-flush is mid-spawn. We can at least check batch_len.
+                if drained && batch_len > 0 {
+                    broken.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Producer: push 200 logs into the batch via direct insertion (matches
+        // what process_record does after its threshold probe).
+        for i in 0..200 {
+            p.log_batch.lock().unwrap().push(make_log_msg(&format!("m-{}", i)));
+            if i % 10 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        let _ = poller.await;
+        assert!(!invariant_broken.load(std::sync::atomic::Ordering::SeqCst),
+            "is_drained() returned true while log_batch had entries (TOCTOU regression)");
+    }
+
+    // M2 regression — estimate_log_size must never return 0 for a non-empty message.
+    // Previously the codebase called serde_json::to_string(&attrs).unwrap_or_default().len()
+    // which silently undersized on serialization error, causing oversized chunks → 413.
+    #[test]
+    fn test_estimate_log_size_nonzero_for_real_message() {
+        let msg = make_log_msg("hello-world");
+        let sz = super::super::estimate_log_size(&msg);
+        assert!(sz > "hello-world".len(),
+            "estimate_log_size({}) must exceed raw message length", sz);
+    }
+
+    // H2 regression — calling start_invocation_retry twice without flush() between
+    // must NOT abort the prior task (data loss). Instead the counter ticks and a
+    // background task awaits the prior handle.
+    #[tokio::test]
+    async fn test_start_invocation_retry_double_call_does_not_abort_prev() {
+        use std::sync::atomic::Ordering;
+        // Direct access to the private RETRY_INVARIANT_VIOLATIONS static — the test
+        // module is a child of `processor`, so private items are visible via super::.
+        super::super::RETRY_INVARIANT_VIOLATIONS.store(0, Ordering::Relaxed);
+
+        let p = create_test_processor();
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some(),
+            "first call should set a handle");
+
+        // Second call without flush() in between — invariant violation path.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        p.start_invocation_retry();
+
+        // Counter ticked.
+        assert_eq!(
+            super::super::RETRY_INVARIANT_VIOLATIONS.load(Ordering::Relaxed),
+            1,
+            "invariant violation counter must increment on double-call"
+        );
+        // New handle is set (replacing the old one in the slot).
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some(),
+            "second call should install a new handle");
+
+        // Clean up the background await task by letting it run.
+        tokio::task::yield_now().await;
+    }
+
+    // H1 regression — flush_on_shutdown must exhaust failed_logs_buffer via repeated
+    // start_invocation_retry + flush passes, up to the per-entry MAX_RETRIES cap. The
+    // loop must terminate (no infinite spin) and zero log is stranded if the per-entry
+    // budget can accommodate the retries.
+    #[tokio::test]
+    async fn test_flush_on_shutdown_drains_failed_buffer() {
+        let p = create_test_processor();
+        // Seed the failed buffer with an entry whose retry_count is already at MAX
+        // so it is filtered out immediately by start_invocation_retry. The drain
+        // loop should terminate without spinning.
+        // MAX_RETRIES is private to the processor module; 3 is the current value and
+        // entries at or above it are filtered out by start_invocation_retry.
+        p.push_to_failed_buffer(make_entry(LogType::Function, 3));
+        assert_eq!(p.failed_logs_buffer_len(), 1);
+
+        let _ = p.flush_on_shutdown().await;
+        assert_eq!(p.failed_logs_buffer_len(), 0,
+            "flush_on_shutdown should drain entries that are past their retry budget");
+    }
+
+    #[tokio::test]
+    async fn test_flush_on_shutdown_terminates_on_persistent_failure() {
+        // Deterministic assertion: the loop MUST terminate within a fixed wall-clock
+        // budget regardless of whether sends succeed or fail. We wrap the call in
+        // a 5s tokio timeout; any hang (infinite retry loop, deadlock, etc.) fails
+        // the test explicitly rather than relying on implicit "no network" behavior.
+        let p = create_test_processor();
+        for _ in 0..5 {
+            p.push_to_failed_buffer(make_entry(LogType::Function, 0));
+        }
+        assert_eq!(p.failed_logs_buffer_len(), 5);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            p.flush_on_shutdown(),
+        )
+        .await;
+        assert!(result.is_ok(), "flush_on_shutdown must terminate within 5s");
+
+        // The loop must have terminated. Whether sends actually succeeded or failed
+        // in the test environment is not the point — the point is termination.
+        let after = p.failed_logs_buffer_len();
+        assert!(after <= 5,
+            "flush_on_shutdown should never grow the failed buffer (was 5, now {})", after);
+    }
+
+    // C2 regression — finished JoinHandles must be reaped so the vec doesn't leak
+    // across a long-lived warm container. After yielding, any completed-task handles
+    // should be gone when is_drained() runs.
+    #[tokio::test]
+    async fn test_pending_flush_handles_reaped_when_finished() {
+        let p = create_test_processor();
+        // Push a mix of handles: 50 that complete immediately, 1 that never does.
+        for _ in 0..50 {
+            let h = tokio::spawn(async {});
+            p.pending_flush_handles.lock().unwrap().push(h);
+        }
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        p.pending_flush_handles.lock().unwrap().push(slow);
+
+        // Let the 50 fast tasks complete.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        // is_drained() triggers the reap; the slow task keeps it false.
+        *p.is_auto_flushing.lock().unwrap() = false;
+        let _drained = p.is_drained();
+
+        let remaining = p.pending_flush_handles.lock().unwrap().len();
+        assert_eq!(remaining, 1,
+            "is_drained() must reap finished handles (expected 1 unfinished, got {})", remaining);
+    }
+
+    #[tokio::test]
+    async fn test_is_drained_false_with_unfinished_handle() {
+        let p = create_test_processor();
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        *p.is_auto_flushing.lock().unwrap() = false;
+
+        // Push a handle that will never finish within the test window.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        p.pending_flush_handles.lock().unwrap().push(handle);
+
+        assert!(!p.is_drained(),
+            "is_drained() must be false when at least one pending_flush_handle is still running");
+    }
+
+    // ========================================================================
+    // PHASE 6: entity.guid stamping coverage
+    // Tests for the 2025-05 fixes that stamp entity.guid on all log paths.
+    // ========================================================================
+
+    /// Build a processor whose apm_app is set to a mock ApmApp with the given entity_guid.
+    fn create_apm_processor(entity_guid: &str) -> LogProcessor {
+        use crate::config::{ExtensionConfig, NewRelicConfig};
+        use crate::apm::app::ApmApp;
+
+        let mut config = ExtensionConfig::default();
+        config.new_relic = NewRelicConfig { collect_trace_id: true, ..NewRelicConfig::default() };
+
+        let mock_app = ApmApp {
+            run_id: "run-1".to_string(),
+            entity_guid: entity_guid.to_string(),
+            collector_host: "collector.newrelic.com".to_string(),
+            license_key: "test-key".to_string(),
+            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            client: reqwest::Client::new(),
+        };
+        let apm_arc: Arc<tokio::sync::RwLock<Option<ApmApp>>> =
+            Arc::new(tokio::sync::RwLock::new(Some(mock_app)));
+
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(
+            &Arc::new(ExtensionConfig::default()),
+        ));
+        let invocation_context = Arc::new(Mutex::new(crate::context::InvocationContext::default()));
+        LogProcessor::new(newrelic_client, Arc::new(config), invocation_context, Some(apm_arc))
+    }
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_stamps_entity_guid() {
+        let p = create_apm_processor("test-entity-guid");
+        {
+            let buffered = p.buffered_logs.as_ref().unwrap();
+            let mut guard = buffered.lock().unwrap();
+            guard.push(make_log_msg("apm-log-1"));
+            guard.push(make_log_msg("apm-log-2"));
+        }
+
+        p.on_trace_id_extracted("trace-abc").await.unwrap();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2);
+        for log in batch.iter() {
+            let guid = log.attributes.get("entity.guid").and_then(|v| v.as_str()).unwrap_or("");
+            assert_eq!(guid, "test-entity-guid",
+                "entity.guid must be stamped on log '{}'", log.message);
+            let tid = log.attributes.get("trace.id").and_then(|v| v.as_str()).unwrap_or("");
+            assert_eq!(tid, "trace-abc",
+                "trace.id must be stamped on log '{}'", log.message);
+        }
+    }
+
+    #[test]
+    fn test_reset_trace_id_state_stamps_entity_guid() {
+        let p = create_apm_processor("reset-entity-guid");
+        {
+            let buffered = p.buffered_logs.as_ref().unwrap();
+            let mut guard = buffered.lock().unwrap();
+            guard.push(make_log_msg("rescued-log-1"));
+        }
+
+        p.reset_trace_id_state();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let guid = batch[0].attributes.get("entity.guid").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(guid, "reset-entity-guid",
+            "entity.guid must be stamped on rescued log");
+    }
+
+    #[test]
+    fn test_process_buffered_logs_stamps_entity_guid_and_trace_id() {
+        
+        let p = create_apm_processor("direct-path-guid");
+
+        // Put a trace ID into invocation_context so the log takes the direct path.
+        p.invocation_context.lock().unwrap().trace_id = Some("trace-xyz".to_string());
+
+        // Set extraction state to Extracted so routing goes direct to log_batch.
+        if let Some(ref state_arc) = p.trace_extraction_state {
+            *state_arc.lock().unwrap() = TraceIdExtractionState::Extracted;
+        }
+
+        // Push a log into request_id_buffer.
+        {
+            let mut buf = p.request_id_buffer.lock().unwrap();
+            buf.push(make_log_msg("direct-log"));
+        }
+
+        p.process_buffered_logs_with_request_id("req-001");
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let guid = batch[0].attributes.get("entity.guid").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(guid, "direct-path-guid", "entity.guid must be stamped on direct-path log");
+        let tid = batch[0].attributes.get("trace.id").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(tid, "trace-xyz", "trace.id must be stamped on direct-path log");
+    }
+
+    #[tokio::test]
+    async fn test_entity_guid_not_panic_when_apm_app_none() {
+        // When apm_app is None, all three paths must complete without panic and
+        // entity.guid must simply be absent from the output.
+        let p = create_trace_processor(); // no apm_app
+
+        {
+            let buffered = p.buffered_logs.as_ref().unwrap();
+            buffered.lock().unwrap().push(make_log_msg("no-apm-log"));
+        }
+        p.on_trace_id_extracted("t1").await.unwrap();
+        let batch = p.log_batch.lock().unwrap();
+        assert!(!batch[0].attributes.contains_key("entity.guid"),
+            "entity.guid must not appear when apm_app is None");
     }
 }

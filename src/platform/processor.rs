@@ -87,6 +87,12 @@ impl PlatformProcessor {
             "version": crate::EXTENSION_VERSION.to_string()
         }));
         attributes.insert("log_type".to_string(), serde_json::json!("platform"));
+        // _nr.logType is the internal key used by LogProcessor::log_type_from_message for
+        // eviction priority in failed_logs_buffer (Platform < Function) and by the dedup hash.
+        // Without it, failed platform logs are misclassified as Function and never evicted.
+        attributes.insert("_nr.logType".to_string(), serde_json::json!("platform"));
+        // newrelic.source is required by the NR Logs API ingest endpoint.
+        attributes.insert("newrelic.source".to_string(), serde_json::json!("api.logs"));
         attributes.insert("level".to_string(), serde_json::json!(level));
         attributes.insert("platform_event_type".to_string(), serde_json::json!(record.record_type));
         
