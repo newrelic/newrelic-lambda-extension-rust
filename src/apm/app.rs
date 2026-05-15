@@ -37,6 +37,7 @@ impl ApmApp {
         function_version: String,
         account_id: Option<String>,
         region: Option<String>,
+        timeout_secs: u64,
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
@@ -55,6 +56,7 @@ impl ApmApp {
                 &function_version,
                 &account_id,
                 &region,
+                timeout_secs,
             )
             .await
             {
@@ -90,6 +92,7 @@ impl ApmApp {
         function_version: &str,
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
+        timeout_secs: u64,
     ) -> Result<ApmApp> {
         // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
@@ -116,7 +119,7 @@ impl ApmApp {
         let agent_version = version_info.agent_version.as_deref().unwrap_or("unknown");
 
         // Run preconnect while we have the cached values
-        let collector_host = preconnect(client, license_key, apm_host)
+        let collector_host = preconnect(client, license_key, apm_host, timeout_secs)
             .await
             .context("PreConnect failed")?;
 
@@ -148,8 +151,8 @@ impl ApmApp {
         );
 
         let connect_resp = connect(
-            client, 
-            license_key, 
+            client,
+            license_key,
             &collector_host,
             &function_name,
             &function_arn,
@@ -158,6 +161,7 @@ impl ApmApp {
             &function_version,
             &runtime,
             &agent_version,
+            timeout_secs,
         )
         .await
         .context("Connect failed")?;

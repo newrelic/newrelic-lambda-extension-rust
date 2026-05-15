@@ -50,6 +50,8 @@ where
         "NEW_RELIC_ADD_VERSION_DETAIL_TAGS",
         "NEW_RELIC_LAYER_VERSION",
         "NEW_RELIC_APM_LAMBDA_MODE",
+        "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
+        "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -1054,6 +1056,8 @@ fn test_new_relic_config_all_fields() {
         add_version_detail_tags: true,
         layer_version: Some("1.0.0".to_string()),
         apm_lambda_mode: true,
+        apm_blocking_handshake: false,
+        apm_handshake_timeout_secs: 5,
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
@@ -1361,5 +1365,89 @@ fn test_from_env_proxy_startup_log_never_leaks_credentials() {
         assert!(masked.contains("***:***@proxy.internal:8080"),
             "Masked output should preserve host: {}", masked);
     });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_handshake_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.apm_blocking_handshake);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_handshake_enabled_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BLOCKING_HANDSHAKE", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_blocking_handshake);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_handshake_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BLOCKING_HANDSHAKE", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.apm_blocking_handshake);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_handshake_timeout_default() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_handshake_timeout_secs, 5);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_handshake_timeout_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS", "7");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_handshake_timeout_secs, 7);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_handshake_timeout_zero_clamped_to_one() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS", "0");
+        let config = ExtensionConfig::from_env();
+        // .max(1) guard prevents zero-second timeout
+        assert_eq!(config.new_relic.apm_handshake_timeout_secs, 1);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_handshake_timeout_invalid_string_falls_back_to_default() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS", "not_a_number");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_handshake_timeout_secs, 5);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_handshake_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_APM_BLOCKING_HANDSHAKE", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.apm_blocking_handshake,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
 }
 

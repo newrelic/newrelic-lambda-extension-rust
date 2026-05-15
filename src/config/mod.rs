@@ -31,6 +31,8 @@ pub struct NewRelicConfig {
     pub add_version_detail_tags: bool,
     pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
+    pub apm_blocking_handshake: bool,
+    pub apm_handshake_timeout_secs: u64,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
@@ -107,6 +109,8 @@ impl Default for NewRelicConfig {
             add_version_detail_tags: false,
             layer_version: None,
             apm_lambda_mode: false,
+            apm_blocking_handshake: false,
+            apm_handshake_timeout_secs: 5,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
@@ -266,6 +270,15 @@ impl ExtensionConfig {
 
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
+        let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
+        config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);
+
+        config.new_relic.apm_handshake_timeout_secs = env::var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
