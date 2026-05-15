@@ -547,7 +547,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         for (request_id, report_line) in all_pending_reports {
                             debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
 
-                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                            let shutdown_arn = LAST_REQUEST_CONTEXT.lock().ok()
+                                .and_then(|g| g.clone().map(|(_, arn)| arn))
+                                .unwrap_or_default();
+                            if let Err(e) = app.send_platform_report_metrics(&report_line, &shutdown_arn).await {
                                 error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
                             } else {
                                 info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
@@ -1134,7 +1137,7 @@ pub async fn process_apm_request(
 
         let apm_app_guard = apm_app.read().await;
         if let Some(ref app) = *apm_app_guard {
-            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+            if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
                 error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
             } else {
                 info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
@@ -1792,7 +1795,7 @@ async fn process_pending_agent_payloads(
 
             let apm_app_guard = apm_app.read().await;
             if let Some(ref app) = *apm_app_guard {
-                if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
                     error!("APM mode: Failed to send platform report metrics for previous request {}: {}", request_id, e);
                 } else {
                     info!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);

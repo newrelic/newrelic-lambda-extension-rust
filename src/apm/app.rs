@@ -308,7 +308,7 @@ impl ApmApp {
     /// Convert and send platform REPORT log metrics
     ///
     /// Based on metric_api.go ParseLambdaReportLog() and ConvertToMetrics()
-    pub async fn send_platform_report_metrics(&self, log_line: &str) -> Result<()> {
+    pub async fn send_platform_report_metrics(&self, log_line: &str, function_arn: &str) -> Result<()> {
         let metrics_data = match parse_lambda_report_log(log_line) {
             Some(data) => data,
             None => {
@@ -329,7 +329,7 @@ impl ApmApp {
             .unwrap_or_else(|_| std::env::var("AWS_LAMBDA_FUNCTION_NAME")
                 .unwrap_or_else(|_| "unknown".to_string()));
 
-        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
+        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name, function_arn);
         
         debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
