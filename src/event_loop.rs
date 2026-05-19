@@ -307,12 +307,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("Error in pending payload processing: {}", e);
                 }
 
-                // Post-invoke wait: sandbox is guaranteed active here (Lambda only freezes after
-                // /next is called). If APM is still connecting, wait for the remaining deadline
-                // budget so the handshake completes before we yield the sandbox.
-                // BLOCKING_HANDSHAKE=true is kept for edge cases (very short timeouts) but the
-                // automatic wait now runs unconditionally in background-connection mode.
-                if components.apm_mode_enabled {
+                // Post-invoke wait: only when NEW_RELIC_APM_BLOCKING_HANDSHAKE=true.
+                // Sandbox is active here (Lambda freezes only after /next is called),
+                // so the wait consumes remaining deadline budget without freeze risk.
+                if components.apm_mode_enabled && components.config.new_relic.apm_blocking_handshake {
                     wait_for_apm_handshake_within_budget(
                         &components.reconnect_in_flight,
                         deadline_ms,
