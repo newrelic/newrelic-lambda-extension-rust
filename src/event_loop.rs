@@ -307,10 +307,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("Error in pending payload processing: {}", e);
                 }
 
-                // Post-invoke wait: if BLOCKING_HANDSHAKE enabled and APM is still connecting,
-                // hold /next until run_id + entity_guid are obtained. Sandbox is guaranteed active
-                // here — Lambda only freezes after /next is called.
-                if components.apm_mode_enabled && components.config.new_relic.apm_blocking_handshake {
+                // Post-invoke wait: sandbox is guaranteed active here (Lambda only freezes after
+                // /next is called). If APM is still connecting, wait for the remaining deadline
+                // budget so the handshake completes before we yield the sandbox.
+                // BLOCKING_HANDSHAKE=true is kept for edge cases (very short timeouts) but the
+                // automatic wait now runs unconditionally in background-connection mode.
+                if components.apm_mode_enabled {
                     wait_for_apm_handshake_within_budget(
                         &components.reconnect_in_flight,
                         deadline_ms,
@@ -1034,9 +1036,8 @@ pub async fn process_apm_request(
         error!("Failed to flush platform for request {}: {}", request_id, e);
     }
 
-    // Note: We do NOT wait for runtime.done here because platform.runtimeDone event
-    // arrives during the NEXT invocation in APM mode, not the current one.
-    // Agent payloads that arrive late will be caught by warm start logic.
+    // Agent payloads arrive via the named pipe independently and are already sent above.
+    // Late agent payloads will be caught by the warm-start pending-payload logic.
 
     cleanup_request_processing_state_internal(&request_id, true);
 

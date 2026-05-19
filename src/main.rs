@@ -457,7 +457,10 @@ async fn perform_one_time_initialization(
 
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
+            // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
+            // and the event loop both observe the same RwLock. Previously these were two separate
+            // Arc instances — the listener's fast-path always saw None.
+            let apm_app = Arc::clone(&*APM_APP);
 
             let license_key = config
                 .new_relic

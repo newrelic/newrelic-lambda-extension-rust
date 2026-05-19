@@ -132,9 +132,16 @@ pub fn remove_pending_report(request_id: &str) -> Option<String> {
 }
 
 /// Get the runtime-done notify for a request (used by the event loop to wait, and by the
-/// telemetry listener to signal). Returns None if the request is not registered.
+/// telemetry listener to signal). Returns None if the request is not registered yet —
+/// callers must then record the pre-fire in PREFIRED_RUNTIME_DONE.
 pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
     REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
+}
+
+/// Record that platform.runtimeDone fired before the request state existed.
+/// Called by the telemetry listener when get_runtime_done_notify returns None.
+pub fn record_prefired_runtime_done(request_id: &str) {
+    PREFIRED_RUNTIME_DONE.insert(request_id.to_string(), ());
 }
 
 /// Get the number of entries in REQUEST_DATA (used for debug logging).
@@ -187,6 +194,19 @@ pub static TELEMETRY_CURRENT_REQUEST_ID: Lazy<Arc<std::sync::Mutex<Option<String
 pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
     Lazy::new(|| Arc::new(std::sync::Mutex::new(Vec::new())));
 
+/// Request IDs for which platform.runtimeDone fired before their RequestData existed.
+///
+/// Race: on very fast functions (< 50 ms), runtimeDone can arrive at the telemetry
+/// listener while the event loop is still constructing the per-request state.
+/// get_runtime_done_notify() returns None → notify_one() is skipped → the Notify
+/// created later by create_request_processing_state() is never signalled → the
+/// wait_for_runtime_done_with_grace call sleeps until the full Lambda deadline.
+///
+/// Fix: record the pre-fired request_id here; create_request_processing_state()
+/// checks this set and calls notify_one() immediately on the fresh Notify.
+pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
+    Lazy::new(DashMap::new);
+
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
@@ -223,6 +243,19 @@ pub fn create_request_processing_state(
 
     let (payload_tx, payload_rx) = mpsc::unbounded_channel();
 
+    let runtime_done_notify = Arc::new(Notify::new());
+
+    // If platform.runtimeDone already fired for this request before we were created
+    // (fast functions where runtimeDone races the event loop setup), fire the notify
+    // now so wait_for_runtime_done_with_grace doesn't sleep until the deadline.
+    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
+        tracing::debug!(
+            "runtime.done pre-fire detected for {} — signalling notify immediately",
+            request_id
+        );
+        runtime_done_notify.notify_one();
+    }
+
     // Insert consolidated request data (replaces 5 separate DashMap inserts)
     REQUEST_DATA.insert(request_id.to_string(), RequestData {
         context: context.clone(),
@@ -230,7 +263,7 @@ pub fn create_request_processing_state(
         coordination_tx: Some(payload_tx),
         pending_report: None,
         creation_invocation: current_invocation_count(),
-        runtime_done_notify: Arc::new(Notify::new()),
+        runtime_done_notify,
     });
 
     let state = RequestProcessingState {
@@ -252,8 +285,14 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
     REQUEST_PROCESSORS.remove(request_id);
 
     if !skip_buffer_cleanup {
-        // Full cleanup: remove the entire consolidated entry
+        // Full cleanup: remove the entire consolidated entry.
+        // Also evict any pre-fired runtimeDone recorded for this request — Lambda can batch
+        // telemetry events such that runtimeDone for request N-1 arrives in the same HTTP
+        // delivery as request N's events, AFTER N's processing already ran full cleanup.
+        // Without this removal the PREFIRED_RUNTIME_DONE entry would never be consumed
+        // (create_request_processing_state for a completed request_id is never called again).
         REQUEST_DATA.remove(request_id);
+        PREFIRED_RUNTIME_DONE.remove(request_id);
     } else {
         // Partial cleanup: keep context/buffer/creation_invocation, clear coordination + pending_report
         if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
