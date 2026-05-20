@@ -134,11 +134,15 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
-                                // Wake the event loop's end-of-invocation flush waiter so it
-                                // drains logs now instead of racing late telemetry POSTs.
-                                // Notify is idempotent: signalling before a waiter arrives is fine.
+                                // Wake the event loop's end-of-invocation flush waiter.
+                                // On fast functions (< ~50 ms), runtimeDone can arrive before
+                                // the event loop has created per-request state — get_runtime_done_notify
+                                // returns None in that case. Record it in PREFIRED_RUNTIME_DONE so
+                                // create_request_processing_state() fires the notify immediately.
                                 if let Some(notify) = get_runtime_done_notify(request_id_str) {
                                     notify.notify_one();
+                                } else {
+                                    crate::request::record_prefired_runtime_done(request_id_str);
                                 }
                             }
                         }

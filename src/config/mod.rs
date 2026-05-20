@@ -31,6 +31,8 @@ pub struct NewRelicConfig {
     pub add_version_detail_tags: bool,
     pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
+    pub apm_blocking_handshake: bool,
+    pub apm_handshake_timeout_secs: u64,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
@@ -60,7 +62,7 @@ pub struct ExtensionSettings {
     /// NEW_RELIC_RUNTIME_DONE_GRACE_MS — grace period (ms) added AFTER
     /// `platform.runtimeDone` before the end-of-invocation flush, only when
     /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
-    /// 150, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
+    /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
     pub runtime_done_grace_ms: u64,
 }
 
@@ -107,6 +109,8 @@ impl Default for NewRelicConfig {
             add_version_detail_tags: false,
             layer_version: None,
             apm_lambda_mode: false,
+            apm_blocking_handshake: false,
+            apm_handshake_timeout_secs: 5,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
@@ -190,7 +194,7 @@ impl Default for ExtensionSettings {
             send_platform_logs: false,
             log_level: "info".to_string(),
             extension_logs_enabled: true,
-            runtime_done_grace_ms: 150,
+            runtime_done_grace_ms: 25,
         }
     }
 }
@@ -267,6 +271,15 @@ impl ExtensionConfig {
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
+        let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
+        config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);
+
+        config.new_relic.apm_handshake_timeout_secs = env::var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
+
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
             .filter(|s| !s.is_empty());
@@ -308,12 +321,11 @@ impl ExtensionConfig {
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
 
         // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
-        // Default 150 ms covers the Telemetry API buffering window (25 ms) plus a
-        // generous margin without meaningfully regressing short-invocation billing.
+        // Default 25 ms — matches the Telemetry API buffer flush window.
         config.extension.runtime_done_grace_ms = env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(150)
+            .unwrap_or(25)
             .min(2000);
 
         config

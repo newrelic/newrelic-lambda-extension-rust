@@ -322,9 +322,9 @@ impl LogProcessor {
     /// No-op when another auto-flush is already in flight (`is_auto_flushing`
     /// mutex). Returns with the batch untouched when no ARN is available.
     fn try_spawn_auto_flush(&self) {
-        /// Auto-flush threshold: 10 logs for faster delivery on high-volume bursts.
-        /// End-of-invocation flush (gated on platform.runtimeDone) ensures the tail is sent.
-        const FLUSH_THRESHOLD: usize = 10;
+        /// Auto-flush threshold: 25 logs reduces NR API calls on medium-volume functions
+        /// without accumulating more than ~25 entries. End-of-invocation flush ensures the tail is sent.
+        const FLUSH_THRESHOLD: usize = 25;
 
         let logs_to_send = {
             let mut batch = self.log_batch.lock().unwrap();

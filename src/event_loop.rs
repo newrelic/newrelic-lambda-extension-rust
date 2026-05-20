@@ -1,6 +1,7 @@
 
 
 use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 use std::time::Duration;
 use reqwest::Client;
 use tracing::{debug, error, info, trace, warn};
@@ -42,6 +43,8 @@ pub struct ExtensionComponents {
     pub global_log_processor: Arc<LogProcessor>,
     pub apm_app: crate::apm::SharedApmApp,
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
+    pub apm_client: Client,
+    pub reconnect_in_flight: Arc<watch::Sender<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +137,64 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             } => {
                 let event_start = std::time::Instant::now();
 
+                // If APM handshake hasn't completed yet, spawn a fresh reconnect attempt.
+                // The spawn is non-blocking — the invoke proceeds immediately. If
+                // NEW_RELIC_APM_BLOCKING_HANDSHAKE=true the post-invoke wait may still capture
+                // this invoke's data; otherwise APM data arrives on a later invoke.
+                // watch::Sender guard prevents multiple concurrent reconnects.
+                if components.apm_mode_enabled && components.apm_app.read().await.is_none() {
+                    if *components.reconnect_in_flight.borrow() {
+                        debug!("APM handshake already in progress — skipping duplicate spawn (BLOCKING_HANDSHAKE will wait if enabled)");
+                    } else {
+                        components.reconnect_in_flight.send_replace(true);
+                        let apm_app = components.apm_app.clone();
+                        let reconnect_flag = components.reconnect_in_flight.clone();
+                        let license_key = components.config.new_relic.license_key
+                            .clone()
+                            .unwrap_or_default();
+                        let apm_host = components.config.new_relic.apm_host.clone();
+                        let metric_endpoint = components.config.new_relic.metric_endpoint.clone();
+                        let apm_client = components.apm_client.clone();
+                        let function_name = components.config.aws.function_name.clone();
+                        let function_version = components.config.aws.function_version
+                            .clone()
+                            .unwrap_or_else(|| "$LATEST".to_string());
+                        let account_id = components.config.aws.account_id.clone();
+                        let region = components.config.aws.region.clone();
+                        let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
+
+                        tokio::spawn(async move {
+                            debug!("APM reconnect attempt started (no delays — fresh invoke)");
+                            match crate::apm::ApmApp::new(
+                                license_key,
+                                apm_host,
+                                metric_endpoint,
+                                apm_client,
+                                function_name,
+                                function_version,
+                                account_id,
+                                region,
+                                timeout_secs,
+                            )
+                            .await
+                            {
+                                Ok(app) => {
+                                    info!(
+                                        "APM reconnect succeeded - Entity GUID: {}",
+                                        app.get_entity_guid()
+                                    );
+                                    let mut w = apm_app.write().await;
+                                    *w = Some(app);
+                                }
+                                Err(e) => {
+                                    warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
+                                }
+                            }
+                            reconnect_flag.send_replace(false);
+                        });
+                    }
+                }
+
                 if is_cold_start {
                     let mut updated_config = (*components.config).clone();
                     updated_config.aws.extract_and_update_account_id_from_arn(&invoked_function_arn);
@@ -202,7 +263,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
-                let pending_task = Some(tokio::spawn({
+                let pending_task = tokio::spawn({
                     let config = components.config.clone();
                     let global_log_processor = components.global_log_processor.clone();
                     let apm_app = components.apm_app.clone();
@@ -217,7 +278,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         )
                         .await;
                     }
-                }));
+                });
 
                 let request_id_clone = request_id.clone();
                 let invoked_function_arn_clone = invoked_function_arn.clone();
@@ -238,12 +299,23 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                let (current_result, pending_result) = tokio::join!(current_task, pending_task.unwrap());
+                let (current_result, pending_result) = tokio::join!(current_task, pending_task);
                 if let Err(e) = current_result {
                     error!("Error in APM request processing: {}", e);
                 }
                 if let Err(e) = pending_result {
                     error!("Error in pending payload processing: {}", e);
+                }
+
+                // Post-invoke wait: only when NEW_RELIC_APM_BLOCKING_HANDSHAKE=true.
+                // Sandbox is active here (Lambda freezes only after /next is called),
+                // so the wait consumes remaining deadline budget without freeze risk.
+                if components.apm_mode_enabled && components.config.new_relic.apm_blocking_handshake {
+                    wait_for_apm_handshake_within_budget(
+                        &components.reconnect_in_flight,
+                        deadline_ms,
+                    )
+                    .await;
                 }
 
                 let event_time = event_start.elapsed();
@@ -283,56 +355,40 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
                     let apm_app_guard = components.apm_app.read().await;
                     if let Some(ref app) = *apm_app_guard {
-                        match shutdown_reason {
-                            runtime::ShutdownReason::Timeout => {
-                                // Lambda timeout - send timeout error event to APM collector
-                                info!("Shutdown due to timeout - sending error event to APM for request: {}", last_request_id);
-                                if let Err(e) = app.send_shutdown_error_event(
-                                    "LambdaTimeout",
-                                    "Task timed out",
-                                    &last_request_id,
-                                    &last_arn,
-                                )
-                                .await
-                                {
-                                    error!("Failed to send timeout error event to APM: {}", e);
-                                }
+                        send_error_for_shutdown_reason(app, shutdown_reason, &last_request_id, &last_arn).await;
+                    } else {
+                        // Drop the read lock before calling write().await on the same RwLock —
+                        // holding a read guard while awaiting a write lock on the same lock deadlocks.
+                        drop(apm_app_guard);
+
+                        // One last synchronous attempt during shutdown — sandbox is still active
+                        // for the duration of the SHUTDOWN handler so no freeze risk.
+                        debug!("APM not connected at shutdown — attempting final sync reconnect");
+                        let shutdown_app = crate::apm::ApmApp::new(
+                            components.config.new_relic.license_key.clone().unwrap_or_default(),
+                            components.config.new_relic.apm_host.clone(),
+                            components.config.new_relic.metric_endpoint.clone(),
+                            components.apm_client.clone(),
+                            components.config.aws.function_name.clone(),
+                            components.config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
+                            components.config.aws.account_id.clone(),
+                            components.config.aws.region.clone(),
+                            // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
+                            components.config.new_relic.apm_handshake_timeout_secs.min(2),
+                        )
+                        .await;
+
+                        match shutdown_app {
+                            Ok(app) => {
+                                info!("APM reconnect succeeded during shutdown - Entity GUID: {}", app.get_entity_guid());
+                                send_error_for_shutdown_reason(&app, shutdown_reason, &last_request_id, &last_arn).await;
+                                let mut w = components.apm_app.write().await;
+                                *w = Some(app);
                             }
-                            runtime::ShutdownReason::Failure => {
-                                // Lambda failure/fault - send platform fault error event to APM collector
-                                info!("Shutdown due to failure - sending error event to APM for request: {}", last_request_id);
-                                if let Err(e) = app.send_shutdown_error_event(
-                                    "LambdaPlatformFault",
-                                    "AWS Lambda platform fault caused a shutdown",
-                                    &last_request_id,
-                                    &last_arn,
-                                )
-                                .await
-                                {
-                                    error!("Failed to send platform fault error event to APM: {}", e);
-                                }
-                            }
-                            runtime::ShutdownReason::Spindown => {
-                                // Normal shutdown - no error needed
-                                debug!("Normal spindown shutdown - no error event needed");
-                            }
-                            runtime::ShutdownReason::Unknown => {
-                                // Unknown/unexpected shutdown reason - send generic error event
-                                warn!("Unknown shutdown reason - sending error event to APM for request: {}", last_request_id);
-                                if let Err(e) = app.send_shutdown_error_event(
-                                    "LambdaShutdown",
-                                    "Lambda shutdown with unknown reason",
-                                    &last_request_id,
-                                    &last_arn,
-                                )
-                                .await
-                                {
-                                    error!("Failed to send shutdown error event to APM: {}", e);
-                                }
+                            Err(e) => {
+                                warn!("APM not connected at shutdown and final reconnect failed: {} - cannot send shutdown error event", e);
                             }
                         }
-                    } else {
-                        warn!("APM app not initialized - cannot send shutdown error event");
                     }
                 }
 
@@ -978,9 +1034,8 @@ pub async fn process_apm_request(
         error!("Failed to flush platform for request {}: {}", request_id, e);
     }
 
-    // Note: We do NOT wait for runtime.done here because platform.runtimeDone event
-    // arrives during the NEXT invocation in APM mode, not the current one.
-    // Agent payloads that arrive late will be caught by warm start logic.
+    // Agent payloads arrive via the named pipe independently and are already sent above.
+    // Late agent payloads will be caught by the warm-start pending-payload logic.
 
     cleanup_request_processing_state_internal(&request_id, true);
 
@@ -1033,7 +1088,7 @@ async fn send_to_apm_collector(
 /// - Upper bound on the runtime.done wait = function's own deadline (`deadlineMs`
 ///   from the INVOKE event), clamped to Lambda's 15 min ceiling. Never outlives
 ///   the function. Falls back to 5 s if `deadline_ms` is missing/stale.
-/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 150 ms,
+/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 25 ms,
 ///   clamp `[0, 2000]`). Skipped entirely when `log_processor.is_drained()` is true.
 ///
 /// Notify is pre-armable: if `runtime.done` fired before we reach this point,
@@ -1097,6 +1152,72 @@ async fn wait_for_runtime_done_with_grace(
             remaining_ms, request_id
         );
     }
+}
+
+/// Sends the appropriate APM error event for a given shutdown reason.
+/// Called from the SHUTDOWN handler whether APM was already connected or just reconnected.
+async fn send_error_for_shutdown_reason(
+    app: &crate::apm::ApmApp,
+    reason: runtime::ShutdownReason,
+    request_id: &str,
+    arn: &str,
+) {
+    match reason {
+        runtime::ShutdownReason::Timeout => {
+            info!("Shutdown due to timeout - sending error event to APM for request: {}", request_id);
+            if let Err(e) = app.send_shutdown_error_event("LambdaTimeout", "Task timed out", request_id, arn).await {
+                error!("Failed to send timeout error event to APM: {}", e);
+            }
+        }
+        runtime::ShutdownReason::Failure => {
+            info!("Shutdown due to failure - sending error event to APM for request: {}", request_id);
+            if let Err(e) = app.send_shutdown_error_event("LambdaPlatformFault", "AWS Lambda platform fault caused a shutdown", request_id, arn).await {
+                error!("Failed to send platform fault error event to APM: {}", e);
+            }
+        }
+        runtime::ShutdownReason::Spindown => {
+            debug!("Normal spindown shutdown - no error event needed");
+        }
+        runtime::ShutdownReason::Unknown => {
+            warn!("Unknown shutdown reason - sending error event to APM for request: {}", request_id);
+            if let Err(e) = app.send_shutdown_error_event("LambdaShutdown", "Lambda shutdown with unknown reason", request_id, arn).await {
+                error!("Failed to send shutdown error event to APM: {}", e);
+            }
+        }
+    }
+}
+
+/// After `platform.runtimeDone`, use remaining deadline budget to let an in-flight
+/// APM handshake complete before calling /next. Sandbox stays active while the
+/// extension has not yet called /next — no freeze risk. Bounded by deadline_ms.
+async fn wait_for_apm_handshake_within_budget(
+    reconnect_sender: &watch::Sender<bool>,
+    deadline_ms: i64,
+) {
+    if !*reconnect_sender.borrow() {
+        return;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    const SAFETY_MARGIN_MS: u64 = 500;
+    let budget_ms = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).saturating_sub(SAFETY_MARGIN_MS)
+    } else {
+        0
+    };
+    if budget_ms == 0 {
+        debug!("APM handshake in-flight but no deadline budget remaining — skipping wait");
+        return;
+    }
+    debug!(
+        "APM handshake in-flight after runtimeDone — waiting up to {}ms within invoke deadline",
+        budget_ms
+    );
+    let mut rx = reconnect_sender.subscribe();
+    let _ = tokio::time::timeout(
+        Duration::from_millis(budget_ms),
+        rx.wait_for(|in_flight| !in_flight),
+    )
+    .await;
 }
 
 pub async fn process_request_concurrently(
@@ -1663,6 +1784,185 @@ pub fn cleanup_old_failed_payloads() {
                 failed_payloads.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deadline_ms_from_now(millis: i64) -> i64 {
+        chrono::Utc::now().timestamp_millis() + millis
+    }
+
+    // Not in-flight (flag = false) → returns immediately without waiting.
+    #[tokio::test]
+    async fn test_handshake_wait_returns_immediately_when_not_in_flight() {
+        let (tx, _rx) = watch::channel(false);
+        let tx = Arc::new(tx);
+        let t0 = std::time::Instant::now();
+        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(10_000)).await;
+        assert!(
+            t0.elapsed().as_millis() < 100,
+            "Should return immediately when flag is false, took {}ms",
+            t0.elapsed().as_millis()
+        );
+    }
+
+    // Deadline already past → budget = 0 → returns immediately even if flag is true.
+    #[tokio::test]
+    async fn test_handshake_wait_skips_when_deadline_already_expired() {
+        let (tx, _rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        let past = deadline_ms_from_now(-1_000);
+        let t0 = std::time::Instant::now();
+        wait_for_apm_handshake_within_budget(&tx, past).await;
+        assert!(
+            t0.elapsed().as_millis() < 100,
+            "Should return immediately on expired deadline, took {}ms",
+            t0.elapsed().as_millis()
+        );
+    }
+
+    // Handshake completes within budget → returns promptly after the flag clears.
+    #[tokio::test]
+    async fn test_handshake_wait_wakes_when_handshake_completes() {
+        let (tx, _rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = tx_clone.send(false);
+        });
+        let t0 = std::time::Instant::now();
+        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(5_000)).await;
+        let elapsed = t0.elapsed().as_millis();
+        assert!(elapsed >= 100, "Should have waited for handshake signal (got {}ms)", elapsed);
+        assert!(elapsed < 500, "Should have woken up promptly after signal (got {}ms)", elapsed);
+    }
+
+    // Budget expires before handshake finishes → returns after budget, not stuck forever.
+    #[tokio::test]
+    async fn test_handshake_wait_times_out_when_budget_expires() {
+        let (tx, _rx) = watch::channel(true); // never completes
+        let tx = Arc::new(tx);
+        // budget = 800ms - 500ms safety = 300ms
+        let t0 = std::time::Instant::now();
+        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(800)).await;
+        let elapsed = t0.elapsed().as_millis();
+        assert!(elapsed >= 200, "Should have waited for budget (got {}ms)", elapsed);
+        assert!(elapsed < 700, "Should not wait beyond budget (got {}ms)", elapsed);
+    }
+
+    // ── Reconnect guard condition tests ──────────────────────────────────────────
+
+    // Guard condition: !*borrow() is false when flag is true → spawn is skipped.
+    #[test]
+    fn test_reconnect_guard_skips_when_in_flight() {
+        let (tx, _rx) = watch::channel(true); // INIT handshake in progress
+        let would_spawn = !*tx.borrow();
+        assert!(!would_spawn, "Guard must not fire when reconnect is already in-flight");
+    }
+
+    // Guard condition: !*borrow() is true when flag is false → spawn is allowed.
+    #[test]
+    fn test_reconnect_guard_fires_when_not_in_flight() {
+        let (tx, _rx) = watch::channel(false); // no handshake running
+        let would_spawn = !*tx.borrow();
+        assert!(would_spawn, "Guard must fire when no reconnect is in-flight");
+    }
+
+    // Flag lifecycle: send(true) before spawn, send(false) after — models the INIT path.
+    // Verifies the first-invoke guard correctly sees the flag throughout the lifecycle.
+    #[test]
+    fn test_init_flag_lifecycle_prevents_duplicate_spawn() {
+        let (tx, _rx) = watch::channel(false);
+
+        // Before INIT spawn: guard would fire (APM not connected, no reconnect running)
+        assert!(!*tx.borrow() == true, "Guard should fire before INIT starts");
+
+        // INIT sets flag true before spawning
+        let _ = tx.send(true);
+        // First invoke arrives: guard must NOT fire (INIT already in progress)
+        assert!(!*tx.borrow() == false, "Guard must not fire while INIT spawn is running");
+
+        // INIT task completes (success or failure) and clears the flag
+        let _ = tx.send(false);
+        // Next invoke: guard can now fire again if APM still not connected
+        assert!(!*tx.borrow() == true, "Guard should be able to fire after INIT completes");
+    }
+
+    // ── send_error_for_shutdown_reason tests ─────────────────────────────────────
+
+    fn make_test_apm_app() -> crate::apm::ApmApp {
+        crate::apm::ApmApp {
+            run_id: "test-run-id".to_string(),
+            entity_guid: "test-entity-guid".to_string(),
+            // port 1 → connection refused immediately, no 20s wait
+            collector_host: "127.0.0.1:1".to_string(),
+            license_key: "test-license-key".to_string(),
+            metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
+            client: reqwest::Client::new(),
+        }
+    }
+
+    // Spindown → no network call, returns instantly.
+    #[tokio::test]
+    async fn test_send_error_spindown_no_network_call() {
+        let app = make_test_apm_app();
+        let t0 = std::time::Instant::now();
+        send_error_for_shutdown_reason(
+            &app,
+            crate::runtime::ShutdownReason::Spindown,
+            "req-123",
+            "arn:aws:lambda:us-east-1:123:function:test",
+        )
+        .await;
+        assert!(
+            t0.elapsed().as_millis() < 100,
+            "Spindown should not make any network call (took {}ms)",
+            t0.elapsed().as_millis()
+        );
+    }
+
+    // Timeout → attempts network, error is swallowed (returns () not Result).
+    #[tokio::test]
+    async fn test_send_error_timeout_swallows_network_error() {
+        let app = make_test_apm_app();
+        // Should complete without panic even though the HTTP call fails
+        send_error_for_shutdown_reason(
+            &app,
+            crate::runtime::ShutdownReason::Timeout,
+            "req-456",
+            "arn:aws:lambda:us-east-1:123:function:test",
+        )
+        .await;
+    }
+
+    // Failure → attempts network, error is swallowed.
+    #[tokio::test]
+    async fn test_send_error_failure_swallows_network_error() {
+        let app = make_test_apm_app();
+        send_error_for_shutdown_reason(
+            &app,
+            crate::runtime::ShutdownReason::Failure,
+            "req-789",
+            "arn:aws:lambda:us-east-1:123:function:test",
+        )
+        .await;
+    }
+
+    // Unknown → attempts network, error is swallowed.
+    #[tokio::test]
+    async fn test_send_error_unknown_swallows_network_error() {
+        let app = make_test_apm_app();
+        send_error_for_shutdown_reason(
+            &app,
+            crate::runtime::ShutdownReason::Unknown,
+            "req-000",
+            "arn:aws:lambda:us-east-1:123:function:test",
+        )
+        .await;
     }
 }
 

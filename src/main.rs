@@ -312,6 +312,8 @@ async fn perform_one_time_initialization(
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
             apm_mode_enabled: false,
+            apm_client: Client::new(),
+            reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
         });
     }
 
@@ -442,68 +444,92 @@ async fn perform_one_time_initialization(
     cleanup_old_failed_payloads();
 
 
-    // Smart conditional parallelization: only use tokio::join! when APM enabled
-    // This avoids async overhead for standard mode (most common case)
+    // Build APM client once — stored in ExtensionComponents for reconnects on every invoke
+    let apm_client = newrelic::client::build_outbound_client(
+        config.new_relic.proxy_url.as_deref(),
+    );
+    if config.new_relic.proxy_url.is_some() {
+        info!("Proxy configured for APM client");
+    }
+
+    // Declared before the APM if-else so the INIT spawn and ExtensionComponents share the same channel.
+    let reconnect_in_flight = Arc::new(tokio::sync::watch::channel(false).0);
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            debug!("APM Lambda mode enabled - non-blocking connection strategy");
+            // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
+            // and the event loop both observe the same RwLock. Previously these were two separate
+            // Arc instances — the listener's fast-path always saw None.
+            let apm_app = Arc::clone(&*APM_APP);
 
-            // Spawn APM connection as background task - event loop starts immediately
-            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
-            
             let license_key = config
                 .new_relic
                 .license_key
                 .clone()
                 .expect("License key must be available for APM mode");
 
-            tokio::spawn({
-                let license_key_clone = license_key.clone();
-                let apm_host = config.new_relic.apm_host.clone();
-                let metric_endpoint = config.new_relic.metric_endpoint.clone();
-                let apm_client = newrelic::client::build_outbound_client(
-                    config.new_relic.proxy_url.as_deref(),
-                );
-                if config.new_relic.proxy_url.is_some() {
-                    info!("Proxy configured for APM client");
-                }
-                let function_name = config.aws.function_name.clone();
-                let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
-                let account_id = config.aws.account_id.clone();
-                let region = config.aws.region.clone();
-                let apm_app_clone = Arc::clone(&apm_app);
+            let handshake_timeout = config.new_relic.apm_handshake_timeout_secs;
 
-                async move {
-                    debug!("Background APM connection started...");
-                    match apm::ApmApp::new(
-                        license_key_clone,
-                        apm_host,
-                        metric_endpoint,
-                        apm_client,
-                        function_name,
-                        function_version,
-                        account_id,
-                        region,
-                    )
-                    .await
-                    {
-                        Ok(app) => {
-                            info!(
-                                "APM app initialized successfully - Entity GUID: {}",
-                                app.get_entity_guid()
-                            );
-                            let mut global_apm = apm_app_clone.write().await;
-                            *global_apm = Some(app);
-                            info!("APM connection complete - ready for agent payloads");
-                        }
-                        Err(e) => {
-                            error!("CRITICAL: Failed to initialize APM app: {}", e);
-                            error!("APM mode was explicitly enabled but connection failed");
-                            error!("Extension will enter NO-OP mode - no telemetry will be processed");
-                            warn!("Lambda function will continue but without New Relic monitoring");
-                        }
+            let apm_host = config.new_relic.apm_host.clone();
+            let metric_endpoint = config.new_relic.metric_endpoint.clone();
+            let function_name = config.aws.function_name.clone();
+            let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
+            let account_id = config.aws.account_id.clone();
+            let region = config.aws.region.clone();
+
+            // Background path: handshake starts immediately during INIT, runs in parallel with
+            // the first function invocation. If NEW_RELIC_APM_BLOCKING_HANDSHAKE=true, the
+            // event loop will delay calling /next after runtimeDone until run_id + entity_guid
+            // are obtained — sandbox stays warm throughout, no freeze risk.
+            if config.new_relic.apm_blocking_handshake {
+                debug!(
+                    "APM Lambda mode enabled - BLOCKING_HANDSHAKE active: will wait after runtimeDone for handshake to complete (timeout: {}s)",
+                    handshake_timeout
+                );
+            } else {
+                debug!("APM Lambda mode enabled - background connection strategy (timeout: {}s)", handshake_timeout);
+            }
+
+            // Set the flag BEFORE spawning so the first-invoke reconnect guard in the event loop
+            // sees it and does not launch a duplicate concurrent handshake.
+            // send_replace() always writes the value regardless of receiver count.
+            // send() silently fails (returns Err) when no receivers exist, so borrow() would
+            // still return false and the guard would fire a duplicate spawn.
+            reconnect_in_flight.send_replace(true);
+            let flag_clone = reconnect_in_flight.clone();
+            let apm_app_clone = Arc::clone(&apm_app);
+            let apm_client_clone = apm_client.clone();
+            tokio::spawn(async move {
+                debug!("Background APM connection started...");
+                match apm::ApmApp::new(
+                    license_key,
+                    apm_host,
+                    metric_endpoint,
+                    apm_client_clone,
+                    function_name,
+                    function_version,
+                    account_id,
+                    region,
+                    handshake_timeout,
+                )
+                .await
+                {
+                    Ok(app) => {
+                        info!(
+                            "APM app initialized successfully - Entity GUID: {}",
+                            app.get_entity_guid()
+                        );
+                        let mut global_apm = apm_app_clone.write().await;
+                        *global_apm = Some(app);
+                        info!("APM connection complete - ready for agent payloads");
+                    }
+                    Err(e) => {
+                        warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
                     }
                 }
+                // Clear the flag whether the handshake succeeded or failed — the event loop
+                // reconnect guard will retry on the next invoke if needed.
+                flag_clone.send_replace(false);
             });
 
             let processor_factory = Arc::new(ProcessorFactory::new(
@@ -579,6 +605,8 @@ async fn perform_one_time_initialization(
         global_log_processor: temp_log_processor,
         apm_app,
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
+        apm_client,
+        reconnect_in_flight,
     })
 }
 
@@ -624,6 +652,8 @@ async fn handle_no_license_key(
         global_log_processor: noop_log_processor,
         apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         apm_mode_enabled: false,
+        apm_client: Client::new(),
+        reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
     })
 }
 

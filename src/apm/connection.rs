@@ -11,9 +11,6 @@ use tracing::{debug, error, info};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
-/// Connection timeouts - MORE AGGRESSIVE than Go for Lambda cold start
-const PRECONNECT_TIMEOUT_SECS: u64 = 20;
-const CONNECT_TIMEOUT_SECS: u64 = 20;
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
 fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
@@ -100,6 +97,7 @@ pub async fn preconnect(
     client: &Client,
     license_key: &str,
     base_host: &str,
+    timeout_secs: u64,
 ) -> Result<String> {
     let url = format!(
         "https://{base_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=preconnect&license_key={license_key}"
@@ -115,9 +113,8 @@ pub async fn preconnect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("PreConnect request to collector (timeout: {}s)", PRECONNECT_TIMEOUT_SECS);
+    debug!("PreConnect request to collector (timeout: {}s)", timeout_secs);
 
-    // OPTIMIZATION: 30s timeout for Lambda cold start (network can be slow)
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -125,12 +122,12 @@ pub async fn preconnect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(Duration::from_secs(PRECONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                error!("PreConnect TIMEOUT after {}s - Lambda cold start network may be slow", PRECONNECT_TIMEOUT_SECS);
+                error!("PreConnect TIMEOUT after {}s - sandbox may have been frozen during handshake", timeout_secs);
             } else if e.is_connect() {
                 error!("PreConnect CONNECTION ERROR - Cannot reach collector at {}", base_host);
             } else if e.is_request() {
@@ -168,6 +165,7 @@ pub async fn connect(
     _function_version: &str,
     runtime: &str,
     agent_version: &str,
+    timeout_secs: u64,
 ) -> Result<ConnectResponse> {
     let url = format!(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
@@ -199,9 +197,8 @@ pub async fn connect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("Connect request to collector (timeout: {}s)", CONNECT_TIMEOUT_SECS);
+    debug!("Connect request to collector (timeout: {}s)", timeout_secs);
 
-    // OPTIMIZATION: 30s timeout for Lambda cold start
     let response = client
         .post(&url)
         .header("Content-Type", "application/octet-stream")
@@ -209,12 +206,12 @@ pub async fn connect(
         .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
-        .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
         .map_err(|e| {
             if e.is_timeout() {
-                error!("Connect TIMEOUT after {}s", CONNECT_TIMEOUT_SECS);
+                error!("Connect TIMEOUT after {}s", timeout_secs);
             } else if e.is_connect() {
                 error!("Connect CONNECTION ERROR - Cannot reach collector at {}", collector_host);
             } else {
