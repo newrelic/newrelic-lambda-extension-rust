@@ -1088,7 +1088,7 @@ async fn send_to_apm_collector(
 /// - Upper bound on the runtime.done wait = function's own deadline (`deadlineMs`
 ///   from the INVOKE event), clamped to Lambda's 15 min ceiling. Never outlives
 ///   the function. Falls back to 5 s if `deadline_ms` is missing/stale.
-/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 150 ms,
+/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 25 ms,
 ///   clamp `[0, 2000]`). Skipped entirely when `log_processor.is_drained()` is true.
 ///
 /// Notify is pre-armable: if `runtime.done` fired before we reach this point,
