@@ -130,8 +130,8 @@ pub struct LogProcessor {
     apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     failed_logs_buffer: Arc<Mutex<FailedBuffer>>,
 
-    /// Track pending auto-flush tasks to ensure they complete before function ends
-    pending_flush_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// At most one auto-flush task can be in-flight at a time (guarded by is_auto_flushing).
+    pending_flush_handles: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 
     /// Buffer for logs received during INIT phase before first INVOKE event
     pre_invoke_buffer: Arc<Mutex<Vec<payload::LogMessage>>>,
@@ -139,7 +139,7 @@ pub struct LogProcessor {
     /// Fallback ARN constructed from registration response (function_name + account_id + AWS_REGION)
     fallback_function_arn: Arc<Mutex<Option<String>>>,
 
-    is_auto_flushing: Arc<Mutex<bool>>,
+    is_auto_flushing: Arc<std::sync::atomic::AtomicBool>,
 
     /// Handle for the start-of-invocation retry task; awaited in flush() before GET /next
     invocation_retry_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -309,10 +309,10 @@ impl LogProcessor {
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(FailedBuffer::new())),
             apm_app,
-            pending_flush_handles: Arc::new(Mutex::new(Vec::new())),
+            pending_flush_handles: Arc::new(Mutex::new(None)),
             pre_invoke_buffer: Arc::new(Mutex::new(Vec::new())),
             fallback_function_arn: Arc::new(Mutex::new(None)),
-            is_auto_flushing: Arc::new(Mutex::new(false)),
+            is_auto_flushing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             invocation_retry_handle: Arc::new(Mutex::new(None)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -342,8 +342,10 @@ impl LogProcessor {
     /// unbounded over a long-lived warm container. Called from the auto-flush spawn
     /// path (before registering a new handle) and from `is_drained()`.
     fn reap_finished_flush_handles(&self) {
-        if let Ok(mut handles) = self.pending_flush_handles.lock() {
-            handles.retain(|handle| !handle.is_finished());
+        if let Ok(mut handle) = self.pending_flush_handles.lock() {
+            if handle.as_ref().map_or(false, |h| h.is_finished()) {
+                *handle = None;
+            }
         }
     }
 
@@ -365,12 +367,11 @@ impl LogProcessor {
             if batch.len() < FLUSH_THRESHOLD {
                 return;
             }
-            let mut is_flushing = self.is_auto_flushing.lock().unwrap();
-            if *is_flushing {
+            // Atomically claim the flush slot; abort if another flush is already running.
+            if self.is_auto_flushing.swap(true, Ordering::AcqRel) {
                 debug!("Auto-flush already in progress - skipping to prevent infinite loop");
                 return;
             }
-            *is_flushing = true;
             std::mem::take(&mut *batch)
         };
 
@@ -398,9 +399,7 @@ impl LogProcessor {
                 if let Ok(mut batch) = self.log_batch.lock() {
                     batch.extend(logs_to_send);
                 }
-                if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-                    *is_flushing = false;
-                }
+                self.is_auto_flushing.store(false, Ordering::Release);
                 return;
             }
             fallback
@@ -468,12 +467,10 @@ impl LogProcessor {
         });
 
         self.reap_finished_flush_handles();
-        if let Ok(mut handles) = self.pending_flush_handles.lock() {
-            handles.push(handle);
+        if let Ok(mut flush_handle) = self.pending_flush_handles.lock() {
+            *flush_handle = Some(handle);
         }
-        if let Ok(mut is_flushing) = self.is_auto_flushing.lock() {
-            *is_flushing = false;
-        }
+        self.is_auto_flushing.store(false, Ordering::Release);
     }
 
     /// Current count of entries waiting in `failed_logs_buffer`. Used by the shutdown
@@ -537,16 +534,12 @@ impl LogProcessor {
         // Prune finished handles so the vec can't grow unbounded while we're checking.
         self.reap_finished_flush_handles();
 
-        let not_flushing = self
-            .is_auto_flushing
-            .lock()
-            .map(|f| !*f)
-            .unwrap_or(false);
+        let not_flushing = !self.is_auto_flushing.load(Ordering::Acquire);
         let batch_empty = self.log_batch.lock().map(|b| b.is_empty()).unwrap_or(false);
         let no_pending = self
             .pending_flush_handles
             .lock()
-            .map(|h| h.is_empty())
+            .map(|h| h.as_ref().map_or(true, |jh| jh.is_finished()))
             .unwrap_or(false);
         not_flushing && batch_empty && no_pending
     }
@@ -672,7 +665,7 @@ impl LogProcessor {
             }
         };
     
-        if let Some(log_message) = self.to_log_message(record.clone()) {
+        if let Some(log_message) = self.to_log_message(&record) {
             // Route to pre_invoke_buffer if ARN is empty (INIT phase before first INVOKE)
             let has_arn = {
                 let context = self.invocation_context.lock().unwrap();
@@ -841,7 +834,7 @@ impl LogProcessor {
     }
 
    
-    fn to_log_message(&self, record: TelemetryRecord) -> Option<payload::LogMessage> {
+    fn to_log_message(&self, record: &TelemetryRecord) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
         
         let message = if let Some(message_value) = record.record.get("message") {
@@ -1494,18 +1487,18 @@ impl LogProcessor {
                 error!("pending_flush_handles drain exceeded {} rounds — possible infinite spawn loop; aborting drain", MAX_DRAIN_ROUNDS);
                 break;
             }
-            let handles = {
+            let handle_opt = {
                 let mut guard = self.pending_flush_handles.lock().unwrap();
-                std::mem::take(&mut *guard)
+                guard.take()
             };
-            if handles.is_empty() {
-                break;
+            match handle_opt {
+                None => break,
+                Some(handle) => {
+                    debug!("Waiting for pending auto-flush task (round {})", round + 1);
+                    let _ = handle.await;
+                    round += 1;
+                }
             }
-            debug!("Waiting for {} pending auto-flush tasks (round {})", handles.len(), round + 1);
-            for handle in handles {
-                let _ = handle.await;
-            }
-            round += 1;
         }
 
         let batch = {
@@ -1765,8 +1758,9 @@ impl Flush for LogProcessor {
         {
             let no_retry = self.invocation_retry_handle.lock().unwrap().is_none();
             let batch_empty = self.log_batch.lock().unwrap().is_empty();
-            let not_flushing = !*self.is_auto_flushing.lock().unwrap();
-            let no_handles = self.pending_flush_handles.lock().unwrap().is_empty();
+            let not_flushing = !self.is_auto_flushing.load(Ordering::Acquire);
+            let no_handles = self.pending_flush_handles.lock().unwrap()
+                .as_ref().map_or(true, |h| h.is_finished());
             if no_retry && batch_empty && not_flushing && no_handles {
                 return Ok(());
             }

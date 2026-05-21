@@ -414,7 +414,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                 }
             }
         } else {
-            warn!("No buffer found for request: {} - payload lost!", request_id);
+            error!("No buffer found for request: {} - payload lost!", request_id);
         }
     } else {
         // No active request - try to route to any existing buffer (late payload scenario)

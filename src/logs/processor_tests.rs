@@ -1007,15 +1007,16 @@ mod tests {
         //   - batch: empty (after mem::take)
         //   - pending_flush_handles: still empty (handle not registered yet)
         //   - is_auto_flushing: true (set before mem::take, cleared after push)
+        use std::sync::atomic::Ordering;
         assert!(p.log_batch.lock().unwrap().is_empty());
-        assert!(p.pending_flush_handles.lock().unwrap().is_empty());
-        *p.is_auto_flushing.lock().unwrap() = true;
+        assert!(p.pending_flush_handles.lock().unwrap().is_none());
+        p.is_auto_flushing.store(true, Ordering::Relaxed);
 
         assert!(!p.is_drained(),
             "is_drained() must be false while is_auto_flushing==true, even if batch is empty and no handles are tracked");
 
         // After the flag clears, we're genuinely drained.
-        *p.is_auto_flushing.lock().unwrap() = false;
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
         assert!(p.is_drained(),
             "is_drained() must be true when not flushing, batch empty, no handles tracked");
     }
@@ -1172,47 +1173,49 @@ mod tests {
 
     // C2 regression — finished JoinHandles must be reaped so the vec doesn't leak
     // across a long-lived warm container. After yielding, any completed-task handles
-    // should be gone when is_drained() runs.
+    // should be None when is_drained() runs.
     #[tokio::test]
     async fn test_pending_flush_handles_reaped_when_finished() {
+        use std::sync::atomic::Ordering;
         let p = create_test_processor();
-        // Push a mix of handles: 50 that complete immediately, 1 that never does.
-        for _ in 0..50 {
-            let h = tokio::spawn(async {});
-            p.pending_flush_handles.lock().unwrap().push(h);
-        }
-        let slow = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        });
-        p.pending_flush_handles.lock().unwrap().push(slow);
+        // Set a fast handle that completes immediately.
+        let fast = tokio::spawn(async {});
+        *p.pending_flush_handles.lock().unwrap() = Some(fast);
 
-        // Let the 50 fast tasks complete.
+        // Let the fast task complete.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        // is_drained() triggers the reap; the slow task keeps it false.
-        *p.is_auto_flushing.lock().unwrap() = false;
-        let _drained = p.is_drained();
+        // is_drained() triggers the reap; finished handle becomes None.
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
+        assert!(p.is_drained(), "is_drained() must reap the finished handle");
+        assert!(p.pending_flush_handles.lock().unwrap().is_none(),
+            "finished handle must be cleared to None after reap");
 
-        let remaining = p.pending_flush_handles.lock().unwrap().len();
-        assert_eq!(remaining, 1,
-            "is_drained() must reap finished handles (expected 1 unfinished, got {})", remaining);
+        // Now set a slow handle — is_drained() must return false.
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        *p.pending_flush_handles.lock().unwrap() = Some(slow);
+        assert!(!p.is_drained(),
+            "is_drained() must be false when the pending handle is still running");
     }
 
     #[tokio::test]
     async fn test_is_drained_false_with_unfinished_handle() {
         let p = create_test_processor();
+        use std::sync::atomic::Ordering;
         assert!(p.log_batch.lock().unwrap().is_empty());
-        *p.is_auto_flushing.lock().unwrap() = false;
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
 
-        // Push a handle that will never finish within the test window.
+        // Set a handle that will never finish within the test window.
         let handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
-        p.pending_flush_handles.lock().unwrap().push(handle);
+        *p.pending_flush_handles.lock().unwrap() = Some(handle);
 
         assert!(!p.is_drained(),
-            "is_drained() must be false when at least one pending_flush_handle is still running");
+            "is_drained() must be false when the pending flush handle is still running");
     }
 
     // ========================================================================
