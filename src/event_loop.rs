@@ -83,14 +83,14 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or standard mode based on config (or runtime override for Java)
+/// Routes to APM or serverless mode based on config (or runtime override for Java)
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let apm_mode_enabled = components.apm_mode_enabled;
     if apm_mode_enabled {
         info!("Starting APM mode event loop (connection may still be in progress)");
         execute_apm_mode_event_loop(components).await
     } else {
-        debug!("Starting standard mode event loop");
+        debug!("Starting serverless mode event loop");
         execute_standard_mode_event_loop(components).await
     }
 }
@@ -518,13 +518,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
     event_counter
 }
 
-/// Standard mode: batches payloads with platform.report, sends to serverless API
+/// Serverless mode: batches payloads with platform.report, sends to serverless API
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
 
     loop {
-        debug!("Standard mode: waiting for next lambda invocation event...");
+        debug!("Serverless mode: waiting for next lambda invocation event...");
 
         let runtime_event =
             match runtime::fetch_next_event(&components.client, &components.extension_id).await {
@@ -596,9 +596,19 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     *active_request = Some(request_id.clone());
                 }
 
-                // SKIP old buffer processing to avoid deadlocks
-                // Late payloads are already handled via the buffer matching on next invocation
-                // The complex locking in this loop was causing 7-second deadlocks
+                // On warm starts, pair any previous-request agent payloads that arrived after
+                // their invocation ended but whose platform.report has since been stored.
+                // Must run after updating CURRENT_ACTIVE_REQUEST_ID so new pipe payloads
+                // route to the current request, not old buffers.
+                if !is_cold_start {
+                    let paired = drain_late_paired_payloads_serverless(&request_id);
+                    if paired > 0 {
+                        debug!(
+                            "Serverless mode: Paired {} late agent payload(s) into batch at start of invocation: {}",
+                            paired, request_id
+                        );
+                    }
+                }
 
                 // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
@@ -690,7 +700,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("Serverless mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -737,6 +747,13 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         }
                     }
                 }
+
+                // Yield to let the IPC pipe collector task route any last in-flight payloads
+                // into agent_buffer before we collect from REQUEST_DATA below.
+                // The collector runs in a separate tokio task; two yields ensure items
+                // already in the mpsc channel are routed before the shutdown collect.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
 
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
@@ -1084,7 +1101,7 @@ async fn send_to_apm_collector(
 }
 
 /// Wait for `platform.runtimeDone` for this request, then give a short grace for
-/// trailing telemetry, then return. Used by both standard mode and APM mode before
+/// trailing telemetry, then return. Used by both serverless mode and APM mode before
 /// the end-of-invocation flush so late logs land in `log_batch` before it drains.
 ///
 /// Bounds:
@@ -1137,11 +1154,33 @@ async fn wait_for_runtime_done_with_grace(
         if !log_processor.is_drained() {
             let grace_ms = config.extension.runtime_done_grace_ms;
             if grace_ms > 0 {
+                // Poll every 2ms and exit as soon as the batch drains.
+                // This matters when grace_ms is large (e.g. customer sets 2000ms):
+                // no reason to hold up GET /next for 2 seconds when logs finished at 50ms.
+                const POLL_INTERVAL_MS: u64 = 2;
                 debug!(
-                    "runtime.done: batch not drained - waiting {}ms grace for trailing telemetry (request: {})",
+                    "runtime.done: batch not drained - polling up to {}ms grace for trailing telemetry (request: {})",
                     grace_ms, request_id
                 );
-                tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+                let grace_start = tokio::time::Instant::now();
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(grace_ms),
+                    async {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+                            if log_processor.is_drained() {
+                                break;
+                            }
+                        }
+                    },
+                )
+                .await;
+                debug!(
+                    "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
+                    grace_start.elapsed().as_millis(),
+                    grace_ms,
+                    request_id
+                );
             }
         } else {
             debug!(
@@ -1232,7 +1271,7 @@ pub async fn process_request_concurrently(
     deadline_ms: i64,
 ) {
     debug!(
-        "Standard mode: Starting processing for request: {}",
+        "Serverless mode: Starting processing for request: {}",
         request_id
     );
 
@@ -1243,7 +1282,7 @@ pub async fn process_request_concurrently(
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
-    let Some(mut state) = state else {
+    let Some(state) = state else {
         error!("No processing state found for request: {}", request_id);
         return;
     };
@@ -1255,12 +1294,11 @@ pub async fn process_request_concurrently(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // Unified wait timeout for all invocations
-    let agent_wait_timeout_ms = 100;
-
-    // Try to take payloads in a single lock. If empty, wait for coordination
-    // signal then take again — avoids a TOCTOU gap between check and drain.
-    let mut agent_payloads = {
+    // Drain whatever the background pipe listener has already routed to this request's buffer.
+    // No waiting — if the agent payload hasn't arrived yet, the Telemetry listener will match
+    // it with the platform.report when both arrive (same or next invocation) via the
+    // agent_buffer → AGENT_BATCH_BUFFER pairing in listener.rs.
+    let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
         } else {
@@ -1269,29 +1307,9 @@ pub async fn process_request_concurrently(
     };
 
     if agent_payloads.is_empty() {
-        debug!(
-            "Standard mode: Waiting up to {}ms for agent payload for request: {}",
-            agent_wait_timeout_ms, request_id
-        );
-        tokio::select! {
-            _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
-                debug!("Agent payload received early for request: {}", request_id);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(agent_wait_timeout_ms)) => {
-                debug!("Agent payload wait timeout ({}ms) for request: {}", agent_wait_timeout_ms, request_id);
-            }
-        }
-        // After wakeup, drain whatever arrived
-        agent_payloads = if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        };
+        debug!("Serverless mode: No agent payload in buffer for request: {} - will be matched when it arrives", request_id);
     } else {
-        debug!(
-            "Agent payload already in buffer for request: {} - no wait needed",
-            request_id
-        );
+        debug!("Serverless mode: {} agent payload(s) in buffer for request: {}", agent_payloads.len(), request_id);
     }
 
     let report_line = remove_pending_report(&request_id).map(|report| {
@@ -1309,7 +1327,7 @@ pub async fn process_request_concurrently(
             if let Some(ref detected_error) = *guard {
                 if detected_error.request_id == request_id {
                     debug!(
-                        "Standard mode: No agent payload for request {} but error detected: {} - sending to telemetry",
+                        "Serverless mode: No agent payload for request {} but error detected: {} - sending to telemetry",
                         request_id, detected_error.error_type
                     );
                     // Error was already sent by log processor, just log this for visibility
@@ -1320,12 +1338,12 @@ pub async fn process_request_concurrently(
 
     // Smart batching: Only send complete payloads (with report)
     let send_agent_task = if agent_payloads.is_empty() {
-        debug!("Standard mode: No agent payload for request: {}", request_id);
+        debug!("Serverless mode: No agent payload for request: {}", request_id);
         None
     } else if let Some(ref report) = report_line {
         // Both payload and report available - send now (complete data)
         debug!(
-            "Standard mode: Payload + report both ready for {} - adding to batch",
+            "Serverless mode: Payload + report both ready for {} - adding to batch",
             request_id
         );
 
@@ -1353,7 +1371,7 @@ pub async fn process_request_concurrently(
     } else {
         // Only payload, no report yet - put back in buffer for next invocation
         debug!(
-            "Standard mode: Payload ready but NO report yet for {} - keeping in buffer",
+            "Serverless mode: Payload ready but NO report yet for {} - keeping in buffer",
             request_id
         );
         debug!(
@@ -1415,7 +1433,7 @@ pub async fn process_request_concurrently(
     }
 
     debug!(
-        "Standard mode: Completed processing for request: {}",
+        "Serverless mode: Completed processing for request: {}",
         request_id
     );
 }
@@ -1481,6 +1499,95 @@ async fn extract_and_coordinate_trace_id(
             error!("Failed to coordinate logs with trace ID: {}", e);
         }
     }
+}
+
+/// Serverless mode: drain previous-request buffers that have BOTH a pending agent payload
+/// AND a platform.report. Called at the start of each warm INVOKE.
+///
+/// Race this fixes:
+///   1. Invocation A completes — agent payload not yet in buffer.
+///   2. platform.report for A arrives in invocation B → listener finds agent_buffer[A]
+///      empty → stores as pending_report[A].
+///   3. Agent payload for A arrives late via named pipe → routes to agent_buffer[A].
+///   4. Neither the listener nor process_request_concurrently pairs them because
+///      each only handles its own request.
+///   5. This function (called at the start of invocation B+1) sees both, pairs them,
+///      and calls add_to_batch so the batch sender can transmit them.
+fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
+    // Collect IDs of old entries that have BOTH pending_report AND non-empty agent_buffer.
+    // Avoid holding DashMap refs across the subsequent get_mut calls.
+    let candidates: Vec<String> = REQUEST_DATA
+        .iter()
+        .filter(|entry| {
+            entry.key() != current_request_id
+                && entry.pending_report.is_some()
+                && entry.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false)
+        })
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    debug!(
+        "Serverless mode: {} previous request(s) have paired payload+report — batching before {}",
+        candidates.len(),
+        current_request_id
+    );
+
+    let mut batched_count = 0;
+
+    for req_id in candidates {
+        let Some(mut entry) = REQUEST_DATA.get_mut(&req_id) else { continue };
+
+        // Take the report — if gone, someone else raced us (listener matched it already).
+        let report = match entry.pending_report.take() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Clone the Arc refs while we hold the write guard, then drop the guard
+        // before locking the Mutex to avoid the borrow-while-mutably-borrowed error.
+        let buffer_arc = entry.agent_buffer.clone();
+        let arn = entry
+            .context
+            .lock()
+            .ok()
+            .map(|ctx| ctx.invoked_function_arn.clone())
+            .filter(|a| !a.is_empty())
+            .unwrap_or_else(crate::get_global_fallback_arn);
+
+        drop(entry); // release DashMap write guard
+
+        let payloads: Vec<Vec<u8>> = match buffer_arc.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        };
+
+        if payloads.is_empty() {
+            // Buffer was empty (raced with listener or nothing arrived yet).
+            // Restore the report so the listener can still pair it when payload arrives.
+            if let Some(mut e) = REQUEST_DATA.get_mut(&req_id) {
+                if e.pending_report.is_none() {
+                    e.pending_report = Some(report);
+                }
+            }
+            continue;
+        }
+
+        let payload_count = payloads.len();
+        for payload_bytes in payloads {
+            add_to_batch(req_id.clone(), payload_bytes, Some(report.clone()), arn.clone());
+        }
+        batched_count += payload_count;
+        debug!(
+            "Serverless mode: Batched {} late payload(s) for previous request: {}",
+            payload_count, req_id
+        );
+    }
+
+    batched_count
 }
 
 /// Process any pending agent payloads from previous invocation (APM mode only)

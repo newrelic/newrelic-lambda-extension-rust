@@ -537,7 +537,6 @@ mod tests {
         crate::request::REQUEST_DATA.insert("req-buf-1".to_string(), crate::request::RequestData {
             context: ctx,
             agent_buffer: buffer,
-            coordination_tx: None,
             pending_report: Some("REPORT Duration: 50ms".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),

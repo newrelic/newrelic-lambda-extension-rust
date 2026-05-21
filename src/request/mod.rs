@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::{
@@ -30,7 +30,6 @@ pub struct RequestProcessingState {
     pub log_processor: Arc<crate::logs::processor::LogProcessor>,
     pub platform_processor: Arc<PlatformProcessor>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
-    pub coordination_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,14 +83,13 @@ pub static REQUEST_PROCESSORS: Lazy<Arc<DashMap<String, RequestProcessingState>>
     Lazy::new(|| Arc::new(DashMap::new()));
 
 /// Consolidated per-request data — replaces 5 separate DashMaps
-/// (context, agent_buffer, coordination_tx, pending_report, creation_invocation).
+/// (context, agent_buffer, pending_report, creation_invocation).
 ///
 /// All fields are accessed via accessor functions below to maintain a clean API.
 #[derive(Debug)]
 pub struct RequestData {
     pub context: Arc<Mutex<InvocationContext>>,
     pub agent_buffer: Arc<Mutex<Vec<Vec<u8>>>>,
-    pub coordination_tx: Option<mpsc::UnboundedSender<()>>,
     pub pending_report: Option<String>,
     pub creation_invocation: u64,
     /// Fired by the telemetry listener when platform.runtimeDone arrives for this request.
@@ -244,8 +242,6 @@ pub fn create_request_processing_state(
         }
     }
 
-    let (payload_tx, payload_rx) = mpsc::unbounded_channel();
-
     let runtime_done_notify = Arc::new(Notify::new());
 
     // If platform.runtimeDone already fired for this request before we were created
@@ -263,7 +259,6 @@ pub fn create_request_processing_state(
     REQUEST_DATA.insert(request_id.to_string(), RequestData {
         context: context.clone(),
         agent_buffer: agent_buffer.clone(),
-        coordination_tx: Some(payload_tx),
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
@@ -274,7 +269,6 @@ pub fn create_request_processing_state(
         log_processor: log_processor.clone(),
         platform_processor,
         agent_buffer: agent_buffer.clone(),
-        coordination_rx: Some(payload_rx),
     };
 
     state
@@ -297,9 +291,8 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         REQUEST_DATA.remove(request_id);
         PREFIRED_RUNTIME_DONE.remove(request_id);
     } else {
-        // Partial cleanup: keep context/buffer/creation_invocation, clear coordination + pending_report
+        // Partial cleanup: keep context/buffer/creation_invocation, clear pending_report
         if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
-            entry.coordination_tx = None;
             entry.pending_report = None;
         }
     }
@@ -408,11 +401,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-
-                    // Signal coordination channel that payload arrived
-                    if let Some(ref tx) = entry.coordination_tx {
-                        let _ = tx.send(());
-                    }
                 }
                 Err(e) => {
                     error!(
@@ -440,10 +428,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-                }
-                // Signal coordination channel so waiters know a payload arrived
-                if let Some(ref tx) = entry.coordination_tx {
-                    let _ = tx.send(());
                 }
             }
         } else {

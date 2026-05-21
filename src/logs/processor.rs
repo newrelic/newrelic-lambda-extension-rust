@@ -726,8 +726,8 @@ impl LogProcessor {
                     }
                 } else {
                     // Standard (non-APM) mode: Send errors to telemetry endpoint
-                    debug!("Standard mode: Error detected in function log: {}", sanitized_msg);
-                    debug!("Standard mode: Sending error for request_id: {}", request_id);
+                    debug!("Serverless mode: Error detected in function log: {}", sanitized_msg);
+                    debug!("Serverless mode: Sending error for request_id: {}", request_id);
 
                     // Determine error type - use consistent LambdaError for all function errors
                     // (except timeout which should match platform timeout)

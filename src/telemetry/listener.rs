@@ -184,7 +184,7 @@ async fn handle_telemetry_request(
                                         // platform.report may arrive in same or next invocation (after freeze/thaw)
                                         if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
-                                            debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                            debug!("Serverless mode: Matched platform.report with batched agent for request: {}", request_id_str);
                                         }
                                         else if let Some(buffer) = get_agent_buffer(request_id_str) {
                                             let arn = get_request_context(request_id_str)
@@ -199,7 +199,7 @@ async fn handle_telemetry_request(
                                                 if buffer_guard.is_empty() {
                                                     false
                                                 } else {
-                                                    debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                                    debug!("Serverless mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
                                                     for payload_bytes in buffer_guard.iter() {
                                                         add_to_batch(
                                                             request_id_str.to_string(),
@@ -216,15 +216,15 @@ async fn handle_telemetry_request(
                                             };
 
                                             if batched {
-                                                debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                                debug!("Serverless mode: Cleared agent buffer for request {} after matching with report", request_id_str);
                                             } else {
                                                 set_pending_report(request_id_str, report_line);
-                                                debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                                debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                             }
                                         }
                                         else {
                                             set_pending_report(request_id_str, report_line);
-                                            debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                            debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
                                 }
