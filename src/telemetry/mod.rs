@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Telemetry Module
 //! 
 //! This module contains all telemetry-related functionality for the New Relic

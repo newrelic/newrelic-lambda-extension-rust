@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests for trace ID extraction
 //!
 //! Unit tests for extracting trace IDs from New Relic agent payloads

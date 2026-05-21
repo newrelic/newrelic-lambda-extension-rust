@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! AWS Lambda API integration to fetch layer information
 
 use tracing::{debug, warn};

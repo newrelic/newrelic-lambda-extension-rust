@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! AWS Lambda Extensions API integration
 //! Handles extension registration, telemetry subscription, and event polling
 

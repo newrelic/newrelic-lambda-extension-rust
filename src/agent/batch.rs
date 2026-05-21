@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent payload batching logic
 //!
 //! This module handles batching of agent payloads for efficient sending to New Relic.

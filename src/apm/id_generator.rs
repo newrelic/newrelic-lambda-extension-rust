@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! ID generation for distributed tracing
 //! 
 //! Generates trace IDs, span IDs, and GUIDs for APM telemetry

@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 #![deny(clippy::unwrap_used)]

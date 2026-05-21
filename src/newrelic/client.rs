@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
 use reqwest::{header, Client, Error, NoProxy, Proxy};
 use serde::Serialize;

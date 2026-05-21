@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Main APM app orchestrator
 //!
 //! Based on internal_app.go NewApp(), connectRoutine(), doHarvest()

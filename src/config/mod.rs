@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};

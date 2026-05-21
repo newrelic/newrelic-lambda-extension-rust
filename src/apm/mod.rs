@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! APM (Application Performance Monitoring) mode implementation
 //!
 //! This module implements the APM Lambda mode, which parses agent payloads
