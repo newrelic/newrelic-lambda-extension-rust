@@ -228,6 +228,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     *active_request = Some(request_id.clone());
                 }
 
+                // Retry any previously-failed agent payloads in the background so the
+                // HTTP round-trips happen during function execution, not post-runtime-done.
+                {
+                    let nr = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(retry_failed_agent_payloads(nr, cfg));
+                }
+
                 // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -577,13 +585,28 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
-
-                crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.client,
-                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
-                )
-                .await;
+                // Spawn error and telemetry retries into the background so they run during
+                // function execution, not pre-invoke. Lambda freeze suspends the tokio runtime,
+                // so sleeping/retrying tasks are paused and resume cleanly on unfreeze —
+                // retry counts are only incremented on actual HTTP failures, not on suspensions.
+                {
+                    let nr = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(async move {
+                        error_synthesis::retry_failed_errors(&nr, &cfg).await;
+                    });
+                }
+                {
+                    let http_client = components.client.clone();
+                    let license_key = components.config.new_relic.license_key.clone();
+                    tokio::spawn(async move {
+                        crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                            &http_client,
+                            license_key.as_deref().unwrap_or(""),
+                        )
+                        .await;
+                    });
+                }
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
@@ -763,15 +786,18 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 )
                 .await;
 
-                // Emergency flush of pre-invoke buffer (logs from INIT phase if shutdown before first INVOKE)
-                if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
+                // Flush pre-invoke buffer and main log buffer concurrently.
+                // Both paths write to independent payloads (pre-invoke vs main batch),
+                // so parallel execution is safe and cuts shutdown latency in half
+                // when both are non-empty. Each path already chunks at 1MB.
+                let (pre_invoke_result, shutdown_result) = tokio::join!(
+                    components.global_log_processor.flush_pre_invoke_buffer_on_shutdown(),
+                    components.global_log_processor.flush_on_shutdown(),
+                );
+                if let Err(e) = pre_invoke_result {
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
-
-                // Shutdown drain: flush + re-flush any entries pushed back into
-                // failed_logs_buffer by send failures in the flush itself. Bounded by
-                // MAX_RETRIES (via per-entry retry_count filter in start_invocation_retry).
-                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
+                if let Err(e) = shutdown_result {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
 
@@ -1154,33 +1180,34 @@ async fn wait_for_runtime_done_with_grace(
         if !log_processor.is_drained() {
             let grace_ms = config.extension.runtime_done_grace_ms;
             if grace_ms > 0 {
-                // Poll every 2ms and exit as soon as the batch drains.
-                // This matters when grace_ms is large (e.g. customer sets 2000ms):
-                // no reason to hold up GET /next for 2 seconds when logs finished at 50ms.
-                const POLL_INTERVAL_MS: u64 = 2;
-                debug!(
-                    "runtime.done: batch not drained - polling up to {}ms grace for trailing telemetry (request: {})",
-                    grace_ms, request_id
-                );
-                let grace_start = tokio::time::Instant::now();
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(grace_ms),
-                    async {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
-                            if log_processor.is_drained() {
-                                break;
-                            }
-                        }
-                    },
-                )
-                .await;
-                debug!(
-                    "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
-                    grace_start.elapsed().as_millis(),
-                    grace_ms,
-                    request_id
-                );
+                // Subscribe to drain notification BEFORE re-checking is_drained()
+                // to avoid a TOCTOU window where notify_one() fires between the
+                // is_drained() check above and the notified().await below.
+                let notify = log_processor.drain_notify();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // enable() registers the subscription so any concurrent notify_one()
+                // fired between here and the await is captured.
+                notified.as_mut().enable();
+
+                if !log_processor.is_drained() {
+                    debug!(
+                        "runtime.done: batch not drained - awaiting drain notify (up to {}ms grace, request: {})",
+                        grace_ms, request_id
+                    );
+                    let grace_start = tokio::time::Instant::now();
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(grace_ms),
+                        notified,
+                    )
+                    .await;
+                    debug!(
+                        "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
+                        grace_start.elapsed().as_millis(),
+                        grace_ms,
+                        request_id
+                    );
+                }
             }
         } else {
             debug!(
@@ -1398,12 +1425,10 @@ pub async fn process_request_concurrently(
 
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
-    let failed_retry = retry_failed_agent_payloads(&newrelic_client, &config);
 
-    let (log_result, platform_result, _, agent_result) = tokio::join!(
+    let (log_result, platform_result, agent_result) = tokio::join!(
         log_flushing,
         platform_flushing,
-        failed_retry,
         async {
             if let Some(handle) = send_agent_task {
                 handle.await
@@ -1550,13 +1575,11 @@ fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
         // Clone the Arc refs while we hold the write guard, then drop the guard
         // before locking the Mutex to avoid the borrow-while-mutably-borrowed error.
         let buffer_arc = entry.agent_buffer.clone();
-        let arn = entry
-            .context
-            .lock()
-            .ok()
-            .map(|ctx| ctx.invoked_function_arn.clone())
-            .filter(|a| !a.is_empty())
-            .unwrap_or_else(crate::get_global_fallback_arn);
+        let arn = if !entry.invoked_function_arn.is_empty() {
+            entry.invoked_function_arn.clone()
+        } else {
+            crate::get_global_fallback_arn()
+        };
 
         drop(entry); // release DashMap write guard
 
@@ -1786,8 +1809,8 @@ fn buffer_failed_agent_payload(
 
 /// Retry failed agent payloads during final flush
 async fn retry_failed_agent_payloads(
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<ExtensionConfig>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
 ) {
     let mut retry_successful_count = 0;
     let mut retry_failed_count = 0;
@@ -1841,8 +1864,8 @@ async fn retry_failed_agent_payloads(
             &failed_payload.payload_bytes,
             &failed_payload.request_id,
             &failed_payload.invoked_function_arn,
-            newrelic_client,
-            config,
+            &newrelic_client,
+            &config,
             None, // No version line for retries (already sent in original attempt)
         )
         .await

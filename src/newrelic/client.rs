@@ -81,6 +81,9 @@ pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
 pub struct NewRelicClient {
     client: Client,
     cached_version_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
+    /// Static log common-attributes: plugin name, faas.name, NR_TAGS, and version tags.
+    /// faas.arn is per-call and inserted separately. Cached on first log send.
+    cached_static_log_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl NewRelicClient {
@@ -122,6 +125,7 @@ impl NewRelicClient {
         Self {
             client,
             cached_version_attrs: std::sync::OnceLock::new(),
+            cached_static_log_attrs: std::sync::OnceLock::new(),
         }
     }
 
@@ -135,6 +139,7 @@ impl NewRelicClient {
         Self {
             client,
             cached_version_attrs: std::sync::OnceLock::new(),
+            cached_static_log_attrs: std::sync::OnceLock::new(),
         }
     }
 
@@ -157,10 +162,21 @@ impl NewRelicClient {
 
         debug!("Sending {} log messages to NR", batch.len());
 
-        let mut common_attributes = serde_json::Map::new();
-        common_attributes.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
+        // Build static attributes once (plugin, faas.name, NR_TAGS). faas.arn is
+        // per-call because it can change across invocations; insert it separately.
+        let static_attrs = self.cached_static_log_attrs.get_or_init(|| {
+            let mut attrs = serde_json::Map::new();
+            attrs.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
+            attrs.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
+            for (key, value) in crate::config::get_nr_tags() {
+                debug!("Adding NR_TAGS to log payload: {}={}", key, value);
+                attrs.insert(key.clone(), serde_json::json!(value));
+            }
+            attrs
+        });
+
+        let mut common_attributes = static_attrs.clone();
         common_attributes.insert("faas.arn".to_string(), serde_json::json!(function_arn));
-        common_attributes.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
 
         if config.new_relic.add_version_detail_tags {
             let version_attrs = self.cached_version_attrs.get_or_init(|| {
@@ -173,12 +189,6 @@ impl NewRelicClient {
                 attrs
             });
             common_attributes.extend(version_attrs.clone());
-        }
-
-        // Add NR_TAGS as common attributes (cached at cold start)
-        for (key, value) in crate::config::get_nr_tags() {
-            debug!("Adding NR_TAGS to log payload: {}={}", key, value);
-            common_attributes.insert(key.clone(), serde_json::json!(value));
         }
 
         let log_count = batch.len();

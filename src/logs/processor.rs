@@ -19,23 +19,37 @@ use std::{
     time::Duration,
 };
 
-/// Estimate a log message's serialized size in bytes. Uses the attributes'
-/// JSON length when we can serialize, otherwise returns a conservative upper
-/// bound (1 MB) so the log is forced into its own chunk rather than silently
-/// sized to 0 bytes (which would pack too many logs into one chunk and 413).
-fn estimate_log_size(log: &payload::LogMessage) -> usize {
-    const PER_LOG_OVERHEAD: usize = 8;
-    const FALLBACK_UPPER_BOUND: usize = 1_000_000;
-    match serde_json::to_string(&log.attributes) {
-        Ok(s) => PER_LOG_OVERHEAD + log.message.len() + s.len(),
-        Err(e) => {
-            error!(
-                "estimate_log_size: serde_json failed on attributes ({}); using {}B upper bound to isolate this log",
-                e, FALLBACK_UPPER_BOUND
-            );
-            FALLBACK_UPPER_BOUND
+/// Recursively estimate the JSON byte size of a serde_json Value without allocating.
+fn estimate_json_value_size(v: &serde_json::Value) -> usize {
+    match v {
+        serde_json::Value::String(s) => s.len() + 2, // surrounding quotes
+        serde_json::Value::Number(n) => n.to_string().len(),
+        serde_json::Value::Bool(b) => if *b { 4 } else { 5 },
+        serde_json::Value::Null => 4,
+        serde_json::Value::Array(arr) => {
+            let inner: usize = arr.iter().map(estimate_json_value_size).sum();
+            2 + inner + arr.len().saturating_sub(1) // [] + commas
+        }
+        serde_json::Value::Object(obj) => {
+            // Each key-value pair: "key": value
+            let inner: usize = obj.iter()
+                .map(|(k, v)| k.len() + 4 + estimate_json_value_size(v)) // 4 = 2 quotes + colon + space
+                .sum();
+            2 + inner + obj.len().saturating_sub(1) // {} + commas
         }
     }
+}
+
+/// Estimate a log message's serialized JSON size in bytes without allocating.
+/// Structural traversal replaces serde_json::to_string so no heap allocation occurs.
+fn estimate_log_size(log: &payload::LogMessage) -> usize {
+    const PER_LOG_OVERHEAD: usize = 8;
+    let attrs_size: usize = log.attributes.iter()
+        .map(|(k, v)| k.len() + 4 + estimate_json_value_size(v))
+        .sum::<usize>()
+        + log.attributes.len().saturating_sub(1) // commas between pairs
+        + 2; // surrounding {}
+    PER_LOG_OVERHEAD + log.message.len() + attrs_size
 }
 
 /// Counts how often `start_invocation_retry` was called while a prior retry task
@@ -129,6 +143,10 @@ pub struct LogProcessor {
 
     /// Handle for the start-of-invocation retry task; awaited in flush() before GET /next
     invocation_retry_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+
+    /// Fired when the processor transitions to fully drained (batch empty, no pending handles).
+    /// Replaces the 2ms poll loop in wait_for_runtime_done_with_grace with a zero-overhead wait.
+    drain_notify: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -296,6 +314,19 @@ impl LogProcessor {
             fallback_function_arn: Arc::new(Mutex::new(None)),
             is_auto_flushing: Arc::new(Mutex::new(false)),
             invocation_retry_handle: Arc::new(Mutex::new(None)),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Returns the drain notifier so the event loop can await it instead of polling.
+    pub fn drain_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.drain_notify.clone()
+    }
+
+    /// Fires the drain notifier if the processor is fully drained.
+    fn notify_if_drained(&self) {
+        if self.is_drained() {
+            self.drain_notify.notify_one();
         }
     }
 
@@ -432,6 +463,8 @@ impl LogProcessor {
             if successful > 0 {
                 debug!("Auto-flush sent {} chunk(s) successfully", successful);
             }
+            // Signal any grace-period waiter that this auto-flush task finished.
+            processor_clone.notify_if_drained();
         });
 
         self.reap_finished_flush_handles();
@@ -1629,11 +1662,14 @@ impl LogProcessor {
                 });
             }
         }
-        
+
+        // Signal any waiter in wait_for_runtime_done_with_grace that the batch drained.
+        self.notify_if_drained();
+
         Ok(())
     }
-    
-   
+
+
     async fn send_chunk_with_retry_internal(
         &self,
         client: &NewRelicClient,
@@ -1725,6 +1761,17 @@ impl LogProcessor {
 #[async_trait]
 impl Flush for LogProcessor {
     async fn flush(&self) -> std::io::Result<()> {
+        // Fast-path: nothing to do — skip all lock acquisitions and allocations.
+        {
+            let no_retry = self.invocation_retry_handle.lock().unwrap().is_none();
+            let batch_empty = self.log_batch.lock().unwrap().is_empty();
+            let not_flushing = !*self.is_auto_flushing.lock().unwrap();
+            let no_handles = self.pending_flush_handles.lock().unwrap().is_empty();
+            if no_retry && batch_empty && not_flushing && no_handles {
+                return Ok(());
+            }
+        }
+
         // Take the handle before the join to avoid holding the Mutex across an await
         let retry_handle = self.invocation_retry_handle.lock().unwrap().take();
 

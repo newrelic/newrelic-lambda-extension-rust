@@ -96,6 +96,9 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
+    /// Cached ARN for this request. Avoids locking `context` just to read the ARN
+    /// on hot paths like cleanup_old_request_buffers and drain_late_paired_payloads.
+    pub invoked_function_arn: String,
 }
 
 pub static REQUEST_DATA: Lazy<Arc<DashMap<String, RequestData>>> =
@@ -262,6 +265,7 @@ pub fn create_request_processing_state(
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
+        invoked_function_arn: invoked_function_arn.to_string(),
     });
 
     let state = RequestProcessingState {
@@ -340,11 +344,11 @@ pub async fn cleanup_old_request_buffers(
                 Ok(mut buf) => buf.drain(..).collect(),
                 Err(_) => Vec::new(),
             };
-            let arn = entry.context.lock()
-                .ok()
-                .map(|c| c.invoked_function_arn.clone())
-                .filter(|a| !a.is_empty())
-                .unwrap_or_else(crate::get_global_fallback_arn);
+            let arn = if !entry.invoked_function_arn.is_empty() {
+                entry.invoked_function_arn.clone()
+            } else {
+                crate::get_global_fallback_arn()
+            };
             (payloads, arn)
         } else {
             (Vec::new(), crate::get_global_fallback_arn())
