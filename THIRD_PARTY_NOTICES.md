@@ -1,6 +1,6 @@
 # Third Party Notices
 
-The `newrelic-lambda-extension` uses source code from third party libraries which carry their own copyright notices and license terms. These notices are provided below.
+The `newrelic-lambda-extension-rust` uses source code from third party libraries which carry their own copyright notices and license terms. These notices are provided below.
 
 In the event that a required notice is missing or incorrect, please notify us by e-mailing open-source@newrelic.com.
 
