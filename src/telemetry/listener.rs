@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,

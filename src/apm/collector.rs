@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! APM collector client for sending telemetry
 //!
 //! Based on collector.go CollectorRequest() and SendAPMTelemetry()

@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Platform metrics conversion for APM mode
 //!
 //! Converts AWS Lambda platform REPORT logs to New Relic APM metrics

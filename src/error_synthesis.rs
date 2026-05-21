@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Error synthesis for Lambda timeout and platform faults
 //!
 //! This module synthesizes error messages for Lambda errors (timeout, platform faults, etc.)

@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! New Relic Lambda Extension Credentials Module
 //! 
 //! This module provides functionality to fetch the New Relic license key from:

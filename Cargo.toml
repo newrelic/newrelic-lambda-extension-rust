@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
 license = "Apache-2.0"
-repository = "https://github.com/yourusername/newrelic-lambda-extension"
+repository = "https://github.com/newrelic/newrelic-lambda-extension-rust"
 readme = "README.md"
 
 [dependencies]

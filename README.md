@@ -1,6 +1,6 @@
 [![Community Plus header](https://github.com/newrelic/opensource-website/raw/main/src/images/categories/Community_Plus.png)](https://opensource.newrelic.com/oss-category/#community-plus)
 
-# newrelic-lambda-extension (Rust) ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml)
 
 A high-performance Rust implementation of the AWS Lambda extension to collect, enhance, and transport telemetry data from your AWS Lambda functions to New Relic without requiring an external transport such as CloudWatch Logs or Kinesis.
 
@@ -207,6 +207,9 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
 | `NEW_RELIC_APM_LAMBDA_MODE` | `false` | `true`, `false`, `1`, `0` | Enable APM mode for deep application monitoring and entity correlation. |
+| `NEW_RELIC_APM_BLOCKING_HANDSHAKE` | `false` | `true`, `false`, `1`, `0` | When `true`, the extension holds `/next` after `platform.runtimeDone` until the APM PreConnect+Connect handshake finishes (or the remaining invoke deadline is exhausted). Improves the likelihood that APM is connected before the sandbox is frozen — useful for sparse-traffic functions (infrequent invocations) or very short function timeouts where the background handshake may not complete in time. When `false` (default), the handshake runs in the background and APM connects within a few invocations for high-frequency functions. |
+| `NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS` | `5` | Number (min: 1) | Maximum seconds to wait for each individual APM PreConnect or Connect request to the New Relic collector. Increase if your function runs in a high-latency network (e.g., cross-region VPC). The total handshake (PreConnect + Connect) can take up to `2 × timeout`. |
+| `NEW_RELIC_RUNTIME_DONE_GRACE_MS` | `25` | Number (0–2000) | Grace period in milliseconds added after the `platform.runtimeDone` signal before the end-of-invocation log flush. Only active when the log batch is not already fully drained. Increasing this gives trailing telemetry (emitted by the agent just before the function returns) more time to arrive. Clamped to `[0, 2000]`. |
 | `NEW_RELIC_COLLECT_TRACE_ID` | `false` | `true`, `false`, `1`, `0` | Add `trace.id` attribute to Lambda logs for distributed tracing correlation. |
 | `NEW_RELIC_ADD_VERSION_DETAIL_TAGS` | `false` | `true`, `false`, `1`, `0` | Add version detail tags to telemetry. |
 | `NEW_RELIC_LAYER_VERSION` | | String | Specify the layer version for tracking purposes. |
@@ -283,10 +286,10 @@ New Relic hosts and moderates an online forum where customers can interact with 
 
 ## Contributing
 
-We encourage your contributions to improve `newrelic-lambda-extension`! Keep in mind when you submit your pull request, you'll need to sign the CLA via the click-through using CLA-Assistant. You only have to sign the CLA one time per project.
+We encourage your contributions to improve `newrelic-lambda-extension-rust`! Keep in mind when you submit your pull request, you'll need to sign the CLA via the click-through using CLA-Assistant. You only have to sign the CLA one time per project.
 
 If you have any questions, or to execute our corporate CLA, required if your contribution is on behalf of a company, please drop us an email at opensource@newrelic.com.
 
 ## License
 
-`newrelic-lambda-extension` is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License. The `newrelic-lambda-extension` also uses source code from third-party libraries. You can find full details on which libraries are used and the terms under which they are licensed in the third-party notices document.
+`newrelic-lambda-extension-rust` is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License. The `newrelic-lambda-extension-rust` also uses source code from third-party libraries. You can find full details on which libraries are used and the terms under which they are licensed in the [third-party notices document](THIRD_PARTY_NOTICES.md).

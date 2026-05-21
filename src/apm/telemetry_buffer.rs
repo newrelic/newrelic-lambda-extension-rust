@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Buffer for failed telemetry in APM mode
 //!
 //! Stores individual telemetry types that fail to send to the APM collector

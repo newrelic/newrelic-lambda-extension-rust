@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent payload parsing for APM mode
 //!
 //! Parses New Relic agent telemetry payloads (protocol v1 and v2)
