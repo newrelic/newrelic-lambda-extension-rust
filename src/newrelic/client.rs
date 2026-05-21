@@ -294,24 +294,40 @@ impl NewRelicClient {
 
         let uncompressed_size = body.len();
 
-        let (send_bytes, use_gzip): (bytes::Bytes, bool) = {
-            use flate2::write::GzEncoder;
-            use flate2::Compression;
-            use std::io::Write;
-            let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
-            match enc.write_all(body.as_bytes()).and_then(|_| enc.finish()) {
-                Ok(compressed) => (bytes::Bytes::from(compressed), true),
-                Err(e) => {
-                    // Log warn once per process; subsequent failures downgrade to debug
-                    // so a persistent gzip failure can't flood operator CloudWatch.
+        // Payloads under 512 bytes compress poorly and the CPU cost exceeds the
+        // bandwidth savings — send them raw.
+        const GZIP_MIN_BYTES: usize = 512;
+
+        let (send_bytes, use_gzip): (bytes::Bytes, bool) = if uncompressed_size < GZIP_MIN_BYTES {
+            (bytes::Bytes::from(body.into_bytes()), false)
+        } else {
+            // Offload synchronous gzip to the blocking thread pool so the single
+            // current_thread tokio executor stays free for Notify signals and other
+            // tasks while compression runs.
+            let raw = bytes::Bytes::from(body.into_bytes());
+            let raw_for_spawn = raw.clone(); // cheap Arc refcount bump
+            let compressed = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
+                use flate2::write::GzEncoder;
+                use flate2::Compression;
+                use std::io::Write;
+                let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
+                enc.write_all(&raw_for_spawn).and_then(|_| enc.finish()).ok()
+            })
+            .await
+            .ok()    // JoinError (task panicked) → None
+            .flatten();
+
+            match compressed {
+                Some(c) => (bytes::Bytes::from(c), true),
+                None => {
                     static WARN_ONCE: std::sync::atomic::AtomicBool =
                         std::sync::atomic::AtomicBool::new(false);
                     if !WARN_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        warn!("gzip compression failed ({}); sending uncompressed (further failures will be logged at debug)", e);
+                        warn!("gzip compression failed; sending uncompressed (further failures will be logged at debug)");
                     } else {
-                        debug!("gzip compression failed ({}); sending uncompressed", e);
+                        debug!("gzip compression failed; sending uncompressed");
                     }
-                    (bytes::Bytes::from(body.into_bytes()), false)
+                    (raw, false)
                 }
             }
         };
