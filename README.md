@@ -118,7 +118,7 @@ cross build --release --target x86_64-unknown-linux-musl
 cross build --release --target aarch64-unknown-linux-gnu
 ```
 
-The compiled binary will be available at `target/<target>/release/newrelic-lambda-extension-rust`.
+The compiled binary will be available at `target/<target>/release/newrelic-lambda-extension`.
 
 ### Using the Build Script
 
@@ -160,7 +160,7 @@ To manually publish a layer to AWS:
 ```sh
 # Create layer structure
 mkdir -p layer/extensions
-cp target/x86_64-unknown-linux-musl/release/newrelic-lambda-extension-rust layer/extensions/
+cp target/x86_64-unknown-linux-musl/release/newrelic-lambda-extension layer/extensions/
 cd layer && zip -r9 ../extension-layer.zip .
 cd ..
 
