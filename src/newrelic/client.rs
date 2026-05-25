@@ -2,11 +2,35 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
-use reqwest::{header, Client, Error, NoProxy, Proxy};
+use reqwest::{header, Client, NoProxy, Proxy};
 use tracing::{debug, info, warn};
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Error type for outbound telemetry sends.
+/// Distinguishes network failures from server-side exhaustion so callers
+/// can decide whether to buffer for cross-invocation retry.
+#[derive(Debug)]
+pub enum SendError {
+    Network(reqwest::Error),
+    ServerExhausted { status: u16 },
+    ClientRejected { status: u16 },
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(e) => write!(f, "network error: {}", e),
+            Self::ServerExhausted { status } => {
+                write!(f, "server error {} after max retries", status)
+            }
+            Self::ClientRejected { status } => {
+                write!(f, "client error {} (not retryable)", status)
+            }
+        }
+    }
+}
 
 fn get_extension_name_with_version() -> String {
     format!("{}:{}", EXTENSION_NAME, EXTENSION_VERSION)
@@ -153,9 +177,9 @@ impl NewRelicClient {
     pub async fn send_logs(
         &self,
         config: &ExtensionConfig,
-        batch: Vec<payload::LogMessage>,
+        batch: &[payload::LogMessage],
         function_arn: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), SendError> {
         if batch.is_empty() {
             warn!("Attempted to send empty log batch");
             return Ok(());
@@ -230,7 +254,7 @@ impl NewRelicClient {
         &self,
         config: &ExtensionConfig,
         payload_json: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<(), reqwest::Error> {
         if config.new_relic.license_key.is_none() {
             warn!("[agentsend] New Relic license key is not set, skipping agent payload send");
             return Ok(());
@@ -309,7 +333,7 @@ impl NewRelicClient {
 
     /// Sends a pre-built JSON body string to an endpoint (compress + retry).
     /// Used by send_logs to avoid double-serialization when common block is pre-cached.
-    async fn send_payload_raw(&self, endpoint: &str, body: String, log_count: Option<usize>) -> Result<(), Error> {
+    async fn send_payload_raw(&self, endpoint: &str, body: String, log_count: Option<usize>) -> Result<(), SendError> {
         let start_time = std::time::Instant::now();
         let uncompressed_size = body.len();
 
@@ -374,14 +398,14 @@ impl NewRelicClient {
                             warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
                         }
                         if status.is_client_error() {
-                            return Ok(());
+                            return Err(SendError::ClientRejected { status: status.as_u16() });
                         }
                         if retries < MAX_RETRIES {
                             retries += 1;
                             tokio::time::sleep(get_backoff_delay(retries)).await;
                             continue;
                         } else {
-                            return Ok(());
+                            return Err(SendError::ServerExhausted { status: status.as_u16() });
                         }
                     }
                 }
@@ -394,7 +418,7 @@ impl NewRelicClient {
                         tokio::time::sleep(get_backoff_delay(retries)).await;
                         continue;
                     } else {
-                        return Err(e);
+                        return Err(SendError::Network(e));
                     }
                 }
             }
@@ -470,5 +494,38 @@ mod tests {
             assert!(masked.contains("@"), "Masked URL should preserve @ separator: {}", masked);
             assert!(masked.contains("***:***"), "Masked URL should contain '***:***': {}", masked);
         }
+    }
+
+    #[test]
+    fn test_send_error_display_network() {
+        let inner = reqwest::Client::builder()
+            .build().unwrap()
+            .get("http://[::1]:1/bad")
+            .header("bad\nheader", "value")
+            .build()
+            .unwrap_err();
+        let err = SendError::Network(inner);
+        let display = format!("{}", err);
+        assert!(display.starts_with("network error:"), "got: {}", display);
+    }
+
+    #[test]
+    fn test_send_error_display_server_exhausted() {
+        let err = SendError::ServerExhausted { status: 503 };
+        assert_eq!(format!("{}", err), "server error 503 after max retries");
+    }
+
+    #[test]
+    fn test_send_error_display_client_rejected() {
+        let err = SendError::ClientRejected { status: 413 };
+        assert_eq!(format!("{}", err), "client error 413 (not retryable)");
+    }
+
+    #[test]
+    fn test_send_error_debug_impl() {
+        let err = SendError::ServerExhausted { status: 500 };
+        let debug = format!("{:?}", err);
+        assert!(debug.contains("ServerExhausted"), "got: {}", debug);
+        assert!(debug.contains("500"), "got: {}", debug);
     }
 }

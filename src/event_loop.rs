@@ -36,6 +36,17 @@ use crate::{
     IS_WARM_START,
 };
 
+const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
+
+/// Drop guard that clears `reconnect_in_flight` on any exit path (success, error, or panic).
+struct ReconnectGuard(Arc<watch::Sender<bool>>);
+
+impl Drop for ReconnectGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
 #[derive(Debug)]
 pub struct ExtensionComponents {
     pub client: Arc<Client>,
@@ -99,6 +110,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
+    let mut prior_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         debug!("APM mode: waiting for next lambda invocation event...");
@@ -112,7 +124,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if error_msg.contains("403") || error_msg.contains("State transition") {
                     error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                     debug!("Performing emergency shutdown cleanup...");
-                    
+
+                    if components.config.extension.pipeline_flush {
+                        if let Some(handle) = prior_flush_handle.take() {
+                            let _ = handle.await;
+                        }
+                    }
+
                     process_pending_agent_payloads(
                         &components.config,
                         &components.global_log_processor,
@@ -167,6 +185,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
 
                         tokio::spawn(async move {
+                            let _guard = ReconnectGuard(reconnect_flag);
                             debug!("APM reconnect attempt started (no delays — fresh invoke)");
                             match crate::apm::ApmApp::new(
                                 license_key,
@@ -193,7 +212,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
                                 }
                             }
-                            reconnect_flag.send_replace(false);
                         });
                     }
                 }
@@ -250,6 +268,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 // Kick off tracked retry of failed logs — runs during Lambda execution,
                 // awaited in flush() before GET /next (freeze-safe)
+                if components.config.extension.pipeline_flush {
+                    if let Some(handle) = prior_flush_handle.take() {
+                        if let Err(e) = handle.await {
+                            error!("Prior pipeline flush task panicked: {}", e);
+                        }
+                    }
+                }
+
                 components
                     .global_log_processor
                     .start_invocation_retry();
@@ -310,17 +336,27 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                let (current_result, pending_result) = tokio::join!(current_task, pending_task);
-                if let Err(e) = current_result {
-                    error!("Error in APM request processing: {}", e);
-                }
-                if let Err(e) = pending_result {
-                    error!("Error in pending payload processing: {}", e);
+                if components.config.extension.pipeline_flush {
+                    let combined = tokio::spawn(async move {
+                        let (r1, r2) = tokio::join!(current_task, pending_task);
+                        if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
+                        if let Err(e) = r2 { error!("Error in pending payload processing: {}", e); }
+                    });
+                    prior_flush_handle = Some(combined);
+                } else {
+                    let (current_result, pending_result) = tokio::join!(current_task, pending_task);
+                    if let Err(e) = current_result {
+                        error!("Error in APM request processing: {}", e);
+                    }
+                    if let Err(e) = pending_result {
+                        error!("Error in pending payload processing: {}", e);
+                    }
                 }
 
                 // Post-invoke wait: only when NEW_RELIC_APM_BLOCKING_HANDSHAKE=true.
-                // Sandbox is active here (Lambda freezes only after /next is called),
-                // so the wait consumes remaining deadline budget without freeze risk.
+                // Independent of pipeline_flush — handshake establishes APM connection (one-time
+                // cost on cold start), pipeline_flush defers data send (every-invoke savings).
+                // Once connected, this is a no-op (reconnect_in_flight=false → instant return).
                 if components.apm_mode_enabled && components.config.new_relic.apm_blocking_handshake {
                     wait_for_apm_handshake_within_budget(
                         &components.reconnect_in_flight,
@@ -329,18 +365,22 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 }
 
-                let event_time = event_start.elapsed();
-                if is_cold_start {
-                    debug!(
-                        "COLD START: First invocation processed in {:?} (request_id: {})",
-                        event_time, request_id
-                    );
+                if !components.config.extension.pipeline_flush {
+                    let event_time = event_start.elapsed();
+                    if is_cold_start {
+                        debug!(
+                            "COLD START: First invocation processed in {:?} (request_id: {})",
+                            event_time, request_id
+                        );
+                        IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        debug!(
+                            "WARM START: Event {} processed in {:?} (request_id: {})",
+                            event_counter, event_time, request_id
+                        );
+                    }
+                } else if is_cold_start {
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    debug!(
-                        "WARM START: Event {} processed in {:?} (request_id: {})",
-                        event_counter, event_time, request_id
-                    );
                 }
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
@@ -361,6 +401,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
                 info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+
+                let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                if components.config.extension.pipeline_flush {
+                    if let Some(handle) = prior_flush_handle.take() {
+                        debug!("APM shutdown: awaiting in-flight pipeline flush");
+                        if let Err(e) = handle.await {
+                            error!("Pipeline flush task panicked during APM shutdown: {}", e);
+                        }
+                    }
+                }
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -516,6 +566,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
+                }).await;
+
+                if shutdown_result.is_err() {
+                    warn!("APM shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
+                }
 
                 info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
@@ -530,6 +585,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
+    let mut prior_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         debug!("Serverless mode: waiting for next lambda invocation event...");
@@ -542,7 +598,13 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     if error_msg.contains("403") || error_msg.contains("State transition") {
                         error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                         info!("Performing emergency shutdown cleanup...");
-                        
+
+                        if components.config.extension.pipeline_flush {
+                            if let Some(handle) = prior_flush_handle.take() {
+                                let _ = handle.await;
+                            }
+                        }
+
                         send_batched_payloads_with_reports_only(
                             components.newrelic_client.clone(),
                             components.config.clone(),
@@ -647,6 +709,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 // Kick off tracked retry of failed logs — runs during Lambda execution,
                 // awaited in flush() before GET /next (freeze-safe)
+                if components.config.extension.pipeline_flush {
+                    if let Some(handle) = prior_flush_handle.take() {
+                        if let Err(e) = handle.await {
+                            error!("Prior pipeline flush task panicked: {}", e);
+                        }
+                    }
+                }
+
                 components
                     .global_log_processor
                     .start_invocation_retry();
@@ -689,22 +759,30 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .await;
                 });
 
-                if let Err(e) = processing_handle.await {
-                    error!("Error in standard mode request processing: {}", e);
+                if components.config.extension.pipeline_flush {
+                    prior_flush_handle = Some(processing_handle);
+                } else {
+                    if let Err(e) = processing_handle.await {
+                        error!("Error in standard mode request processing: {}", e);
+                    }
                 }
 
-                let event_time = event_start.elapsed();
-                if is_cold_start {
-                    debug!(
-                        "COLD START: First invocation processed in {:?} (request_id: {})",
-                        event_time, request_id
-                    );
+                if !components.config.extension.pipeline_flush {
+                    let event_time = event_start.elapsed();
+                    if is_cold_start {
+                        debug!(
+                            "COLD START: First invocation processed in {:?} (request_id: {})",
+                            event_time, request_id
+                        );
+                        IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        debug!(
+                            "WARM START: Event {} processed in {:?} (request_id: {})",
+                            event_counter, event_time, request_id
+                        );
+                    }
+                } else if is_cold_start {
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    debug!(
-                        "WARM START: Event {} processed in {:?} (request_id: {})",
-                        event_counter, event_time, request_id
-                    );
                 }
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
@@ -724,6 +802,16 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
                 info!("Serverless mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+
+                let shutdown_timeout_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                if components.config.extension.pipeline_flush {
+                    if let Some(handle) = prior_flush_handle.take() {
+                        debug!("Shutdown: awaiting in-flight pipeline flush");
+                        if let Err(e) = handle.await {
+                            error!("Pipeline flush task panicked during shutdown: {}", e);
+                        }
+                    }
+                }
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -790,15 +878,20 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // Both paths write to independent payloads (pre-invoke vs main batch),
                 // so parallel execution is safe and cuts shutdown latency in half
                 // when both are non-empty. Each path already chunks at 1MB.
-                let (pre_invoke_result, shutdown_result) = tokio::join!(
+                let (pre_invoke_result, flush_result) = tokio::join!(
                     components.global_log_processor.flush_pre_invoke_buffer_on_shutdown(),
                     components.global_log_processor.flush_on_shutdown(),
                 );
                 if let Err(e) = pre_invoke_result {
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
-                if let Err(e) = shutdown_result {
+                if let Err(e) = flush_result {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
+                }
+                }).await;
+
+                if shutdown_timeout_result.is_err() {
+                    warn!("Serverless shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
                 }
 
                 info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
@@ -2088,6 +2181,41 @@ mod tests {
             "arn:aws:lambda:us-east-1:123:function:test",
         )
         .await;
+    }
+
+    #[test]
+    fn test_reconnect_guard_clears_flag_on_drop() {
+        let (tx, mut rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        assert!(*rx.borrow());
+
+        {
+            let _guard = ReconnectGuard(tx.clone());
+        } // guard dropped here
+
+        // Flag should now be false
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn test_reconnect_guard_clears_flag_on_panic() {
+        let (tx, mut rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        assert!(*rx.borrow());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReconnectGuard(tx.clone());
+            panic!("simulated panic inside task");
+        }));
+
+        assert!(result.is_err());
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn test_shutdown_timeout_constant_is_under_2s() {
+        assert!(SHUTDOWN_TIMEOUT_MS < 2000, "Shutdown timeout must be under Lambda's 2s limit");
+        assert!(SHUTDOWN_TIMEOUT_MS >= 1000, "Shutdown timeout should be at least 1s to allow work");
     }
 }
 

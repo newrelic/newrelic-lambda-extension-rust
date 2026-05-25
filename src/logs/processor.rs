@@ -106,7 +106,6 @@ enum TraceIdExtractionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum LogType {
     Function,
     Platform,
@@ -114,7 +113,6 @@ enum LogType {
 }
 
 impl LogType {
-    #[allow(dead_code)]
     fn from_record_type(s: &str) -> Self {
         match s {
             "platform"  => Self::Platform,
@@ -388,7 +386,13 @@ impl LogProcessor {
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = match self.invocation_context.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("Invocation context mutex poisoned — skipping auto-flush");
+                return;
+            }
+        };
         let processor_clone = self.clone();
 
         let auto_flush_arn = if !context.invoked_function_arn.is_empty() {
@@ -432,16 +436,36 @@ impl LogProcessor {
             let mut successful = 0;
             for chunk in chunks {
                 let chunk_len = chunk.len();
-                // send_logs → send_payload retries 3x internally; no outer retry needed.
-                match client.send_logs(&config, chunk, &auto_flush_arn).await {
+                match client.send_logs(&config, &chunk, &auto_flush_arn).await {
                     Ok(()) => {
                         successful += 1;
                     }
                     Err(e) => {
-                        warn!(
-                            "Auto-flush failed after internal retries ({} logs): {}",
-                            chunk_len, e
+                        let should_buffer = matches!(
+                            e,
+                            crate::newrelic::client::SendError::ServerExhausted { .. }
+                            | crate::newrelic::client::SendError::Network(_)
                         );
+                        if should_buffer {
+                            warn!(
+                                "Auto-flush failed ({} logs), buffering for next-invoke retry: {}",
+                                chunk_len, e
+                            );
+                            for log_message in chunk {
+                                let entry = FailedLogEntry {
+                                    log_type: LogProcessor::log_type_from_message(&log_message),
+                                    log_message,
+                                    original_request_id: context.request_id.clone(),
+                                    retry_count: 0,
+                                };
+                                processor_clone.push_to_failed_buffer(entry);
+                            }
+                        } else {
+                            error!(
+                                "Auto-flush rejected by server ({} logs dropped): {}",
+                                chunk_len, e
+                            );
+                        }
                     }
                 }
             }
@@ -657,7 +681,13 @@ impl LogProcessor {
         if let Some(log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
             // Read context ONCE — avoids 4 separate mutex lock/unlock cycles per record.
             let (has_arn, has_valid_request_id, ctx_request_id, ctx_arn) = {
-                let context = self.invocation_context.lock().unwrap();
+                let context = match self.invocation_context.lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        warn!("Invocation context mutex poisoned — dropping log record");
+                        return;
+                    }
+                };
                 (
                     !context.invoked_function_arn.is_empty(),
                     !context.request_id.is_empty() && context.request_id != "unknown",
@@ -792,7 +822,13 @@ impl LogProcessor {
                 
                 let state = extraction_state.lock().unwrap();
                 let has_trace_id = {
-                    let context = self.invocation_context.lock().unwrap();
+                    let context = match self.invocation_context.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            warn!("Invocation context mutex poisoned — skipping trace buffer check");
+                            return;
+                        }
+                    };
                     context.trace_id.is_some()
                 };
                 
@@ -847,7 +883,6 @@ impl LogProcessor {
 
     /// Derive LogType from the _nr.logType attribute stamped by to_log_message_with_msg.
     /// Safe default is Function (never drop).
-    #[cfg(test)]
     fn log_type_from_message(msg: &payload::LogMessage) -> LogType {
         msg.attributes
             .get("_nr.logType")
@@ -1026,14 +1061,14 @@ impl LogProcessor {
                     let origin_req = chunk.first()
                         .map(|e| e.original_request_id.as_str())
                         .unwrap_or("?");
-                    // Use send_chunk_with_retry_internal so a single transient network
+                    // Use try_send_chunk so a single transient network
                     // blip doesn't consume an entire invocation-retry slot. That helper
                     // applies MAX_RETRIES retries with exponential backoff per chunk.
-                    match proc.send_chunk_with_retry_internal(client, config, batch, arn).await {
+                    match proc.try_send_chunk(client, config, batch, arn).await {
                         Ok(()) => {
                             info!("Invocation retry: sent {} logs successfully (origin req: {})", chunk.len(), origin_req);
                         }
-                        Err(e) => {
+                        Err((e, _returned_logs)) => {
                             warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
                             for entry in chunk {
                                 proc.push_to_failed_buffer(entry);
@@ -1365,12 +1400,19 @@ impl LogProcessor {
             
             // Capture ARN once outside the loop — context is stable at this point.
             let buffered_arn = {
-                let ctx = self.invocation_context.lock().unwrap();
-                if !ctx.invoked_function_arn.is_empty() {
-                    ctx.invoked_function_arn.clone()
-                } else {
-                    drop(ctx);
-                    self.get_best_available_arn()
+                match self.invocation_context.lock() {
+                    Ok(ctx) => {
+                        if !ctx.invoked_function_arn.is_empty() {
+                            ctx.invoked_function_arn.clone()
+                        } else {
+                            drop(ctx);
+                            self.get_best_available_arn()
+                        }
+                    }
+                    Err(_) => {
+                        warn!("Invocation context mutex poisoned — using fallback ARN for buffered logs");
+                        self.get_best_available_arn()
+                    }
                 }
             };
 
@@ -1393,7 +1435,13 @@ impl LogProcessor {
 
                     let state = extraction_state.lock().unwrap();
                     let trace_id_opt = {
-                        let context = self.invocation_context.lock().unwrap();
+                        let context = match self.invocation_context.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                warn!("Invocation context mutex poisoned — skipping buffered log trace check");
+                                continue;
+                            }
+                        };
                         context.trace_id.clone()
                     };
 
@@ -1548,7 +1596,13 @@ impl LogProcessor {
 
         let client = Arc::clone(&self.newrelic_client);
         let config = Arc::clone(&self.config);
-        let context = self.invocation_context.lock().unwrap().clone();
+        let context = match self.invocation_context.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("Invocation context mutex poisoned — cannot flush logs");
+                return Ok(());
+            }
+        };
 
         // GUARD: Never send logs without ARN - use fallback chain if context ARN is empty
         let effective_arn = if !context.invoked_function_arn.is_empty() {
@@ -1605,12 +1659,22 @@ impl LogProcessor {
 
         for chunk in chunks {
             let chunk_len = chunk.len();
-            match self.send_chunk_with_retry_internal(&client, &config, chunk, &effective_arn).await {
+            let request_id = context.request_id.clone();
+            match self.try_send_chunk(&client, &config, chunk, &effective_arn).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },
-                Err(e) => {
-                    error!("Log batch send failed ({} logs): {}", chunk_len, e);
+                Err((e, failed_logs)) => {
+                    error!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
+                    for log_message in failed_logs {
+                        let entry = FailedLogEntry {
+                            log_type: Self::log_type_from_message(&log_message),
+                            log_message,
+                            original_request_id: request_id.clone(),
+                            retry_count: 0,
+                        };
+                        self.push_to_failed_buffer(entry);
+                    }
                 }
             }
         }
@@ -1626,25 +1690,30 @@ impl LogProcessor {
     }
 
 
-    async fn send_chunk_with_retry_internal(
+    async fn try_send_chunk(
         &self,
         client: &NewRelicClient,
         config: &ExtensionConfig,
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
-    ) -> std::io::Result<()> {
-        // send_logs → send_payload already retries 3x internally (serialize once,
-        // retry the compressed bytes). No outer retry needed — avoids cloning the
-        // entire Vec<LogMessage> on each attempt.
-        match client.send_logs(config, chunk, function_arn).await {
+    ) -> Result<(), (std::io::Error, Vec<payload::LogMessage>)> {
+        use crate::newrelic::client::SendError;
+        match client.send_logs(config, &chunk, function_arn).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("413") || msg.contains("Payload Too Large") {
-                    error!("Payload too large even after chunking");
-                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
-                } else {
-                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
+                match e {
+                    SendError::ClientRejected { status } if status == 413 => {
+                        error!("Payload too large (413) even after chunking — logs dropped");
+                        Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()))
+                    }
+                    SendError::ClientRejected { .. } => {
+                        error!("Client error (4xx) — logs dropped: {}", msg);
+                        Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()))
+                    }
+                    SendError::ServerExhausted { .. } | SendError::Network(_) => {
+                        Err((std::io::Error::new(std::io::ErrorKind::Other, msg), chunk))
+                    }
                 }
             }
         }
@@ -1689,7 +1758,7 @@ impl LogProcessor {
 
         for chunk in chunks {
             let dropped = chunk.len();
-            if let Err(e) = client.send_logs(config, chunk, function_arn).await {
+            if let Err(e) = client.send_logs(config, &chunk, function_arn).await {
                 error!("Failed to send log chunk on shutdown — {} logs permanently dropped: {}", dropped, e);
             }
         }

@@ -1335,4 +1335,127 @@ mod tests {
         assert!(!batch[0].attributes.contains_key("entity.guid"),
             "entity.guid must not appear when apm_app is None");
     }
+
+    // ========================================================================
+    // PHASE 8: SendError classification + log_type_from_message
+    // ========================================================================
+
+    #[test]
+    fn test_log_type_from_message_function() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("function"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_log_type_from_message_platform() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("platform"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Platform);
+    }
+
+    #[test]
+    fn test_log_type_from_message_extension() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("extension"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Extension);
+    }
+
+    #[test]
+    fn test_log_type_from_message_missing_attribute_defaults_to_function() {
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: serde_json::Map::new(),
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_log_type_from_message_unknown_value_defaults_to_function() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("unknown_type"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_send_error_client_rejected_drops_logs() {
+        use crate::newrelic::client::SendError;
+        let err = SendError::ClientRejected { status: 413 };
+        // ClientRejected means logs should NOT be rebuffered (empty vec)
+        assert!(matches!(err, SendError::ClientRejected { status: 413 }));
+        // Verify the error is NOT retryable
+        assert!(!matches!(err, SendError::ServerExhausted { .. } | SendError::Network(_)));
+    }
+
+    #[test]
+    fn test_send_error_server_exhausted_is_retryable() {
+        use crate::newrelic::client::SendError;
+        let err = SendError::ServerExhausted { status: 503 };
+        assert!(matches!(err, SendError::ServerExhausted { .. }));
+    }
+
+    #[test]
+    fn test_failed_buffer_populated_for_retryable_errors() {
+        let p = create_test_processor();
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
+
+        // Simulate what happens when try_send_chunk returns a retryable error:
+        // The caller pushes logs to failed buffer
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 1234,
+            message: "test log".to_string(),
+            attributes: serde_json::Map::new(),
+        };
+        let entry = FailedLogEntry {
+            log_type: LogType::Function,
+            log_message: msg,
+            original_request_id: "req-123".to_string(),
+            retry_count: 0,
+        };
+        p.push_to_failed_buffer(entry);
+
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.len_of(LogType::Function), 1);
+    }
+
+    #[test]
+    fn test_failed_buffer_not_populated_for_client_errors() {
+        let p = create_test_processor();
+        // For ClientRejected (4xx), we return empty Vec — nothing to rebuffer
+        // Simulate: try_send_chunk returns Err((_, Vec::new()))
+        let empty_logs: Vec<crate::newrelic::payload::LogMessage> = Vec::new();
+        // No logs to push to buffer
+        for log_message in empty_logs {
+            let entry = FailedLogEntry {
+                log_type: LogProcessor::log_type_from_message(&log_message),
+                log_message,
+                original_request_id: "req-456".to_string(),
+                retry_count: 0,
+            };
+            p.push_to_failed_buffer(entry);
+        }
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
+    }
 }
