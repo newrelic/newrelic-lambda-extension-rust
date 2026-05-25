@@ -110,7 +110,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
-    let mut prior_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_flush_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
         debug!("APM mode: waiting for next lambda invocation event...");
@@ -126,7 +126,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("Performing emergency shutdown cleanup...");
 
                     if components.config.extension.pipeline_flush {
-                        if let Some(handle) = prior_flush_handle.take() {
+                        for handle in pending_flush_handles.drain(..) {
                             if let Err(e) = handle.await {
                                 error!("Pipeline flush task panicked during emergency shutdown: {}", e);
                             }
@@ -268,14 +268,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
-                // Kick off tracked retry of failed logs — runs during Lambda execution,
-                // awaited in flush() before GET /next (freeze-safe)
+                // Pipeline flush: prior flushes run in parallel — don't block.
+                // Drain finished handles (0ms each); leave in-flight ones running.
                 if components.config.extension.pipeline_flush {
-                    if let Some(handle) = prior_flush_handle.take() {
-                        if let Err(e) = handle.await {
-                            error!("Prior pipeline flush task panicked: {}", e);
-                        }
-                    }
+                    pending_flush_handles.retain(|h| !h.is_finished());
                 }
 
                 components
@@ -344,7 +340,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
                         if let Err(e) = r2 { error!("Error in pending payload processing: {}", e); }
                     });
-                    prior_flush_handle = Some(combined);
+                    pending_flush_handles.push(combined);
                 } else {
                     let (current_result, pending_result) = tokio::join!(current_task, pending_task);
                     if let Err(e) = current_result {
@@ -406,7 +402,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
                 if components.config.extension.pipeline_flush {
-                    if let Some(handle) = prior_flush_handle.take() {
+                    for handle in pending_flush_handles.drain(..) {
                         debug!("APM shutdown: awaiting in-flight pipeline flush");
                         if let Err(e) = handle.await {
                             error!("Pipeline flush task panicked during APM shutdown: {}", e);
@@ -587,7 +583,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
-    let mut prior_flush_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut pending_flush_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
         debug!("Serverless mode: waiting for next lambda invocation event...");
@@ -602,7 +598,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         info!("Performing emergency shutdown cleanup...");
 
                         if components.config.extension.pipeline_flush {
-                            if let Some(handle) = prior_flush_handle.take() {
+                            for handle in pending_flush_handles.drain(..) {
                                 if let Err(e) = handle.await {
                                     error!("Pipeline flush task panicked during emergency shutdown: {}", e);
                                 }
@@ -711,14 +707,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
-                // Kick off tracked retry of failed logs — runs during Lambda execution,
-                // awaited in flush() before GET /next (freeze-safe)
+                // Pipeline flush: prior flushes run in parallel — don't block.
+                // Drain finished handles (0ms each); leave in-flight ones running.
                 if components.config.extension.pipeline_flush {
-                    if let Some(handle) = prior_flush_handle.take() {
-                        if let Err(e) = handle.await {
-                            error!("Prior pipeline flush task panicked: {}", e);
-                        }
-                    }
+                    pending_flush_handles.retain(|h| !h.is_finished());
                 }
 
                 components
@@ -764,7 +756,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 });
 
                 if components.config.extension.pipeline_flush {
-                    prior_flush_handle = Some(processing_handle);
+                    pending_flush_handles.push(processing_handle);
                 } else {
                     if let Err(e) = processing_handle.await {
                         error!("Error in standard mode request processing: {}", e);
@@ -809,7 +801,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 let shutdown_timeout_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
                 if components.config.extension.pipeline_flush {
-                    if let Some(handle) = prior_flush_handle.take() {
+                    for handle in pending_flush_handles.drain(..) {
                         debug!("Shutdown: awaiting in-flight pipeline flush");
                         if let Err(e) = handle.await {
                             error!("Pipeline flush task panicked during shutdown: {}", e);
@@ -953,8 +945,11 @@ pub async fn process_apm_request(
     debug!("APM mode: Starting processing for request: {}", request_id);
 
     // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    // Only write if slot hasn't been advanced to a newer request (pipeline flush race guard)
     if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
+        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
+            *active_request = Some(request_id.clone());
+        }
     }
 
     if !is_cold_start {
@@ -1172,9 +1167,11 @@ pub async fn process_apm_request(
     cleanup_request_processing_state_internal(&request_id, true);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // It will be overwritten when next INVOKE arrives
+    // Only write if the slot hasn't been advanced to a newer request (pipeline flush race guard)
     if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
+        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
+            *active_request = Some(request_id.clone());
+        }
     }
 
     debug!(
@@ -1389,8 +1386,11 @@ pub async fn process_request_concurrently(
     );
 
     // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
+    // Only write if slot hasn't been advanced to a newer request (pipeline flush race guard)
     if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
+        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
+            *active_request = Some(request_id.clone());
+        }
     }
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
@@ -1538,9 +1538,11 @@ pub async fn process_request_concurrently(
     cleanup_request_processing_state_internal(&request_id, true);
 
     // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // It will be overwritten when next INVOKE arrives
+    // Only write if the slot hasn't been advanced to a newer request (pipeline flush race guard)
     if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
+        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
+            *active_request = Some(request_id.clone());
+        }
     }
 
     debug!(
