@@ -3,7 +3,6 @@
 
 use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
 use reqwest::{header, Client, Error, NoProxy, Proxy};
-use serde::Serialize;
 use tracing::{debug, info, warn};
 
 const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
@@ -84,6 +83,9 @@ pub struct NewRelicClient {
     /// Static log common-attributes: plugin name, faas.name, NR_TAGS, and version tags.
     /// faas.arn is per-call and inserted separately. Cached on first log send.
     cached_static_log_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
+    /// Per-ARN cached common-attributes JSON string (includes faas.arn).
+    /// Avoids re-serializing the common block on every send — only the logs array changes.
+    cached_common_json_by_arn: dashmap::DashMap<String, String>,
 }
 
 impl NewRelicClient {
@@ -126,6 +128,7 @@ impl NewRelicClient {
             client,
             cached_version_attrs: std::sync::OnceLock::new(),
             cached_static_log_attrs: std::sync::OnceLock::new(),
+            cached_common_json_by_arn: dashmap::DashMap::new(),
         }
     }
 
@@ -140,10 +143,13 @@ impl NewRelicClient {
             client,
             cached_version_attrs: std::sync::OnceLock::new(),
             cached_static_log_attrs: std::sync::OnceLock::new(),
+            cached_common_json_by_arn: dashmap::DashMap::new(),
         }
     }
 
     /// Sends a batch of logs to New Relic.
+    /// Uses pre-serialized common block per-ARN and builds final JSON via string concat
+    /// to avoid cloning Map + re-serializing common attributes on every call.
     pub async fn send_logs(
         &self,
         config: &ExtensionConfig,
@@ -160,10 +166,33 @@ impl NewRelicClient {
             return Ok(());
         }
 
-        debug!("Sending {} log messages to NR", batch.len());
+        let log_count = batch.len();
+        debug!("Sending {} log messages to NR", log_count);
 
-        // Build static attributes once (plugin, faas.name, NR_TAGS). faas.arn is
-        // per-call because it can change across invocations; insert it separately.
+        // Get or build the cached common JSON for this ARN
+        let common_json = self.get_or_build_common_json(config, function_arn);
+
+        // Serialize just the logs array
+        let logs_json = match serde_json::to_string(&batch) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!("Failed to serialize log batch: {}", e);
+                return Ok(());
+            }
+        };
+
+        // Build final payload: [{"common": <cached>, "logs": <batch>}]
+        let body = format!(r#"[{{"common":{{"attributes":{}}},"logs":{}}}]"#, common_json, logs_json);
+
+        self.send_payload_raw(&config.new_relic.log_endpoint, body, Some(log_count)).await
+    }
+
+    /// Build or retrieve the pre-serialized common attributes JSON for a given ARN.
+    fn get_or_build_common_json(&self, config: &ExtensionConfig, function_arn: &str) -> String {
+        if let Some(cached) = self.cached_common_json_by_arn.get(function_arn) {
+            return cached.clone();
+        }
+
         let static_attrs = self.cached_static_log_attrs.get_or_init(|| {
             let mut attrs = serde_json::Map::new();
             attrs.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
@@ -191,12 +220,9 @@ impl NewRelicClient {
             common_attributes.extend(version_attrs.clone());
         }
 
-        let log_count = batch.len();
-        let log_data = vec![payload::LogPayload {
-            common: payload::Common { attributes: common_attributes },
-            logs: batch,
-        }];
-        self.send_payload(&config.new_relic.log_endpoint, &log_data, Some(log_count)).await
+        let json = serde_json::to_string(&common_attributes).unwrap_or_else(|_| "{}".to_string());
+        self.cached_common_json_by_arn.insert(function_arn.to_string(), json.clone());
+        json
     }
 
     /// Sends the wrapped agent payload to the New Relic collector.
@@ -281,31 +307,19 @@ impl NewRelicClient {
         }
     }
 
-    /// Sends a JSON payload to a specified endpoint.
-    async fn send_payload<T: Serialize>(&self, endpoint: &str, payload: &T, log_count: Option<usize>) -> Result<(), Error> {
+    /// Sends a pre-built JSON body string to an endpoint (compress + retry).
+    /// Used by send_logs to avoid double-serialization when common block is pre-cached.
+    async fn send_payload_raw(&self, endpoint: &str, body: String, log_count: Option<usize>) -> Result<(), Error> {
         let start_time = std::time::Instant::now();
-        let body = match serde_json::to_string(payload) {
-            Ok(json) => json,
-            Err(e) => {
-                warn!("Failed to serialize payload to JSON: {}", e);
-                return Ok(());
-            }
-        };
-
         let uncompressed_size = body.len();
 
-        // Payloads under 512 bytes compress poorly and the CPU cost exceeds the
-        // bandwidth savings — send them raw.
         const GZIP_MIN_BYTES: usize = 512;
 
         let (send_bytes, use_gzip): (bytes::Bytes, bool) = if uncompressed_size < GZIP_MIN_BYTES {
             (bytes::Bytes::from(body.into_bytes()), false)
         } else {
-            // Offload synchronous gzip to the blocking thread pool so the single
-            // current_thread tokio executor stays free for Notify signals and other
-            // tasks while compression runs.
             let raw = bytes::Bytes::from(body.into_bytes());
-            let raw_for_spawn = raw.clone(); // cheap Arc refcount bump
+            let raw_for_spawn = raw.clone();
             let compressed = tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
                 use flate2::write::GzEncoder;
                 use flate2::Compression;
@@ -314,19 +328,13 @@ impl NewRelicClient {
                 enc.write_all(&raw_for_spawn).and_then(|_| enc.finish()).ok()
             })
             .await
-            .ok()    // JoinError (task panicked) → None
+            .ok()
             .flatten();
 
             match compressed {
                 Some(c) => (bytes::Bytes::from(c), true),
                 None => {
-                    static WARN_ONCE: std::sync::atomic::AtomicBool =
-                        std::sync::atomic::AtomicBool::new(false);
-                    if !WARN_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        warn!("gzip compression failed; sending uncompressed (further failures will be logged at debug)");
-                    } else {
-                        debug!("gzip compression failed; sending uncompressed");
-                    }
+                    debug!("gzip compression failed; sending uncompressed");
                     (raw, false)
                 }
             }
@@ -346,7 +354,6 @@ impl NewRelicClient {
             if use_gzip {
                 request = request.header("Content-Encoding", "gzip");
             }
-            // bytes::Bytes clone is a cheap Arc refcount bump, not a full Vec copy.
             let res = request
                 .body(send_bytes.clone())
                 .send()
@@ -355,56 +362,38 @@ impl NewRelicClient {
             match res {
                 Ok(response) => {
                     let status = response.status();
-                    
                     if status.is_success() {
                         let duration = start_time.elapsed();
                         if let Some(count) = log_count {
                             debug!("Logs sent: {} logs, {} bytes, duration: {:?}", count, uncompressed_size, duration);
-                        } else {
-                            debug!("Payload sent: {} bytes, duration: {:?}", uncompressed_size, duration);
                         }
                         return Ok(());
                     } else {
-                        let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
+                        let response_text = response.text().await.unwrap_or_default();
                         if retries == 0 {
                             warn!("Failed to send data. Status: {}, Response: {}", status, response_text);
                         }
-                        
                         if status.is_client_error() {
-                            warn!("Client error (4xx), not retrying");
                             return Ok(());
                         }
-                        
                         if retries < MAX_RETRIES {
                             retries += 1;
-                            let delay = get_backoff_delay(retries);
-                            tokio::time::sleep(delay).await;
+                            tokio::time::sleep(get_backoff_delay(retries)).await;
                             continue;
                         } else {
-                            warn!("Max retries exceeded");
                             return Ok(());
                         }
                     }
                 }
                 Err(e) => {
                     if retries == 0 {
-                        let error_msg = e.to_string();
-                        if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
-                            warn!("Connection issue (will retry): {}", e);
-                        } else if e.is_timeout() {
-                            warn!("Request timeout (will retry): {}", e);
-                        } else {
-                            warn!("Network error: {}", e);
-                        }
+                        warn!("Network error sending payload: {}", e);
                     }
-
                     if retries < MAX_RETRIES {
                         retries += 1;
-                        let delay = get_backoff_delay(retries);
-                        tokio::time::sleep(delay).await;
+                        tokio::time::sleep(get_backoff_delay(retries)).await;
                         continue;
                     } else {
-                        warn!("Max network retries exceeded");
                         return Err(e);
                     }
                 }

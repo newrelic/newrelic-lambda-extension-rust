@@ -16,8 +16,19 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
 };
+
+// Pre-interned attribute key constants — avoids per-record heap allocation of the same strings.
+const ATTR_LEVEL: &str = "level";
+const ATTR_LOG_PATTERN: &str = "newrelic.logPattern";
+const ATTR_SOURCE: &str = "newrelic.source";
+const ATTR_LOG_TYPE: &str = "_nr.logType";
+const ATTR_AWS: &str = "aws";
+const ATTR_LAMBDA_REQUEST_ID: &str = "lambda_request_id";
+const ATTR_FAAS_EXECUTION: &str = "faas.execution";
+const ATTR_FAAS_ARN: &str = "faas.arn";
+const ATTR_TRACE_ID: &str = "trace.id";
+const ATTR_ENTITY_GUID: &str = "entity.guid";
 
 /// Recursively estimate the JSON byte size of a serde_json Value without allocating.
 fn estimate_json_value_size(v: &serde_json::Value) -> usize {
@@ -95,6 +106,7 @@ enum TraceIdExtractionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 enum LogType {
     Function,
     Platform,
@@ -102,6 +114,7 @@ enum LogType {
 }
 
 impl LogType {
+    #[allow(dead_code)]
     fn from_record_type(s: &str) -> Self {
         match s {
             "platform"  => Self::Platform,
@@ -253,14 +266,6 @@ impl FailedBuffer {
             LogType::Platform => self.platform.len(),
             LogType::Extension => self.extension.len(),
         }
-    }
-}
-
-fn get_backoff_delay(retry_attempt: usize) -> Duration {
-    match retry_attempt {
-        1 => Duration::from_millis(200),
-        2 => Duration::from_millis(400),
-        _ => Duration::from_millis(900),
     }
 }
 
@@ -426,36 +431,17 @@ impl LogProcessor {
 
             let mut successful = 0;
             for chunk in chunks {
-                let mut retries = 0;
-                loop {
-                    match client.send_logs(&config, chunk.clone(), &auto_flush_arn).await {
-                        Ok(()) => {
-                            successful += 1;
-                            break;
-                        }
-                        Err(_e) => {
-                            if retries < MAX_RETRIES {
-                                retries += 1;
-                                tokio::time::sleep(get_backoff_delay(retries)).await;
-                                continue;
-                            } else {
-                                warn!(
-                                    "Auto-flush failed after {} retries - buffering {} logs",
-                                    MAX_RETRIES,
-                                    chunk.len()
-                                );
-                                for log in chunk {
-                                    let lt = LogProcessor::log_type_from_message(&log);
-                                    processor_clone.push_to_failed_buffer(FailedLogEntry {
-                                        log_message: log,
-                                        original_request_id: context.request_id.clone(),
-                                        retry_count: 0,
-                                        log_type: lt,
-                                    });
-                                }
-                                break;
-                            }
-                        }
+                let chunk_len = chunk.len();
+                // send_logs → send_payload retries 3x internally; no outer retry needed.
+                match client.send_logs(&config, chunk, &auto_flush_arn).await {
+                    Ok(()) => {
+                        successful += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Auto-flush failed after internal retries ({} logs): {}",
+                            chunk_len, e
+                        );
                     }
                 }
             }
@@ -584,11 +570,11 @@ impl LogProcessor {
 
             if !effective_request_id.is_empty() && effective_request_id != "unknown" {
                 let mut aws_attrs = serde_json::Map::new();
-                aws_attrs.insert("lambda_request_id".to_string(),
+                aws_attrs.insert(ATTR_LAMBDA_REQUEST_ID.to_string(),
                     serde_json::Value::String(effective_request_id.clone()));
-                log_message.attributes.insert("aws".to_string(),
+                log_message.attributes.insert(ATTR_AWS.to_string(),
                     serde_json::Value::Object(aws_attrs));
-                log_message.attributes.insert("faas.execution".to_string(),
+                log_message.attributes.insert(ATTR_FAAS_EXECUTION.to_string(),
                     serde_json::Value::String(effective_request_id));
             }
 
@@ -601,12 +587,12 @@ impl LogProcessor {
             };
 
             if !arn.is_empty() {
-                log_message.attributes.insert("faas.arn".to_string(),
+                log_message.attributes.insert(ATTR_FAAS_ARN.to_string(),
                     serde_json::Value::String(arn));
             }
 
             if let Some(ref trace_id) = context.trace_id {
-                log_message.attributes.insert("trace.id".to_string(),
+                log_message.attributes.insert(ATTR_TRACE_ID.to_string(),
                     serde_json::Value::String(trace_id.clone()));
             }
         } else {
@@ -618,7 +604,7 @@ impl LogProcessor {
                 if let Some(ref app) = *apm_guard {
                     let entity_guid = app.get_entity_guid();
                     if !entity_guid.is_empty() {
-                        log_message.attributes.insert("entity.guid".to_string(),
+                        log_message.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                             serde_json::Value::String(entity_guid.to_string()));
                     }
                 }
@@ -651,38 +637,41 @@ impl LogProcessor {
             }
         }
         
-        let message_str = match &record.record {
-            serde_json::Value::String(s) => s.as_str(),
+        // Compute message string ONCE — used for error detection AND passed to to_log_message
+        // to avoid double-serialization of non-String records.
+        let message_owned: String = match &record.record {
+            serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Object(obj) => {
-                if let Some(message_value) = obj.get("message") {
-                    message_value.as_str().unwrap_or("")
+                if let Some(serde_json::Value::String(s)) = obj.get("message") {
+                    s.clone()
+                } else if let Some(other) = obj.get("message") {
+                    other.to_string()
                 } else {
-                    &serde_json::to_string(&record.record).unwrap_or_default()
+                    serde_json::to_string(&record.record).unwrap_or_default()
                 }
             }
-            _ => {
-                &serde_json::to_string(&record.record).unwrap_or_default()
-            }
+            other => other.to_string(),
         };
-    
-        if let Some(log_message) = self.to_log_message(&record) {
-            // Route to pre_invoke_buffer if ARN is empty (INIT phase before first INVOKE)
-            let has_arn = {
+        let message_str = message_owned.as_str();
+
+        if let Some(log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+            // Read context ONCE — avoids 4 separate mutex lock/unlock cycles per record.
+            let (has_arn, has_valid_request_id, ctx_request_id, ctx_arn) = {
                 let context = self.invocation_context.lock().unwrap();
-                !context.invoked_function_arn.is_empty()
+                (
+                    !context.invoked_function_arn.is_empty(),
+                    !context.request_id.is_empty() && context.request_id != "unknown",
+                    context.request_id.clone(),
+                    context.invoked_function_arn.clone(),
+                )
             };
-    
+
             if !has_arn {
                 let mut pre_invoke_buf = self.pre_invoke_buffer.lock().unwrap();
                 pre_invoke_buf.push(log_message);
                 return;
             }
 
-            let has_valid_request_id = {
-                let context = self.invocation_context.lock().unwrap();
-                !context.request_id.is_empty() && context.request_id != "unknown"
-            };
-    
             if !has_valid_request_id {
                 let mut request_buffer = self.request_id_buffer.lock().unwrap();
                 request_buffer.push(log_message);
@@ -710,11 +699,8 @@ impl LogProcessor {
                 // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
                 let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
                     .replace('\n', "\\n").replace('\r', "\\r");
-                
-                let (request_id, function_arn) = {
-                    let context = self.invocation_context.lock().unwrap();
-                    (context.request_id.clone(), context.invoked_function_arn.clone())
-                };
+
+                let (request_id, function_arn) = (ctx_request_id.clone(), ctx_arn.clone());
 
                 // Store error details for potential platform fault correlation
                 let error_type = if message_str.contains("Task timed out") {
@@ -833,33 +819,22 @@ impl LogProcessor {
         }
     }
 
-   
-    fn to_log_message(&self, record: &TelemetryRecord) -> Option<payload::LogMessage> {
+
+    /// Build LogMessage using a pre-computed message string (avoids re-serialization).
+    fn to_log_message_with_msg(&self, record: &TelemetryRecord, message: String) -> Option<payload::LogMessage> {
         let timestamp = record.time.timestamp_millis();
-        
-        let message = if let Some(message_value) = record.record.get("message") {
-            match message_value {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string()
-            }
-        } else {
-            match &record.record {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string()
-            }
-        };
-        
+
         let mut attributes = serde_json::Map::new();
-        
+
         let log_level = self.extract_log_level(&record.record, &message);
-        attributes.insert("level".to_string(), log_level.into());
-        
-        attributes.insert("newrelic.logPattern".to_string(), "nr.DID_NOT_MATCH".into());
-        
-        attributes.insert("newrelic.source".to_string(), "api.logs".into());
+        attributes.insert(ATTR_LEVEL.to_string(), log_level.into());
+
+        attributes.insert(ATTR_LOG_PATTERN.to_string(), "nr.DID_NOT_MATCH".into());
+
+        attributes.insert(ATTR_SOURCE.to_string(), "api.logs".into());
 
         attributes.insert(
-            "_nr.logType".to_string(),
+            ATTR_LOG_TYPE.to_string(),
             serde_json::Value::String(record.record_type.clone()),
         );
 
@@ -870,8 +845,9 @@ impl LogProcessor {
         })
     }
 
-    /// Derive LogType from the _nr.logType attribute stamped by to_log_message.
+    /// Derive LogType from the _nr.logType attribute stamped by to_log_message_with_msg.
     /// Safe default is Function (never drop).
+    #[cfg(test)]
     fn log_type_from_message(msg: &payload::LogMessage) -> LogType {
         msg.attributes
             .get("_nr.logType")
@@ -1625,35 +1601,22 @@ impl LogProcessor {
                   chunks.iter().map(|c| c.len()).sum::<usize>(), chunks.len());
         }
         
-        let mut failed_logs = Vec::new();
         let mut successful_chunks = 0;
-        
+
         for chunk in chunks {
-            match self.send_chunk_with_retry_internal(&client, &config, chunk.clone(), &effective_arn).await {
+            let chunk_len = chunk.len();
+            match self.send_chunk_with_retry_internal(&client, &config, chunk, &effective_arn).await {
                 Ok(()) => {
                     successful_chunks += 1;
                 },
                 Err(e) => {
-                    error!("Log batch send failed: {}", e);
-                    failed_logs.extend(chunk);
+                    error!("Log batch send failed ({} logs): {}", chunk_len, e);
                 }
             }
         }
-        
+
         if successful_chunks > 0 {
             info!("Successfully sent {} log chunks", successful_chunks);
-        }
-        if !failed_logs.is_empty() {
-            warn!("Buffering {} failed logs for retry on next invocation", failed_logs.len());
-            for log in failed_logs {
-                let lt = Self::log_type_from_message(&log);
-                self.push_to_failed_buffer(FailedLogEntry {
-                    log_message: log,
-                    original_request_id: context.request_id.clone(),
-                    retry_count: 0,
-                    log_type: lt,
-                });
-            }
         }
 
         // Signal any waiter in wait_for_runtime_done_with_grace that the batch drained.
@@ -1670,35 +1633,18 @@ impl LogProcessor {
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
     ) -> std::io::Result<()> {
-        let mut retries = 0;
-
-        loop {
-            match client.send_logs(config, chunk.clone(), function_arn).await {
-                Ok(()) => {
-                    return Ok(());
-                },
-                Err(e) => {
-                    if retries == 0 {
-                        warn!("Log send failed: {}", e);
-                    }
-
-                    if e.to_string().contains("413") || e.to_string().contains("Payload Too Large") {
-                        error!("Payload too large even after chunking - dropping {} logs", chunk.len());
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Payload too large even after chunking"
-                        ));
-                    }
-
-                    if retries < MAX_RETRIES {
-                        retries += 1;
-                        let delay = get_backoff_delay(retries);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    } else {
-                        // Callers decide whether to re-buffer; this function only signals failure.
-                        return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                    }
+        // send_logs → send_payload already retries 3x internally (serialize once,
+        // retry the compressed bytes). No outer retry needed — avoids cloning the
+        // entire Vec<LogMessage> on each attempt.
+        match client.send_logs(config, chunk, function_arn).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("413") || msg.contains("Payload Too Large") {
+                    error!("Payload too large even after chunking");
+                    Err(std::io::Error::new(std::io::ErrorKind::InvalidData, msg))
+                } else {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other, e))
                 }
             }
         }

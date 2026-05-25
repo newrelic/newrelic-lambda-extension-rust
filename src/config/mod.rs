@@ -67,6 +67,12 @@ pub struct ExtensionSettings {
     /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
     /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
     pub runtime_done_grace_ms: u64,
+    /// NEW_RELIC_EXTENSION_PIPELINE_FLUSH — when true, the extension calls
+    /// GET /next immediately after runtimeDone and flushes telemetry in the
+    /// background during the freeze/thaw gap. Reduces billed duration but
+    /// may lose data on final shutdown if flush doesn't complete in time.
+    /// Default: false (safe mode — flush completes before GET /next).
+    pub pipeline_flush: bool,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -198,6 +204,7 @@ impl Default for ExtensionSettings {
             log_level: "info".to_string(),
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
+            pipeline_flush: false,
         }
     }
 }
@@ -330,6 +337,12 @@ impl ExtensionConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(25)
             .min(2000);
+
+        // NEW_RELIC_EXTENSION_PIPELINE_FLUSH: opt-in to pipeline GET /next pattern.
+        // When enabled, the extension calls GET /next immediately after runtimeDone
+        // and flushes telemetry in the background, reducing billed duration.
+        let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
+        config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
 
         config
     }

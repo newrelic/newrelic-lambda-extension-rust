@@ -885,32 +885,21 @@ pub async fn process_apm_request(
             );
 
             for (old_request_id, late_payloads) in pending_with_payloads {
-
+                // Send all late payloads concurrently — each is an independent HTTP POST
+                // that only takes a read lock on apm_app (no write contention).
+                let mut set = tokio::task::JoinSet::new();
                 for payload_bytes in late_payloads {
-                    debug!(
-                        "Sending late agent payload for request: {} ({} bytes)",
-                        old_request_id,
-                        payload_bytes.len()
-                    );
-
-                    if let Err(e) = send_to_apm_collector(
-                        &payload_bytes,
-                        &old_request_id,
-                        &apm_app,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to send late agent payload for {}: {}",
-                            old_request_id, e
-                        );
-                    } else {
-                        info!(
-                            "Successfully sent late agent payload for request: {}",
-                            old_request_id
-                        );
-                    }
+                    let rid = old_request_id.clone();
+                    let apm = apm_app.clone();
+                    set.spawn(async move {
+                        if let Err(e) = send_to_apm_collector(&payload_bytes, &rid, &apm).await {
+                            error!("Failed to send late agent payload for {}: {}", rid, e);
+                        } else {
+                            info!("Successfully sent late agent payload for request: {}", rid);
+                        }
+                    });
                 }
+                while set.join_next().await.is_some() {}
 
                 cleanup_request_processing_state_internal(&old_request_id, false);
             }
@@ -1687,20 +1676,23 @@ async fn process_pending_agent_payloads(
                 request_id
             );
 
+            // Send all payloads for this request concurrently
+            let mut set = tokio::task::JoinSet::new();
             for payload_bytes in payloads {
-                if let Err(e) = process_and_send_agent_payload(
-                    &payload_bytes,
-                    &request_id,
-                    &invoked_function_arn,
-                    global_log_processor,
-                    config,
-                    apm_app,
-                )
-                .await
-                {
-                    error!("Failed to process pending agent payload: {}", e);
-                }
+                let rid = request_id.clone();
+                let arn = invoked_function_arn.clone();
+                let lp = global_log_processor.clone();
+                let cfg = config.clone();
+                let apm = apm_app.clone();
+                set.spawn(async move {
+                    if let Err(e) = process_and_send_agent_payload(
+                        &payload_bytes, &rid, &arn, &lp, &cfg, &apm,
+                    ).await {
+                        error!("Failed to process pending agent payload: {}", e);
+                    }
+                });
             }
+            while set.join_next().await.is_some() {}
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)

@@ -1099,6 +1099,7 @@ fn test_extension_settings_all_fields() {
         log_level: "debug".to_string(),
         extension_logs_enabled: false,
         runtime_done_grace_ms: 250,
+        pipeline_flush: false,
     };
     
     assert!(settings.send_function_logs);

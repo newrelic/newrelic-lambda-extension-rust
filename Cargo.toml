@@ -10,7 +10,7 @@ readme = "README.md"
 
 [dependencies]
 # Tokio - only load what we actually use (massive startup time improvement)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 # Reqwest - use newer version to match AWS SDK and reduce duplicates
 reqwest = { version = "0.13.1", features = ["json", "rustls"], default-features = false }
 serde = { version = "1.0", features = ["derive"] }
@@ -69,3 +69,4 @@ opt-level = 1  # Some optimization for better development experience
 
 [dev-dependencies]
 serial_test = "3.0"
+tokio = { version = "1", features = ["rt-multi-thread"] }
