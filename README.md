@@ -216,6 +216,12 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
 
+### Performance Optimization
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` | `false` | `true`, `false`, `1`, `0` | **Pipeline flush mode** — when enabled, the extension calls GET /next immediately after `runtimeDone` and flushes telemetry in the background. This removes flush latency from **billed duration** (typically saving 50–200ms per invocation). The in-flight flush is always awaited at the start of the next invocation or during shutdown, so no data is lost. If the TCP connection is broken during a Lambda freeze, the extension retries with exponential backoff on thaw. Recommended for high-frequency functions where per-invocation cost savings matter. |
+
 ### Network / Proxy Configuration
 
 | Environment variable | Default value | Options | Description |
