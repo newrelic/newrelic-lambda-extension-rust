@@ -47,9 +47,9 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
 /// Mask credentials in a proxy URL for safe logging.
 /// `http://user:pass@proxy:8080` -> `http://***:***@proxy:8080`
 pub fn mask_proxy_url(url: &str) -> String {
-    // Try to find the `@` that separates credentials from host
-    // Pattern: scheme://user:pass@host...
-    if let Some(at_pos) = url.find('@') {
+    // Use rfind to find the LAST `@` — the credential/host separator.
+    // Handles passwords containing `@` (e.g., `http://user:P@ss@proxy:8080`)
+    if let Some(at_pos) = url.rfind('@') {
         if let Some(scheme_end) = url.find("://") {
             let prefix = &url[..scheme_end + 3]; // "http://" or "https://"
             let suffix = &url[at_pos..];          // "@proxy:8080/..."

@@ -125,22 +125,24 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                     debug!("Performing emergency shutdown cleanup...");
 
-                    if components.config.extension.pipeline_flush {
-                        for handle in pending_flush_handles.drain(..) {
-                            if let Err(e) = handle.await {
-                                error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                    let _ = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                        if components.config.extension.pipeline_flush {
+                            for handle in pending_flush_handles.drain(..) {
+                                if let Err(e) = handle.await {
+                                    error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                                }
                             }
                         }
-                    }
 
-                    process_pending_agent_payloads(
-                        &components.config,
-                        &components.global_log_processor,
-                        &components.apm_app,
-                        "",
-                    )
-                    .await;
-                    
+                        process_pending_agent_payloads(
+                            &components.config,
+                            &components.global_log_processor,
+                            &components.apm_app,
+                            "",
+                        )
+                        .await;
+                    }).await;
+
                     info!("Emergency shutdown cleanup completed. Extension exiting.");
                     break;
                 }
@@ -272,6 +274,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // Drain finished handles (0ms each); leave in-flight ones running.
                 if components.config.extension.pipeline_flush {
                     pending_flush_handles.retain(|h| !h.is_finished());
+                    // Cap at 8 to bound memory under sustained fast invocations
+                    while pending_flush_handles.len() >= 8 {
+                        if let Some(oldest) = pending_flush_handles.drain(..1).next() {
+                            if let Err(e) = oldest.await {
+                                error!("Oldest pipeline flush task panicked: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 components
@@ -597,22 +607,24 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                         info!("Performing emergency shutdown cleanup...");
 
-                        if components.config.extension.pipeline_flush {
-                            for handle in pending_flush_handles.drain(..) {
-                                if let Err(e) = handle.await {
-                                    error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                        let _ = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                            if components.config.extension.pipeline_flush {
+                                for handle in pending_flush_handles.drain(..) {
+                                    if let Err(e) = handle.await {
+                                        error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                                    }
                                 }
                             }
-                        }
 
-                        send_batched_payloads_with_reports_only(
-                            components.newrelic_client.clone(),
-                            components.config.clone(),
-                        )
-                        .await;
-                        
-                        let _ = components.global_log_processor.flush().await;
-                        
+                            send_batched_payloads_with_reports_only(
+                                components.newrelic_client.clone(),
+                                components.config.clone(),
+                            )
+                            .await;
+
+                            let _ = components.global_log_processor.flush().await;
+                        }).await;
+
                         info!("Emergency shutdown cleanup completed. Extension exiting.");
                         break;
                     }
@@ -711,6 +723,14 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // Drain finished handles (0ms each); leave in-flight ones running.
                 if components.config.extension.pipeline_flush {
                     pending_flush_handles.retain(|h| !h.is_finished());
+                    // Cap at 8 to bound memory under sustained fast invocations
+                    while pending_flush_handles.len() >= 8 {
+                        if let Some(oldest) = pending_flush_handles.drain(..1).next() {
+                            if let Err(e) = oldest.await {
+                                error!("Oldest pipeline flush task panicked: {}", e);
+                            }
+                        }
+                    }
                 }
 
                 components
@@ -944,13 +964,6 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    // Only write if slot hasn't been advanced to a newer request (pipeline flush race guard)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
-            *active_request = Some(request_id.clone());
-        }
-    }
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -1166,13 +1179,6 @@ pub async fn process_apm_request(
 
     cleanup_request_processing_state_internal(&request_id, true);
 
-    // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // Only write if the slot hasn't been advanced to a newer request (pipeline flush race guard)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
-            *active_request = Some(request_id.clone());
-        }
-    }
 
     debug!(
         "APM mode: Completed processing for request: {}",
@@ -1385,13 +1391,6 @@ pub async fn process_request_concurrently(
         request_id
     );
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    // Only write if slot hasn't been advanced to a newer request (pipeline flush race guard)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
-            *active_request = Some(request_id.clone());
-        }
-    }
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
@@ -1537,13 +1536,6 @@ pub async fn process_request_concurrently(
     // Unified cleanup: Always preserve buffers for late payload handling
     cleanup_request_processing_state_internal(&request_id, true);
 
-    // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // Only write if the slot hasn't been advanced to a newer request (pipeline flush race guard)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        if active_request.as_deref() == Some(request_id.as_str()) || active_request.is_none() {
-            *active_request = Some(request_id.clone());
-        }
-    }
 
     debug!(
         "Serverless mode: Completed processing for request: {}",

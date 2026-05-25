@@ -297,7 +297,7 @@ impl ExtensionConfig {
         if let Some(ref url) = config.new_relic.proxy_url {
             // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
             // Mask credentials: http://user:pass@host -> http://***:***@host
-            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.find('@')) {
+            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
                 format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
             } else {
                 url.clone()
