@@ -36,6 +36,17 @@ use crate::{
     IS_WARM_START,
 };
 
+const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
+
+/// Drop guard that clears `reconnect_in_flight` on any exit path (success, error, or panic).
+struct ReconnectGuard(Arc<watch::Sender<bool>>);
+
+impl Drop for ReconnectGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
 #[derive(Debug)]
 pub struct ExtensionComponents {
     pub client: Arc<Client>,
@@ -83,14 +94,14 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or standard mode based on config (or runtime override for Java)
+/// Routes to APM or serverless mode based on config (or runtime override for Java)
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
     let apm_mode_enabled = components.apm_mode_enabled;
     if apm_mode_enabled {
         info!("Starting APM mode event loop (connection may still be in progress)");
         execute_apm_mode_event_loop(components).await
     } else {
-        debug!("Starting standard mode event loop");
+        debug!("Starting serverless mode event loop");
         execute_standard_mode_event_loop(components).await
     }
 }
@@ -99,6 +110,7 @@ async fn execute_main_telemetry_processing_loop(components: &mut ExtensionCompon
 pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
+    let mut pending_flush_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
         debug!("APM mode: waiting for next lambda invocation event...");
@@ -112,15 +124,25 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if error_msg.contains("403") || error_msg.contains("State transition") {
                     error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                     debug!("Performing emergency shutdown cleanup...");
-                    
-                    process_pending_agent_payloads(
-                        &components.config,
-                        &components.global_log_processor,
-                        &components.apm_app,
-                        "",
-                    )
-                    .await;
-                    
+
+                    let _ = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                        if components.config.extension.pipeline_flush {
+                            for handle in pending_flush_handles.drain(..) {
+                                if let Err(e) = handle.await {
+                                    error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                                }
+                            }
+                        }
+
+                        process_pending_agent_payloads(
+                            &components.config,
+                            &components.global_log_processor,
+                            &components.apm_app,
+                            "",
+                        )
+                        .await;
+                    }).await;
+
                     info!("Emergency shutdown cleanup completed. Extension exiting.");
                     break;
                 }
@@ -167,6 +189,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
 
                         tokio::spawn(async move {
+                            let _guard = ReconnectGuard(reconnect_flag);
                             debug!("APM reconnect attempt started (no delays — fresh invoke)");
                             match crate::apm::ApmApp::new(
                                 license_key,
@@ -193,7 +216,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
                                 }
                             }
-                            reconnect_flag.send_replace(false);
                         });
                     }
                 }
@@ -228,6 +250,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     *active_request = Some(request_id.clone());
                 }
 
+                // Retry any previously-failed agent payloads in the background so the
+                // HTTP round-trips happen during function execution, not post-runtime-done.
+                {
+                    let nr = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(retry_failed_agent_payloads(nr, cfg));
+                }
+
                 // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
                     &request_id,
@@ -240,8 +270,20 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
-                // Kick off tracked retry of failed logs — runs during Lambda execution,
-                // awaited in flush() before GET /next (freeze-safe)
+                // Pipeline flush: prior flushes run in parallel — don't block.
+                // Drain finished handles (0ms each); leave in-flight ones running.
+                if components.config.extension.pipeline_flush {
+                    pending_flush_handles.retain(|h| !h.is_finished());
+                    // Cap at 8 to bound memory under sustained fast invocations
+                    while pending_flush_handles.len() >= 8 {
+                        if let Some(oldest) = pending_flush_handles.drain(..1).next() {
+                            if let Err(e) = oldest.await {
+                                error!("Oldest pipeline flush task panicked: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 components
                     .global_log_processor
                     .start_invocation_retry();
@@ -302,17 +344,27 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                let (current_result, pending_result) = tokio::join!(current_task, pending_task);
-                if let Err(e) = current_result {
-                    error!("Error in APM request processing: {}", e);
-                }
-                if let Err(e) = pending_result {
-                    error!("Error in pending payload processing: {}", e);
+                if components.config.extension.pipeline_flush {
+                    let combined = tokio::spawn(async move {
+                        let (r1, r2) = tokio::join!(current_task, pending_task);
+                        if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
+                        if let Err(e) = r2 { error!("Error in pending payload processing: {}", e); }
+                    });
+                    pending_flush_handles.push(combined);
+                } else {
+                    let (current_result, pending_result) = tokio::join!(current_task, pending_task);
+                    if let Err(e) = current_result {
+                        error!("Error in APM request processing: {}", e);
+                    }
+                    if let Err(e) = pending_result {
+                        error!("Error in pending payload processing: {}", e);
+                    }
                 }
 
                 // Post-invoke wait: only when NEW_RELIC_APM_BLOCKING_HANDSHAKE=true.
-                // Sandbox is active here (Lambda freezes only after /next is called),
-                // so the wait consumes remaining deadline budget without freeze risk.
+                // Independent of pipeline_flush — handshake establishes APM connection (one-time
+                // cost on cold start), pipeline_flush defers data send (every-invoke savings).
+                // Once connected, this is a no-op (reconnect_in_flight=false → instant return).
                 if components.apm_mode_enabled && components.config.new_relic.apm_blocking_handshake {
                     wait_for_apm_handshake_within_budget(
                         &components.reconnect_in_flight,
@@ -321,18 +373,22 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 }
 
-                let event_time = event_start.elapsed();
-                if is_cold_start {
-                    debug!(
-                        "COLD START: First invocation processed in {:?} (request_id: {})",
-                        event_time, request_id
-                    );
+                if !components.config.extension.pipeline_flush {
+                    let event_time = event_start.elapsed();
+                    if is_cold_start {
+                        debug!(
+                            "COLD START: First invocation processed in {:?} (request_id: {})",
+                            event_time, request_id
+                        );
+                        IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        debug!(
+                            "WARM START: Event {} processed in {:?} (request_id: {})",
+                            event_counter, event_time, request_id
+                        );
+                    }
+                } else if is_cold_start {
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    debug!(
-                        "WARM START: Event {} processed in {:?} (request_id: {})",
-                        event_counter, event_time, request_id
-                    );
                 }
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
@@ -353,6 +409,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
                 info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+
+                let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                if components.config.extension.pipeline_flush {
+                    for handle in pending_flush_handles.drain(..) {
+                        debug!("APM shutdown: awaiting in-flight pipeline flush");
+                        if let Err(e) = handle.await {
+                            error!("Pipeline flush task panicked during APM shutdown: {}", e);
+                        }
+                    }
+                }
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -508,8 +574,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
+                }).await;
 
-                info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                if shutdown_result.is_err() {
+                    warn!("APM shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
+                } else {
+                    info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                }
                 break;
             }
         }
@@ -518,13 +589,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
     event_counter
 }
 
-/// Standard mode: batches payloads with platform.report, sends to serverless API
+/// Serverless mode: batches payloads with platform.report, sends to serverless API
 pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     let mut event_counter = 0;
     let mut cleanup_counter = 0; // Track when to run periodic cleanup
+    let mut pending_flush_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     loop {
-        debug!("Standard mode: waiting for next lambda invocation event...");
+        debug!("Serverless mode: waiting for next lambda invocation event...");
 
         let runtime_event =
             match runtime::fetch_next_event(&components.client, &components.extension_id).await {
@@ -534,15 +606,25 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     if error_msg.contains("403") || error_msg.contains("State transition") {
                         error!("Fatal extension state error (403 - Lambda shutting down): {:?}", e);
                         info!("Performing emergency shutdown cleanup...");
-                        
-                        send_batched_payloads_with_reports_only(
-                            components.newrelic_client.clone(),
-                            components.config.clone(),
-                        )
-                        .await;
-                        
-                        let _ = components.global_log_processor.flush().await;
-                        
+
+                        let _ = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                            if components.config.extension.pipeline_flush {
+                                for handle in pending_flush_handles.drain(..) {
+                                    if let Err(e) = handle.await {
+                                        error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                                    }
+                                }
+                            }
+
+                            send_batched_payloads_with_reports_only(
+                                components.newrelic_client.clone(),
+                                components.config.clone(),
+                            )
+                            .await;
+
+                            let _ = components.global_log_processor.flush().await;
+                        }).await;
+
                         info!("Emergency shutdown cleanup completed. Extension exiting.");
                         break;
                     }
@@ -577,13 +659,28 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 error_synthesis::clear_sent_errors_for_request(&request_id);
 
-                error_synthesis::retry_failed_errors(&components.newrelic_client, &components.config).await;
-
-                crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.client,
-                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
-                )
-                .await;
+                // Spawn error and telemetry retries into the background so they run during
+                // function execution, not pre-invoke. Lambda freeze suspends the tokio runtime,
+                // so sleeping/retrying tasks are paused and resume cleanly on unfreeze —
+                // retry counts are only incremented on actual HTTP failures, not on suspensions.
+                {
+                    let nr = components.newrelic_client.clone();
+                    let cfg = components.config.clone();
+                    tokio::spawn(async move {
+                        error_synthesis::retry_failed_errors(&nr, &cfg).await;
+                    });
+                }
+                {
+                    let http_client = components.client.clone();
+                    let license_key = components.config.new_relic.license_key.clone();
+                    tokio::spawn(async move {
+                        crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                            &http_client,
+                            license_key.as_deref().unwrap_or(""),
+                        )
+                        .await;
+                    });
+                }
 
                 if is_cold_start && components.config.new_relic.add_version_detail_tags {
                     tag_lambda_function_once(invoked_function_arn.clone(), &components.config);
@@ -596,9 +693,19 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     *active_request = Some(request_id.clone());
                 }
 
-                // SKIP old buffer processing to avoid deadlocks
-                // Late payloads are already handled via the buffer matching on next invocation
-                // The complex locking in this loop was causing 7-second deadlocks
+                // On warm starts, pair any previous-request agent payloads that arrived after
+                // their invocation ended but whose platform.report has since been stored.
+                // Must run after updating CURRENT_ACTIVE_REQUEST_ID so new pipe payloads
+                // route to the current request, not old buffers.
+                if !is_cold_start {
+                    let paired = drain_late_paired_payloads_serverless(&request_id);
+                    if paired > 0 {
+                        debug!(
+                            "Serverless mode: Paired {} late agent payload(s) into batch at start of invocation: {}",
+                            paired, request_id
+                        );
+                    }
+                }
 
                 // Create per-request state (platform_processor, agent_buffer, context)
                 let request_state = create_request_processing_state(
@@ -612,8 +719,20 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .global_log_processor
                     .update_invocation_context(request_state.context.clone());
 
-                // Kick off tracked retry of failed logs — runs during Lambda execution,
-                // awaited in flush() before GET /next (freeze-safe)
+                // Pipeline flush: prior flushes run in parallel — don't block.
+                // Drain finished handles (0ms each); leave in-flight ones running.
+                if components.config.extension.pipeline_flush {
+                    pending_flush_handles.retain(|h| !h.is_finished());
+                    // Cap at 8 to bound memory under sustained fast invocations
+                    while pending_flush_handles.len() >= 8 {
+                        if let Some(oldest) = pending_flush_handles.drain(..1).next() {
+                            if let Err(e) = oldest.await {
+                                error!("Oldest pipeline flush task panicked: {}", e);
+                            }
+                        }
+                    }
+                }
+
                 components
                     .global_log_processor
                     .start_invocation_retry();
@@ -656,22 +775,30 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .await;
                 });
 
-                if let Err(e) = processing_handle.await {
-                    error!("Error in standard mode request processing: {}", e);
+                if components.config.extension.pipeline_flush {
+                    pending_flush_handles.push(processing_handle);
+                } else {
+                    if let Err(e) = processing_handle.await {
+                        error!("Error in standard mode request processing: {}", e);
+                    }
                 }
 
-                let event_time = event_start.elapsed();
-                if is_cold_start {
-                    debug!(
-                        "COLD START: First invocation processed in {:?} (request_id: {})",
-                        event_time, request_id
-                    );
+                if !components.config.extension.pipeline_flush {
+                    let event_time = event_start.elapsed();
+                    if is_cold_start {
+                        debug!(
+                            "COLD START: First invocation processed in {:?} (request_id: {})",
+                            event_time, request_id
+                        );
+                        IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        debug!(
+                            "WARM START: Event {} processed in {:?} (request_id: {})",
+                            event_counter, event_time, request_id
+                        );
+                    }
+                } else if is_cold_start {
                     IS_WARM_START.store(true, std::sync::atomic::Ordering::Relaxed);
-                } else {
-                    debug!(
-                        "WARM START: Event {} processed in {:?} (request_id: {})",
-                        event_counter, event_time, request_id
-                    );
                 }
 
                 // Periodic cleanup: Run every 10 invocations to prevent memory leaks
@@ -690,7 +817,17 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
                 let shutdown_start_time = std::time::Instant::now();
-                info!("Standard mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+                info!("Serverless mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
+
+                let shutdown_timeout_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                if components.config.extension.pipeline_flush {
+                    for handle in pending_flush_handles.drain(..) {
+                        debug!("Shutdown: awaiting in-flight pipeline flush");
+                        if let Err(e) = handle.await {
+                            error!("Pipeline flush task panicked during shutdown: {}", e);
+                        }
+                    }
+                }
 
                 // Synthesize and send error based on shutdown reason
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
@@ -738,6 +875,13 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     }
                 }
 
+                // Yield to let the IPC pipe collector task route any last in-flight payloads
+                // into agent_buffer before we collect from REQUEST_DATA below.
+                // The collector runs in a separate tokio task; two yields ensure items
+                // already in the mpsc channel are routed before the shutdown collect.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
                 send_all_pending_payloads_on_shutdown(
@@ -746,19 +890,27 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 )
                 .await;
 
-                // Emergency flush of pre-invoke buffer (logs from INIT phase if shutdown before first INVOKE)
-                if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
+                // Flush pre-invoke buffer and main log buffer concurrently.
+                // Both paths write to independent payloads (pre-invoke vs main batch),
+                // so parallel execution is safe and cuts shutdown latency in half
+                // when both are non-empty. Each path already chunks at 1MB.
+                let (pre_invoke_result, flush_result) = tokio::join!(
+                    components.global_log_processor.flush_pre_invoke_buffer_on_shutdown(),
+                    components.global_log_processor.flush_on_shutdown(),
+                );
+                if let Err(e) = pre_invoke_result {
                     error!("Standard mode shutdown: Failed to flush pre-invoke buffer: {}", e);
                 }
-
-                // Shutdown drain: flush + re-flush any entries pushed back into
-                // failed_logs_buffer by send failures in the flush itself. Bounded by
-                // MAX_RETRIES (via per-entry retry_count filter in start_invocation_retry).
-                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
+                if let Err(e) = flush_result {
                     error!("Standard mode shutdown: Failed to flush logs: {}", e);
                 }
+                }).await;
 
-                info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                if shutdown_timeout_result.is_err() {
+                    warn!("Serverless shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
+                } else {
+                    info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
+                }
                 break;
             }
         }
@@ -812,10 +964,6 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -842,32 +990,21 @@ pub async fn process_apm_request(
             );
 
             for (old_request_id, late_payloads) in pending_with_payloads {
-
+                // Send all late payloads concurrently — each is an independent HTTP POST
+                // that only takes a read lock on apm_app (no write contention).
+                let mut set = tokio::task::JoinSet::new();
                 for payload_bytes in late_payloads {
-                    debug!(
-                        "Sending late agent payload for request: {} ({} bytes)",
-                        old_request_id,
-                        payload_bytes.len()
-                    );
-
-                    if let Err(e) = send_to_apm_collector(
-                        &payload_bytes,
-                        &old_request_id,
-                        &apm_app,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to send late agent payload for {}: {}",
-                            old_request_id, e
-                        );
-                    } else {
-                        info!(
-                            "Successfully sent late agent payload for request: {}",
-                            old_request_id
-                        );
-                    }
+                    let rid = old_request_id.clone();
+                    let apm = apm_app.clone();
+                    set.spawn(async move {
+                        if let Err(e) = send_to_apm_collector(&payload_bytes, &rid, &apm).await {
+                            error!("Failed to send late agent payload for {}: {}", rid, e);
+                        } else {
+                            info!("Successfully sent late agent payload for request: {}", rid);
+                        }
+                    });
                 }
+                while set.join_next().await.is_some() {}
 
                 cleanup_request_processing_state_internal(&old_request_id, false);
             }
@@ -1042,11 +1179,6 @@ pub async fn process_apm_request(
 
     cleanup_request_processing_state_internal(&request_id, true);
 
-    // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // It will be overwritten when next INVOKE arrives
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
 
     debug!(
         "APM mode: Completed processing for request: {}",
@@ -1084,7 +1216,7 @@ async fn send_to_apm_collector(
 }
 
 /// Wait for `platform.runtimeDone` for this request, then give a short grace for
-/// trailing telemetry, then return. Used by both standard mode and APM mode before
+/// trailing telemetry, then return. Used by both serverless mode and APM mode before
 /// the end-of-invocation flush so late logs land in `log_batch` before it drains.
 ///
 /// Bounds:
@@ -1137,11 +1269,34 @@ async fn wait_for_runtime_done_with_grace(
         if !log_processor.is_drained() {
             let grace_ms = config.extension.runtime_done_grace_ms;
             if grace_ms > 0 {
-                debug!(
-                    "runtime.done: batch not drained - waiting {}ms grace for trailing telemetry (request: {})",
-                    grace_ms, request_id
-                );
-                tokio::time::sleep(Duration::from_millis(grace_ms)).await;
+                // Subscribe to drain notification BEFORE re-checking is_drained()
+                // to avoid a TOCTOU window where notify_one() fires between the
+                // is_drained() check above and the notified().await below.
+                let notify = log_processor.drain_notify();
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                // enable() registers the subscription so any concurrent notify_one()
+                // fired between here and the await is captured.
+                notified.as_mut().enable();
+
+                if !log_processor.is_drained() {
+                    debug!(
+                        "runtime.done: batch not drained - awaiting drain notify (up to {}ms grace, request: {})",
+                        grace_ms, request_id
+                    );
+                    let grace_start = tokio::time::Instant::now();
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(grace_ms),
+                        notified,
+                    )
+                    .await;
+                    debug!(
+                        "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
+                        grace_start.elapsed().as_millis(),
+                        grace_ms,
+                        request_id
+                    );
+                }
             }
         } else {
             debug!(
@@ -1232,18 +1387,14 @@ pub async fn process_request_concurrently(
     deadline_ms: i64,
 ) {
     debug!(
-        "Standard mode: Starting processing for request: {}",
+        "Serverless mode: Starting processing for request: {}",
         request_id
     );
 
-    // Set active request for agent payload routing (2.4.1 approach - simple and reliable)
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_, v)| v);
 
-    let Some(mut state) = state else {
+    let Some(state) = state else {
         error!("No processing state found for request: {}", request_id);
         return;
     };
@@ -1255,12 +1406,11 @@ pub async fn process_request_concurrently(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
-    // Unified wait timeout for all invocations
-    let agent_wait_timeout_ms = 100;
-
-    // Try to take payloads in a single lock. If empty, wait for coordination
-    // signal then take again — avoids a TOCTOU gap between check and drain.
-    let mut agent_payloads = {
+    // Drain whatever the background pipe listener has already routed to this request's buffer.
+    // No waiting — if the agent payload hasn't arrived yet, the Telemetry listener will match
+    // it with the platform.report when both arrive (same or next invocation) via the
+    // agent_buffer → AGENT_BATCH_BUFFER pairing in listener.rs.
+    let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
         } else {
@@ -1269,29 +1419,9 @@ pub async fn process_request_concurrently(
     };
 
     if agent_payloads.is_empty() {
-        debug!(
-            "Standard mode: Waiting up to {}ms for agent payload for request: {}",
-            agent_wait_timeout_ms, request_id
-        );
-        tokio::select! {
-            _ = state.coordination_rx.as_mut().expect("coordination_rx should exist").recv() => {
-                debug!("Agent payload received early for request: {}", request_id);
-            }
-            _ = tokio::time::sleep(Duration::from_millis(agent_wait_timeout_ms)) => {
-                debug!("Agent payload wait timeout ({}ms) for request: {}", agent_wait_timeout_ms, request_id);
-            }
-        }
-        // After wakeup, drain whatever arrived
-        agent_payloads = if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        };
+        debug!("Serverless mode: No agent payload in buffer for request: {} - will be matched when it arrives", request_id);
     } else {
-        debug!(
-            "Agent payload already in buffer for request: {} - no wait needed",
-            request_id
-        );
+        debug!("Serverless mode: {} agent payload(s) in buffer for request: {}", agent_payloads.len(), request_id);
     }
 
     let report_line = remove_pending_report(&request_id).map(|report| {
@@ -1309,7 +1439,7 @@ pub async fn process_request_concurrently(
             if let Some(ref detected_error) = *guard {
                 if detected_error.request_id == request_id {
                     debug!(
-                        "Standard mode: No agent payload for request {} but error detected: {} - sending to telemetry",
+                        "Serverless mode: No agent payload for request {} but error detected: {} - sending to telemetry",
                         request_id, detected_error.error_type
                     );
                     // Error was already sent by log processor, just log this for visibility
@@ -1320,12 +1450,12 @@ pub async fn process_request_concurrently(
 
     // Smart batching: Only send complete payloads (with report)
     let send_agent_task = if agent_payloads.is_empty() {
-        debug!("Standard mode: No agent payload for request: {}", request_id);
+        debug!("Serverless mode: No agent payload for request: {}", request_id);
         None
     } else if let Some(ref report) = report_line {
         // Both payload and report available - send now (complete data)
         debug!(
-            "Standard mode: Payload + report both ready for {} - adding to batch",
+            "Serverless mode: Payload + report both ready for {} - adding to batch",
             request_id
         );
 
@@ -1353,7 +1483,7 @@ pub async fn process_request_concurrently(
     } else {
         // Only payload, no report yet - put back in buffer for next invocation
         debug!(
-            "Standard mode: Payload ready but NO report yet for {} - keeping in buffer",
+            "Serverless mode: Payload ready but NO report yet for {} - keeping in buffer",
             request_id
         );
         debug!(
@@ -1380,12 +1510,10 @@ pub async fn process_request_concurrently(
 
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
-    let failed_retry = retry_failed_agent_payloads(&newrelic_client, &config);
 
-    let (log_result, platform_result, _, agent_result) = tokio::join!(
+    let (log_result, platform_result, agent_result) = tokio::join!(
         log_flushing,
         platform_flushing,
-        failed_retry,
         async {
             if let Some(handle) = send_agent_task {
                 handle.await
@@ -1408,14 +1536,9 @@ pub async fn process_request_concurrently(
     // Unified cleanup: Always preserve buffers for late payload handling
     cleanup_request_processing_state_internal(&request_id, true);
 
-    // Keep active request set for late payload routing (agent payloads may arrive after processing)
-    // It will be overwritten when next INVOKE arrives
-    if let Ok(mut active_request) = request::CURRENT_ACTIVE_REQUEST_ID.lock() {
-        *active_request = Some(request_id.clone());
-    }
 
     debug!(
-        "Standard mode: Completed processing for request: {}",
+        "Serverless mode: Completed processing for request: {}",
         request_id
     );
 }
@@ -1481,6 +1604,93 @@ async fn extract_and_coordinate_trace_id(
             error!("Failed to coordinate logs with trace ID: {}", e);
         }
     }
+}
+
+/// Serverless mode: drain previous-request buffers that have BOTH a pending agent payload
+/// AND a platform.report. Called at the start of each warm INVOKE.
+///
+/// Race this fixes:
+///   1. Invocation A completes — agent payload not yet in buffer.
+///   2. platform.report for A arrives in invocation B → listener finds agent_buffer[A]
+///      empty → stores as pending_report[A].
+///   3. Agent payload for A arrives late via named pipe → routes to agent_buffer[A].
+///   4. Neither the listener nor process_request_concurrently pairs them because
+///      each only handles its own request.
+///   5. This function (called at the start of invocation B+1) sees both, pairs them,
+///      and calls add_to_batch so the batch sender can transmit them.
+fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
+    // Collect IDs of old entries that have BOTH pending_report AND non-empty agent_buffer.
+    // Avoid holding DashMap refs across the subsequent get_mut calls.
+    let candidates: Vec<String> = REQUEST_DATA
+        .iter()
+        .filter(|entry| {
+            entry.key() != current_request_id
+                && entry.pending_report.is_some()
+                && entry.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false)
+        })
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    debug!(
+        "Serverless mode: {} previous request(s) have paired payload+report — batching before {}",
+        candidates.len(),
+        current_request_id
+    );
+
+    let mut batched_count = 0;
+
+    for req_id in candidates {
+        let Some(mut entry) = REQUEST_DATA.get_mut(&req_id) else { continue };
+
+        // Take the report — if gone, someone else raced us (listener matched it already).
+        let report = match entry.pending_report.take() {
+            Some(r) => r,
+            None => continue,
+        };
+
+        // Clone the Arc refs while we hold the write guard, then drop the guard
+        // before locking the Mutex to avoid the borrow-while-mutably-borrowed error.
+        let buffer_arc = entry.agent_buffer.clone();
+        let arn = if !entry.invoked_function_arn.is_empty() {
+            entry.invoked_function_arn.clone()
+        } else {
+            crate::get_global_fallback_arn()
+        };
+
+        drop(entry); // release DashMap write guard
+
+        let payloads: Vec<Vec<u8>> = match buffer_arc.lock() {
+            Ok(mut buf) => std::mem::take(&mut *buf),
+            Err(_) => Vec::new(),
+        };
+
+        if payloads.is_empty() {
+            // Buffer was empty (raced with listener or nothing arrived yet).
+            // Restore the report so the listener can still pair it when payload arrives.
+            if let Some(mut e) = REQUEST_DATA.get_mut(&req_id) {
+                if e.pending_report.is_none() {
+                    e.pending_report = Some(report);
+                }
+            }
+            continue;
+        }
+
+        let payload_count = payloads.len();
+        for payload_bytes in payloads {
+            add_to_batch(req_id.clone(), payload_bytes, Some(report.clone()), arn.clone());
+        }
+        batched_count += payload_count;
+        debug!(
+            "Serverless mode: Batched {} late payload(s) for previous request: {}",
+            payload_count, req_id
+        );
+    }
+
+    batched_count
 }
 
 /// Process any pending agent payloads from previous invocation (APM mode only)
@@ -1557,20 +1767,23 @@ async fn process_pending_agent_payloads(
                 request_id
             );
 
+            // Send all payloads for this request concurrently
+            let mut set = tokio::task::JoinSet::new();
             for payload_bytes in payloads {
-                if let Err(e) = process_and_send_agent_payload(
-                    &payload_bytes,
-                    &request_id,
-                    &invoked_function_arn,
-                    global_log_processor,
-                    config,
-                    apm_app,
-                )
-                .await
-                {
-                    error!("Failed to process pending agent payload: {}", e);
-                }
+                let rid = request_id.clone();
+                let arn = invoked_function_arn.clone();
+                let lp = global_log_processor.clone();
+                let cfg = config.clone();
+                let apm = apm_app.clone();
+                set.spawn(async move {
+                    if let Err(e) = process_and_send_agent_payload(
+                        &payload_bytes, &rid, &arn, &lp, &cfg, &apm,
+                    ).await {
+                        error!("Failed to process pending agent payload: {}", e);
+                    }
+                });
             }
+            while set.join_next().await.is_some() {}
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)
@@ -1679,8 +1892,8 @@ fn buffer_failed_agent_payload(
 
 /// Retry failed agent payloads during final flush
 async fn retry_failed_agent_payloads(
-    newrelic_client: &Arc<NewRelicClient>,
-    config: &Arc<ExtensionConfig>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
 ) {
     let mut retry_successful_count = 0;
     let mut retry_failed_count = 0;
@@ -1734,8 +1947,8 @@ async fn retry_failed_agent_payloads(
             &failed_payload.payload_bytes,
             &failed_payload.request_id,
             &failed_payload.invoked_function_arn,
-            newrelic_client,
-            config,
+            &newrelic_client,
+            &config,
             None, // No version line for retries (already sent in original attempt)
         )
         .await
@@ -1966,6 +2179,41 @@ mod tests {
             "arn:aws:lambda:us-east-1:123:function:test",
         )
         .await;
+    }
+
+    #[test]
+    fn test_reconnect_guard_clears_flag_on_drop() {
+        let (tx, mut rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        assert!(*rx.borrow());
+
+        {
+            let _guard = ReconnectGuard(tx.clone());
+        } // guard dropped here
+
+        // Flag should now be false
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn test_reconnect_guard_clears_flag_on_panic() {
+        let (tx, mut rx) = watch::channel(true);
+        let tx = Arc::new(tx);
+        assert!(*rx.borrow());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ReconnectGuard(tx.clone());
+            panic!("simulated panic inside task");
+        }));
+
+        assert!(result.is_err());
+        assert!(!*rx.borrow_and_update());
+    }
+
+    #[test]
+    fn test_shutdown_timeout_constant_is_under_2s() {
+        assert!(SHUTDOWN_TIMEOUT_MS < 2000, "Shutdown timeout must be under Lambda's 2s limit");
+        assert!(SHUTDOWN_TIMEOUT_MS >= 1000, "Shutdown timeout should be at least 1s to allow work");
     }
 }
 

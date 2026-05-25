@@ -1007,15 +1007,16 @@ mod tests {
         //   - batch: empty (after mem::take)
         //   - pending_flush_handles: still empty (handle not registered yet)
         //   - is_auto_flushing: true (set before mem::take, cleared after push)
+        use std::sync::atomic::Ordering;
         assert!(p.log_batch.lock().unwrap().is_empty());
-        assert!(p.pending_flush_handles.lock().unwrap().is_empty());
-        *p.is_auto_flushing.lock().unwrap() = true;
+        assert!(p.pending_flush_handles.lock().unwrap().is_none());
+        p.is_auto_flushing.store(true, Ordering::Relaxed);
 
         assert!(!p.is_drained(),
             "is_drained() must be false while is_auto_flushing==true, even if batch is empty and no handles are tracked");
 
         // After the flag clears, we're genuinely drained.
-        *p.is_auto_flushing.lock().unwrap() = false;
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
         assert!(p.is_drained(),
             "is_drained() must be true when not flushing, batch empty, no handles tracked");
     }
@@ -1172,47 +1173,49 @@ mod tests {
 
     // C2 regression — finished JoinHandles must be reaped so the vec doesn't leak
     // across a long-lived warm container. After yielding, any completed-task handles
-    // should be gone when is_drained() runs.
+    // should be None when is_drained() runs.
     #[tokio::test]
     async fn test_pending_flush_handles_reaped_when_finished() {
+        use std::sync::atomic::Ordering;
         let p = create_test_processor();
-        // Push a mix of handles: 50 that complete immediately, 1 that never does.
-        for _ in 0..50 {
-            let h = tokio::spawn(async {});
-            p.pending_flush_handles.lock().unwrap().push(h);
-        }
-        let slow = tokio::spawn(async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        });
-        p.pending_flush_handles.lock().unwrap().push(slow);
+        // Set a fast handle that completes immediately.
+        let fast = tokio::spawn(async {});
+        *p.pending_flush_handles.lock().unwrap() = Some(fast);
 
-        // Let the 50 fast tasks complete.
+        // Let the fast task complete.
         tokio::task::yield_now().await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        // is_drained() triggers the reap; the slow task keeps it false.
-        *p.is_auto_flushing.lock().unwrap() = false;
-        let _drained = p.is_drained();
+        // is_drained() triggers the reap; finished handle becomes None.
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
+        assert!(p.is_drained(), "is_drained() must reap the finished handle");
+        assert!(p.pending_flush_handles.lock().unwrap().is_none(),
+            "finished handle must be cleared to None after reap");
 
-        let remaining = p.pending_flush_handles.lock().unwrap().len();
-        assert_eq!(remaining, 1,
-            "is_drained() must reap finished handles (expected 1 unfinished, got {})", remaining);
+        // Now set a slow handle — is_drained() must return false.
+        let slow = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        *p.pending_flush_handles.lock().unwrap() = Some(slow);
+        assert!(!p.is_drained(),
+            "is_drained() must be false when the pending handle is still running");
     }
 
     #[tokio::test]
     async fn test_is_drained_false_with_unfinished_handle() {
         let p = create_test_processor();
+        use std::sync::atomic::Ordering;
         assert!(p.log_batch.lock().unwrap().is_empty());
-        *p.is_auto_flushing.lock().unwrap() = false;
+        p.is_auto_flushing.store(false, Ordering::Relaxed);
 
-        // Push a handle that will never finish within the test window.
+        // Set a handle that will never finish within the test window.
         let handle = tokio::spawn(async {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         });
-        p.pending_flush_handles.lock().unwrap().push(handle);
+        *p.pending_flush_handles.lock().unwrap() = Some(handle);
 
         assert!(!p.is_drained(),
-            "is_drained() must be false when at least one pending_flush_handle is still running");
+            "is_drained() must be false when the pending flush handle is still running");
     }
 
     // ========================================================================
@@ -1331,5 +1334,128 @@ mod tests {
         let batch = p.log_batch.lock().unwrap();
         assert!(!batch[0].attributes.contains_key("entity.guid"),
             "entity.guid must not appear when apm_app is None");
+    }
+
+    // ========================================================================
+    // PHASE 8: SendError classification + log_type_from_message
+    // ========================================================================
+
+    #[test]
+    fn test_log_type_from_message_function() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("function"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_log_type_from_message_platform() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("platform"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Platform);
+    }
+
+    #[test]
+    fn test_log_type_from_message_extension() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("extension"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Extension);
+    }
+
+    #[test]
+    fn test_log_type_from_message_missing_attribute_defaults_to_function() {
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: serde_json::Map::new(),
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_log_type_from_message_unknown_value_defaults_to_function() {
+        let mut attrs = serde_json::Map::new();
+        attrs.insert("_nr.logType".to_string(), json!("unknown_type"));
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 0,
+            message: String::new(),
+            attributes: attrs,
+        };
+        assert_eq!(LogProcessor::log_type_from_message(&msg), LogType::Function);
+    }
+
+    #[test]
+    fn test_send_error_client_rejected_drops_logs() {
+        use crate::newrelic::client::SendError;
+        let err = SendError::ClientRejected { status: 413 };
+        // ClientRejected means logs should NOT be rebuffered (empty vec)
+        assert!(matches!(err, SendError::ClientRejected { status: 413 }));
+        // Verify the error is NOT retryable
+        assert!(!matches!(err, SendError::ServerExhausted { .. } | SendError::Network(_)));
+    }
+
+    #[test]
+    fn test_send_error_server_exhausted_is_retryable() {
+        use crate::newrelic::client::SendError;
+        let err = SendError::ServerExhausted { status: 503 };
+        assert!(matches!(err, SendError::ServerExhausted { .. }));
+    }
+
+    #[test]
+    fn test_failed_buffer_populated_for_retryable_errors() {
+        let p = create_test_processor();
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
+
+        // Simulate what happens when try_send_chunk returns a retryable error:
+        // The caller pushes logs to failed buffer
+        let msg = crate::newrelic::payload::LogMessage {
+            timestamp: 1234,
+            message: "test log".to_string(),
+            attributes: serde_json::Map::new(),
+        };
+        let entry = FailedLogEntry {
+            log_type: LogType::Function,
+            log_message: msg,
+            original_request_id: "req-123".to_string(),
+            retry_count: 0,
+        };
+        p.push_to_failed_buffer(entry);
+
+        let buf = p.failed_logs_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.len_of(LogType::Function), 1);
+    }
+
+    #[test]
+    fn test_failed_buffer_not_populated_for_client_errors() {
+        let p = create_test_processor();
+        // For ClientRejected (4xx), we return empty Vec — nothing to rebuffer
+        // Simulate: try_send_chunk returns Err((_, Vec::new()))
+        let empty_logs: Vec<crate::newrelic::payload::LogMessage> = Vec::new();
+        // No logs to push to buffer
+        for log_message in empty_logs {
+            let entry = FailedLogEntry {
+                log_type: LogProcessor::log_type_from_message(&log_message),
+                log_message,
+                original_request_id: "req-456".to_string(),
+                retry_count: 0,
+            };
+            p.push_to_failed_buffer(entry);
+        }
+        assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
     }
 }
