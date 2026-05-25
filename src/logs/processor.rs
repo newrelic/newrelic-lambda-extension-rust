@@ -436,22 +436,22 @@ impl LogProcessor {
             let mut successful = 0;
             for chunk in chunks {
                 let chunk_len = chunk.len();
-                match client.send_logs(&config, &chunk, &auto_flush_arn).await {
+                match processor_clone.try_send_chunk(&client, &config, chunk, &auto_flush_arn).await {
                     Ok(()) => {
                         successful += 1;
                     }
-                    Err(e) => {
-                        let should_buffer = matches!(
-                            e,
-                            crate::newrelic::client::SendError::ServerExhausted { .. }
-                            | crate::newrelic::client::SendError::Network(_)
-                        );
-                        if should_buffer {
+                    Err((e, failed_logs)) => {
+                        if failed_logs.is_empty() {
+                            error!(
+                                "Auto-flush rejected by server ({} logs dropped): {}",
+                                chunk_len, e
+                            );
+                        } else {
                             warn!(
                                 "Auto-flush failed ({} logs), buffering for next-invoke retry: {}",
                                 chunk_len, e
                             );
-                            for log_message in chunk {
+                            for log_message in failed_logs {
                                 let entry = FailedLogEntry {
                                     log_type: LogProcessor::log_type_from_message(&log_message),
                                     log_message,
@@ -460,11 +460,6 @@ impl LogProcessor {
                                 };
                                 processor_clone.push_to_failed_buffer(entry);
                             }
-                        } else {
-                            error!(
-                                "Auto-flush rejected by server ({} logs dropped): {}",
-                                chunk_len, e
-                            );
                         }
                     }
                 }
@@ -1068,10 +1063,14 @@ impl LogProcessor {
                         Ok(()) => {
                             info!("Invocation retry: sent {} logs successfully (origin req: {})", chunk.len(), origin_req);
                         }
-                        Err((e, _returned_logs)) => {
-                            warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
-                            for entry in chunk {
-                                proc.push_to_failed_buffer(entry);
+                        Err((e, returned_logs)) => {
+                            if returned_logs.is_empty() {
+                                warn!("Invocation retry: non-retryable error, {} logs permanently dropped (origin req: {}): {}", chunk.len(), origin_req, e);
+                            } else {
+                                warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
+                                for entry in chunk {
+                                    proc.push_to_failed_buffer(entry);
+                                }
                             }
                         }
                     }
@@ -1665,15 +1664,19 @@ impl LogProcessor {
                     successful_chunks += 1;
                 },
                 Err((e, failed_logs)) => {
-                    error!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
-                    for log_message in failed_logs {
-                        let entry = FailedLogEntry {
-                            log_type: Self::log_type_from_message(&log_message),
-                            log_message,
-                            original_request_id: request_id.clone(),
-                            retry_count: 0,
-                        };
-                        self.push_to_failed_buffer(entry);
+                    if failed_logs.is_empty() {
+                        error!("Log batch send failed ({} logs), non-retryable — logs dropped: {}", chunk_len, e);
+                    } else {
+                        error!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
+                        for log_message in failed_logs {
+                            let entry = FailedLogEntry {
+                                log_type: Self::log_type_from_message(&log_message),
+                                log_message,
+                                original_request_id: request_id.clone(),
+                                retry_count: 0,
+                            };
+                            self.push_to_failed_buffer(entry);
+                        }
                     }
                 }
             }
@@ -1697,15 +1700,54 @@ impl LogProcessor {
         chunk: Vec<payload::LogMessage>,
         function_arn: &str,
     ) -> Result<(), (std::io::Error, Vec<payload::LogMessage>)> {
+        self.try_send_chunk_recursive(client, config, chunk, function_arn, 0).await
+    }
+
+    fn try_send_chunk_recursive<'a>(
+        &'a self,
+        client: &'a NewRelicClient,
+        config: &'a ExtensionConfig,
+        chunk: Vec<payload::LogMessage>,
+        function_arn: &'a str,
+        depth: u8,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), (std::io::Error, Vec<payload::LogMessage>)>> + Send + 'a>> {
+        Box::pin(async move {
         use crate::newrelic::client::SendError;
+
+        const MAX_SPLIT_DEPTH: u8 = 4;
+
         match client.send_logs(config, &chunk, function_arn).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();
                 match e {
                     SendError::ClientRejected { status } if status == 413 => {
-                        error!("Payload too large (413) even after chunking — logs dropped");
-                        Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()))
+                        if chunk.len() <= 1 {
+                            error!("Single log message too large (413) — dropping 1 oversized log");
+                            return Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()));
+                        }
+                        if depth >= MAX_SPLIT_DEPTH {
+                            error!("413 persists after {} splits ({} logs) — dropping batch", depth, chunk.len());
+                            return Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()));
+                        }
+                        let mid = chunk.len() / 2;
+                        let (left, right) = chunk.split_at(mid);
+                        let left = left.to_vec();
+                        let right = right.to_vec();
+                        warn!("Payload too large (413) — splitting {} logs into halves and retrying (depth {})", left.len() + right.len(), depth + 1);
+
+                        let mut failed = Vec::new();
+                        if let Err((_, f)) = self.try_send_chunk_recursive(client, config, left, function_arn, depth + 1).await {
+                            failed.extend(f);
+                        }
+                        if let Err((_, f)) = self.try_send_chunk_recursive(client, config, right, function_arn, depth + 1).await {
+                            failed.extend(f);
+                        }
+                        if failed.is_empty() {
+                            Ok(())
+                        } else {
+                            Err((std::io::Error::new(std::io::ErrorKind::InvalidData, "413 after split"), failed))
+                        }
                     }
                     SendError::ClientRejected { .. } => {
                         error!("Client error (4xx) — logs dropped: {}", msg);
@@ -1717,6 +1759,7 @@ impl LogProcessor {
                 }
             }
         }
+        })
     }
 
     /// Helper method to send logs with proper 1MB chunking

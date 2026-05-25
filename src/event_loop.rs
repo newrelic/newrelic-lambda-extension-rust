@@ -127,7 +127,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                     if components.config.extension.pipeline_flush {
                         if let Some(handle) = prior_flush_handle.take() {
-                            let _ = handle.await;
+                            if let Err(e) = handle.await {
+                                error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                            }
                         }
                     }
 
@@ -570,9 +572,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 if shutdown_result.is_err() {
                     warn!("APM shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
+                } else {
+                    info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 }
-
-                info!("APM mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
             }
         }
@@ -601,7 +603,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                         if components.config.extension.pipeline_flush {
                             if let Some(handle) = prior_flush_handle.take() {
-                                let _ = handle.await;
+                                if let Err(e) = handle.await {
+                                    error!("Pipeline flush task panicked during emergency shutdown: {}", e);
+                                }
                             }
                         }
 
@@ -892,9 +896,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
 
                 if shutdown_timeout_result.is_err() {
                     warn!("Serverless shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
+                } else {
+                    info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 }
-
-                info!("Standard mode shutdown: All data processed and sent in {}ms", shutdown_start_time.elapsed().as_millis());
                 break;
             }
         }
