@@ -70,3 +70,4 @@ opt-level = 1  # Some optimization for better development experience
 [dev-dependencies]
 serial_test = "3.0"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+wiremock = "0.6"

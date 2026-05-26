@@ -10,6 +10,8 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
+pub mod deployment;
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {

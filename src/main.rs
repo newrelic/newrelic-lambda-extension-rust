@@ -712,7 +712,19 @@ async fn initialize_lambda_runtime_client_and_register(
         .pool_max_idle_per_host(10)
         .build()?);
 
-    let (registration, extension_id) = runtime::register_extension(&lambda_runtime_client, EXTENSION_NAME).await?;
+    // Detect deployment context once and dispatch the matching registration
+    // schema. Standard Lambda subscribes to INVOKE+SHUTDOWN; Lambda Managed
+    // Instances subscribes to SHUTDOWN only (AWS rejects INVOKE on LMI).
+    // See LMI_SUPPORT.md §3.
+    let deployment = config::deployment::detect();
+    let schema = runtime::schema_for(deployment);
+
+    let (registration, extension_id) = runtime::register_extension(
+        &lambda_runtime_client,
+        EXTENSION_NAME,
+        schema,
+    )
+    .await?;
     Ok((lambda_runtime_client, extension_id, registration))
 }
 
