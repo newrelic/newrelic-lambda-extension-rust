@@ -145,7 +145,7 @@ impl ApmApp {
                 "000000000000".to_string()
             });
 
-        // Construct ARN using the correct account_id from registration
+        // Construct ARN using actual Lambda function name, not the app name override
         let function_arn = format!(
             "arn:aws:lambda:{}:{}:function:{}",
             region, account_id, lambda_function_name
