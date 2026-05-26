@@ -2,25 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! AWS Lambda Extensions API integration
-//! Handles extension registration, telemetry subscription, and event polling
+//! Handles extension registration, telemetry subscription, and event polling.
+//!
+//! Registration lives in the [`registration`] submodule (Standard + Managed
+//! schemas). Telemetry subscription and event polling stay in this file.
+
+pub mod registration;
+
+// Re-export the call-site API. The trait and concrete schemas stay scoped to
+// `registration::` — callers should reach into the submodule explicitly when
+// they need them, keeping the runtime root API minimal.
+pub use registration::{register_extension, schema_for, ExtensionRegistrationResponse};
 
 use std::{env, time::Duration};
 use reqwest::Client;
 use serde::Deserialize;
 use tracing::{debug, error, warn};
 
-const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
-const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
-
-#[derive(Deserialize, Debug)]
-pub struct ExtensionRegistrationResponse {
-    #[serde(rename = "functionName")]
-    pub function_name: String,
-    #[serde(rename = "functionVersion")]
-    pub function_version: String,
-    #[serde(rename = "accountId", default)]
-    pub account_id: Option<String>,
-}
+/// Header used by registration, telemetry subscription, and event polling.
+/// `pub(crate)` so the `registration` submodule can share it.
+pub(crate) const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
 /// Shutdown reasons from AWS Lambda (matching Go extension implementation)
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -71,47 +72,6 @@ pub enum LambdaRuntimeEvent {
         #[serde(rename(deserialize = "shutdownReason"))]
         shutdown_reason: ShutdownReason,
     },
-}
-
-pub async fn register_extension(
-    client: &Client,
-    extension_name: &str,
-) -> Result<(ExtensionRegistrationResponse, String), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
-
-    let url = format!("http://{}/2020-01-01/extension/register", runtime_api);
-    
-    let payload = serde_json::json!({
-        "events": ["INVOKE", "SHUTDOWN"]
-    });
-
-    let response = client
-        .post(&url)
-        .header(EXTENSION_NAME_HEADER, extension_name)
-        .header("Lambda-Extension-Accept-Feature", "accountId")
-        .json(&payload)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Registration failed with status: {}, body: {}", status, body);
-        return Err(format!("Registration failed with status: {}", status).into());
-    }
-
-    let extension_id = response
-        .headers()
-        .get(EXTENSION_ID_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .ok_or("Missing extension ID in response headers")?
-        .to_string();
-
-    let registration: ExtensionRegistrationResponse = response.json().await?;
-
-    Ok((registration, extension_id))
 }
 
 pub async fn subscribe_to_telemetry(
