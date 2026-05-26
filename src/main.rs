@@ -20,6 +20,7 @@ mod apm;
 mod runtime;
 mod request;
 mod event_loop;
+mod event_loop_lmi;
 mod error_synthesis;
 
 #[cfg(debug_assertions)]
@@ -317,6 +318,7 @@ async fn perform_one_time_initialization(
             apm_mode_enabled: false,
             apm_client: Client::new(),
             reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+            deployment: config.deployment,
         });
     }
 
@@ -610,6 +612,7 @@ async fn perform_one_time_initialization(
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
         apm_client,
         reconnect_in_flight,
+        deployment: config.deployment,
     })
 }
 
@@ -657,6 +660,7 @@ async fn handle_no_license_key(
         apm_mode_enabled: false,
         apm_client: Client::new(),
         reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+        deployment: config.deployment,
     })
 }
 
