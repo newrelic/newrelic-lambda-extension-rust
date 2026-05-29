@@ -593,8 +593,16 @@ async fn perform_one_time_initialization(
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         };
 
-    runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
-        .await?;
+    let telemetry_schema = runtime::subscribe_to_telemetry(
+        &client,
+        &extension_id,
+        telemetry_listener_address.port(),
+    )
+    .await?;
+    debug!(
+        "Telemetry API subscription active using schema={}",
+        telemetry_schema.name()
+    );
 
     // Log flushing is event-driven: size-based auto-flush inside LogProcessor, plus
     // end-of-execution flush in the event loop gated on platform.runtimeDone, plus

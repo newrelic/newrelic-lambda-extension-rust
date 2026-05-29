@@ -1168,4 +1168,244 @@ mod tests {
 
         clear_telemetry_state();
     }
+
+    // ========================================================================
+    // platform.initStart → managed-instance metadata capture (LMI)
+    // ========================================================================
+
+    /// Helper: clear the LMI metadata global so each test starts from a clean
+    /// slate. Tests using this MUST be `#[serial]`.
+    async fn clear_managed_instance_metadata() {
+        let mut guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.write().await;
+        *guard = None;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_with_host_group_populates_both_fields() {
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+            .await
+            .expect("listener");
+
+        // 2025-01-29 schema shape: instanceId AND hostGroup present.
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "lambda-managed-instances",
+                "instanceId": "2026/05/29/test-fn[$LATEST]abc123",
+                "hostGroup": "default-host-group",
+                "runtimeVersion": "python:3.14.v43"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        let meta = guard.as_ref().expect("metadata should be populated");
+        assert_eq!(meta.instance_id, "2026/05/29/test-fn[$LATEST]abc123");
+        assert_eq!(meta.host_group.as_deref(), Some("default-host-group"));
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_without_host_group_populates_only_instance_id() {
+        // 2022-07-01 fallback schema: instanceId present, hostGroup absent.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "lambda-managed-instances",
+                "instanceId": "no-host-group-id"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        let meta = guard.as_ref().expect("metadata should be populated");
+        assert_eq!(meta.instance_id, "no-host-group-id");
+        assert!(
+            meta.host_group.is_none(),
+            "host_group must be None on 2022-07-01 schema"
+        );
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_on_standard_lambda_leaves_metadata_none() {
+        // Standard Lambda case: initStart fires but neither instanceId nor
+        // hostGroup is in the record. Global must remain None so attribute
+        // composition omits the LMI keys entirely.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "on-demand",
+                "runtimeVersion": "python:3.14.v43"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        assert!(
+            guard.is_none(),
+            "Standard Lambda initStart must not populate the LMI metadata global"
+        );
+        drop(guard);
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_does_not_break_other_records_in_same_batch() {
+        // initStart should not short-circuit subsequent records in the batch.
+        // Send initStart followed by platform.start and assert the request_id
+        // tracking still updates.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([
+            {
+                "time": "2026-05-29T11:00:00Z",
+                "type": "platform.initStart",
+                "record": {
+                    "instanceId": "batch-test-id",
+                    "hostGroup": "batch-test-group"
+                }
+            },
+            {
+                "time": "2026-05-29T11:00:01Z",
+                "type": "platform.start",
+                "record": {"requestId": "after-init-req", "version": "$LATEST"}
+            }
+        ]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        // Both side effects must have fired.
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert_eq!(id, Some("after-init-req".to_string()));
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        assert_eq!(
+            guard.as_ref().map(|m| m.instance_id.as_str()),
+            Some("batch-test-id")
+        );
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_try_read_metadata_returns_populated_value_for_attribute_sites() {
+        // Regression guard: the three attribute-composition sites (logs,
+        // newrelic client, apm metric converter) all read via try_read_metadata.
+        // Confirm that path returns Some after a successful initStart capture.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "instanceId": "attr-site-id",
+                "hostGroup": "attr-site-group"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        // Give the async write a moment to land on this single-threaded runtime.
+        tokio::task::yield_now().await;
+
+        let meta = crate::telemetry::managed_instance::try_read_metadata()
+            .expect("attribute sites must observe the metadata");
+        assert_eq!(meta.instance_id, "attr-site-id");
+        assert_eq!(meta.host_group.as_deref(), Some("attr-site-group"));
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
 }

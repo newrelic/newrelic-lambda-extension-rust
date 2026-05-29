@@ -8,16 +8,18 @@
 //! schemas). Telemetry subscription and event polling stay in this file.
 
 pub mod registration;
+pub mod telemetry_schema;
 
 // Re-export the call-site API. The trait and concrete schemas stay scoped to
 // `registration::` — callers should reach into the submodule explicitly when
 // they need them, keeping the runtime root API minimal.
 pub use registration::{register_extension, schema_for, ExtensionRegistrationResponse};
+pub use telemetry_schema::{TelemetrySchema, TelemetrySubscriptionError};
 
 use std::{env, time::Duration};
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Header used by registration, telemetry subscription, and event polling.
 /// `pub(crate)` so the `registration` submodule can share it.
@@ -74,29 +76,92 @@ pub enum LambdaRuntimeEvent {
     },
 }
 
+/// Subscribe to the Lambda Telemetry API.
+///
+/// Tries [`TelemetrySchema::V2025_01_29`] first; on `HTTP 400` only, retries
+/// once with [`TelemetrySchema::V2022_07_01`] (Standard Lambda runtimes that
+/// have not yet been upgraded to the newer schema).
+///
+/// Returns the schema actually accepted by AWS so callers can gate
+/// schema-specific record parsing (e.g., the `hostGroup` field that only
+/// appears under `2025-01-29`).
+///
+/// # Errors
+///
+/// - [`TelemetrySubscriptionError::MissingRuntimeApi`] if `AWS_LAMBDA_RUNTIME_API`
+///   is not set.
+/// - [`TelemetrySubscriptionError::Transport`] for network/IO failures.
+/// - [`TelemetrySubscriptionError::Rejected`] for any non-2xx response that is
+///   *not* a 400 on the preferred schema (400 on the preferred schema triggers
+///   the fallback rather than returning).
 pub async fn subscribe_to_telemetry(
     client: &Client,
     ext_id: &str,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let runtime_api = env::var("AWS_LAMBDA_RUNTIME_API")
-        .map_err(|_| "AWS_LAMBDA_RUNTIME_API not set")?;
+) -> Result<TelemetrySchema, TelemetrySubscriptionError> {
+    match try_subscribe(client, ext_id, port, TelemetrySchema::V2025_01_29).await {
+        Ok(()) => {
+            info!(
+                "[NR_EXT] subscribed to Telemetry API schema={}",
+                TelemetrySchema::V2025_01_29.name()
+            );
+            Ok(TelemetrySchema::V2025_01_29)
+        }
+        Err(TelemetrySubscriptionError::Rejected {
+            status: 400,
+            body,
+            schema: TelemetrySchema::V2025_01_29,
+        }) => {
+            warn!(
+                "[NR_EXT] Telemetry API {} rejected with 400 (body: {body}) — falling back to {}",
+                TelemetrySchema::V2025_01_29.name(),
+                TelemetrySchema::V2022_07_01.name()
+            );
+            try_subscribe(client, ext_id, port, TelemetrySchema::V2022_07_01).await?;
+            info!(
+                "[NR_EXT] subscribed to Telemetry API schema={} (after fallback)",
+                TelemetrySchema::V2022_07_01.name()
+            );
+            Ok(TelemetrySchema::V2022_07_01)
+        }
+        Err(e) => Err(e),
+    }
+}
 
-    let url = format!("http://{}/2022-07-01/telemetry", runtime_api);
-    
+/// Single subscription attempt against one schema. Used both as the first
+/// try (`2025-01-29`) and the fallback (`2022-07-01`) — same wire shape, same
+/// headers, same timeout.
+async fn try_subscribe(
+    client: &Client,
+    ext_id: &str,
+    port: u16,
+    schema: TelemetrySchema,
+) -> Result<(), TelemetrySubscriptionError> {
+    let runtime_api =
+        env::var("AWS_LAMBDA_RUNTIME_API").map_err(|_| TelemetrySubscriptionError::MissingRuntimeApi)?;
+
+    let url = format!("http://{runtime_api}/{}/telemetry", schema.url_segment());
+
     let payload = serde_json::json!({
-        "schemaVersion": "2022-07-01",
+        "schemaVersion": schema.schema_version(),
         "types": ["platform", "function", "extension"],
         "buffering": {
             "maxBytes": 262144,
             "maxItems": 1000,
-            "timeoutMs": 25  // Minimum value to ensure platform.report events are delivered in current invocation
+            // Minimum value to ensure platform.report events are delivered in
+            // the current invocation rather than after the freeze.
+            "timeoutMs": 25
         },
         "destination": {
             "protocol": "HTTP",
-            "URI": format!("http://sandbox:{}/telemetry", port)
+            "URI": format!("http://sandbox:{port}/telemetry")
         }
     });
+
+    debug!(
+        "[NR_EXT] attempting Telemetry API subscription schema={} url={url}",
+        schema.name()
+    );
 
     let response = client
         .put(&url)
@@ -104,13 +169,24 @@ pub async fn subscribe_to_telemetry(
         .json(&payload)
         .timeout(Duration::from_secs(30))
         .send()
-        .await?;
+        .await
+        .map_err(TelemetrySubscriptionError::Transport)?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_else(|_| "Failed to read response body".to_string());
-        error!("Telemetry subscription failed with status: {}, body: {}", status, body);
-        return Err(format!("Telemetry subscription failed with status: {}", status).into());
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+        error!(
+            "[NR_EXT] Telemetry subscription failed schema={} status={status} body={body}",
+            schema.name()
+        );
+        return Err(TelemetrySubscriptionError::Rejected {
+            status,
+            body,
+            schema,
+        });
     }
 
     Ok(())
@@ -188,3 +264,7 @@ pub async fn fetch_next_event(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "telemetry_subscribe_test.rs"]
+mod telemetry_subscribe_test;
