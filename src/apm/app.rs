@@ -37,6 +37,7 @@ impl ApmApp {
         metric_endpoint: String,
         client: Client,
         function_name: String,
+        lambda_function_name: String,
         function_version: String,
         account_id: Option<String>,
         region: Option<String>,
@@ -56,6 +57,7 @@ impl ApmApp {
                 &metric_endpoint,
                 &client,
                 &function_name,
+                &lambda_function_name,
                 &function_version,
                 &account_id,
                 &region,
@@ -92,6 +94,7 @@ impl ApmApp {
         metric_endpoint: &str,
         client: &Client,
         function_name: &str,
+        lambda_function_name: &str,
         function_version: &str,
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
@@ -142,10 +145,10 @@ impl ApmApp {
                 "000000000000".to_string()
             });
 
-        // Construct ARN using the correct account_id from registration
+        // Construct ARN using actual Lambda function name, not the app name override
         let function_arn = format!(
             "arn:aws:lambda:{}:{}:function:{}",
-            region, account_id, function_name
+            region, account_id, lambda_function_name
         );
 
         debug!(
@@ -305,7 +308,7 @@ impl ApmApp {
     /// Convert and send platform REPORT log metrics
     ///
     /// Based on metric_api.go ParseLambdaReportLog() and ConvertToMetrics()
-    pub async fn send_platform_report_metrics(&self, log_line: &str) -> Result<()> {
+    pub async fn send_platform_report_metrics(&self, log_line: &str, function_arn: &str) -> Result<()> {
         let metrics_data = match parse_lambda_report_log(log_line) {
             Some(data) => data,
             None => {
@@ -322,10 +325,11 @@ impl ApmApp {
             metrics_data.max_memory_used
         );
 
-        let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+            .unwrap_or_else(|_| std::env::var("AWS_LAMBDA_FUNCTION_NAME")
+                .unwrap_or_else(|_| "unknown".to_string()));
 
-        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
+        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name, function_arn);
         
         debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
