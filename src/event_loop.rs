@@ -180,7 +180,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let apm_host = components.config.new_relic.apm_host.clone();
                         let metric_endpoint = components.config.new_relic.metric_endpoint.clone();
                         let apm_client = components.apm_client.clone();
-                        let function_name = components.config.aws.function_name.clone();
+                        let lambda_function_name = components.config.aws.function_name.clone();
+                        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| lambda_function_name.clone());
                         let function_version = components.config.aws.function_version
                             .clone()
                             .unwrap_or_else(|| "$LATEST".to_string());
@@ -197,6 +201,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 metric_endpoint,
                                 apm_client,
                                 function_name,
+                                lambda_function_name,
                                 function_version,
                                 account_id,
                                 region,
@@ -433,12 +438,18 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         // One last synchronous attempt during shutdown — sandbox is still active
                         // for the duration of the SHUTDOWN handler so no freeze risk.
                         debug!("APM not connected at shutdown — attempting final sync reconnect");
+                        let lambda_function_name = components.config.aws.function_name.clone();
+                        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| lambda_function_name.clone());
                         let shutdown_app = crate::apm::ApmApp::new(
                             components.config.new_relic.license_key.clone().unwrap_or_default(),
                             components.config.new_relic.apm_host.clone(),
                             components.config.new_relic.metric_endpoint.clone(),
                             components.apm_client.clone(),
-                            components.config.aws.function_name.clone(),
+                            function_name,
+                            lambda_function_name,
                             components.config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
                             components.config.aws.account_id.clone(),
                             components.config.aws.region.clone(),

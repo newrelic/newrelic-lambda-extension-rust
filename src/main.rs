@@ -476,8 +476,9 @@ async fn perform_one_time_initialization(
             let apm_host = config.new_relic.apm_host.clone();
             let metric_endpoint = config.new_relic.metric_endpoint.clone();
             let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                .ok()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|_| config.aws.function_name.clone());
+                .unwrap_or_else(|| config.aws.function_name.clone());
             let lambda_function_name = config.aws.function_name.clone();
             let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
             let account_id = config.aws.account_id.clone();
