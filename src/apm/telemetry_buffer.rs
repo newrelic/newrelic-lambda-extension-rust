@@ -12,6 +12,16 @@ use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, warn};
 
+/// Sentinel telemetry type for *synthesized* error events (timeout/fault errors).
+/// These use the `send_error_events` wire format (`[run_id, {meta}, [events]]`),
+/// which differs from agent-originated `error_event_data` that flows through
+/// `send_apm_telemetry`. Routed specially in the retry loop.
+pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
+
+/// Hard cap on buffered telemetry items to bound memory during a sustained
+/// collector outage on a high-traffic function. When full, the oldest is evicted.
+const MAX_BUFFERED_ITEMS: usize = 500;
+
 /// Failed telemetry data that needs to be retried
 #[derive(Debug, Clone)]
 pub struct FailedTelemetry {
@@ -47,6 +57,11 @@ pub fn buffer_failed_telemetry(
     };
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+        // Bound memory: evict oldest if at capacity (prefer keeping fresher telemetry).
+        if buffer.len() >= MAX_BUFFERED_ITEMS {
+            buffer.remove(0);
+            warn!("Telemetry buffer full ({}) - evicted oldest item", MAX_BUFFERED_ITEMS);
+        }
         buffer.push(failed_telemetry);
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
@@ -59,10 +74,19 @@ pub fn buffer_failed_telemetry(
     }
 }
 
-/// Retry all buffered telemetry
+/// Retry all buffered telemetry.
+///
+/// `current_run_id`/`current_collector_host`, when supplied, OVERRIDE the values
+/// captured when the item was buffered. This is essential after a reconnect: the
+/// buffered `run_id` is stale (the collector expired it / issued a restart), so
+/// retrying with it would fail forever. Passing the live session's identifiers
+/// lets buffered items succeed against the fresh connection. When `None` (e.g.
+/// not connected), the stored values are used as a best-effort fallback.
 pub async fn retry_buffered_telemetry(
     client: &reqwest::Client,
     license_key: &str,
+    current_run_id: Option<&str>,
+    current_collector_host: Option<&str>,
 ) {
     let failed_telemetry = {
         if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
@@ -106,31 +130,45 @@ pub async fn retry_buffered_telemetry(
             item.telemetry_type, item.request_id, item.retry_count
         );
 
-        // Retry sending
-        let command = match item.telemetry_type.as_str() {
-            "metric_data" => super::collector::CMD_METRICS,
-            "span_event_data" => super::collector::CMD_SPAN_EVENTS,
-            "error_data" => super::collector::CMD_ERROR_DATA,
-            "error_event_data" => super::collector::CMD_ERROR_EVENTS,
-            "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
-            "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
-            "log_event_data" => super::collector::CMD_LOG_EVENTS,
-            "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
-            "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
-            _ => {
-                warn!("Unknown telemetry type: {}", item.telemetry_type);
-                continue;
-            }
+        let run_id = current_run_id.unwrap_or(item.run_id.as_str());
+        let collector_host = current_collector_host.unwrap_or(item.collector_host.as_str());
+
+        // Synthesized error events use a different wire format and send function.
+        let result = if item.telemetry_type == SYNTHESIZED_ERROR_EVENTS {
+            super::collector::send_error_events(
+                client,
+                license_key,
+                collector_host,
+                run_id,
+                &item.data,
+            )
+            .await
+        } else {
+            let command = match item.telemetry_type.as_str() {
+                "metric_data" => super::collector::CMD_METRICS,
+                "span_event_data" => super::collector::CMD_SPAN_EVENTS,
+                "error_data" => super::collector::CMD_ERROR_DATA,
+                "error_event_data" => super::collector::CMD_ERROR_EVENTS,
+                "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
+                "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
+                "log_event_data" => super::collector::CMD_LOG_EVENTS,
+                "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
+                "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
+                _ => {
+                    warn!("Unknown telemetry type: {}", item.telemetry_type);
+                    continue;
+                }
+            };
+            super::collector::send_apm_telemetry(
+                client,
+                license_key,
+                collector_host,
+                run_id,
+                command,
+                &item.data,
+            )
+            .await
         };
-        let result = super::collector::send_apm_telemetry(
-            client,
-            license_key,
-            &item.collector_host,
-            &item.run_id,
-            command,
-            &item.data,
-        )
-        .await;
 
         match result {
             Ok(()) => {
@@ -176,4 +214,56 @@ pub fn get_buffer_count() -> usize {
         .lock()
         .map(|buffer| buffer.len())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod telemetry_buffer_tests {
+    use super::*;
+    use serde_json::json;
+    use serial_test::serial;
+
+    fn clear() {
+        if let Ok(mut b) = FAILED_TELEMETRY_BUFFER.lock() {
+            b.clear();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn buffers_and_counts() {
+        clear();
+        buffer_failed_telemetry(
+            "metric_data".into(),
+            vec![json!(null), json!({"m": 1})],
+            "req".into(),
+            "run".into(),
+            "host".into(),
+        );
+        assert_eq!(get_buffer_count(), 1);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn caps_buffer_size_by_evicting_oldest() {
+        clear();
+        for _ in 0..(MAX_BUFFERED_ITEMS + 25) {
+            buffer_failed_telemetry(
+                "metric_data".into(),
+                vec![json!(null)],
+                "req".into(),
+                "run".into(),
+                "host".into(),
+            );
+        }
+        assert_eq!(get_buffer_count(), MAX_BUFFERED_ITEMS, "must never exceed cap");
+        clear();
+    }
+
+    #[test]
+    fn synthesized_error_sentinel_is_distinct() {
+        // Must not collide with agent-originated error_event_data, which routes
+        // through send_apm_telemetry with a different wire format.
+        assert_ne!(SYNTHESIZED_ERROR_EVENTS, "error_event_data");
+    }
 }

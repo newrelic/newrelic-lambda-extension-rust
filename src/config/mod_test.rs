@@ -55,6 +55,7 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
+        "NEW_RELIC_APM_SEND_PLATFORM_METRICS",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -322,6 +323,44 @@ fn test_parse_bool_false_values() {
         env::set_var("NEW_RELIC_COLLECT_TRACE_ID", "");
         let config = ExtensionConfig::from_env();
         assert!(!config.new_relic.collect_trace_id);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_send_platform_metrics_defaults_true() {
+    with_full_clean_env(|| {
+        // Unset → default true (preserves existing behavior).
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_send_platform_metrics);
+
+        // Empty string → treated as unset → still true.
+        env::set_var("NEW_RELIC_APM_SEND_PLATFORM_METRICS", "");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_send_platform_metrics);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_send_platform_metrics_disabled() {
+    with_full_clean_env(|| {
+        for val in ["false", "0", "no", "off"] {
+            env::set_var("NEW_RELIC_APM_SEND_PLATFORM_METRICS", val);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                !config.new_relic.apm_send_platform_metrics,
+                "value {val:?} should disable platform metrics"
+            );
+        }
+        for val in ["true", "1", "yes", "on"] {
+            env::set_var("NEW_RELIC_APM_SEND_PLATFORM_METRICS", val);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.apm_send_platform_metrics,
+                "value {val:?} should enable platform metrics"
+            );
+        }
     });
 }
 
@@ -1061,6 +1100,7 @@ fn test_new_relic_config_all_fields() {
         apm_lambda_mode: true,
         apm_blocking_handshake: false,
         apm_handshake_timeout_secs: 5,
+        apm_send_platform_metrics: true,
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),

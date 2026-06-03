@@ -11,6 +11,7 @@ pub mod collector;
 pub mod connection;
 pub mod error_event;
 pub mod id_generator;
+pub mod metric_api_buffer;
 pub mod metric_converter;
 pub mod payload_parser;
 pub mod telemetry_buffer;

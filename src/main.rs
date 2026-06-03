@@ -458,6 +458,10 @@ async fn perform_one_time_initialization(
     // Declared before the APM if-else so the INIT spawn and ExtensionComponents share the same channel.
     let reconnect_in_flight = Arc::new(tokio::sync::watch::channel(false).0);
 
+    // Mirror the platform-metrics flag into the apm module so code paths without
+    // ExtensionConfig in scope (telemetry listener) can honor it.
+    apm::collector::set_platform_metrics_enabled(config.new_relic.apm_send_platform_metrics);
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
             // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)

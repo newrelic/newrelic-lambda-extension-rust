@@ -36,6 +36,9 @@ pub struct NewRelicConfig {
     pub apm_lambda_mode: bool,
     pub apm_blocking_handshake: bool,
     pub apm_handshake_timeout_secs: u64,
+    /// When false, REPORT lines are not converted to `apm.lambda.*` metrics or
+    /// sent to the Metric API (APM mode only). Default true.
+    pub apm_send_platform_metrics: bool,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
@@ -120,6 +123,7 @@ impl Default for NewRelicConfig {
             apm_lambda_mode: false,
             apm_blocking_handshake: false,
             apm_handshake_timeout_secs: 5,
+            apm_send_platform_metrics: true,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
@@ -289,6 +293,13 @@ impl ExtensionConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(5)
             .max(1);
+
+        // Defaults to true; only an explicit falsey value disables platform metrics.
+        config.new_relic.apm_send_platform_metrics = env::var("NEW_RELIC_APM_SEND_PLATFORM_METRICS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| parse_bool(&s))
+            .unwrap_or(true);
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
