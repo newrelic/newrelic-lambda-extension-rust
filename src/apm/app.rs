@@ -244,6 +244,12 @@ impl ApmApp {
                 continue;
             }
 
+            // Customer opted out of this telemetry type — drop it (no send, no buffer).
+            if super::collector::is_telemetry_disabled(&telemetry_type) {
+                debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                continue;
+            }
+
             debug!(
                 "Sending {} telemetry items as {}",
                 data.len(),
@@ -308,7 +314,19 @@ impl ApmApp {
     /// Convert and send platform REPORT log metrics
     ///
     /// Based on metric_api.go ParseLambdaReportLog() and ConvertToMetrics()
-    pub async fn send_platform_report_metrics(&self, log_line: &str, function_arn: &str) -> Result<()> {
+    pub async fn send_platform_report_metrics(
+        &self,
+        log_line: &str,
+        function_arn: &str,
+    ) -> Result<()> {
+        // Customer disabled platform metrics (NEW_RELIC_APM_DISABLE_TELEMETRY contains
+        // platform_metrics): skip conversion and the Metric API send entirely.
+        // Error-synthesis memory capture is a separate path and is unaffected.
+        if super::collector::is_telemetry_disabled("platform_metrics") {
+            debug!("APM platform metrics disabled - skipping REPORT conversion/send");
+            return Ok(());
+        }
+
         let metrics_data = match parse_lambda_report_log(log_line) {
             Some(data) => data,
             None => {
@@ -333,13 +351,31 @@ impl ApmApp {
         
         debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
-        send_platform_metrics(
+        match send_platform_metrics(
             &self.client,
             &self.license_key,
             &self.metric_endpoint,
-            metrics,
+            &metrics,
         )
         .await
+        {
+            Ok(()) => Ok(()),
+            // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
+            Err(e) if e.is_permanent() => {
+                warn!("Platform metrics dropped (permanent): {}", e);
+                Ok(())
+            }
+            // Transient/network failures: buffer for retry on a later invoke / at shutdown.
+            Err(e) => {
+                let retry_after = e.retry_after();
+                super::metric_api_buffer::buffer_failed_metric_api(
+                    metrics,
+                    self.metric_endpoint.clone(),
+                    retry_after,
+                );
+                Ok(())
+            }
+        }
     }
 
     pub async fn send_error_event_from_fault(
@@ -363,14 +399,45 @@ impl ApmApp {
             request_id
         );
 
-        send_error_events(
+        self.send_error_events_buffered(error_events, request_id).await
+    }
+
+    /// Send synthesized error events, buffering them for retry on failure so a
+    /// transient collector error or stale run_id does not silently drop them.
+    async fn send_error_events_buffered(
+        &self,
+        error_events: Vec<serde_json::Value>,
+        request_id: &str,
+    ) -> Result<()> {
+        // Customer opted out of error events — drop synthesized timeout/fault errors too.
+        if super::collector::is_telemetry_disabled("error_event_data") {
+            debug!("error_event_data disabled - skipping synthesized error event");
+            return Ok(());
+        }
+
+        let result = send_error_events(
             &self.client,
             &self.license_key,
             &self.collector_host,
             &self.run_id,
             &error_events,
         )
-        .await
+        .await;
+
+        if let Err(e) = result {
+            warn!(
+                "Failed to send error events for request {}: {} - buffering for retry",
+                request_id, e
+            );
+            super::telemetry_buffer::buffer_failed_telemetry(
+                super::telemetry_buffer::SYNTHESIZED_ERROR_EVENTS.to_string(),
+                error_events,
+                request_id.to_string(),
+                self.run_id.clone(),
+                self.collector_host.clone(),
+            );
+        }
+        Ok(())
     }
 
     /// Send error event for shutdown events (timeout, failure)
@@ -395,14 +462,7 @@ impl ApmApp {
             error_class, request_id
         );
 
-        send_error_events(
-            &self.client,
-            &self.license_key,
-            &self.collector_host,
-            &self.run_id,
-            &error_events,
-        )
-        .await
+        self.send_error_events_buffered(error_events, request_id).await
     }
 
     /// Get entity GUID for log correlation
