@@ -1,6 +1,7 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};
@@ -36,9 +37,10 @@ pub struct NewRelicConfig {
     pub apm_lambda_mode: bool,
     pub apm_blocking_handshake: bool,
     pub apm_handshake_timeout_secs: u64,
-    /// When false, REPORT lines are not converted to `apm.lambda.*` metrics or
-    /// sent to the Metric API (APM mode only). Default true.
-    pub apm_send_platform_metrics: bool,
+    /// Telemetry types the customer has opted to drop (APM mode only) via
+    /// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Excluded types are neither sent nor
+    /// buffered. See `crate::apm::collector::KNOWN_TELEMETRY_TYPES`.
+    pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
@@ -123,7 +125,7 @@ impl Default for NewRelicConfig {
             apm_lambda_mode: false,
             apm_blocking_handshake: false,
             apm_handshake_timeout_secs: 5,
-            apm_send_platform_metrics: true,
+            apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
@@ -213,6 +215,36 @@ impl Default for ExtensionSettings {
     }
 }
 
+/// Parse `NEW_RELIC_APM_DISABLE_TELEMETRY` into a set of telemetry types to drop.
+///
+/// Comma-separated, case-insensitive, whitespace-trimmed. Only the canonical
+/// types in [`crate::apm::collector::KNOWN_TELEMETRY_TYPES`] are accepted;
+/// unknown tokens are warned about and ignored (fail-soft).
+pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if crate::apm::collector::KNOWN_TELEMETRY_TYPES.contains(&t.as_str()) {
+            set.insert(t);
+        } else {
+            warn!(
+                "NEW_RELIC_APM_DISABLE_TELEMETRY: ignoring unknown telemetry type '{}' (valid: {})",
+                t,
+                crate::apm::collector::KNOWN_TELEMETRY_TYPES.join(", ")
+            );
+        }
+    }
+    if !set.is_empty() {
+        let mut types: Vec<&str> = set.iter().map(String::as_str).collect();
+        types.sort_unstable();
+        debug!("APM telemetry disabled for types: {}", types.join(", "));
+    }
+    set
+}
+
 impl ExtensionConfig {
     /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
@@ -294,12 +326,9 @@ impl ExtensionConfig {
             .unwrap_or(5)
             .max(1);
 
-        // Defaults to true; only an explicit falsey value disables platform metrics.
-        config.new_relic.apm_send_platform_metrics = env::var("NEW_RELIC_APM_SEND_PLATFORM_METRICS")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|s| parse_bool(&s))
-            .unwrap_or(true);
+        // Comma-separated telemetry types the customer wants dropped (APM mode).
+        config.new_relic.apm_disabled_telemetry =
+            parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()

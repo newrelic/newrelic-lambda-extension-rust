@@ -65,20 +65,42 @@ pub fn take_reconnect_needed() -> bool {
     RECONNECT_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Process-wide mirror of `NEW_RELIC_APM_SEND_PLATFORM_METRICS`, set once at
-/// startup. Lets code paths without `ExtensionConfig` in scope (e.g. the
-/// telemetry listener) honor the flag. Defaults to enabled.
-static SEND_PLATFORM_METRICS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+/// All telemetry types the customer may disable via `NEW_RELIC_APM_DISABLE_TELEMETRY`.
+/// The first nine are agent-payload types; `platform_metrics` is the `apm.lambda.*`
+/// pseudo-type derived from REPORT lines and sent to the Metric API.
+pub const KNOWN_TELEMETRY_TYPES: &[&str] = &[
+    "metric_data",
+    "custom_event_data",
+    "log_event_data",
+    "analytic_event_data",
+    "error_event_data",
+    "error_data",
+    "span_event_data",
+    "sql_trace_data",
+    "transaction_sample_data",
+    "platform_metrics",
+];
 
-/// Record whether platform metrics should be sent in APM mode (called at startup).
-pub fn set_platform_metrics_enabled(enabled: bool) {
-    SEND_PLATFORM_METRICS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+/// Process-wide set of telemetry types to drop, populated once at startup from
+/// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Lets code paths without `ExtensionConfig`
+/// in scope (e.g. the telemetry listener) honor the customer's exclusions.
+static DISABLED_TELEMETRY: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// Record which telemetry types are disabled (called once at startup).
+pub fn set_disabled_telemetry(types: std::collections::HashSet<String>) {
+    if let Ok(mut guard) = DISABLED_TELEMETRY.write() {
+        *guard = types;
+    }
 }
 
-/// Whether platform metrics are enabled in APM mode.
-pub fn platform_metrics_enabled() -> bool {
-    SEND_PLATFORM_METRICS.load(std::sync::atomic::Ordering::Relaxed)
+/// Whether the given telemetry type has been disabled by the customer.
+pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
+    DISABLED_TELEMETRY
+        .read()
+        .map(|g| g.contains(telemetry_type))
+        .unwrap_or(false)
 }
 
 /// HTTP status codes worth retrying — transient server/throttle conditions.
@@ -453,10 +475,24 @@ mod collector_tests {
 
     #[test]
     #[serial]
-    fn platform_metrics_flag_roundtrips() {
-        set_platform_metrics_enabled(false);
-        assert!(!platform_metrics_enabled());
-        set_platform_metrics_enabled(true);
-        assert!(platform_metrics_enabled());
+    fn disabled_telemetry_roundtrips() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("platform_metrics".to_string());
+        set.insert("sql_trace_data".to_string());
+        set_disabled_telemetry(set);
+        assert!(is_telemetry_disabled("platform_metrics"));
+        assert!(is_telemetry_disabled("sql_trace_data"));
+        assert!(!is_telemetry_disabled("metric_data"));
+        // Reset so other serial tests see a clean state.
+        set_disabled_telemetry(std::collections::HashSet::new());
+        assert!(!is_telemetry_disabled("platform_metrics"));
+    }
+
+    #[test]
+    fn known_telemetry_types_complete() {
+        // The 9 agent-payload types + platform_metrics.
+        assert_eq!(KNOWN_TELEMETRY_TYPES.len(), 10);
+        assert!(KNOWN_TELEMETRY_TYPES.contains(&"platform_metrics"));
+        assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
     }
 }

@@ -162,7 +162,7 @@ async fn handle_telemetry_request(
                                         let apm_app_read = crate::APM_APP.read().await;
                                         let current_arn = crate::get_global_fallback_arn();
                                         let send_failed = if let Some(ref app) = *apm_app_read {
-                                            if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn, crate::apm::collector::platform_metrics_enabled()).await {
+                                            if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn).await {
                                                 warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id_str, e);
                                                 true
                                             } else {

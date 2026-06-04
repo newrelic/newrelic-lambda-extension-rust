@@ -244,6 +244,12 @@ impl ApmApp {
                 continue;
             }
 
+            // Customer opted out of this telemetry type — drop it (no send, no buffer).
+            if super::collector::is_telemetry_disabled(&telemetry_type) {
+                debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                continue;
+            }
+
             debug!(
                 "Sending {} telemetry items as {}",
                 data.len(),
@@ -312,12 +318,11 @@ impl ApmApp {
         &self,
         log_line: &str,
         function_arn: &str,
-        send_enabled: bool,
     ) -> Result<()> {
-        // When platform metrics are disabled (NEW_RELIC_APM_SEND_PLATFORM_METRICS=false),
-        // skip conversion and the Metric API send entirely. Error-synthesis memory
-        // capture is a separate path and is unaffected.
-        if !send_enabled {
+        // Customer disabled platform metrics (NEW_RELIC_APM_DISABLE_TELEMETRY contains
+        // platform_metrics): skip conversion and the Metric API send entirely.
+        // Error-synthesis memory capture is a separate path and is unaffected.
+        if super::collector::is_telemetry_disabled("platform_metrics") {
             debug!("APM platform metrics disabled - skipping REPORT conversion/send");
             return Ok(());
         }
@@ -404,6 +409,12 @@ impl ApmApp {
         error_events: Vec<serde_json::Value>,
         request_id: &str,
     ) -> Result<()> {
+        // Customer opted out of error events — drop synthesized timeout/fault errors too.
+        if super::collector::is_telemetry_disabled("error_event_data") {
+            debug!("error_event_data disabled - skipping synthesized error event");
+            return Ok(());
+        }
+
         let result = send_error_events(
             &self.client,
             &self.license_key,
