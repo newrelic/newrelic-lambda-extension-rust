@@ -30,7 +30,7 @@ const ATTR_FAAS_ARN: &str = "faas.arn";
 const ATTR_TRACE_ID: &str = "trace.id";
 const ATTR_ENTITY_GUID: &str = "entity.guid";
 const ATTR_LMI_INSTANCE_ID: &str = "aws.lambda.managedInstance.instanceId";
-const ATTR_LMI_HOST_GROUP: &str = "aws.lambda.managedInstance.hostGroup";
+const ATTR_LMI_INSTANCE_MAX_MEMORY: &str = "aws.lambda.managedInstance.instanceMaxMemory";
 
 /// Recursively estimate the JSON byte size of a serde_json Value without allocating.
 fn estimate_json_value_size(v: &serde_json::Value) -> usize {
@@ -637,10 +637,10 @@ impl LogProcessor {
                 ATTR_LMI_INSTANCE_ID.to_string(),
                 serde_json::Value::String(meta.instance_id),
             );
-            if let Some(host_group) = meta.host_group {
+            if let Some(max_memory) = meta.instance_max_memory {
                 log_message.attributes.insert(
-                    ATTR_LMI_HOST_GROUP.to_string(),
-                    serde_json::Value::String(host_group),
+                    ATTR_LMI_INSTANCE_MAX_MEMORY.to_string(),
+                    serde_json::Value::Number(max_memory.into()),
                 );
             }
         }

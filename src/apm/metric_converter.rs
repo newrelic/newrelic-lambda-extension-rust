@@ -112,10 +112,10 @@ pub fn convert_to_apm_metrics(
             "aws.lambda.managedInstance.instanceId".to_string(),
             json!(meta.instance_id),
         );
-        if let Some(host_group) = meta.host_group {
+        if let Some(max_memory) = meta.instance_max_memory {
             common_attrs.insert(
-                "aws.lambda.managedInstance.hostGroup".to_string(),
-                json!(host_group),
+                "aws.lambda.managedInstance.instanceMaxMemory".to_string(),
+                json!(max_memory),
             );
         }
     }

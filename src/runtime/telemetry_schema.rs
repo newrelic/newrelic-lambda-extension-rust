@@ -1,28 +1,37 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Lambda Telemetry API: schema versions.
+//! Lambda Telemetry API: event schema versions.
 //!
-//! Two schema versions are supported. The newer `2025-01-29` adds the
-//! `hostGroup` field on `platform.initStart` records and is required to
-//! capture full host-level metadata for Lambda Managed Instances. The older
-//! `2022-07-01` is the universal fallback for Standard Lambda runtimes that
-//! AWS has not yet upgraded to accept the newer schema (those return HTTP
-//! 400 to a `2025-01-29` subscription).
+//! The Telemetry API has **two independent version axes**, and conflating them
+//! routes the subscription to a non-existent path (`404 page not found`):
+//!
+//! - **API endpoint version** — the fixed segment in the subscription URL
+//!   (`PUT /2022-07-01/telemetry`). It identifies the API itself and never
+//!   varies, exactly like the `2020-01-01` Extensions API path used for
+//!   registration and event polling. It lives as
+//!   [`crate::runtime::TELEMETRY_API_VERSION`], not here.
+//! - **Event schema version** — the `schemaVersion` field in the subscription
+//!   request *body*, modelled by this enum. The newer `2025-01-29` carries the
+//!   host-level metadata AWS surfaces for Lambda Managed Instances; the older
+//!   `2022-07-01` is the universal fallback for Standard Lambda runtimes AWS
+//!   has not yet upgraded (those reject a `2025-01-29` body with HTTP 400).
 //!
 //! Schema choice is independent of [`crate::config::deployment::DeploymentContext`]
 //! — the extension always tries `2025-01-29` first and falls back only when
-//! AWS rejects it. Tying the choice to the deployment context would conflate
-//! two orthogonal axes (see `LMI_SUPPORT.md` §6).
+//! AWS rejects the body. Tying the choice to the deployment context would
+//! conflate two orthogonal axes (see `LMI_SUPPORT.md` §6).
 
-/// Lambda Telemetry API schema version.
+/// Lambda Telemetry API event schema version — the `schemaVersion` field in
+/// the subscription request *body*.
 ///
-/// Each variant captures both the URL path segment AWS expects on `PUT
-/// /{schema}/telemetry` and the matching `schemaVersion` field in the
-/// subscription body — they always move together.
+/// This is **not** the URL path version: the subscription always PUTs to the
+/// fixed [`crate::runtime::TELEMETRY_API_VERSION`] endpoint regardless of which
+/// schema variant is sent in the body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TelemetrySchema {
-    /// Preferred. Adds `hostGroup` on `platform.initStart` records (LMI-only field).
+    /// Preferred. Carries the host-level metadata AWS surfaces for Lambda
+    /// Managed Instances on `platform.initStart`.
     V2025_01_29,
     /// Legacy fallback. Used when AWS returns HTTP 400 on the newer schema —
     /// Standard Lambda runtimes that have not yet been upgraded.
@@ -30,18 +39,7 @@ pub enum TelemetrySchema {
 }
 
 impl TelemetrySchema {
-    /// URL path segment, e.g. `"2025-01-29"`. Used to build the PUT URL.
-    #[must_use]
-    pub fn url_segment(self) -> &'static str {
-        match self {
-            Self::V2025_01_29 => "2025-01-29",
-            Self::V2022_07_01 => "2022-07-01",
-        }
-    }
-
     /// Value for the `schemaVersion` field in the subscription request body.
-    /// Always identical to [`Self::url_segment`] — kept as a separate accessor
-    /// so a future schema with a divergent body field is a one-line change.
     #[must_use]
     pub fn schema_version(self) -> &'static str {
         match self {
@@ -116,18 +114,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn url_segment_and_schema_version_match() {
+    fn schema_version_matches_name() {
         for schema in [TelemetrySchema::V2025_01_29, TelemetrySchema::V2022_07_01] {
-            assert_eq!(schema.url_segment(), schema.schema_version());
-            assert_eq!(schema.url_segment(), schema.name());
+            assert_eq!(schema.schema_version(), schema.name());
         }
     }
 
     #[test]
     fn schemas_have_distinct_versions() {
         assert_ne!(
-            TelemetrySchema::V2025_01_29.url_segment(),
-            TelemetrySchema::V2022_07_01.url_segment()
+            TelemetrySchema::V2025_01_29.schema_version(),
+            TelemetrySchema::V2022_07_01.schema_version()
+        );
+    }
+
+    #[test]
+    fn body_schema_version_is_distinct_from_api_path_version() {
+        // Regression guard for the LMI subscription `404 page not found`: the
+        // `2025-01-29` schema belongs in the request body, never in the URL
+        // path. The path stays on the fixed Telemetry API endpoint version.
+        assert_eq!(TelemetrySchema::V2025_01_29.schema_version(), "2025-01-29");
+        assert_ne!(
+            crate::runtime::TELEMETRY_API_VERSION,
+            TelemetrySchema::V2025_01_29.schema_version(),
+            "preferred body schema must differ from the fixed API path version"
         );
     }
 

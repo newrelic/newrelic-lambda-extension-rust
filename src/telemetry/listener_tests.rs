@@ -1183,7 +1183,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial]
-    async fn test_init_start_with_host_group_populates_both_fields() {
+    async fn test_init_start_with_max_memory_populates_both_fields() {
         clear_telemetry_state();
         clear_managed_instance_metadata().await;
 
@@ -1192,14 +1192,14 @@ mod tests {
             .await
             .expect("listener");
 
-        // 2025-01-29 schema shape: instanceId AND hostGroup present.
+        // Real LMI 2025-01-29 shape: instanceId AND instanceMaxMemory present.
         let body = serde_json::json!([{
             "time": "2026-05-29T11:00:00Z",
             "type": "platform.initStart",
             "record": {
                 "initializationType": "lambda-managed-instances",
                 "instanceId": "2026/05/29/test-fn[$LATEST]abc123",
-                "hostGroup": "default-host-group",
+                "instanceMaxMemory": 2147483648u64,
                 "runtimeVersion": "python:3.14.v43"
             }
         }]);
@@ -1217,7 +1217,7 @@ mod tests {
             crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
         let meta = guard.as_ref().expect("metadata should be populated");
         assert_eq!(meta.instance_id, "2026/05/29/test-fn[$LATEST]abc123");
-        assert_eq!(meta.host_group.as_deref(), Some("default-host-group"));
+        assert_eq!(meta.instance_max_memory, Some(2147483648));
         drop(guard);
 
         clear_managed_instance_metadata().await;
@@ -1226,8 +1226,8 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial]
-    async fn test_init_start_without_host_group_populates_only_instance_id() {
-        // 2022-07-01 fallback schema: instanceId present, hostGroup absent.
+    async fn test_init_start_without_max_memory_populates_only_instance_id() {
+        // instanceId present, instanceMaxMemory absent (AWS may omit it).
         clear_telemetry_state();
         clear_managed_instance_metadata().await;
 
@@ -1259,8 +1259,8 @@ mod tests {
         let meta = guard.as_ref().expect("metadata should be populated");
         assert_eq!(meta.instance_id, "no-host-group-id");
         assert!(
-            meta.host_group.is_none(),
-            "host_group must be None on 2022-07-01 schema"
+            meta.instance_max_memory.is_none(),
+            "instance_max_memory must be None when AWS omits it"
         );
         drop(guard);
 
@@ -1272,8 +1272,8 @@ mod tests {
     #[serial]
     async fn test_init_start_on_standard_lambda_leaves_metadata_none() {
         // Standard Lambda case: initStart fires but neither instanceId nor
-        // hostGroup is in the record. Global must remain None so attribute
-        // composition omits the LMI keys entirely.
+        // instanceMaxMemory is in the record. Global must remain None so
+        // attribute composition omits the LMI keys entirely.
         clear_telemetry_state();
         clear_managed_instance_metadata().await;
 
@@ -1331,7 +1331,7 @@ mod tests {
                 "type": "platform.initStart",
                 "record": {
                     "instanceId": "batch-test-id",
-                    "hostGroup": "batch-test-group"
+                    "instanceMaxMemory": 1073741824u64
                 }
             },
             {
@@ -1385,7 +1385,7 @@ mod tests {
             "type": "platform.initStart",
             "record": {
                 "instanceId": "attr-site-id",
-                "hostGroup": "attr-site-group"
+                "instanceMaxMemory": 2147483648u64
             }
         }]);
 
@@ -1403,7 +1403,7 @@ mod tests {
         let meta = crate::telemetry::managed_instance::try_read_metadata()
             .expect("attribute sites must observe the metadata");
         assert_eq!(meta.instance_id, "attr-site-id");
-        assert_eq!(meta.host_group.as_deref(), Some("attr-site-group"));
+        assert_eq!(meta.instance_max_memory, Some(2147483648));
 
         clear_managed_instance_metadata().await;
         clear_telemetry_state();

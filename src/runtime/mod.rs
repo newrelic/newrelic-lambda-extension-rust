@@ -25,6 +25,16 @@ use tracing::{debug, error, info, warn};
 /// `pub(crate)` so the `registration` submodule can share it.
 pub(crate) const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 
+/// Fixed Telemetry API endpoint version — the `<version>` segment in
+/// `PUT /<version>/telemetry`.
+///
+/// This identifies the API, **not** the event schema: it never varies with
+/// [`TelemetrySchema`], which only sets the body `schemaVersion`. It is the
+/// sibling of the `2020-01-01` Extensions API path used for registration and
+/// `/event/next`. Routing the schema version (e.g. `2025-01-29`) into this
+/// path segment is what produced the LMI subscription `404 page not found`.
+pub const TELEMETRY_API_VERSION: &str = "2022-07-01";
+
 /// Shutdown reasons from AWS Lambda (matching Go extension implementation)
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -78,13 +88,16 @@ pub enum LambdaRuntimeEvent {
 
 /// Subscribe to the Lambda Telemetry API.
 ///
-/// Tries [`TelemetrySchema::V2025_01_29`] first; on `HTTP 400` only, retries
-/// once with [`TelemetrySchema::V2022_07_01`] (Standard Lambda runtimes that
-/// have not yet been upgraded to the newer schema).
+/// Both attempts PUT to the fixed [`TELEMETRY_API_VERSION`] endpoint; only the
+/// body `schemaVersion` differs. Tries [`TelemetrySchema::V2025_01_29`] first;
+/// on `HTTP 400` or `404`, retries once with [`TelemetrySchema::V2022_07_01`]
+/// (Standard Lambda runtimes that have not yet been upgraded to the newer
+/// schema reject the body with 400; a 404 from a runtime that does not serve
+/// the newer schema is treated the same way rather than failing hard).
 ///
 /// Returns the schema actually accepted by AWS so callers can gate
-/// schema-specific record parsing (e.g., the `hostGroup` field that only
-/// appears under `2025-01-29`).
+/// schema-specific record parsing (e.g., host-level metadata that only appears
+/// under `2025-01-29`).
 ///
 /// # Errors
 ///
@@ -92,8 +105,8 @@ pub enum LambdaRuntimeEvent {
 ///   is not set.
 /// - [`TelemetrySubscriptionError::Transport`] for network/IO failures.
 /// - [`TelemetrySubscriptionError::Rejected`] for any non-2xx response that is
-///   *not* a 400 on the preferred schema (400 on the preferred schema triggers
-///   the fallback rather than returning).
+///   *not* a 400/404 on the preferred schema (those trigger the fallback
+///   rather than returning).
 pub async fn subscribe_to_telemetry(
     client: &Client,
     ext_id: &str,
@@ -108,12 +121,12 @@ pub async fn subscribe_to_telemetry(
             Ok(TelemetrySchema::V2025_01_29)
         }
         Err(TelemetrySubscriptionError::Rejected {
-            status: 400,
+            status: status @ (400 | 404),
             body,
             schema: TelemetrySchema::V2025_01_29,
         }) => {
             warn!(
-                "[NR_EXT] Telemetry API {} rejected with 400 (body: {body}) — falling back to {}",
+                "[NR_EXT] Telemetry API {} rejected with {status} (body: {body}) — falling back to {}",
                 TelemetrySchema::V2025_01_29.name(),
                 TelemetrySchema::V2022_07_01.name()
             );
@@ -140,7 +153,9 @@ async fn try_subscribe(
     let runtime_api =
         env::var("AWS_LAMBDA_RUNTIME_API").map_err(|_| TelemetrySubscriptionError::MissingRuntimeApi)?;
 
-    let url = format!("http://{runtime_api}/{}/telemetry", schema.url_segment());
+    // The URL path version is the fixed Telemetry API endpoint version — never
+    // the event schema. The schema is carried only in the body `schemaVersion`.
+    let url = format!("http://{runtime_api}/{TELEMETRY_API_VERSION}/telemetry");
 
     let payload = serde_json::json!({
         "schemaVersion": schema.schema_version(),

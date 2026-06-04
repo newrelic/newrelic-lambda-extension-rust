@@ -253,10 +253,10 @@ impl NewRelicClient {
                 "aws.lambda.managedInstance.instanceId".to_string(),
                 serde_json::json!(meta.instance_id),
             );
-            if let Some(host_group) = meta.host_group {
+            if let Some(max_memory) = meta.instance_max_memory {
                 common_attributes.insert(
-                    "aws.lambda.managedInstance.hostGroup".to_string(),
-                    serde_json::json!(host_group),
+                    "aws.lambda.managedInstance.instanceMaxMemory".to_string(),
+                    serde_json::json!(max_memory),
                 );
             }
         }

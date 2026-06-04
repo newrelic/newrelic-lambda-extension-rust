@@ -238,8 +238,8 @@ async fn handle_telemetry_request(
                         function_completed = true;
                     }
                     "platform.initStart" => {
-                        // LMI-only host metadata (instanceId always; hostGroup
-                        // only on the 2025-01-29 subscription schema). Captured
+                        // LMI host metadata (instanceId + instanceMaxMemory,
+                        // both AWS-documented on the 2025-01-29 schema). Captured
                         // once into the global static, then read by every
                         // outbound attribute composer. See
                         // src/telemetry/managed_instance.rs.
@@ -251,8 +251,8 @@ async fn handle_telemetry_request(
                                     .write()
                                     .await;
                             debug!(
-                                "Captured managed-instance metadata: instance_id={} host_group={:?}",
-                                meta.instance_id, meta.host_group
+                                "Captured managed-instance metadata: instance_id={} instance_max_memory={:?}",
+                                meta.instance_id, meta.instance_max_memory
                             );
                             *guard = Some(meta);
                         }
