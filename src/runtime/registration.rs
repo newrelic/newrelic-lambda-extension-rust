@@ -23,11 +23,11 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::deployment::DeploymentContext;
 
-use super::EXTENSION_ID_HEADER;
+use super::{retry, EXTENSION_ID_HEADER};
 
 const EXTENSION_NAME_HEADER: &str = "Lambda-Extension-Name";
 const ACCEPT_FEATURE_HEADER: &str = "Lambda-Extension-Accept-Feature";
@@ -111,6 +111,24 @@ impl From<reqwest::Error> for RegistrationError {
     }
 }
 
+impl RegistrationError {
+    /// Whether this failure is transient and worth retrying (see
+    /// [`crate::runtime::retry`]).
+    ///
+    /// Transport failures and `5xx`/`429` responses are retried. `Rejected`
+    /// with any other `4xx`, a missing identifier header, a deserialize
+    /// failure, and a missing env var are all terminal — none will resolve on
+    /// a retry.
+    #[must_use]
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Rejected { status, .. } => retry::status_is_retryable(*status),
+            Self::MissingRuntimeApi | Self::MissingExtensionId | Self::Deserialize(_) => false,
+        }
+    }
+}
+
 /// The shape of an extension registration request.
 ///
 /// Implementations differ only in `events()` — everything else (URL, headers,
@@ -168,17 +186,51 @@ pub fn schema_for(ctx: DeploymentContext) -> &'static dyn RegistrationSchema {
     }
 }
 
-/// Register the extension with the Lambda Runtime API.
+/// Register the extension with the Lambda Runtime API, with bounded retry on
+/// transient failures.
 ///
 /// `schema` controls the lifecycle events the extension subscribes to. Use
 /// [`schema_for`] to dispatch from a [`DeploymentContext`].
+///
+/// Wraps [`register_once`] in the shared cold-start retry policy ([`retry`]):
+/// transport errors and `5xx`/`429` responses are retried up to
+/// [`retry::MAX_ATTEMPTS`] times with escalating backoff. Registration is a
+/// once-per-execution-environment call, so a transient blip here would
+/// otherwise leave the environment running blind for its whole lifetime.
 ///
 /// # Errors
 ///
 /// Returns [`RegistrationError`] for any failure — env-var missing, network
 /// error, non-2xx response, missing identifier header, or response that fails
-/// to deserialize.
+/// to deserialize. Terminal (non-retryable) errors are returned on the first
+/// attempt.
 pub async fn register_extension(
+    client: &Client,
+    extension_name: &str,
+    schema: &dyn RegistrationSchema,
+) -> Result<(ExtensionRegistrationResponse, String), RegistrationError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match register_once(client, extension_name, schema).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < retry::MAX_ATTEMPTS && e.is_retryable() => {
+                let delay = retry::backoff(attempt);
+                warn!(
+                    "[NR_EXT] registration schema={} attempt {attempt}/{} failed: {e} — retrying in {delay:?}",
+                    schema.name(),
+                    retry::MAX_ATTEMPTS
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A single registration attempt. Retry/backoff lives in the caller
+/// [`register_extension`].
+async fn register_once(
     client: &Client,
     extension_name: &str,
     schema: &dyn RegistrationSchema,

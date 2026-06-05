@@ -105,6 +105,21 @@ pub fn convert_to_apm_metrics(
     common_attrs.insert("entity.name".to_string(), json!(function_name));
     common_attrs.insert("entity.type".to_string(), json!("APM"));
 
+    // LMI host metadata. None on Standard Lambda; populated once at
+    // cold-start init when the listener processes platform.initStart.
+    if let Some(meta) = crate::telemetry::managed_instance::try_read_metadata() {
+        common_attrs.insert(
+            "aws.lambda.managedInstance.instanceId".to_string(),
+            json!(meta.instance_id),
+        );
+        if let Some(max_memory) = meta.instance_max_memory {
+            common_attrs.insert(
+                "aws.lambda.managedInstance.instanceMaxMemory".to_string(),
+                json!(max_memory),
+            );
+        }
+    }
+
     let mut apm_metrics = Vec::new();
 
     if let Some(duration) = metrics.duration {

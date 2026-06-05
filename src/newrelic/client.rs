@@ -244,6 +244,23 @@ impl NewRelicClient {
             common_attributes.extend(version_attrs.clone());
         }
 
+        // LMI host metadata. `platform.initStart` fires during init phase
+        // immediately after Telemetry API subscription, so by the time the
+        // first per-ARN cache build happens (during the first log send), the
+        // global static is already populated. None on Standard Lambda.
+        if let Some(meta) = crate::telemetry::managed_instance::try_read_metadata() {
+            common_attributes.insert(
+                "aws.lambda.managedInstance.instanceId".to_string(),
+                serde_json::json!(meta.instance_id),
+            );
+            if let Some(max_memory) = meta.instance_max_memory {
+                common_attributes.insert(
+                    "aws.lambda.managedInstance.instanceMaxMemory".to_string(),
+                    serde_json::json!(max_memory),
+                );
+            }
+        }
+
         let json = serde_json::to_string(&common_attributes).unwrap_or_else(|_| "{}".to_string());
         self.cached_common_json_by_arn.insert(function_arn.to_string(), json.clone());
         json

@@ -12,12 +12,19 @@ use tracing_subscriber::{
 
 pub mod deployment;
 
+use deployment::{DeploymentContext, TelemetryMode};
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
     pub new_relic: NewRelicConfig,
     pub aws: AwsConfig,
     pub extension: ExtensionSettings,
+    /// Detected once at startup — single source of truth for the deployment
+    /// environment (Normal Lambda vs LMI). All loop-dispatch and mode-aware
+    /// branching reads this rather than re-parsing env vars. See
+    /// `LMI_SUPPORT.md` §2.
+    pub deployment: DeploymentContext,
 }
 
 /// New Relic specific configuration
@@ -101,6 +108,9 @@ impl Default for ExtensionConfig {
             new_relic: NewRelicConfig::default(),
             aws: AwsConfig::default(),
             extension: ExtensionSettings::default(),
+            // Default for tests / non-Lambda contexts. Production code paths
+            // overwrite this in `from_env()` via `deployment::detect()`.
+            deployment: DeploymentContext::Normal { mode: TelemetryMode::Serverless },
         }
     }
 }
@@ -282,6 +292,15 @@ impl ExtensionConfig {
 
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
+
+        // Detect deployment context exactly once. On LMI, APM mode is forced
+        // regardless of the user-supplied `NEW_RELIC_APM_LAMBDA_MODE` value —
+        // `deployment::detect()` already logs a warning when the user explicitly
+        // disabled it. See `LMI_SUPPORT.md` §7.
+        config.deployment = deployment::detect();
+        if config.deployment.is_lmi() {
+            config.new_relic.apm_lambda_mode = true;
+        }
 
         let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
         config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);

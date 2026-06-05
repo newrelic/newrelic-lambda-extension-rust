@@ -237,6 +237,29 @@ async fn handle_telemetry_request(
                         platform_processor.process_record(record);
                         function_completed = true;
                     }
+                    "platform.initStart" => {
+                        // LMI host metadata (instanceId + instanceMaxMemory,
+                        // both AWS-documented on the 2025-01-29 schema). Captured
+                        // once into the global static, then read by every
+                        // outbound attribute composer. See
+                        // src/telemetry/managed_instance.rs.
+                        if let Some(meta) =
+                            crate::telemetry::managed_instance::extract_managed_instance_metadata(&record.record)
+                        {
+                            let mut guard =
+                                crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA
+                                    .write()
+                                    .await;
+                            debug!(
+                                "Captured managed-instance metadata: instance_id={} instance_max_memory={:?}",
+                                meta.instance_id, meta.instance_max_memory
+                            );
+                            *guard = Some(meta);
+                        }
+                        // Existing log-emission path stays the source of truth
+                        // for surfacing platform.initStart as a log entry.
+                        platform_processor.process_record(record);
+                    }
                     _ => {
                         platform_count += 1;
                         platform_processor.process_record(record);

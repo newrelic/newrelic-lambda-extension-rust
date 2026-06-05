@@ -11,7 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     runtime,
-    config::{self, ExtensionConfig},
+    config::{self, ExtensionConfig, deployment::DeploymentContext},
     newrelic::client::NewRelicClient,
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
@@ -59,6 +59,10 @@ pub struct ExtensionComponents {
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
     pub apm_client: Client,
     pub reconnect_in_flight: Arc<watch::Sender<bool>>,
+    /// Deployment context (Normal Lambda vs LMI). Drives top-level loop dispatch
+    /// in `execute_main_telemetry_processing_loop` — Normal Lambda routes to the
+    /// existing APM/Serverless loops; LMI routes to `event_loop_lmi`.
+    pub deployment: DeploymentContext,
 }
 
 #[derive(Debug, Clone)]
@@ -94,15 +98,30 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or serverless mode based on config (or runtime override for Java)
+///
+/// Top-level dispatch on `DeploymentContext` first — LMI runs a dedicated
+/// telemetry-driven loop because AWS rejects `INVOKE` registration for LMI.
+/// On Normal Lambda, the existing APM-vs-Serverless decision is preserved
+/// (Java-runtime override is encoded in `apm_mode_enabled`).
+///
+/// The match has no `_` arm: adding a new `DeploymentContext` variant in the
+/// future is a compile error here, forcing an explicit decision (see
+/// `LMI_SUPPORT.md` §3).
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let apm_mode_enabled = components.apm_mode_enabled;
-    if apm_mode_enabled {
-        info!("Starting APM mode event loop (connection may still be in progress)");
-        execute_apm_mode_event_loop(components).await
-    } else {
-        debug!("Starting serverless mode event loop");
-        execute_standard_mode_event_loop(components).await
+    match components.deployment {
+        DeploymentContext::Lmi => {
+            info!("Starting LMI event loop (telemetry-driven, no INVOKE polling)");
+            crate::event_loop_lmi::execute_lmi_mode_event_loop(components).await
+        }
+        DeploymentContext::Normal { .. } => {
+            if components.apm_mode_enabled {
+                info!("Starting APM mode event loop (connection may still be in progress)");
+                execute_apm_mode_event_loop(components).await
+            } else {
+                debug!("Starting serverless mode event loop");
+                execute_standard_mode_event_loop(components).await
+            }
+        }
     }
 }
 
@@ -1314,7 +1333,7 @@ async fn wait_for_runtime_done_with_grace(
 
 /// Sends the appropriate APM error event for a given shutdown reason.
 /// Called from the SHUTDOWN handler whether APM was already connected or just reconnected.
-async fn send_error_for_shutdown_reason(
+pub(crate) async fn send_error_for_shutdown_reason(
     app: &crate::apm::ApmApp,
     reason: runtime::ShutdownReason,
     request_id: &str,
@@ -1695,7 +1714,7 @@ fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
 
 /// Process any pending agent payloads from previous invocation (APM mode only)
 /// Excludes the current request ID to avoid processing empty buffer
-async fn process_pending_agent_payloads(
+pub(crate) async fn process_pending_agent_payloads(
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,

@@ -20,6 +20,7 @@ mod apm;
 mod runtime;
 mod request;
 mod event_loop;
+mod event_loop_lmi;
 mod error_synthesis;
 
 #[cfg(debug_assertions)]
@@ -317,6 +318,7 @@ async fn perform_one_time_initialization(
             apm_mode_enabled: false,
             apm_client: Client::new(),
             reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+            deployment: config.deployment,
         });
     }
 
@@ -591,8 +593,16 @@ async fn perform_one_time_initialization(
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         };
 
-    runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
-        .await?;
+    let telemetry_schema = runtime::subscribe_to_telemetry(
+        &client,
+        &extension_id,
+        telemetry_listener_address.port(),
+    )
+    .await?;
+    debug!(
+        "Telemetry API subscription active using schema={}",
+        telemetry_schema.name()
+    );
 
     // Log flushing is event-driven: size-based auto-flush inside LogProcessor, plus
     // end-of-execution flush in the event loop gated on platform.runtimeDone, plus
@@ -610,6 +620,7 @@ async fn perform_one_time_initialization(
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
         apm_client,
         reconnect_in_flight,
+        deployment: config.deployment,
     })
 }
 
@@ -657,6 +668,7 @@ async fn handle_no_license_key(
         apm_mode_enabled: false,
         apm_client: Client::new(),
         reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+        deployment: config.deployment,
     })
 }
 

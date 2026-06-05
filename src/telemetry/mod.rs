@@ -8,6 +8,7 @@
 //! management.
 
 pub mod listener;
+pub mod managed_instance;
 
 #[cfg(test)]
 mod listener_tests;
