@@ -82,6 +82,25 @@ pub enum TelemetrySubscriptionError {
     },
 }
 
+impl TelemetrySubscriptionError {
+    /// Whether this failure is transient and worth retrying (see
+    /// [`crate::runtime::retry`]).
+    ///
+    /// Transport failures and `5xx`/`429` responses are retried. Every other
+    /// `Rejected` status is terminal — in particular `400`/`404`, which
+    /// [`crate::runtime::subscribe_to_telemetry`] needs to surface to drive the
+    /// schema fallback rather than retry away. `MissingRuntimeApi` is terminal
+    /// (the env var will not appear on a retry).
+    #[must_use]
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport(_) => true,
+            Self::Rejected { status, .. } => crate::runtime::retry::status_is_retryable(*status),
+            Self::MissingRuntimeApi => false,
+        }
+    }
+}
+
 impl std::fmt::Display for TelemetrySubscriptionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -158,5 +177,39 @@ mod tests {
     fn missing_runtime_api_display_is_actionable() {
         let err = TelemetrySubscriptionError::MissingRuntimeApi;
         assert!(format!("{err}").contains("AWS_LAMBDA_RUNTIME_API"));
+    }
+
+    #[test]
+    fn rejected_5xx_and_429_are_retryable() {
+        for status in [500, 502, 503, 504, 429] {
+            let err = TelemetrySubscriptionError::Rejected {
+                status,
+                body: String::new(),
+                schema: TelemetrySchema::V2025_01_29,
+            };
+            assert!(err.is_retryable(), "status {status} should be retryable");
+        }
+    }
+
+    #[test]
+    fn rejected_400_and_404_are_terminal_for_retry() {
+        // 400/404 must NOT be retried — they are the schema-fallback signal that
+        // `subscribe_to_telemetry` needs to see (V2025 → V2022).
+        for status in [400, 401, 403, 404, 409, 422] {
+            let err = TelemetrySubscriptionError::Rejected {
+                status,
+                body: String::new(),
+                schema: TelemetrySchema::V2025_01_29,
+            };
+            assert!(
+                !err.is_retryable(),
+                "status {status} must be terminal so the fallback path can act"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_runtime_api_is_terminal_for_retry() {
+        assert!(!TelemetrySubscriptionError::MissingRuntimeApi.is_retryable());
     }
 }

@@ -9,6 +9,7 @@
 
 pub mod registration;
 pub mod telemetry_schema;
+mod retry;
 
 // Re-export the call-site API. The trait and concrete schemas stay scoped to
 // `registration::` — callers should reach into the submodule explicitly when
@@ -141,10 +142,43 @@ pub async fn subscribe_to_telemetry(
     }
 }
 
-/// Single subscription attempt against one schema. Used both as the first
-/// try (`2025-01-29`) and the fallback (`2022-07-01`) — same wire shape, same
-/// headers, same timeout.
+/// Subscribe against one schema, with bounded retry on transient failures.
+///
+/// Used both as the first try (`2025-01-29`) and the fallback (`2022-07-01`).
+/// Wraps [`subscribe_once`] in the shared cold-start retry policy
+/// ([`retry`]): transport errors and `5xx`/`429` responses are retried up to
+/// [`retry::MAX_ATTEMPTS`] times with escalating backoff; every other error
+/// (notably the `400`/`404` that drives the schema fallback in
+/// [`subscribe_to_telemetry`]) is terminal and returned immediately.
 async fn try_subscribe(
+    client: &Client,
+    ext_id: &str,
+    port: u16,
+    schema: TelemetrySchema,
+) -> Result<(), TelemetrySubscriptionError> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match subscribe_once(client, ext_id, port, schema).await {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < retry::MAX_ATTEMPTS && e.is_retryable() => {
+                let delay = retry::backoff(attempt);
+                warn!(
+                    "[NR_EXT] Telemetry subscription schema={} attempt {attempt}/{} failed: {e} — retrying in {delay:?}",
+                    schema.name(),
+                    retry::MAX_ATTEMPTS
+                );
+                tokio::time::sleep(delay).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A single subscription attempt against one schema — same wire shape, headers,
+/// and timeout for both the preferred and fallback schema. Retry/backoff lives
+/// in the caller [`try_subscribe`].
+async fn subscribe_once(
     client: &Client,
     ext_id: &str,
     port: u16,

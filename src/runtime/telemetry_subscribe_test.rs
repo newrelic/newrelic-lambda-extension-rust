@@ -218,7 +218,10 @@ async fn subscribe_falls_back_to_2022_on_404() {
 
 #[tokio::test]
 #[serial]
-async fn subscribe_does_not_fall_back_on_500() {
+async fn subscribe_retries_500_then_gives_up_without_falling_back() {
+    // 500 is transient, so it is retried on the SAME schema up to MAX_ATTEMPTS
+    // (3) — never falling back to 2022, which would mask a transient AWS error
+    // as "fallback worked" and silently downgrade the schema.
     let server = MockServer::start().await;
 
     Mock::given(method("PUT"))
@@ -227,12 +230,11 @@ async fn subscribe_does_not_fall_back_on_500() {
             "schemaVersion": "2025-01-29"
         })))
         .respond_with(ResponseTemplate::new(500))
-        .expect(1)
+        .expect(3) // initial attempt + 2 retries, all on the 2025 schema
         .mount(&server)
         .await;
 
-    // The 2022 fallback body must NOT be sent on 500 — that would mask
-    // transient AWS errors as "fallback worked" and silently downgrade.
+    // The 2022 fallback body must NEVER be sent on 500.
     Mock::given(method("PUT"))
         .and(path(TELEMETRY_PATH))
         .and(body_partial_json(serde_json::json!({
@@ -250,8 +252,105 @@ async fn subscribe_does_not_fall_back_on_500() {
             assert_eq!(status, 500);
             assert_eq!(schema, TelemetrySchema::V2025_01_29);
         }
-        other => panic!("expected Rejected(500, V2025_01_29), got {other:?}"),
+        other => panic!("expected Rejected(500, V2025_01_29) after retries, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retry path: a transient 503 on the preferred schema is retried on the SAME
+// schema and succeeds — no fallback, no startup abort.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn subscribe_retries_on_503_then_succeeds_same_schema() {
+    let server = MockServer::start().await;
+
+    // First two attempts: 503 (transient). Higher priority + capped so it is
+    // consumed first, then yields to the success mock.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2025-01-29"
+        })))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    // Third attempt: 200 on the SAME (preferred) schema.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2025-01-29"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Fallback must never fire — the preferred schema ultimately succeeded.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2022-07-01"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let result = subscribe(&server).await;
+
+    assert_eq!(
+        result.expect("transient 503 should be retried, not fatal"),
+        TelemetrySchema::V2025_01_29
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retry path interacts correctly with the fallback: a 503 on the preferred
+// schema is retried (not a fallback signal); a 400 IS the fallback signal and
+// is NOT retried. Here the preferred schema 503s persistently → give up,
+// surface the 5xx, never fall back. (Companion to the 400/404 fallback tests.)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn subscribe_does_not_retry_400_but_falls_back_immediately() {
+    let server = MockServer::start().await;
+
+    // 400 is terminal for retry (it is the fallback signal): exactly ONE 2025
+    // attempt, then fall back.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2025-01-29"
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_string("schema not supported"))
+        .expect(1) // NOT retried — proves 400 is terminal for the retry layer
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2022-07-01"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = subscribe(&server).await;
+
+    assert_eq!(
+        result.expect("400 should fall back, not retry"),
+        TelemetrySchema::V2022_07_01
+    );
 }
 
 #[tokio::test]
@@ -333,6 +432,61 @@ async fn subscribe_does_not_fall_back_when_2022_also_400() {
         }
         other => panic!("expected Rejected(400, V2022_07_01) on second failure, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Retry + fallback compose: the fallback (2022) schema carries its OWN retry
+// budget. A 400 on 2025 falls back (no retry), then a transient 503 on 2022 is
+// retried on 2022 and succeeds. Worst case is 1 (V2025) + up to 3 (V2022) calls.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial]
+async fn subscribe_falls_back_then_retries_2022_on_503() {
+    let server = MockServer::start().await;
+
+    // V2025: 400 → terminal for retry, triggers exactly one fallback.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2025-01-29"
+        })))
+        .respond_with(ResponseTemplate::new(400).set_body_string("schema not supported"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // V2022: first attempt 503 (transient), then 200 — proving the fallback
+    // schema retries on its own budget rather than giving up.
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2022-07-01"
+        })))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("PUT"))
+        .and(path(TELEMETRY_PATH))
+        .and(body_partial_json(serde_json::json!({
+            "schemaVersion": "2022-07-01"
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = subscribe(&server).await;
+
+    assert_eq!(
+        result.expect("fallback schema should retry a transient 503 and succeed"),
+        TelemetrySchema::V2022_07_01
+    );
 }
 
 // ---------------------------------------------------------------------------
