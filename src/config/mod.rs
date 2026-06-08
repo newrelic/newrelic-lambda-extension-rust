@@ -82,6 +82,13 @@ pub struct ExtensionSettings {
     /// may lose data on final shutdown if flush doesn't complete in time.
     /// Default: false (safe mode — flush completes before GET /next).
     pub pipeline_flush: bool,
+    /// NEW_RELIC_LMI_FLUSH_INTERVAL_MS — heartbeat flush cadence (ms) for the
+    /// Lambda Managed Instances (LMI) event loop. LMI runs continuously (no
+    /// freeze between invokes), so buffered telemetry is drained on this
+    /// interval by a background task rather than at `platform.runtimeDone`.
+    /// Default 30_000, floored at 1000. Read ONLY by the LMI loop; ignored on
+    /// standard Lambda.
+    pub lmi_flush_interval_ms: u64,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -217,6 +224,7 @@ impl Default for ExtensionSettings {
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
             pipeline_flush: false,
+            lmi_flush_interval_ms: 30_000,
         }
     }
 }
@@ -364,6 +372,15 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        // NEW_RELIC_LMI_FLUSH_INTERVAL_MS: heartbeat flush cadence for the LMI
+        // event loop. Floored at 1000 ms to avoid pathological flush storms.
+        // Default 30_000 ms.
+        config.extension.lmi_flush_interval_ms = env::var("NEW_RELIC_LMI_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000)
+            .max(1000);
 
         config
     }

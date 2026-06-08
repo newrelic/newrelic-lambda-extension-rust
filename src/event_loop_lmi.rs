@@ -31,15 +31,22 @@
 //! `perform_one_time_initialization` sets up — both run as background tasks
 //! and are mode-agnostic. The LMI loop never touches them directly.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use reqwest::Client;
+use tokio::sync::watch;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    config::ExtensionConfig,
     event_loop::{
         process_pending_agent_payloads, send_error_for_shutdown_reason,
         ExtensionComponents, LAST_REQUEST_CONTEXT,
     },
+    logs::processor::LogProcessor,
+    newrelic::flush::Flush,
     runtime,
 };
 
@@ -47,11 +54,110 @@ use crate::{
 /// exit before AWS terminates us mid-flight.
 const LMI_SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
+/// Cloneable handles for the LMI flush path. All `Arc`, so the heartbeat task
+/// can own its own copy without borrowing the event loop's `&mut components`.
+#[derive(Clone)]
+struct LmiFlushHandles {
+    config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+    apm_app: crate::apm::SharedApmApp,
+    client: Arc<Client>,
+}
+
+impl LmiFlushHandles {
+    fn from_components(c: &ExtensionComponents) -> Self {
+        Self {
+            config: Arc::clone(&c.config),
+            global_log_processor: Arc::clone(&c.global_log_processor),
+            apm_app: Arc::clone(&c.apm_app),
+            client: Arc::clone(&c.client),
+        }
+    }
+}
+
+/// Drain buffered telemetry to New Relic. The single flush implementation,
+/// shared by the periodic heartbeat (`final_drain = false`) and the SHUTDOWN
+/// drain (`final_drain = true`).
+///
+/// Agent payloads are delivered by `run_id` (empty `request_id` = "every
+/// pending request"); `platform.report` metrics are already sent on arrival by
+/// the telemetry listener, so only previously-failed APM telemetry is retried.
+/// Logs use the normal batch flush on the heartbeat and the retrying shutdown
+/// flush (pre-invoke buffer + `flush_on_shutdown`) on the final drain. When the
+/// buffers are empty these calls perform no network I/O, so idle ticks are
+/// effectively a no-op.
+async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
+    process_pending_agent_payloads(&h.config, &h.global_log_processor, &h.apm_app, "").await;
+
+    crate::apm::telemetry_buffer::retry_buffered_telemetry(
+        &h.client,
+        h.config.new_relic.license_key.as_deref().unwrap_or(""),
+    )
+    .await;
+
+    if final_drain {
+        if let Err(e) = h
+            .global_log_processor
+            .flush_pre_invoke_buffer_on_shutdown()
+            .await
+        {
+            error!("LMI: failed to flush pre-invoke log buffer: {}", e);
+        }
+        if let Err(e) = h.global_log_processor.flush_on_shutdown().await {
+            error!("LMI: failed to flush logs on shutdown: {}", e);
+        }
+    } else if let Err(e) = h.global_log_processor.flush().await {
+        error!("LMI: heartbeat log flush failed: {}", e);
+    }
+}
+
+/// Spawn the periodic heartbeat flush task.
+///
+/// LMI runs continuously (no freeze between invokes) and never delivers
+/// `platform.runtimeDone`, so periodic flushing must be time-driven and live in
+/// its own task — the `/event/next` loop is blocked waiting for SHUTDOWN.
+/// `MissedTickBehavior::Skip` avoids burst catch-up. The task stops when
+/// `cancel_rx` flips to `true`; it does NOT drain on cancel because the main
+/// loop performs the authoritative final drain on SHUTDOWN.
+fn spawn_lmi_heartbeat(
+    h: LmiFlushHandles,
+    mut cancel_rx: watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let interval_ms = h.config.extension.lmi_flush_interval_ms;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker.tick().await; // discard the immediate first tick
+        info!("LMI heartbeat flush task started (interval={}ms)", interval_ms);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    debug!("LMI heartbeat: periodic flush tick");
+                    flush_lmi_telemetry(&h, false).await;
+                }
+                res = cancel_rx.changed() => {
+                    if res.is_err() || *cancel_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+        info!("LMI heartbeat flush task stopped");
+    })
+}
+
 /// LMI event loop. Telemetry-driven; `/event/next` is used only as a
 /// SHUTDOWN waiter.
 pub async fn execute_lmi_mode_event_loop(components: &mut ExtensionComponents) -> u32 {
     debug_assert!(components.deployment.is_lmi(), "LMI loop entered without LMI deployment context");
     debug_assert!(components.apm_mode_enabled, "LMI must force APM mode");
+
+    // The heartbeat flush task runs concurrently: /event/next below blocks
+    // waiting for SHUTDOWN, so it cannot drive periodic flushing itself. The
+    // task drains buffered telemetry every `lmi_flush_interval_ms`; on cancel it
+    // stops (the final drain is performed by this loop on SHUTDOWN).
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let heartbeat = spawn_lmi_heartbeat(LmiFlushHandles::from_components(components), cancel_rx);
 
     let mut event_counter: u32 = 0;
 
@@ -69,6 +175,7 @@ pub async fn execute_lmi_mode_event_loop(components: &mut ExtensionComponents) -
                 let error_msg = e.to_string();
                 if error_msg.contains("403") || error_msg.contains("State transition") {
                     error!("LMI mode: fatal /next error (403 — Lambda shutting down): {:?}", e);
+                    let _ = cancel_tx.send(true);
                     drain_on_shutdown_with_timeout(components, None).await;
                     info!("LMI mode: emergency shutdown cleanup completed. Extension exiting.");
                     break;
@@ -101,6 +208,7 @@ pub async fn execute_lmi_mode_event_loop(components: &mut ExtensionComponents) -
                     shutdown_reason
                 );
 
+                let _ = cancel_tx.send(true);
                 drain_on_shutdown_with_timeout(components, Some(shutdown_reason)).await;
 
                 info!(
@@ -111,6 +219,11 @@ pub async fn execute_lmi_mode_event_loop(components: &mut ExtensionComponents) -
             }
         }
     }
+
+    // Stop and join the heartbeat task before returning (idempotent if already
+    // cancelled on the shutdown/fatal path above).
+    let _ = cancel_tx.send(true);
+    let _ = heartbeat.await;
 
     event_counter
 }
@@ -145,43 +258,14 @@ async fn drain_on_shutdown_with_timeout(
             }
         }
 
-        // Drain any agent payloads that arrived but haven't been sent yet.
-        // Empty current_request_id means "consider every request pending."
-        process_pending_agent_payloads(
-            &components.config,
-            &components.global_log_processor,
-            &components.apm_app,
-            "",
-        )
-        .await;
-
-        // Retry any APM telemetry buffered after a transient send failure.
-        crate::apm::telemetry_buffer::retry_buffered_telemetry(
-            &components.client,
-            components
-                .config
-                .new_relic
-                .license_key
-                .as_deref()
-                .unwrap_or(""),
-        )
-        .await;
+        // Unified final drain — the same flush path the heartbeat uses, with
+        // shutdown log-flush semantics (agent payloads by run_id, retry buffered
+        // APM telemetry, then pre-invoke buffer + retrying shutdown log flush).
+        flush_lmi_telemetry(&LmiFlushHandles::from_components(components), true).await;
 
         let remaining = crate::apm::telemetry_buffer::get_buffer_count();
         if remaining > 0 {
             error!("LMI shutdown: {} telemetry items could not be sent", remaining);
-        }
-
-        // Final log flush — INIT-phase pre-invoke buffer first, then the main flush.
-        if let Err(e) = components
-            .global_log_processor
-            .flush_pre_invoke_buffer_on_shutdown()
-            .await
-        {
-            error!("LMI shutdown: failed to flush pre-invoke log buffer: {}", e);
-        }
-        if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
-            error!("LMI shutdown: failed to flush logs: {}", e);
         }
     })
     .await;
