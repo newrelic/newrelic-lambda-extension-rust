@@ -10,7 +10,9 @@ use super::collector::{
     CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
     CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
-use super::connection::{connect, preconnect};
+use super::connection::{
+    connect, is_handshake_fatal, is_permanent_auth_error, preconnect, signal_handshake_fatal,
+};
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
 use anyhow::{Context, Result};
@@ -18,7 +20,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -45,11 +47,20 @@ impl ApmApp {
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
+        // If a prior handshake was permanently rejected (bad license key / no
+        // permission), don't keep hammering the collector for this container's life.
+        if is_handshake_fatal() {
+            return Err(anyhow::anyhow!(
+                "APM handshake permanently disabled for this container (auth previously rejected)"
+            ));
+        }
+
         let backoff_ms = [200, 500, 900];
+        let total_attempts = backoff_ms.len();
         let mut last_error = None;
 
         for (attempt, delay) in backoff_ms.iter().enumerate() {
-            debug!("APM connection attempt {} of {}", attempt + 1, 3);
+            debug!("APM connection attempt {} of {}", attempt + 1, total_attempts);
 
             match Self::try_connect(
                 &license_key,
@@ -73,10 +84,29 @@ impl ApmApp {
                     return Ok(app);
                 }
                 Err(e) => {
-                    warn!("APM connection attempt {} failed: {}", attempt + 1, e);
+                    // Permanent auth failure (401/403): stop immediately and latch APM
+                    // off so the per-invoke loop won't retry. This is a real config
+                    // error the customer must fix, so log it at error level — once.
+                    if let Some(status) = is_permanent_auth_error(&e) {
+                        error!(
+                            "APM handshake rejected (HTTP {}) - invalid license key or insufficient permissions. Disabling APM connection attempts for this container.",
+                            status
+                        );
+                        signal_handshake_fatal();
+                        return Err(e);
+                    }
+
+                    // Transient failure: this is a retry, not a fatal error — warn with
+                    // the attempt count so it's clear the extension is still trying.
+                    warn!(
+                        "APM handshake attempt {}/{} failed: {} - retrying",
+                        attempt + 1,
+                        total_attempts,
+                        e
+                    );
                     last_error = Some(e);
 
-                    if attempt < backoff_ms.len() - 1 {
+                    if attempt < total_attempts - 1 {
                         debug!("Retrying in {}ms", delay);
                         tokio::time::sleep(tokio::time::Duration::from_millis(*delay)).await;
                     }

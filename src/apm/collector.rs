@@ -212,7 +212,10 @@ pub async fn send_error_events(
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await?;
+        .await
+        // Strip the request URL (carries `license_key`) from any error before it
+        // propagates to a log site.
+        .map_err(|e| e.without_url())?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -309,7 +312,10 @@ pub async fn send_apm_telemetry(
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await?;
+        .await
+        // Strip the request URL (carries `license_key`) from any error before it
+        // propagates to a log site.
+        .map_err(|e| e.without_url())?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -392,6 +398,9 @@ pub async fn send_platform_metrics(
     {
         Ok(resp) => resp,
         Err(e) => {
+            // license key travels in the `Api-Key` header here (not the URL), but
+            // strip the URL anyway for defense-in-depth before logging.
+            let e = e.without_url();
             warn!("Platform metrics network error: {} - will retry", e);
             return Err(MetricApiError::Network(anyhow::Error::new(e)));
         }

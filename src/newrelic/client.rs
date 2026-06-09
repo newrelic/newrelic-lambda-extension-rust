@@ -59,6 +59,18 @@ pub fn mask_proxy_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Strip the query string and fragment from a URL for safe logging.
+///
+/// APM connect/preconnect and collector URLs carry the license key as a
+/// `?...&license_key=<KEY>` query parameter, so this returns only the
+/// `scheme://host/path` prefix — never query parameters or credentials.
+/// `https://collector.newrelic.com/agent_listener/invoke_raw_method?license_key=KEY`
+/// -> `https://collector.newrelic.com/agent_listener/invoke_raw_method`
+pub fn redact_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    url[..end].to_string()
+}
+
 /// Parse a proxy URL string into a `reqwest::Proxy` for all traffic.
 /// Excludes localhost/loopback from proxying (Lambda Extensions API, telemetry listener).
 /// Returns `None` and logs a warning if the URL is invalid.
@@ -459,6 +471,33 @@ mod tests {
         assert_eq!(
             mask_proxy_url("http://u:p@proxy:8080/path"),
             "http://***:***@proxy:8080/path"
+        );
+    }
+
+    #[test]
+    fn redact_url_strips_license_key_query() {
+        let url = "https://collector.newrelic.com/agent_listener/invoke_raw_method?marshal_format=json&method=connect&license_key=NRAK-SECRET123&run_id=42";
+        let redacted = redact_url(url);
+        assert_eq!(
+            redacted,
+            "https://collector.newrelic.com/agent_listener/invoke_raw_method"
+        );
+        // The secret must not survive redaction.
+        assert!(!redacted.contains("license_key"));
+        assert!(!redacted.contains("NRAK-SECRET123"));
+    }
+
+    #[test]
+    fn redact_url_keeps_url_without_query() {
+        let url = "https://collector.newrelic.com/agent_listener/invoke_raw_method";
+        assert_eq!(redact_url(url), url);
+    }
+
+    #[test]
+    fn redact_url_strips_fragment_too() {
+        assert_eq!(
+            redact_url("https://host/path#section?license_key=KEY"),
+            "https://host/path"
         );
     }
 

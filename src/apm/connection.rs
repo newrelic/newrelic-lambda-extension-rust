@@ -9,11 +9,59 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use crate::newrelic::client::redact_url;
+
+/// Permanent APM handshake rejection (HTTP 401/403): the license key is invalid
+/// or the account lacks permission. Retrying cannot fix this, so the caller
+/// latches APM off for the life of the container instead of looping every invoke.
+#[derive(Debug)]
+pub struct PermanentAuthError {
+    pub status: u16,
+}
+
+impl std::fmt::Display for PermanentAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "APM handshake rejected (HTTP {}): invalid license key or insufficient permissions",
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for PermanentAuthError {}
+
+/// Return the HTTP status if a [`PermanentAuthError`] appears anywhere in the
+/// error chain (errors are wrapped with `.context(...)` by callers).
+pub fn is_permanent_auth_error(err: &anyhow::Error) -> Option<u16> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<PermanentAuthError>().map(|e| e.status))
+}
+
+/// Latched once when the handshake hits a permanent auth failure (401/403).
+/// While set, the extension stops attempting APM handshakes for this container.
+static HANDSHAKE_FATAL: AtomicBool = AtomicBool::new(false);
+
+/// Mark the APM handshake as permanently failed (invalid credentials).
+pub fn signal_handshake_fatal() {
+    HANDSHAKE_FATAL.store(true, Ordering::Relaxed);
+}
+
+/// Whether APM handshakes have been permanently disabled for this container.
+pub fn is_handshake_fatal() -> bool {
+    HANDSHAKE_FATAL.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn reset_handshake_fatal_for_test() {
+    HANDSHAKE_FATAL.store(false, Ordering::Relaxed);
+}
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
 fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
@@ -116,7 +164,8 @@ pub async fn preconnect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("PreConnect request to collector (timeout: {}s)", timeout_secs);
+    // Log only the redacted endpoint (the URL query carries the license key).
+    debug!("PreConnect request to {} (timeout: {}s)", redact_url(&url), timeout_secs);
 
     let response = client
         .post(&url)
@@ -128,25 +177,31 @@ pub async fn preconnect(
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
+        // Strip the request URL from the error BEFORE it is logged or propagated:
+        // reqwest's error Display embeds the URL, which contains `license_key`.
+        // These are transient and retried by the caller, so log at debug, not error.
         .map_err(|e| {
-            if e.is_timeout() {
-                error!("PreConnect TIMEOUT after {}s - sandbox may have been frozen during handshake", timeout_secs);
-            } else if e.is_connect() {
-                error!("PreConnect CONNECTION ERROR - Cannot reach collector at {}", base_host);
-            } else if e.is_request() {
-                error!("PreConnect REQUEST ERROR - Invalid request format or parameters");
+            let sanitized = e.without_url();
+            if sanitized.is_timeout() {
+                debug!("PreConnect timeout after {}s - sandbox may have been frozen during handshake", timeout_secs);
+            } else if sanitized.is_connect() {
+                debug!("PreConnect connection error - cannot reach collector at {}", base_host);
             } else {
-                error!("PreConnect HTTP request failed: {}", e);
+                debug!("PreConnect request failed: {}", sanitized);
             }
-            e
+            sanitized
         })?;
 
     let status = response.status();
     if !status.is_success() {
+        let code = status.as_u16();
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
-        error!("PreConnect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
-        error!("This usually means: 1) Invalid license key, 2) Network connectivity issue, 3) Collector endpoint unreachable");
-        return Err(anyhow!("PreConnect failed with HTTP {} - {}", status, error_body));
+        // 401/403 are permanent (bad license key / no permission) — do not retry.
+        if code == 401 || code == 403 {
+            return Err(anyhow::Error::new(PermanentAuthError { status: code }));
+        }
+        debug!("PreConnect failed - HTTP {}: {}", code, error_body);
+        return Err(anyhow!("PreConnect failed with HTTP {} - {}", code, error_body));
     }
 
     let preconnect_resp: PreconnectResponse = response.json().await?;
@@ -200,7 +255,8 @@ pub async fn connect(
     // OPTIMIZATION: Inline compression for small payloads (Go-style - no spawn_blocking overhead)
     let compressed_body = compress_inline(&body)?;
 
-    debug!("Connect request to collector (timeout: {}s)", timeout_secs);
+    // Log only the redacted endpoint (the URL query carries the license key).
+    debug!("Connect request to {} (timeout: {}s)", redact_url(&url), timeout_secs);
 
     let response = client
         .post(&url)
@@ -212,22 +268,30 @@ pub async fn connect(
         .timeout(Duration::from_secs(timeout_secs))
         .send()
         .await
+        // Strip the request URL (contains `license_key`) before log/propagation.
+        // Transient failure retried by the caller, so log at debug, not error.
         .map_err(|e| {
-            if e.is_timeout() {
-                error!("Connect TIMEOUT after {}s", timeout_secs);
-            } else if e.is_connect() {
-                error!("Connect CONNECTION ERROR - Cannot reach collector at {}", collector_host);
+            let sanitized = e.without_url();
+            if sanitized.is_timeout() {
+                debug!("Connect timeout after {}s", timeout_secs);
+            } else if sanitized.is_connect() {
+                debug!("Connect connection error - cannot reach collector at {}", collector_host);
             } else {
-                error!("Connect HTTP request failed: {}", e);
+                debug!("Connect request failed: {}", sanitized);
             }
-            e
+            sanitized
         })?;
 
     let status = response.status();
     if !status.is_success() {
+        let code = status.as_u16();
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
-        error!("Connect FAILED - HTTP Status: {}, Response Body: {}", status, error_body);
-        return Err(anyhow!("Connect failed with HTTP {} - {}", status, error_body));
+        // 401/403 are permanent (bad license key / no permission) — do not retry.
+        if code == 401 || code == 403 {
+            return Err(anyhow::Error::new(PermanentAuthError { status: code }));
+        }
+        debug!("Connect failed - HTTP {}: {}", code, error_body);
+        return Err(anyhow!("Connect failed with HTTP {} - {}", code, error_body));
     }
 
     let connect_resp: ConnectResponse = response.json().await?;
@@ -283,4 +347,42 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     }
 
     labels
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn permanent_auth_error_detected_through_context_chain() {
+        // Mirrors how try_connect wraps the error: `.context("PreConnect failed")`.
+        let err = anyhow::Error::new(PermanentAuthError { status: 401 })
+            .context("PreConnect failed");
+        assert_eq!(is_permanent_auth_error(&err), Some(401));
+    }
+
+    #[test]
+    fn transient_error_is_not_permanent() {
+        let err = anyhow!("Connect failed with HTTP 503 - service unavailable");
+        assert_eq!(is_permanent_auth_error(&err), None);
+    }
+
+    #[test]
+    fn permanent_auth_error_display_has_no_secret() {
+        let msg = PermanentAuthError { status: 403 }.to_string();
+        assert!(msg.contains("403"));
+        assert!(!msg.contains("license_key"));
+    }
+
+    #[test]
+    #[serial]
+    fn handshake_fatal_latch_roundtrips() {
+        reset_handshake_fatal_for_test();
+        assert!(!is_handshake_fatal());
+        signal_handshake_fatal();
+        assert!(is_handshake_fatal());
+        reset_handshake_fatal_for_test();
+        assert!(!is_handshake_fatal());
+    }
 }
