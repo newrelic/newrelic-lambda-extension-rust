@@ -536,7 +536,11 @@ async fn perform_one_time_initialization(
                         info!("APM connection complete - ready for agent payloads");
                     }
                     Err(e) => {
-                        warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
+                        // A permanent auth failure already logged an error and latched APM
+                        // off inside ApmApp::new — don't promise a retry that won't happen.
+                        if !crate::apm::connection::is_handshake_fatal() {
+                            warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
+                        }
                     }
                 }
                 // Clear the flag whether the handshake succeeded or failed — the event loop

@@ -213,7 +213,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // NEW_RELIC_APM_BLOCKING_HANDSHAKE=true the post-invoke wait may still capture
                 // this invoke's data; otherwise APM data arrives on a later invoke.
                 // watch::Sender guard prevents multiple concurrent reconnects.
-                if components.apm_mode_enabled && components.apm_app.read().await.is_none() {
+                if components.apm_mode_enabled
+                    && components.apm_app.read().await.is_none()
+                    && !crate::apm::connection::is_handshake_fatal()
+                {
                     if *components.reconnect_in_flight.borrow() {
                         debug!("APM handshake already in progress — skipping duplicate spawn (BLOCKING_HANDSHAKE will wait if enabled)");
                     } else {
@@ -264,7 +267,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     *w = Some(app);
                                 }
                                 Err(e) => {
-                                    warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
+                                    // A permanent auth failure already logged an error and
+                                    // latched APM off in ApmApp::new — don't claim we'll retry.
+                                    if !crate::apm::connection::is_handshake_fatal() {
+                                        warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
+                                    }
                                 }
                             }
                         });
@@ -481,6 +488,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         // holding a read guard while awaiting a write lock on the same lock deadlocks.
                         drop(apm_app_guard);
 
+                        // If APM was permanently disabled (auth rejected), a reconnect
+                        // cannot succeed — don't waste the shutdown budget. The data is
+                        // lost, which the earlier error log already recorded.
+                        if crate::apm::connection::is_handshake_fatal() {
+                            error!("APM permanently disabled (auth rejected) — shutdown error event DROPPED");
+                        } else {
                         // One last synchronous attempt during shutdown — sandbox is still active
                         // for the duration of the SHUTDOWN handler so no freeze risk.
                         debug!("APM not connected at shutdown — attempting final sync reconnect");
@@ -512,8 +525,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 *w = Some(app);
                             }
                             Err(e) => {
-                                warn!("APM not connected at shutdown and final reconnect failed: {} - cannot send shutdown error event", e);
+                                // Shutdown is the last chance to flush; a failure here means
+                                // the shutdown error event is permanently lost — log as error.
+                                error!("APM not connected at shutdown and final reconnect failed: {} - shutdown error event DROPPED", e);
                             }
+                        }
                         }
                     }
                 }
