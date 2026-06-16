@@ -64,6 +64,16 @@ jobs:
       - name: Update Cargo.lock
         run: cargo update --workspace
 
+      # ── Regenerate third-party attribution ───────────────────────────────────
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --features cli
+
+      - name: Regenerate THIRD_PARTY_NOTICES.md
+        # Pins every direct + transitive dependency to its Cargo.lock version.
+        # Fails if a dependency carries a license not allowlisted in about.toml.
+        run: bash scripts/generate-third-party-notices.sh
+
       # ── Generate changelog ──────────────────────────────────────────────────
 
       - name: Generate changelog
@@ -92,7 +102,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${{ steps.version.outputs.branch }}"
-          git add Cargo.toml Cargo.lock
+          git add Cargo.toml Cargo.lock THIRD_PARTY_NOTICES.md
           git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
           git push origin "${{ steps.version.outputs.branch }}"
 

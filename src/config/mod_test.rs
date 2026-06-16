@@ -55,6 +55,7 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
+        "NEW_RELIC_APM_DISABLE_TELEMETRY",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -323,6 +324,67 @@ fn test_parse_bool_false_values() {
         let config = ExtensionConfig::from_env();
         assert!(!config.new_relic.collect_trace_id);
     });
+}
+
+#[test]
+#[serial]
+fn test_apm_disable_telemetry_defaults_empty() {
+    with_full_clean_env(|| {
+        // Unset → nothing disabled (default behavior unchanged).
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_disabled_telemetry.is_empty());
+
+        env::set_var("NEW_RELIC_APM_DISABLE_TELEMETRY", "");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_disabled_telemetry.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_disable_telemetry_parses_canonical_types() {
+    with_full_clean_env(|| {
+        // Case-insensitive, whitespace-trimmed, comma-separated.
+        env::set_var(
+            "NEW_RELIC_APM_DISABLE_TELEMETRY",
+            " platform_metrics , SQL_TRACE_DATA ,custom_event_data",
+        );
+        let config = ExtensionConfig::from_env();
+        let d = &config.new_relic.apm_disabled_telemetry;
+        assert_eq!(d.len(), 3);
+        assert!(d.contains("platform_metrics"));
+        assert!(d.contains("sql_trace_data"));
+        assert!(d.contains("custom_event_data"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_disable_telemetry_ignores_unknown_tokens() {
+    with_full_clean_env(|| {
+        // Unknown tokens (e.g. the short form 'sql_trace') are dropped, valid ones kept.
+        env::set_var(
+            "NEW_RELIC_APM_DISABLE_TELEMETRY",
+            "sql_trace,bogus,metric_data",
+        );
+        let config = ExtensionConfig::from_env();
+        let d = &config.new_relic.apm_disabled_telemetry;
+        assert_eq!(d.len(), 1);
+        assert!(d.contains("metric_data"));
+        assert!(!d.contains("sql_trace"));
+        assert!(!d.contains("bogus"));
+    });
+}
+
+#[test]
+fn test_parse_disabled_telemetry_unit() {
+    use super::parse_disabled_telemetry;
+    assert!(parse_disabled_telemetry("").is_empty());
+    assert!(parse_disabled_telemetry("   ,  ,").is_empty());
+    let all = parse_disabled_telemetry(
+        "metric_data,custom_event_data,log_event_data,analytic_event_data,error_event_data,error_data,span_event_data,sql_trace_data,transaction_sample_data,platform_metrics",
+    );
+    assert_eq!(all.len(), 10);
 }
 
 // ============================================================================
@@ -1061,6 +1123,7 @@ fn test_new_relic_config_all_fields() {
         apm_lambda_mode: true,
         apm_blocking_handshake: false,
         apm_handshake_timeout_secs: 5,
+        apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),

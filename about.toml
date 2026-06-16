@@ -1,0 +1,33 @@
+# cargo-about configuration for THIRD_PARTY_NOTICES.md generation.
+#
+# This drives `cargo about generate` (see scripts/generate-third-party-notices.sh).
+# The generated file is committed and refreshed automatically on every release
+# (see .github/workflows/prepare-release.yml). Do not hand-edit
+# THIRD_PARTY_NOTICES.md — edit this config / about.hbs and regenerate.
+#
+# `accepted` is an allowlist of SPDX licenses we permit in the dependency tree.
+# If a new (transitive) dependency introduces a license that is NOT listed here,
+# generation FAILS — forcing a deliberate compliance decision before release.
+# Every entry is a permissive license vetted as acceptable; the set covers the
+# licenses observed across the dependency tree (a few permissive ones are
+# pre-approved here so routine dependency updates don't break the release).
+
+# Only evaluate the targets we actually build and ship to Lambda, so the notices
+# reflect the real binary contents (excludes Windows/macOS-only crates).
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+
+# Exclude our own first-party workspace crate from the third-party list.
+private = { ignore = true }
+
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "MIT-0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+]

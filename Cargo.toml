@@ -1,12 +1,16 @@
 [package]
 name = "newrelic-lambda-extension"
-version = "2.5.3"
+version = "2.6.2"
 edition = "2021"
 authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
 license = "Apache-2.0"
 repository = "https://github.com/newrelic/newrelic-lambda-extension-rust"
 readme = "README.md"
+# This crate ships as an AWS Lambda layer zip, not to crates.io. Marking it
+# unpublished prevents accidental `cargo publish` and excludes our own
+# first-party code from the generated THIRD_PARTY_NOTICES.md.
+publish = false
 
 [dependencies]
 # Tokio - only load what we actually use (massive startup time improvement)

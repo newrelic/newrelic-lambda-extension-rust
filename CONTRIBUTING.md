@@ -18,6 +18,28 @@ Before submitting an Issue, please search for similar ones in the
 2. Increase the version numbers in any examples files and the README.md to the new version that this Pull Request would represent. The versioning scheme we use is [SemVer](http://semver.org/).
 3. You may merge the Pull Request in once you have the sign-off of two other developers, or if you do not have permission to do that, you may request the second reviewer to merge it for you.
 
+## Third-Party Attribution
+
+`THIRD_PARTY_NOTICES.md` is **generated**, not hand-edited. It is produced from
+`Cargo.lock` by [`cargo-about`](https://github.com/EmbarkStudios/cargo-about),
+so every direct and transitive dependency is pinned to the exact version that
+ships in a release (useful for CVE and license audits).
+
+- It is regenerated and committed automatically on every release (see
+  `.github/workflows/prepare-release.yml`), so no manual upkeep is required.
+- If you add or update a dependency and want to preview the change, regenerate
+  it locally:
+
+  ```sh
+  cargo install --locked cargo-about --features cli   # one-time
+  scripts/generate-third-party-notices.sh
+  ```
+
+- Accepted licenses are allowlisted in `about.toml`. If a new dependency
+  introduces a license that is not listed there, generation **fails** on
+  purpose — add the license to `about.toml` only after confirming it is
+  acceptable, or replace the dependency.
+
 ## Contributor License Agreement
 
 Keep in mind that when you submit your Pull Request, you'll need to sign the CLA via the click-through using CLA-Assistant. If you'd like to execute our corporate CLA, or if you have any questions, please drop us an email at opensource@newrelic.com.

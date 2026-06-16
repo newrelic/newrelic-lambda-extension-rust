@@ -89,11 +89,32 @@ impl LmiFlushHandles {
 async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
     process_pending_agent_payloads(&h.config, &h.global_log_processor, &h.apm_app, "").await;
 
+    let license_key = h.config.new_relic.license_key.as_deref().unwrap_or("");
+
+    // Override stale buffered run_id/collector_host with the live session's
+    // values when connected (mirrors the APM-mode retry path in event_loop.rs).
+    // After a reconnect the buffered run_id is expired, so retrying with it
+    // fails forever; None falls back to the stored values when not connected.
+    let (cur_run_id, cur_collector_host) = {
+        let guard = h.apm_app.read().await;
+        match guard.as_ref() {
+            Some(app) => (Some(app.run_id.clone()), Some(app.collector_host.clone())),
+            None => (None, None),
+        }
+    };
+
     crate::apm::telemetry_buffer::retry_buffered_telemetry(
         &h.client,
-        h.config.new_relic.license_key.as_deref().unwrap_or(""),
+        license_key,
+        cur_run_id.as_deref(),
+        cur_collector_host.as_deref(),
     )
     .await;
+
+    // Retry platform.report metrics that failed the Metric API send-on-arrival.
+    // Under LMI these are buffered by send_platform_report_metrics and would
+    // otherwise never resend (no INVOKE-driven retry on LMI).
+    crate::apm::metric_api_buffer::retry_buffered_metric_api(&h.client, license_key).await;
 
     if final_drain {
         if let Err(e) = h

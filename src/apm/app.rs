@@ -10,7 +10,9 @@ use super::collector::{
     CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
     CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
-use super::connection::{connect, preconnect};
+use super::connection::{
+    connect, is_handshake_fatal, is_permanent_auth_error, preconnect, signal_handshake_fatal,
+};
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
 use anyhow::{Context, Result};
@@ -18,7 +20,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -37,6 +39,7 @@ impl ApmApp {
         metric_endpoint: String,
         client: Client,
         function_name: String,
+        lambda_function_name: String,
         function_version: String,
         account_id: Option<String>,
         region: Option<String>,
@@ -44,11 +47,20 @@ impl ApmApp {
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
+        // If a prior handshake was permanently rejected (bad license key / no
+        // permission), don't keep hammering the collector for this container's life.
+        if is_handshake_fatal() {
+            return Err(anyhow::anyhow!(
+                "APM handshake permanently disabled for this container (auth previously rejected)"
+            ));
+        }
+
         let backoff_ms = [200, 500, 900];
+        let total_attempts = backoff_ms.len();
         let mut last_error = None;
 
         for (attempt, delay) in backoff_ms.iter().enumerate() {
-            debug!("APM connection attempt {} of {}", attempt + 1, 3);
+            debug!("APM connection attempt {} of {}", attempt + 1, total_attempts);
 
             match Self::try_connect(
                 &license_key,
@@ -56,6 +68,7 @@ impl ApmApp {
                 &metric_endpoint,
                 &client,
                 &function_name,
+                &lambda_function_name,
                 &function_version,
                 &account_id,
                 &region,
@@ -71,10 +84,29 @@ impl ApmApp {
                     return Ok(app);
                 }
                 Err(e) => {
-                    warn!("APM connection attempt {} failed: {}", attempt + 1, e);
+                    // Permanent auth failure (401/403): stop immediately and latch APM
+                    // off so the per-invoke loop won't retry. This is a real config
+                    // error the customer must fix, so log it at error level — once.
+                    if let Some(status) = is_permanent_auth_error(&e) {
+                        error!(
+                            "APM handshake rejected (HTTP {}) - invalid license key or insufficient permissions. Disabling APM connection attempts for this container.",
+                            status
+                        );
+                        signal_handshake_fatal();
+                        return Err(e);
+                    }
+
+                    // Transient failure: this is a retry, not a fatal error — warn with
+                    // the attempt count so it's clear the extension is still trying.
+                    warn!(
+                        "APM handshake attempt {}/{} failed: {} - retrying",
+                        attempt + 1,
+                        total_attempts,
+                        e
+                    );
                     last_error = Some(e);
 
-                    if attempt < backoff_ms.len() - 1 {
+                    if attempt < total_attempts - 1 {
                         debug!("Retrying in {}ms", delay);
                         tokio::time::sleep(tokio::time::Duration::from_millis(*delay)).await;
                     }
@@ -92,6 +124,7 @@ impl ApmApp {
         metric_endpoint: &str,
         client: &Client,
         function_name: &str,
+        lambda_function_name: &str,
         function_version: &str,
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
@@ -142,10 +175,10 @@ impl ApmApp {
                 "000000000000".to_string()
             });
 
-        // Construct ARN using the correct account_id from registration
+        // Construct ARN using actual Lambda function name, not the app name override
         let function_arn = format!(
             "arn:aws:lambda:{}:{}:function:{}",
-            region, account_id, function_name
+            region, account_id, lambda_function_name
         );
 
         debug!(
@@ -241,6 +274,12 @@ impl ApmApp {
                 continue;
             }
 
+            // Customer opted out of this telemetry type — drop it (no send, no buffer).
+            if super::collector::is_telemetry_disabled(&telemetry_type) {
+                debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                continue;
+            }
+
             debug!(
                 "Sending {} telemetry items as {}",
                 data.len(),
@@ -305,7 +344,19 @@ impl ApmApp {
     /// Convert and send platform REPORT log metrics
     ///
     /// Based on metric_api.go ParseLambdaReportLog() and ConvertToMetrics()
-    pub async fn send_platform_report_metrics(&self, log_line: &str) -> Result<()> {
+    pub async fn send_platform_report_metrics(
+        &self,
+        log_line: &str,
+        function_arn: &str,
+    ) -> Result<()> {
+        // Customer disabled platform metrics (NEW_RELIC_APM_DISABLE_TELEMETRY contains
+        // platform_metrics): skip conversion and the Metric API send entirely.
+        // Error-synthesis memory capture is a separate path and is unaffected.
+        if super::collector::is_telemetry_disabled("platform_metrics") {
+            debug!("APM platform metrics disabled - skipping REPORT conversion/send");
+            return Ok(());
+        }
+
         let metrics_data = match parse_lambda_report_log(log_line) {
             Some(data) => data,
             None => {
@@ -322,20 +373,39 @@ impl ApmApp {
             metrics_data.max_memory_used
         );
 
-        let function_name = std::env::var("AWS_LAMBDA_FUNCTION_NAME")
-            .unwrap_or_else(|_| "unknown".to_string());
+        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+            .unwrap_or_else(|_| std::env::var("AWS_LAMBDA_FUNCTION_NAME")
+                .unwrap_or_else(|_| "unknown".to_string()));
 
-        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name);
+        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name, function_arn);
         
         debug!("APM: Sending {} platform metrics to Metric API", metrics.len());
 
-        send_platform_metrics(
+        match send_platform_metrics(
             &self.client,
             &self.license_key,
             &self.metric_endpoint,
-            metrics,
+            &metrics,
         )
         .await
+        {
+            Ok(()) => Ok(()),
+            // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
+            Err(e) if e.is_permanent() => {
+                warn!("Platform metrics dropped (permanent): {}", e);
+                Ok(())
+            }
+            // Transient/network failures: buffer for retry on a later invoke / at shutdown.
+            Err(e) => {
+                let retry_after = e.retry_after();
+                super::metric_api_buffer::buffer_failed_metric_api(
+                    metrics,
+                    self.metric_endpoint.clone(),
+                    retry_after,
+                );
+                Ok(())
+            }
+        }
     }
 
     pub async fn send_error_event_from_fault(
@@ -359,14 +429,45 @@ impl ApmApp {
             request_id
         );
 
-        send_error_events(
+        self.send_error_events_buffered(error_events, request_id).await
+    }
+
+    /// Send synthesized error events, buffering them for retry on failure so a
+    /// transient collector error or stale run_id does not silently drop them.
+    async fn send_error_events_buffered(
+        &self,
+        error_events: Vec<serde_json::Value>,
+        request_id: &str,
+    ) -> Result<()> {
+        // Customer opted out of error events — drop synthesized timeout/fault errors too.
+        if super::collector::is_telemetry_disabled("error_event_data") {
+            debug!("error_event_data disabled - skipping synthesized error event");
+            return Ok(());
+        }
+
+        let result = send_error_events(
             &self.client,
             &self.license_key,
             &self.collector_host,
             &self.run_id,
             &error_events,
         )
-        .await
+        .await;
+
+        if let Err(e) = result {
+            warn!(
+                "Failed to send error events for request {}: {} - buffering for retry",
+                request_id, e
+            );
+            super::telemetry_buffer::buffer_failed_telemetry(
+                super::telemetry_buffer::SYNTHESIZED_ERROR_EVENTS.to_string(),
+                error_events,
+                request_id.to_string(),
+                self.run_id.clone(),
+                self.collector_host.clone(),
+            );
+        }
+        Ok(())
     }
 
     /// Send error event for shutdown events (timeout, failure)
@@ -391,14 +492,7 @@ impl ApmApp {
             error_class, request_id
         );
 
-        send_error_events(
-            &self.client,
-            &self.license_key,
-            &self.collector_host,
-            &self.run_id,
-            &error_events,
-        )
-        .await
+        self.send_error_events_buffered(error_events, request_id).await
     }
 
     /// Get entity GUID for log correlation

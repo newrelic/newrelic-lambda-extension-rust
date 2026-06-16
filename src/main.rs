@@ -460,6 +460,10 @@ async fn perform_one_time_initialization(
     // Declared before the APM if-else so the INIT spawn and ExtensionComponents share the same channel.
     let reconnect_in_flight = Arc::new(tokio::sync::watch::channel(false).0);
 
+    // Mirror the disabled-telemetry set into the apm module so code paths without
+    // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
+    apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
             // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
@@ -477,7 +481,11 @@ async fn perform_one_time_initialization(
 
             let apm_host = config.new_relic.apm_host.clone();
             let metric_endpoint = config.new_relic.metric_endpoint.clone();
-            let function_name = config.aws.function_name.clone();
+            let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| config.aws.function_name.clone());
+            let lambda_function_name = config.aws.function_name.clone();
             let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
             let account_id = config.aws.account_id.clone();
             let region = config.aws.region.clone();
@@ -512,6 +520,7 @@ async fn perform_one_time_initialization(
                     metric_endpoint,
                     apm_client_clone,
                     function_name,
+                    lambda_function_name,
                     function_version,
                     account_id,
                     region,
@@ -529,7 +538,11 @@ async fn perform_one_time_initialization(
                         info!("APM connection complete - ready for agent payloads");
                     }
                     Err(e) => {
-                        warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
+                        // A permanent auth failure already logged an error and latched APM
+                        // off inside ApmApp::new — don't promise a retry that won't happen.
+                        if !crate::apm::connection::is_handshake_fatal() {
+                            warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
+                        }
                     }
                 }
                 // Clear the flag whether the handshake succeeded or failed — the event loop

@@ -181,12 +181,61 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
             } => {
                 let event_start = std::time::Instant::now();
 
+                // If a prior send saw a collector restart (401/409) or disconnect (410),
+                // the cached run_id is stale. Invalidate the connection so the block below
+                // re-establishes a fresh handshake; buffered telemetry then retries with the
+                // new run_id (see retry_buffered_telemetry's current_run_id override).
+                if components.apm_mode_enabled
+                    && crate::apm::collector::take_reconnect_needed()
+                    && components.apm_app.read().await.is_some()
+                {
+                    *components.apm_app.write().await = None;
+                    warn!("APM run_id invalidated (collector restart/disconnect) - will reconnect");
+                }
+
+                // Drain buffered telemetry (failed sends + platform metrics) on each invoke,
+                // not just at shutdown. Lambda freeze suspends these tasks cleanly; they resume
+                // on thaw. Passing the live run_id/collector_host lets items that were buffered
+                // against an expired run_id succeed after reconnect.
+                // Only spawn when something is actually buffered — avoids a per-invoke task
+                // on the healthy hot path (two cheap atomic-guarded count checks instead).
+                let has_buffered = crate::apm::telemetry_buffer::get_buffer_count() > 0
+                    || crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0;
+                if components.apm_mode_enabled && has_buffered {
+                    let (cur_run_id, cur_collector_host) = {
+                        let guard = components.apm_app.read().await;
+                        match guard.as_ref() {
+                            Some(app) => (Some(app.run_id.clone()), Some(app.collector_host.clone())),
+                            None => (None, None),
+                        }
+                    };
+                    let http_client = components.client.clone();
+                    let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
+                    tokio::spawn(async move {
+                        crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                            &http_client,
+                            &license_key,
+                            cur_run_id.as_deref(),
+                            cur_collector_host.as_deref(),
+                        )
+                        .await;
+                        crate::apm::metric_api_buffer::retry_buffered_metric_api(
+                            &http_client,
+                            &license_key,
+                        )
+                        .await;
+                    });
+                }
+
                 // If APM handshake hasn't completed yet, spawn a fresh reconnect attempt.
                 // The spawn is non-blocking — the invoke proceeds immediately. If
                 // NEW_RELIC_APM_BLOCKING_HANDSHAKE=true the post-invoke wait may still capture
                 // this invoke's data; otherwise APM data arrives on a later invoke.
                 // watch::Sender guard prevents multiple concurrent reconnects.
-                if components.apm_mode_enabled && components.apm_app.read().await.is_none() {
+                if components.apm_mode_enabled
+                    && components.apm_app.read().await.is_none()
+                    && !crate::apm::connection::is_handshake_fatal()
+                {
                     if *components.reconnect_in_flight.borrow() {
                         debug!("APM handshake already in progress — skipping duplicate spawn (BLOCKING_HANDSHAKE will wait if enabled)");
                     } else {
@@ -199,7 +248,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let apm_host = components.config.new_relic.apm_host.clone();
                         let metric_endpoint = components.config.new_relic.metric_endpoint.clone();
                         let apm_client = components.apm_client.clone();
-                        let function_name = components.config.aws.function_name.clone();
+                        let lambda_function_name = components.config.aws.function_name.clone();
+                        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| lambda_function_name.clone());
                         let function_version = components.config.aws.function_version
                             .clone()
                             .unwrap_or_else(|| "$LATEST".to_string());
@@ -216,6 +269,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 metric_endpoint,
                                 apm_client,
                                 function_name,
+                                lambda_function_name,
                                 function_version,
                                 account_id,
                                 region,
@@ -232,7 +286,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     *w = Some(app);
                                 }
                                 Err(e) => {
-                                    warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
+                                    // A permanent auth failure already logged an error and
+                                    // latched APM off in ApmApp::new — don't claim we'll retry.
+                                    if !crate::apm::connection::is_handshake_fatal() {
+                                        warn!("APM reconnect attempt failed: {} - will retry next invoke", e);
+                                    }
                                 }
                             }
                         });
@@ -449,15 +507,27 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         // holding a read guard while awaiting a write lock on the same lock deadlocks.
                         drop(apm_app_guard);
 
+                        // If APM was permanently disabled (auth rejected), a reconnect
+                        // cannot succeed — don't waste the shutdown budget. The data is
+                        // lost, which the earlier error log already recorded.
+                        if crate::apm::connection::is_handshake_fatal() {
+                            error!("APM permanently disabled (auth rejected) — shutdown error event DROPPED");
+                        } else {
                         // One last synchronous attempt during shutdown — sandbox is still active
                         // for the duration of the SHUTDOWN handler so no freeze risk.
                         debug!("APM not connected at shutdown — attempting final sync reconnect");
+                        let lambda_function_name = components.config.aws.function_name.clone();
+                        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                            .ok()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| lambda_function_name.clone());
                         let shutdown_app = crate::apm::ApmApp::new(
                             components.config.new_relic.license_key.clone().unwrap_or_default(),
                             components.config.new_relic.apm_host.clone(),
                             components.config.new_relic.metric_endpoint.clone(),
                             components.apm_client.clone(),
-                            components.config.aws.function_name.clone(),
+                            function_name,
+                            lambda_function_name,
                             components.config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
                             components.config.aws.account_id.clone(),
                             components.config.aws.region.clone(),
@@ -474,8 +544,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 *w = Some(app);
                             }
                             Err(e) => {
-                                warn!("APM not connected at shutdown and final reconnect failed: {} - cannot send shutdown error event", e);
+                                // Shutdown is the last chance to flush; a failure here means
+                                // the shutdown error event is permanently lost — log as error.
+                                error!("APM not connected at shutdown and final reconnect failed: {} - shutdown error event DROPPED", e);
                             }
+                        }
                         }
                     }
                 }
@@ -537,13 +610,29 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
                 debug!("APM mode shutdown: Retrying all buffered telemetry");
+                let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
+                let (cur_run_id, cur_collector_host) = {
+                    let guard = components.apm_app.read().await;
+                    match guard.as_ref() {
+                        Some(app) => (Some(app.run_id.clone()), Some(app.collector_host.clone())),
+                        None => (None, None),
+                    }
+                };
                 crate::apm::telemetry_buffer::retry_buffered_telemetry(
                     &components.client,
-                    components.config.new_relic.license_key.as_deref().unwrap_or(""),
+                    &license_key,
+                    cur_run_id.as_deref(),
+                    cur_collector_host.as_deref(),
+                )
+                .await;
+                crate::apm::metric_api_buffer::retry_buffered_metric_api(
+                    &components.client,
+                    &license_key,
                 )
                 .await;
 
-                let remaining_count = crate::apm::telemetry_buffer::get_buffer_count();
+                let remaining_count = crate::apm::telemetry_buffer::get_buffer_count()
+                    + crate::apm::metric_api_buffer::get_metric_api_buffer_count();
                 if remaining_count > 0 {
                     error!("APM mode shutdown: {} telemetry items could not be sent", remaining_count);
                 }
@@ -566,7 +655,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         for (request_id, report_line) in all_pending_reports {
                             debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
 
-                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                            let shutdown_arn = LAST_REQUEST_CONTEXT.lock().ok()
+                                .and_then(|g| g.clone().map(|(_, arn)| arn))
+                                .unwrap_or_default();
+                            if let Err(e) = app.send_platform_report_metrics(&report_line, &shutdown_arn).await {
                                 error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
                             } else {
                                 info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
@@ -696,6 +788,8 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                         crate::apm::telemetry_buffer::retry_buffered_telemetry(
                             &http_client,
                             license_key.as_deref().unwrap_or(""),
+                            None,
+                            None,
                         )
                         .await;
                     });
@@ -1153,7 +1247,7 @@ pub async fn process_apm_request(
 
         let apm_app_guard = apm_app.read().await;
         if let Some(ref app) = *apm_app_guard {
-            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+            if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
                 error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
             } else {
                 info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
@@ -1811,7 +1905,7 @@ pub(crate) async fn process_pending_agent_payloads(
 
             let apm_app_guard = apm_app.read().await;
             if let Some(ref app) = *apm_app_guard {
-                if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
                     error!("APM mode: Failed to send platform report metrics for previous request {}: {}", request_id, e);
                 } else {
                     info!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);
