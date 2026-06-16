@@ -38,6 +38,13 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
+/// Budget reserved (out of SHUTDOWN_TIMEOUT_MS) to POST the APM "telemetry
+/// dropped" diagnostic directly to New Relic Logs. The main shutdown work runs
+/// in `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`, then the diagnostic gets
+/// this protected window — so a slow flush/reconnect can't starve the one log
+/// the customer most needs to see. Sum stays < Lambda's 2s SHUTDOWN deadline.
+const SHUTDOWN_DIAG_RESERVE_MS: u64 = 500;
+
 /// Drop guard that clears `reconnect_in_flight` on any exit path (success, error, or panic).
 struct ReconnectGuard(Arc<watch::Sender<bool>>);
 
@@ -513,7 +520,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 let shutdown_start_time = std::time::Instant::now();
                 info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
-                let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS), async {
+                // Computed inside the main block, sent AFTER it with reserved budget
+                // so the critical "telemetry dropped" line always reaches New Relic.
+                let mut shutdown_diagnostic: Option<(String, String)> = None;
+
+                let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS), async {
                 if components.config.extension.pipeline_flush {
                     for handle in pending_flush_handles.drain(..) {
                         debug!("APM shutdown: awaiting in-flight pipeline flush");
@@ -713,41 +724,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                     error!("{}", summary);
 
-                    // The extension's own stdout cannot round-trip through the Lambda
-                    // Logs API before shutdown completes, so this critical line never
-                    // reaches New Relic via the normal log path. POST it directly to
-                    // the NR Log ingest (license-key header, no APM handshake needed),
-                    // best-effort and time-bounded so it can't blow the shutdown budget.
+                    // Stash the summary + ARN; it is POSTed to New Relic Logs AFTER
+                    // this block, within its own reserved budget (see below). The
+                    // extension's own stdout can't round-trip the Lambda Logs API
+                    // before shutdown, so the normal log path would never deliver it.
                     let arn = LAST_REQUEST_CONTEXT
                         .lock()
                         .ok()
                         .and_then(|g| g.as_ref().map(|(_, arn)| arn.clone()))
                         .filter(|a| !a.is_empty())
                         .unwrap_or_else(crate::get_global_fallback_arn);
-                    let diag = crate::newrelic::payload::LogMessage {
-                        timestamp: chrono::Utc::now().timestamp_millis(),
-                        message: format!("[NR_EXT] ERROR {summary}"),
-                        attributes: {
-                            let mut m = serde_json::Map::new();
-                            m.insert("level".to_string(), serde_json::json!("ERROR"));
-                            m.insert("log_type".to_string(), serde_json::json!("extension"));
-                            m
-                        },
-                    };
-                    match tokio::time::timeout(
-                        Duration::from_millis(1500),
-                        components.newrelic_client.send_logs(
-                            components.config.as_ref(),
-                            std::slice::from_ref(&diag),
-                            &arn,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => debug!("Forwarded shutdown drop diagnostic to New Relic Logs"),
-                        Ok(Err(e)) => warn!("Could not forward shutdown diagnostic to New Relic: {}", e),
-                        Err(_) => warn!("Timed out forwarding shutdown diagnostic to New Relic"),
-                    }
+                    shutdown_diagnostic = Some((summary, arn));
                 }
 
                 // Process any pending platform.report lines as metrics (APM mode)
@@ -799,6 +786,38 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
                 }).await;
+
+                // Reserved-budget delivery of the "telemetry dropped" diagnostic to
+                // New Relic Logs. Runs OUTSIDE the main block (even if that timed out)
+                // with its own protected window, so the one log the customer most
+                // needs is not starved by a slow flush/reconnect. Direct POST to the
+                // log ingest (license-key header) — does not need an APM handshake.
+                if let Some((summary, arn)) = shutdown_diagnostic {
+                    let diag = crate::newrelic::payload::LogMessage {
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                        message: format!("[NR_EXT] ERROR {summary}"),
+                        attributes: {
+                            let mut m = serde_json::Map::new();
+                            m.insert("level".to_string(), serde_json::json!("ERROR"));
+                            m.insert("log_type".to_string(), serde_json::json!("extension"));
+                            m
+                        },
+                    };
+                    match tokio::time::timeout(
+                        Duration::from_millis(SHUTDOWN_DIAG_RESERVE_MS),
+                        components.newrelic_client.send_logs(
+                            components.config.as_ref(),
+                            std::slice::from_ref(&diag),
+                            &arn,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => info!("Forwarded shutdown drop diagnostic to New Relic Logs"),
+                        Ok(Err(e)) => warn!("Could not forward shutdown diagnostic to New Relic: {}", e),
+                        Err(_) => warn!("Timed out forwarding shutdown diagnostic to New Relic"),
+                    }
+                }
 
                 if shutdown_result.is_err() {
                     warn!("APM shutdown timed out after {}ms — Lambda will terminate remaining work", shutdown_start_time.elapsed().as_millis());
@@ -2466,6 +2485,20 @@ mod tests {
     fn test_shutdown_timeout_constant_is_under_2s() {
         assert!(SHUTDOWN_TIMEOUT_MS < 2000, "Shutdown timeout must be under Lambda's 2s limit");
         assert!(SHUTDOWN_TIMEOUT_MS >= 1000, "Shutdown timeout should be at least 1s to allow work");
+    }
+
+    #[test]
+    fn test_shutdown_diagnostic_reserve_fits_budget() {
+        // The reserved diagnostic window must leave the main shutdown work real
+        // budget, and the two together must stay under Lambda's 2s deadline.
+        assert!(SHUTDOWN_DIAG_RESERVE_MS > 0, "diagnostic send needs a window");
+        assert!(
+            SHUTDOWN_DIAG_RESERVE_MS < SHUTDOWN_TIMEOUT_MS,
+            "reserve must not consume the whole shutdown budget"
+        );
+        // Main work budget = total - reserve; both slices live inside SHUTDOWN_TIMEOUT_MS.
+        assert!(SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS >= 1000, "main work needs >= 1s");
+        assert!(SHUTDOWN_TIMEOUT_MS < 2000, "total must stay under Lambda's 2s deadline");
     }
 }
 
