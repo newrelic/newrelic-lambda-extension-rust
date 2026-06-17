@@ -97,6 +97,7 @@ pub fn try_read_metadata() -> Option<ManagedInstanceMetadata> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use serial_test::serial;
 
     #[test]
     fn extracts_both_fields_when_present() {
@@ -168,6 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn try_read_returns_none_until_written() {
         // Reset the global to a clean state for this serial test.
         {
