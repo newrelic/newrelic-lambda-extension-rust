@@ -793,16 +793,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // needs is not starved by a slow flush/reconnect. Direct POST to the
                 // log ingest (license-key header) — does not need an APM handshake.
                 if let Some((summary, arn)) = shutdown_diagnostic {
-                    let diag = crate::newrelic::payload::LogMessage {
-                        timestamp: chrono::Utc::now().timestamp_millis(),
-                        message: format!("[NR_EXT] ERROR {summary}"),
-                        attributes: {
-                            let mut m = serde_json::Map::new();
-                            m.insert("level".to_string(), serde_json::json!("ERROR"));
-                            m.insert("log_type".to_string(), serde_json::json!("extension"));
-                            m
-                        },
-                    };
+                    let diag = crate::newrelic::payload::LogMessage::diagnostic(
+                        "ERROR",
+                        format!("[NR_EXT] ERROR {summary}"),
+                    );
                     match tokio::time::timeout(
                         Duration::from_millis(SHUTDOWN_DIAG_RESERVE_MS),
                         components.newrelic_client.send_logs(
