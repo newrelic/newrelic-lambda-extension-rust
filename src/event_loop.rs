@@ -708,9 +708,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         ids.join(", ")
                     };
 
+                    // Counts-only summary for CloudWatch (the request_id list would
+                    // bloat CloudWatch and isn't queryable there).
                     let summary = if apm_connected {
                         format!(
-                            "APM telemetry DROPPED at shutdown: {affected} invocation(s) / {remaining_count} item(s) could not be sent despite APM being connected{earlier_note}. request_ids: [{ids_preview}]"
+                            "APM telemetry DROPPED at shutdown: {affected} invocation(s) / {remaining_count} item(s) could not be sent despite APM being connected{earlier_note}."
                         )
                     } else {
                         let reason = crate::apm::connection::last_failure_reason()
@@ -718,23 +720,26 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let cycles = crate::apm::connection::connect_cycles();
                         let attempts = crate::apm::connection::connect_attempts_total();
                         format!(
-                            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s). {affected} invocation(s) affected, {remaining_count} item(s) still buffered{earlier_note}. request_ids: [{ids_preview}]"
+                            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s). {affected} invocation(s) affected, {remaining_count} item(s) still buffered{earlier_note}."
                         )
                     };
 
+                    // CloudWatch: counts only.
                     error!("{}", summary);
 
-                    // Stash the summary + ARN; it is POSTed to New Relic Logs AFTER
-                    // this block, within its own reserved budget (see below). The
-                    // extension's own stdout can't round-trip the Lambda Logs API
-                    // before shutdown, so the normal log path would never deliver it.
+                    // New Relic: same summary PLUS the affected request_ids, so they're
+                    // queryable/correlatable in NR Logs. POSTed AFTER this block within
+                    // its own reserved budget (see below) — the extension's own stdout
+                    // can't round-trip the Lambda Logs API before shutdown, so the
+                    // normal log path would never deliver it.
+                    let nr_message = format!("{summary} request_ids: [{ids_preview}]");
                     let arn = LAST_REQUEST_CONTEXT
                         .lock()
                         .ok()
                         .and_then(|g| g.as_ref().map(|(_, arn)| arn.clone()))
                         .filter(|a| !a.is_empty())
                         .unwrap_or_else(crate::get_global_fallback_arn);
-                    shutdown_diagnostic = Some((summary, arn));
+                    shutdown_diagnostic = Some((nr_message, arn));
                 }
 
                 // Process any pending platform.report lines as metrics (APM mode)
