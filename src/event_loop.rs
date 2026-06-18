@@ -84,7 +84,7 @@ pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgen
 /// most ~30 min, so this is a memory guard, not a retry policy: payloads are kept
 /// until they flush on reconnect or the container shuts down — NOT dropped after
 /// a few retries. ~500 × a few KB ≈ low single-digit MB. When full, the oldest is
-/// evicted (and counted) so a long outage on a busy function can't grow unbounded.
+/// evicted (and counted) so a long disconnected period on a busy function can't grow unbounded.
 const MAX_FAILED_AGENT_PAYLOADS: usize = 500;
 
 /// Count of buffered agent payloads dropped *before* shutdown (evicted when the
@@ -687,15 +687,15 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 let remaining_count = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0)
                     + crate::apm::telemetry_buffer::get_buffer_count()
                     + crate::apm::metric_api_buffer::get_metric_api_buffer_count();
-                // Payloads already evicted/aged-out earlier in the outage (no longer
-                // in the buffer to count) — add them so the total loss is honest.
+                // Payloads already evicted/aged-out earlier (no longer in the buffer
+                // to count) — add them so the total loss is honest.
                 let dropped_earlier = dropped_agent_payload_count();
 
                 if remaining_count > 0 || !dropped_request_ids.is_empty() || dropped_earlier > 0 {
                     let apm_connected = cur_run_id.is_some();
                     let affected = dropped_request_ids.len();
                     let earlier_note = if dropped_earlier > 0 {
-                        format!(" (+{dropped_earlier} more dropped earlier during the outage)")
+                        format!(" (+{dropped_earlier} more dropped earlier)")
                     } else {
                         String::new()
                     };

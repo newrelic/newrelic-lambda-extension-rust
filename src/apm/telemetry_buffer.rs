@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
 
 /// Hard cap on buffered telemetry items to bound memory during a sustained
-/// collector outage on a high-traffic function. When full, the oldest is evicted.
+/// collector failure on a high-traffic function. When full, the oldest is evicted.
 const MAX_BUFFERED_ITEMS: usize = 500;
 
 /// Failed telemetry data that needs to be retried
