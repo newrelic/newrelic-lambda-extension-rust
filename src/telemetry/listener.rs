@@ -7,7 +7,7 @@ use crate::{
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
     request::{
         get_agent_buffer, get_request_context, get_runtime_done_notify, set_pending_report,
-        TELEMETRY_CURRENT_REQUEST_ID,
+        CURRENT_ACTIVE_REQUEST_ID, TELEMETRY_CURRENT_REQUEST_ID,
     },
 };
 use chrono::{DateTime, Utc};
@@ -119,6 +119,14 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 if let Ok(mut telemetry_req) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
                                     *telemetry_req = Some(request_id_str.to_string());
+                                }
+                                // LMI: INVOKE never arrives, so set the active request and buffer slot
+                                // here. In normal APM mode INVOKE already did this — no-op.
+                                if is_apm_mode {
+                                    if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+                                        *active = Some(request_id_str.to_string());
+                                    }
+                                    crate::request::ensure_lmi_request_slot(request_id_str);
                                 }
                                 debug!("platform.start: Updated telemetry request_id to: {}", request_id_str);
                             }

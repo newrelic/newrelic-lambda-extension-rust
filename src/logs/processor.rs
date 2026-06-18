@@ -363,13 +363,18 @@ impl LogProcessor {
     /// No-op when another auto-flush is already in flight (`is_auto_flushing`
     /// mutex). Returns with the batch untouched when no ARN is available.
     fn try_spawn_auto_flush(&self) {
-        /// Auto-flush threshold: 10 logs flushes more batches during function execution,
-        /// leaving a smaller tail for the post-runtime-done flush (billed time).
         const FLUSH_THRESHOLD: usize = 25;
+        const LMI_FLUSH_THRESHOLD_BYTES: usize = 1_000_000;
 
         let logs_to_send = {
             let mut batch = self.log_batch.lock().unwrap();
-            if batch.len() < FLUSH_THRESHOLD {
+            let should_flush = if self.config.deployment.is_lmi() {
+                let batch_bytes: usize = batch.iter().map(estimate_log_size).sum();
+                batch_bytes >= LMI_FLUSH_THRESHOLD_BYTES
+            } else {
+                batch.len() >= FLUSH_THRESHOLD
+            };
+            if !should_flush {
                 return;
             }
             // Atomically claim the flush slot; abort if another flush is already running.
@@ -1196,6 +1201,49 @@ impl LogProcessor {
         if let Ok(mut batch) = self.log_batch.lock() {
             batch.extend(pre_invoke_logs);
         }
+    }
+
+    /// In LMI mode there is no INVOKE event, so invocation context (ARN + request_id) is
+    /// never set. This moves logs from pre_invoke_buffer into log_batch using the fallback
+    /// ARN from platform.initStart, leaving request_id empty. Called by the heartbeat so
+    /// these logs are not stuck indefinitely waiting for a context that never arrives.
+    pub fn process_pre_invoke_logs_lmi(&self) {
+        let arn = self.get_best_available_arn();
+        if arn.is_empty() {
+            debug!("LMI: skipping pre-invoke buffer drain — no ARN available yet");
+            return;
+        }
+
+        let pre_invoke_logs = {
+            let mut buf = self.pre_invoke_buffer.lock().unwrap();
+            if buf.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *buf)
+        };
+
+        debug!("LMI: moving {} pre-invoke logs to batch using fallback ARN", pre_invoke_logs.len());
+
+        let entity_guid = self.apm_app.as_ref().and_then(|arc| {
+            arc.try_read().ok().and_then(|guard| {
+                guard.as_ref().map(|app| app.get_entity_guid().to_string())
+            })
+        });
+
+        let mut stamped = pre_invoke_logs;
+        for log in &mut stamped {
+            log.attributes.insert("faas.arn".to_string(), serde_json::Value::String(arn.clone()));
+            if let Some(ref guid) = entity_guid {
+                if !guid.is_empty() {
+                    log.attributes.insert("entity.guid".to_string(), serde_json::Value::String(guid.clone()));
+                }
+            }
+        }
+
+        if let Ok(mut batch) = self.log_batch.lock() {
+            batch.extend(stamped);
+        }
+        self.try_spawn_auto_flush();
     }
 
     /// Send pre-invoke logs on shutdown with last request ID (or force flush with marker in error cases)

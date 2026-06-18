@@ -127,8 +127,11 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
         if let Err(e) = h.global_log_processor.flush_on_shutdown().await {
             error!("LMI: failed to flush logs on shutdown: {}", e);
         }
-    } else if let Err(e) = h.global_log_processor.flush().await {
-        error!("LMI: heartbeat log flush failed: {}", e);
+    } else {
+        h.global_log_processor.process_pre_invoke_logs_lmi();
+        if let Err(e) = h.global_log_processor.flush().await {
+            error!("LMI: heartbeat log flush failed: {}", e);
+        }
     }
 }
 
