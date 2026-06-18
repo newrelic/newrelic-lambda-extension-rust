@@ -694,11 +694,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if remaining_count > 0 || !dropped_request_ids.is_empty() || dropped_earlier > 0 {
                     let apm_connected = cur_run_id.is_some();
                     let affected = dropped_request_ids.len();
-                    let earlier_note = if dropped_earlier > 0 {
-                        format!(" (+{dropped_earlier} more dropped earlier)")
-                    } else {
-                        String::new()
-                    };
 
                     // Cap the request_id list so one line can't explode the log.
                     let ids: Vec<String> = dropped_request_ids.iter().cloned().collect();
@@ -708,31 +703,30 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         ids.join(", ")
                     };
 
-                    // Counts-only summary for CloudWatch (the request_id list would
-                    // bloat CloudWatch and isn't queryable there).
-                    let summary = if apm_connected {
-                        format!(
-                            "APM telemetry DROPPED at shutdown: {affected} invocation(s) / {remaining_count} item(s) could not be sent despite APM being connected{earlier_note}."
-                        )
+                    let reason = if apm_connected {
+                        String::new()
                     } else {
-                        let reason = crate::apm::connection::last_failure_reason()
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let cycles = crate::apm::connection::connect_cycles();
-                        let attempts = crate::apm::connection::connect_attempts_total();
-                        format!(
-                            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s). {affected} invocation(s) affected, {remaining_count} item(s) still buffered{earlier_note}."
-                        )
+                        crate::apm::connection::last_failure_reason()
+                            .unwrap_or_else(|| "unknown".to_string())
                     };
+                    let (summary, nr_message) = build_shutdown_drop_messages(
+                        apm_connected,
+                        affected,
+                        remaining_count,
+                        dropped_earlier,
+                        &reason,
+                        crate::apm::connection::connect_cycles(),
+                        crate::apm::connection::connect_attempts_total(),
+                        &ids_preview,
+                    );
 
-                    // CloudWatch: counts only.
+                    // CloudWatch gets the counts-only summary; New Relic gets the same
+                    // summary plus the request_ids (queryable there). The NR copy is
+                    // POSTed AFTER this block in its own reserved budget — the
+                    // extension's own stdout can't round-trip the Lambda Logs API
+                    // before shutdown, so the normal log path would never deliver it.
                     error!("{}", summary);
 
-                    // New Relic: same summary PLUS the affected request_ids, so they're
-                    // queryable/correlatable in NR Logs. POSTed AFTER this block within
-                    // its own reserved budget (see below) — the extension's own stdout
-                    // can't round-trip the Lambda Logs API before shutdown, so the
-                    // normal log path would never deliver it.
-                    let nr_message = format!("{summary} request_ids: [{ids_preview}]");
                     let arn = LAST_REQUEST_CONTEXT
                         .lock()
                         .ok()
@@ -2108,6 +2102,41 @@ async fn process_and_send_agent_payload(
     Ok(())
 }
 
+/// Build the shutdown "telemetry DROPPED" summary in two forms:
+/// - the CloudWatch line (counts only — request_ids would bloat it and aren't
+///   queryable there), returned first;
+/// - the New Relic line (the same summary plus the affected request_ids for
+///   correlation), returned second.
+/// Pure (no I/O) so the wording and the CloudWatch-vs-NR split are unit-tested.
+#[allow(clippy::too_many_arguments)]
+fn build_shutdown_drop_messages(
+    apm_connected: bool,
+    affected: usize,
+    remaining_count: usize,
+    dropped_earlier: u64,
+    reason: &str,
+    cycles: u64,
+    attempts: u64,
+    ids_preview: &str,
+) -> (String, String) {
+    let earlier_note = if dropped_earlier > 0 {
+        format!(" (+{dropped_earlier} more dropped earlier)")
+    } else {
+        String::new()
+    };
+    let summary = if apm_connected {
+        format!(
+            "APM telemetry DROPPED at shutdown: {affected} invocation(s) / {remaining_count} item(s) could not be sent despite APM being connected{earlier_note}."
+        )
+    } else {
+        format!(
+            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s). {affected} invocation(s) affected, {remaining_count} item(s) still buffered{earlier_note}."
+        )
+    };
+    let nr_message = format!("{summary} request_ids: [{ids_preview}]");
+    (summary, nr_message)
+}
+
 /// Buffer failed agent payload for retry across invocations
 fn buffer_failed_agent_payload(
     payload_bytes: &[u8],
@@ -2261,6 +2290,33 @@ mod tests {
             retry_count: 0,
             failed_at: chrono::Utc::now(),
         }
+    }
+
+    #[test]
+    fn shutdown_drop_messages_cloudwatch_omits_ids_nr_includes_them() {
+        let (cw, nr) = build_shutdown_drop_messages(
+            false, 9, 0, 5, "HTTP 503", 12, 36, "a1b2, c3d4",
+        );
+        // CloudWatch: counts + reason + attempts, but NO request_ids and NO "outage".
+        assert!(cw.contains("9 invocation(s) affected"));
+        assert!(cw.contains("12 reconnect cycle(s) / 36 handshake attempt(s)"));
+        assert!(cw.contains("last failure: HTTP 503"));
+        assert!(cw.contains("(+5 more dropped earlier)"));
+        assert!(!cw.contains("request_ids"), "CloudWatch line must omit request_ids");
+        assert!(!cw.to_lowercase().contains("outage"), "must not say 'outage'");
+        // New Relic: the same summary PLUS the request_ids.
+        assert!(nr.starts_with(&cw), "NR message extends the CloudWatch summary");
+        assert!(nr.contains("request_ids: [a1b2, c3d4]"));
+    }
+
+    #[test]
+    fn shutdown_drop_messages_connected_variant() {
+        // No "earlier" note when dropped_earlier == 0; connected wording.
+        let (cw, nr) = build_shutdown_drop_messages(true, 3, 2, 0, "", 0, 0, "x");
+        assert!(cw.contains("despite APM being connected"));
+        assert!(!cw.contains("dropped earlier"));
+        assert!(!cw.contains("request_ids"));
+        assert!(nr.contains("request_ids: [x]"));
     }
 
     // Payloads are kept (not dropped after N retries); only evicted FIFO at the
