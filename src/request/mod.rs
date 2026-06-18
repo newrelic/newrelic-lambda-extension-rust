@@ -211,6 +211,47 @@ pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
 pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
     Lazy::new(DashMap::new);
 
+/// LMI: create a minimal RequestData slot driven by platform.start (no INVOKE in LMI).
+/// No-op if a full entry already exists (normal APM mode where INVOKE fires first).
+pub fn ensure_lmi_request_slot(request_id: &str) {
+    if REQUEST_DATA.contains_key(request_id) {
+        return;
+    }
+    let arn = crate::get_global_fallback_arn();
+    let context = Arc::new(Mutex::new(InvocationContext {
+        request_id: request_id.to_string(),
+        invoked_function_arn: arn.clone(),
+        trace_id: None,
+    }));
+    let runtime_done_notify = Arc::new(Notify::new());
+    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
+        runtime_done_notify.notify_one();
+    }
+    let entry = REQUEST_DATA.entry(request_id.to_string()).or_insert_with(|| RequestData {
+        context,
+        agent_buffer: Arc::new(Mutex::new(Vec::new())),
+        pending_report: None,
+        creation_invocation: current_invocation_count(),
+        runtime_done_notify,
+        invoked_function_arn: arn,
+    });
+
+    // Drain payloads that beat platform.start to the pipe (cold-start race).
+    if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+        if !orphaned.is_empty() {
+            let drained: Vec<Vec<u8>> = orphaned.drain(..).collect();
+            info!(
+                "LMI: draining {} orphaned agent payload(s) into slot for request {}",
+                drained.len(),
+                request_id
+            );
+            if let Ok(mut buf) = entry.agent_buffer.lock() {
+                buf.extend(drained);
+            }
+        }
+    }
+}
+
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
