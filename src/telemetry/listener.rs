@@ -196,24 +196,38 @@ async fn handle_telemetry_request(
                                                         .filter(|arn| !arn.is_empty())
                                                 })
                                                 .unwrap_or_else(crate::get_global_fallback_arn);
-                                            let batched = if let Ok(mut buffer_guard) = buffer.lock() {
-                                                if buffer_guard.is_empty() {
-                                                    false
-                                                } else {
-                                                    debug!("Serverless mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
-                                                    for payload_bytes in buffer_guard.iter() {
-                                                        add_to_batch(
-                                                            request_id_str.to_string(),
-                                                            payload_bytes.clone(),
-                                                            Some(report_line.clone()),
-                                                            arn.clone(),
-                                                        );
-                                                    }
-                                                    buffer_guard.clear();
-                                                    true
-                                                }
-                                            } else {
+                                            // Take ownership of the payloads and drop the
+                                            // buffer lock BEFORE any await (trace extraction is
+                                            // async; holding a std Mutex across await is unsound).
+                                            let payloads: Vec<Vec<u8>> = match buffer.lock() {
+                                                Ok(mut g) => std::mem::take(&mut *g),
+                                                Err(_) => Vec::new(),
+                                            };
+                                            let batched = if payloads.is_empty() {
                                                 false
+                                            } else {
+                                                debug!("Serverless mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                                for payload_bytes in payloads {
+                                                    // Extract this payload's trace.id and stamp + flush the
+                                                    // request's held logs before batching (serverless: the
+                                                    // listener is the common pairing path).
+                                                    if log_processor.is_trace_collection_enabled() {
+                                                        if let Ok(Some(trace_id)) =
+                                                            crate::trace::extract_trace_id_from_payload(&payload_bytes)
+                                                        {
+                                                            let _ = log_processor
+                                                                .on_trace_id_extracted(request_id_str, &trace_id)
+                                                                .await;
+                                                        }
+                                                    }
+                                                    add_to_batch(
+                                                        request_id_str.to_string(),
+                                                        payload_bytes,
+                                                        Some(report_line.clone()),
+                                                        arn.clone(),
+                                                    );
+                                                }
+                                                true
                                             };
 
                                             if batched {

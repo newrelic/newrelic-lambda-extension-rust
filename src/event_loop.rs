@@ -652,6 +652,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 } else {
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
+
+                // Any logs still held for a request whose payload never arrived (true
+                // orphans) get flushed now, untagged — last chance before the sandbox dies.
+                components.global_log_processor.flush_pending_logs_unstamped();
+
                 debug!("APM mode shutdown: Retrying all buffered telemetry");
                 let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
                 let (cur_run_id, cur_collector_host) = {
@@ -936,7 +941,12 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // Must run after updating CURRENT_ACTIVE_REQUEST_ID so new pipe payloads
                 // route to the current request, not old buffers.
                 if !is_cold_start {
-                    let paired = drain_late_paired_payloads_serverless(&request_id);
+                    let paired = drain_late_paired_payloads_serverless(
+                        &request_id,
+                        &components.config,
+                        &components.global_log_processor,
+                    )
+                    .await;
                     if paired > 0 {
                         debug!(
                             "Serverless mode: Paired {} late agent payload(s) into batch at start of invocation: {}",
@@ -1128,6 +1138,10 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 )
                 .await;
 
+                // Flush any logs still held for a request whose payload never arrived,
+                // untagged — last chance before the sandbox dies.
+                components.global_log_processor.flush_pending_logs_unstamped();
+
                 // Flush pre-invoke buffer and main log buffer concurrently.
                 // Both paths write to independent payloads (pre-invoke vs main batch),
                 // so parallel execution is safe and cuts shutdown latency in half
@@ -1258,7 +1272,11 @@ pub async fn process_apm_request(
 
     let invocation_start_time = chrono::Utc::now();
     global_log_processor.set_invocation_start_time(invocation_start_time);
-    global_log_processor.reset_trace_id_state();
+    // trace.id buffering is per-request (keyed by request_id) inside LogProcessor, so
+    // there's no per-invocation state to reset here: the previous request's logs are
+    // stamped + flushed when its deferred agent payload is processed
+    // (process_pending_agent_payloads -> on_trace_id_extracted), independent of this
+    // invocation.
     state
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
@@ -1299,6 +1317,7 @@ pub async fn process_apm_request(
             for payload_bytes in &agent_payloads_clone {
                 extract_and_coordinate_trace_id(
                     payload_bytes,
+                    &request_id_clone,
                     &config_clone,
                     &global_log_processor_clone,
                 )
@@ -1639,7 +1658,9 @@ pub async fn process_request_concurrently(
 
     let invocation_start_time = chrono::Utc::now();
     global_log_processor.set_invocation_start_time(invocation_start_time);
-    global_log_processor.reset_trace_id_state();
+    // trace.id buffering is per-request (keyed by request_id) inside LogProcessor — no
+    // per-invocation reset needed; each request's held logs are stamped + flushed when
+    // its deferred agent payload is processed.
     state
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
@@ -1660,6 +1681,15 @@ pub async fn process_request_concurrently(
         debug!("Serverless mode: No agent payload in buffer for request: {} - will be matched when it arrives", request_id);
     } else {
         debug!("Serverless mode: {} agent payload(s) in buffer for request: {}", agent_payloads.len(), request_id);
+        // Extract this request's trace.id from its payload(s) and stamp + flush its
+        // held logs. The trace lives in the payload (independent of the platform.report),
+        // so do this as soon as the payload is in hand — even if it gets put back to
+        // wait for its report below. Mirrors the APM path's extract_and_coordinate_trace_id.
+        if config.new_relic.collect_trace_id {
+            for payload_bytes in &agent_payloads {
+                extract_and_coordinate_trace_id(payload_bytes, &request_id, &config, &global_log_processor).await;
+            }
+        }
     }
 
     let report_line = remove_pending_report(&request_id).map(|report| {
@@ -1829,6 +1859,7 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
 /// Extract trace ID from agent payload if enabled in config
 async fn extract_and_coordinate_trace_id(
     payload_bytes: &[u8],
+    request_id: &str,
     config: &Arc<ExtensionConfig>,
     log_processor: &Arc<LogProcessor>,
 ) {
@@ -1838,7 +1869,7 @@ async fn extract_and_coordinate_trace_id(
 
     if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
         debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
-        if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
+        if let Err(e) = log_processor.on_trace_id_extracted(request_id, &trace_id).await {
             error!("Failed to coordinate logs with trace ID: {}", e);
         }
     }
@@ -1856,7 +1887,11 @@ async fn extract_and_coordinate_trace_id(
 ///      each only handles its own request.
 ///   5. This function (called at the start of invocation B+1) sees both, pairs them,
 ///      and calls add_to_batch so the batch sender can transmit them.
-fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
+async fn drain_late_paired_payloads_serverless(
+    current_request_id: &str,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+) -> usize {
     // Collect IDs of old entries that have BOTH pending_report AND non-empty agent_buffer.
     // Avoid holding DashMap refs across the subsequent get_mut calls.
     let candidates: Vec<String> = REQUEST_DATA
@@ -1919,6 +1954,11 @@ fn drain_late_paired_payloads_serverless(current_request_id: &str) -> usize {
 
         let payload_count = payloads.len();
         for payload_bytes in payloads {
+            // Extract this late payload's trace.id and stamp + flush the request's held
+            // logs before batching it for send.
+            if config.new_relic.collect_trace_id {
+                extract_and_coordinate_trace_id(&payload_bytes, &req_id, config, global_log_processor).await;
+            }
             add_to_batch(req_id.clone(), payload_bytes, Some(report.clone()), arn.clone());
         }
         batched_count += payload_count;
@@ -2059,7 +2099,7 @@ async fn process_and_send_agent_payload(
         if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
             debug!("Extracted trace ID: {}, coordinating with logs", trace_id);
 
-            if let Err(e) = log_processor.on_trace_id_extracted(&trace_id).await {
+            if let Err(e) = log_processor.on_trace_id_extracted(request_id, &trace_id).await {
                 error!("Failed to coordinate logs with trace ID: {}", e);
             }
         } else {
