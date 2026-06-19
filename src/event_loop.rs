@@ -29,7 +29,6 @@ use crate::{
         send_batched_payloads_with_reports_only,
         send_all_pending_payloads_on_shutdown,
     },
-    agent::payload::send_agent_payload_to_newrelic,
     error_synthesis,
     trace,
     version,
@@ -363,9 +362,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // Retry any previously-failed agent payloads in the background so the
                 // HTTP round-trips happen during function execution, not post-runtime-done.
                 {
-                    let nr = components.newrelic_client.clone();
-                    let cfg = components.config.clone();
-                    tokio::spawn(retry_failed_agent_payloads(nr, cfg));
+                    let apm = components.apm_app.clone();
+                    tokio::spawn(retry_failed_agent_payloads(apm));
                 }
 
                 // Create per-request state (platform_processor, agent_buffer, context)
@@ -522,7 +520,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 // Computed inside the main block, sent AFTER it with reserved budget
                 // so the critical "telemetry dropped" line always reaches New Relic.
-                let mut shutdown_diagnostic: Option<(String, String)> = None;
+                let mut shutdown_diagnostic: Option<ShutdownDropDiagnostic> = None;
 
                 let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS), async {
                 if components.config.extension.pipeline_flush {
@@ -688,6 +686,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 for id in crate::apm::telemetry_buffer::buffered_request_ids() {
                     dropped_request_ids.insert(id);
                 }
+                // Metric-API items count toward remaining_count below, so their requests
+                // must count toward `affected` too — otherwise a metric-only request
+                // inflates item count without bumping the invocation count.
+                for id in crate::apm::metric_api_buffer::buffered_request_ids() {
+                    dropped_request_ids.insert(id);
+                }
 
                 let remaining_count = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0)
                     + crate::apm::telemetry_buffer::get_buffer_count()
@@ -699,13 +703,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if remaining_count > 0 || !dropped_request_ids.is_empty() || dropped_earlier > 0 {
                     let apm_connected = cur_run_id.is_some();
                     let affected = dropped_request_ids.len();
-
-                    // Cap the request_id list so one line can't explode the log.
-                    let ids: Vec<String> = dropped_request_ids.iter().cloned().collect();
-                    let ids_preview = if ids.len() > 20 {
-                        format!("{}, … (+{} more)", ids[..20].join(", "), ids.len() - 20)
-                    } else {
-                        ids.join(", ")
+                    let ids: Vec<String> = {
+                        let mut v: Vec<String> = dropped_request_ids.iter().cloned().collect();
+                        v.sort();
+                        v
                     };
 
                     let reason = if apm_connected {
@@ -714,7 +715,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         crate::apm::connection::last_failure_reason()
                             .unwrap_or_else(|| "unknown".to_string())
                     };
-                    let (summary, nr_message) = build_shutdown_drop_messages(
+                    let summary = build_shutdown_drop_summary(
                         apm_connected,
                         affected,
                         remaining_count,
@@ -722,14 +723,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         &reason,
                         crate::apm::connection::connect_cycles(),
                         crate::apm::connection::connect_attempts_total(),
-                        &ids_preview,
                     );
 
-                    // CloudWatch gets the counts-only summary; New Relic gets the same
-                    // summary plus the request_ids (queryable there). The NR copy is
-                    // POSTed AFTER this block in its own reserved budget — the
-                    // extension's own stdout can't round-trip the Lambda Logs API
-                    // before shutdown, so the normal log path would never deliver it.
+                    // CloudWatch gets the counts-only summary. New Relic gets the same
+                    // summary as the log message PLUS the dropped request_ids and counts as
+                    // queryable attributes (dropped.request_ids / dropped.request_id_count /
+                    // dropped.item_count) — POSTed after this block in its reserved budget,
+                    // since the extension's own stdout can't round-trip the Logs API before
+                    // shutdown.
                     error!("{}", summary);
 
                     let arn = LAST_REQUEST_CONTEXT
@@ -738,7 +739,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         .and_then(|g| g.as_ref().map(|(_, arn)| arn.clone()))
                         .filter(|a| !a.is_empty())
                         .unwrap_or_else(crate::get_global_fallback_arn);
-                    shutdown_diagnostic = Some((nr_message, arn));
+                    shutdown_diagnostic = Some(ShutdownDropDiagnostic {
+                        message: summary,
+                        arn,
+                        request_ids: ids,
+                        request_id_count: affected,
+                        item_count: remaining_count,
+                    });
                 }
 
                 // Process any pending platform.report lines as metrics (APM mode)
@@ -796,17 +803,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // with its own protected window, so the one log the customer most
                 // needs is not starved by a slow flush/reconnect. Direct POST to the
                 // log ingest (license-key header) — does not need an APM handshake.
-                if let Some((summary, arn)) = shutdown_diagnostic {
-                    let diag = crate::newrelic::payload::LogMessage::diagnostic(
-                        "ERROR",
-                        format!("[NR_EXT] ERROR {summary}"),
-                    );
+                if let Some(diag_data) = shutdown_diagnostic {
+                    let diag = build_shutdown_drop_log(&diag_data);
                     match tokio::time::timeout(
                         Duration::from_millis(SHUTDOWN_DIAG_RESERVE_MS),
                         components.newrelic_client.send_logs(
                             components.config.as_ref(),
                             std::slice::from_ref(&diag),
-                            &arn,
+                            &diag_data.arn,
                         ),
                     )
                     .await
@@ -1135,6 +1139,7 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 send_all_pending_payloads_on_shutdown(
                     components.newrelic_client.clone(),
                     components.config.clone(),
+                    Some(&components.global_log_processor),
                 )
                 .await;
 
@@ -2149,7 +2154,30 @@ async fn process_and_send_agent_payload(
 ///   correlation), returned second.
 /// Pure (no I/O) so the wording and the CloudWatch-vs-NR split are unit-tested.
 #[allow(clippy::too_many_arguments)]
-fn build_shutdown_drop_messages(
+/// Data for the shutdown "telemetry DROPPED" diagnostic. The human summary goes to the
+/// CloudWatch line AND the NR log message; the request_ids and counts go to NR as
+/// queryable attributes (not embedded in the message text).
+struct ShutdownDropDiagnostic {
+    message: String,
+    arn: String,
+    /// Distinct request_ids whose telemetry was dropped (the affected invocations).
+    request_ids: Vec<String>,
+    /// = request_ids.len() (distinct invocations affected).
+    request_id_count: usize,
+    /// Raw buffered item count across all APM buffers (can exceed request_id_count
+    /// when one invocation has multiple buffered items).
+    item_count: usize,
+}
+
+/// Max request_ids embedded in the `dropped.request_ids` attribute string. The numeric
+/// `dropped.request_id_count` is always exact even if this list is truncated.
+const MAX_DROPPED_IDS_IN_ATTR: usize = 100;
+
+/// Build the human-readable shutdown drop summary (CloudWatch line and NR log message
+/// body). Counts only — no request_ids. Worded so item/invocation counts read as
+/// "N items across M invocations" rather than inviting an additive misread.
+/// Pure (no I/O) so the wording is unit-tested.
+fn build_shutdown_drop_summary(
     apm_connected: bool,
     affected: usize,
     remaining_count: usize,
@@ -2157,24 +2185,53 @@ fn build_shutdown_drop_messages(
     reason: &str,
     cycles: u64,
     attempts: u64,
-    ids_preview: &str,
-) -> (String, String) {
+) -> String {
     let earlier_note = if dropped_earlier > 0 {
         format!(" (+{dropped_earlier} more dropped earlier)")
     } else {
         String::new()
     };
-    let summary = if apm_connected {
+    if apm_connected {
         format!(
-            "APM telemetry DROPPED at shutdown: {affected} invocation(s) / {remaining_count} item(s) could not be sent despite APM being connected{earlier_note}."
+            "APM telemetry DROPPED at shutdown: {remaining_count} item(s) across {affected} invocation(s) could not be sent despite APM being connected{earlier_note}."
         )
     } else {
         format!(
-            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s). {affected} invocation(s) affected, {remaining_count} item(s) still buffered{earlier_note}."
+            "APM telemetry DROPPED at shutdown: APM never connected (last failure: {reason}) after {cycles} reconnect cycle(s) / {attempts} handshake attempt(s) — {remaining_count} item(s) across {affected} invocation(s) lost{earlier_note}."
         )
-    };
-    let nr_message = format!("{summary} request_ids: [{ids_preview}]");
-    (summary, nr_message)
+    }
+}
+
+/// Build the New Relic diagnostic log: the summary as the message, plus the dropped
+/// request_ids and counts as queryable attributes (`dropped.request_ids`,
+/// `dropped.request_id_count`, `dropped.item_count`). Pure so attributes are unit-tested.
+fn build_shutdown_drop_log(diag: &ShutdownDropDiagnostic) -> crate::newrelic::payload::LogMessage {
+    let mut log = crate::newrelic::payload::LogMessage::diagnostic(
+        "ERROR",
+        format!("[NR_EXT] ERROR {}", diag.message),
+    );
+    if !diag.request_ids.is_empty() {
+        let joined = if diag.request_ids.len() > MAX_DROPPED_IDS_IN_ATTR {
+            format!(
+                "{},(+{} more)",
+                diag.request_ids[..MAX_DROPPED_IDS_IN_ATTR].join(","),
+                diag.request_ids.len() - MAX_DROPPED_IDS_IN_ATTR
+            )
+        } else {
+            diag.request_ids.join(",")
+        };
+        log.attributes
+            .insert("dropped.request_ids".to_string(), serde_json::json!(joined));
+    }
+    log.attributes.insert(
+        "dropped.request_id_count".to_string(),
+        serde_json::json!(diag.request_id_count),
+    );
+    log.attributes.insert(
+        "dropped.item_count".to_string(),
+        serde_json::json!(diag.item_count),
+    );
+    log
 }
 
 /// Buffer failed agent payload for retry across invocations
@@ -2203,11 +2260,15 @@ fn buffer_failed_agent_payload(
     }
 }
 
-/// Retry failed agent payloads during final flush
-async fn retry_failed_agent_payloads(
-    newrelic_client: Arc<NewRelicClient>,
-    config: Arc<ExtensionConfig>,
-) {
+/// Retry failed agent payloads via the APM collector (APM mode only).
+///
+/// `FAILED_AGENT_PAYLOADS` is populated solely by the APM payload path
+/// (`process_and_send_agent_payload`) when the APM collector is unreachable or not yet
+/// connected. Retries therefore go back to the **APM collector** — never the serverless
+/// telemetry endpoint — so APM-mode telemetry can't leak into the serverless pipeline.
+/// Payloads that still can't be sent (APM not connected) stay buffered for the next
+/// invoke / shutdown. Mirrors the Err→re-buffer convention of the initial send path.
+async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
     let mut retry_successful_count = 0;
     let mut retry_failed_count = 0;
 
@@ -2249,33 +2310,48 @@ async fn retry_failed_agent_payloads(
         }
 
         debug!(
-            "Retrying agent payload for request {} (attempt {})",
-            failed_payload.request_id, failed_payload.retry_count
+            "Retrying agent payload for request {} (arn: {}, attempt {}) via APM collector",
+            failed_payload.request_id, failed_payload.invoked_function_arn, failed_payload.retry_count
         );
 
-        match send_agent_payload_to_newrelic(
-            &failed_payload.payload_bytes,
-            &failed_payload.request_id,
-            &failed_payload.invoked_function_arn,
-            &newrelic_client,
-            &config,
-            None, // No version line for retries (already sent in original attempt)
-        )
-        .await
-        {
-            Ok(()) => {
+        // Send to the APM collector (NOT the serverless endpoint). If APM isn't
+        // connected yet, keep the payload buffered for a later invoke / shutdown.
+        let send_result = {
+            let apm_guard = apm_app.read().await;
+            match *apm_guard {
+                Some(ref app) => Some(
+                    app.process_agent_payload(
+                        failed_payload.payload_bytes.clone(),
+                        &failed_payload.request_id,
+                    )
+                    .await,
+                ),
+                None => None,
+            }
+        };
+
+        match send_result {
+            Some(Ok(())) => {
                 retry_successful_count += 1;
                 info!(
-                    "Successfully retried agent payload for request {}",
+                    "Successfully retried agent payload for request {} (APM collector)",
                     failed_payload.request_id
                 );
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 retry_failed_count += 1;
-                error!("Failed to retry agent payload: {}", e);
-
-                // Keep it buffered (capped) so it retries on the next invoke /
-                // reconnect — do not drop based on retry count.
+                error!("Failed to retry agent payload to APM collector: {}", e);
+                // Keep it buffered (capped) so it retries on the next invoke / reconnect.
+                if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
+                    push_failed_payload_capped(&mut failed_payloads, failed_payload);
+                }
+            }
+            None => {
+                // APM not connected yet — not a failed send; keep buffered for later.
+                debug!(
+                    "APM not connected — keeping agent payload buffered for request {}",
+                    failed_payload.request_id
+                );
                 if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
                     push_failed_payload_capped(&mut failed_payloads, failed_payload);
                 }
@@ -2314,286 +2390,5 @@ pub fn cleanup_old_failed_payloads() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    fn deadline_ms_from_now(millis: i64) -> i64 {
-        chrono::Utc::now().timestamp_millis() + millis
-    }
-
-    fn make_failed_payload(request_id: &str) -> FailedAgentPayload {
-        FailedAgentPayload {
-            payload_bytes: vec![1, 2, 3],
-            request_id: request_id.to_string(),
-            invoked_function_arn: "arn".to_string(),
-            retry_count: 0,
-            failed_at: chrono::Utc::now(),
-        }
-    }
-
-    #[test]
-    fn shutdown_drop_messages_cloudwatch_omits_ids_nr_includes_them() {
-        let (cw, nr) = build_shutdown_drop_messages(
-            false, 9, 0, 5, "HTTP 503", 12, 36, "a1b2, c3d4",
-        );
-        // CloudWatch: counts + reason + attempts, but NO request_ids and NO "outage".
-        assert!(cw.contains("9 invocation(s) affected"));
-        assert!(cw.contains("12 reconnect cycle(s) / 36 handshake attempt(s)"));
-        assert!(cw.contains("last failure: HTTP 503"));
-        assert!(cw.contains("(+5 more dropped earlier)"));
-        assert!(!cw.contains("request_ids"), "CloudWatch line must omit request_ids");
-        assert!(!cw.to_lowercase().contains("outage"), "must not say 'outage'");
-        // New Relic: the same summary PLUS the request_ids.
-        assert!(nr.starts_with(&cw), "NR message extends the CloudWatch summary");
-        assert!(nr.contains("request_ids: [a1b2, c3d4]"));
-    }
-
-    #[test]
-    fn shutdown_drop_messages_connected_variant() {
-        // No "earlier" note when dropped_earlier == 0; connected wording.
-        let (cw, nr) = build_shutdown_drop_messages(true, 3, 2, 0, "", 0, 0, "x");
-        assert!(cw.contains("despite APM being connected"));
-        assert!(!cw.contains("dropped earlier"));
-        assert!(!cw.contains("request_ids"));
-        assert!(nr.contains("request_ids: [x]"));
-    }
-
-    // Payloads are kept (not dropped after N retries); only evicted FIFO at the
-    // memory cap, and each eviction is counted for the shutdown summary.
-    #[test]
-    #[serial]
-    fn failed_agent_payload_buffer_caps_and_counts_evictions() {
-        let before = dropped_agent_payload_count();
-        let mut buf: Vec<FailedAgentPayload> = Vec::new();
-        // Push one past the cap: exactly one eviction, length stays at the cap.
-        for i in 0..(MAX_FAILED_AGENT_PAYLOADS + 1) {
-            push_failed_payload_capped(&mut buf, make_failed_payload(&format!("req-{i}")));
-        }
-        assert_eq!(buf.len(), MAX_FAILED_AGENT_PAYLOADS, "must not exceed cap");
-        assert_eq!(dropped_agent_payload_count(), before + 1, "one eviction counted");
-        // Oldest (req-0) was evicted; newest is retained.
-        assert!(!buf.iter().any(|p| p.request_id == "req-0"));
-        assert!(buf.iter().any(|p| p.request_id == format!("req-{MAX_FAILED_AGENT_PAYLOADS}")));
-    }
-
-    // Not in-flight (flag = false) → returns immediately without waiting.
-    #[tokio::test]
-    async fn test_handshake_wait_returns_immediately_when_not_in_flight() {
-        let (tx, _rx) = watch::channel(false);
-        let tx = Arc::new(tx);
-        let t0 = std::time::Instant::now();
-        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(10_000)).await;
-        assert!(
-            t0.elapsed().as_millis() < 100,
-            "Should return immediately when flag is false, took {}ms",
-            t0.elapsed().as_millis()
-        );
-    }
-
-    // Deadline already past → budget = 0 → returns immediately even if flag is true.
-    #[tokio::test]
-    async fn test_handshake_wait_skips_when_deadline_already_expired() {
-        let (tx, _rx) = watch::channel(true);
-        let tx = Arc::new(tx);
-        let past = deadline_ms_from_now(-1_000);
-        let t0 = std::time::Instant::now();
-        wait_for_apm_handshake_within_budget(&tx, past).await;
-        assert!(
-            t0.elapsed().as_millis() < 100,
-            "Should return immediately on expired deadline, took {}ms",
-            t0.elapsed().as_millis()
-        );
-    }
-
-    // Handshake completes within budget → returns promptly after the flag clears.
-    #[tokio::test]
-    async fn test_handshake_wait_wakes_when_handshake_completes() {
-        let (tx, _rx) = watch::channel(true);
-        let tx = Arc::new(tx);
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let _ = tx_clone.send(false);
-        });
-        let t0 = std::time::Instant::now();
-        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(5_000)).await;
-        let elapsed = t0.elapsed().as_millis();
-        assert!(elapsed >= 100, "Should have waited for handshake signal (got {}ms)", elapsed);
-        assert!(elapsed < 500, "Should have woken up promptly after signal (got {}ms)", elapsed);
-    }
-
-    // Budget expires before handshake finishes → returns after budget, not stuck forever.
-    #[tokio::test]
-    async fn test_handshake_wait_times_out_when_budget_expires() {
-        let (tx, _rx) = watch::channel(true); // never completes
-        let tx = Arc::new(tx);
-        // budget = 800ms - 500ms safety = 300ms
-        let t0 = std::time::Instant::now();
-        wait_for_apm_handshake_within_budget(&tx, deadline_ms_from_now(800)).await;
-        let elapsed = t0.elapsed().as_millis();
-        assert!(elapsed >= 200, "Should have waited for budget (got {}ms)", elapsed);
-        assert!(elapsed < 700, "Should not wait beyond budget (got {}ms)", elapsed);
-    }
-
-    // ── Reconnect guard condition tests ──────────────────────────────────────────
-
-    // Guard condition: !*borrow() is false when flag is true → spawn is skipped.
-    #[test]
-    fn test_reconnect_guard_skips_when_in_flight() {
-        let (tx, _rx) = watch::channel(true); // INIT handshake in progress
-        let would_spawn = !*tx.borrow();
-        assert!(!would_spawn, "Guard must not fire when reconnect is already in-flight");
-    }
-
-    // Guard condition: !*borrow() is true when flag is false → spawn is allowed.
-    #[test]
-    fn test_reconnect_guard_fires_when_not_in_flight() {
-        let (tx, _rx) = watch::channel(false); // no handshake running
-        let would_spawn = !*tx.borrow();
-        assert!(would_spawn, "Guard must fire when no reconnect is in-flight");
-    }
-
-    // Flag lifecycle: send(true) before spawn, send(false) after — models the INIT path.
-    // Verifies the first-invoke guard correctly sees the flag throughout the lifecycle.
-    #[test]
-    fn test_init_flag_lifecycle_prevents_duplicate_spawn() {
-        let (tx, _rx) = watch::channel(false);
-
-        // Before INIT spawn: guard would fire (APM not connected, no reconnect running)
-        assert!(!*tx.borrow() == true, "Guard should fire before INIT starts");
-
-        // INIT sets flag true before spawning
-        let _ = tx.send(true);
-        // First invoke arrives: guard must NOT fire (INIT already in progress)
-        assert!(!*tx.borrow() == false, "Guard must not fire while INIT spawn is running");
-
-        // INIT task completes (success or failure) and clears the flag
-        let _ = tx.send(false);
-        // Next invoke: guard can now fire again if APM still not connected
-        assert!(!*tx.borrow() == true, "Guard should be able to fire after INIT completes");
-    }
-
-    // ── send_error_for_shutdown_reason tests ─────────────────────────────────────
-
-    fn make_test_apm_app() -> crate::apm::ApmApp {
-        crate::apm::ApmApp {
-            run_id: "test-run-id".to_string(),
-            entity_guid: "test-entity-guid".to_string(),
-            // port 1 → connection refused immediately, no 20s wait
-            collector_host: "127.0.0.1:1".to_string(),
-            license_key: "test-license-key".to_string(),
-            metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
-            client: reqwest::Client::new(),
-        }
-    }
-
-    // Spindown → no network call, returns instantly.
-    #[tokio::test]
-    async fn test_send_error_spindown_no_network_call() {
-        let app = make_test_apm_app();
-        let t0 = std::time::Instant::now();
-        send_error_for_shutdown_reason(
-            &app,
-            crate::runtime::ShutdownReason::Spindown,
-            "req-123",
-            "arn:aws:lambda:us-east-1:123:function:test",
-        )
-        .await;
-        assert!(
-            t0.elapsed().as_millis() < 100,
-            "Spindown should not make any network call (took {}ms)",
-            t0.elapsed().as_millis()
-        );
-    }
-
-    // Timeout → attempts network, error is swallowed (returns () not Result).
-    #[tokio::test]
-    async fn test_send_error_timeout_swallows_network_error() {
-        let app = make_test_apm_app();
-        // Should complete without panic even though the HTTP call fails
-        send_error_for_shutdown_reason(
-            &app,
-            crate::runtime::ShutdownReason::Timeout,
-            "req-456",
-            "arn:aws:lambda:us-east-1:123:function:test",
-        )
-        .await;
-    }
-
-    // Failure → attempts network, error is swallowed.
-    #[tokio::test]
-    async fn test_send_error_failure_swallows_network_error() {
-        let app = make_test_apm_app();
-        send_error_for_shutdown_reason(
-            &app,
-            crate::runtime::ShutdownReason::Failure,
-            "req-789",
-            "arn:aws:lambda:us-east-1:123:function:test",
-        )
-        .await;
-    }
-
-    // Unknown → attempts network, error is swallowed.
-    #[tokio::test]
-    async fn test_send_error_unknown_swallows_network_error() {
-        let app = make_test_apm_app();
-        send_error_for_shutdown_reason(
-            &app,
-            crate::runtime::ShutdownReason::Unknown,
-            "req-000",
-            "arn:aws:lambda:us-east-1:123:function:test",
-        )
-        .await;
-    }
-
-    #[test]
-    fn test_reconnect_guard_clears_flag_on_drop() {
-        let (tx, mut rx) = watch::channel(true);
-        let tx = Arc::new(tx);
-        assert!(*rx.borrow());
-
-        {
-            let _guard = ReconnectGuard(tx.clone());
-        } // guard dropped here
-
-        // Flag should now be false
-        assert!(!*rx.borrow_and_update());
-    }
-
-    #[test]
-    fn test_reconnect_guard_clears_flag_on_panic() {
-        let (tx, mut rx) = watch::channel(true);
-        let tx = Arc::new(tx);
-        assert!(*rx.borrow());
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ReconnectGuard(tx.clone());
-            panic!("simulated panic inside task");
-        }));
-
-        assert!(result.is_err());
-        assert!(!*rx.borrow_and_update());
-    }
-
-    #[test]
-    fn test_shutdown_timeout_constant_is_under_2s() {
-        assert!(SHUTDOWN_TIMEOUT_MS < 2000, "Shutdown timeout must be under Lambda's 2s limit");
-        assert!(SHUTDOWN_TIMEOUT_MS >= 1000, "Shutdown timeout should be at least 1s to allow work");
-    }
-
-    #[test]
-    fn test_shutdown_diagnostic_reserve_fits_budget() {
-        // The reserved diagnostic window must leave the main shutdown work real
-        // budget, and the two together must stay under Lambda's 2s deadline.
-        assert!(SHUTDOWN_DIAG_RESERVE_MS > 0, "diagnostic send needs a window");
-        assert!(
-            SHUTDOWN_DIAG_RESERVE_MS < SHUTDOWN_TIMEOUT_MS,
-            "reserve must not consume the whole shutdown budget"
-        );
-        // Main work budget = total - reserve; both slices live inside SHUTDOWN_TIMEOUT_MS.
-        assert!(SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS >= 1000, "main work needs >= 1s");
-        assert!(SHUTDOWN_TIMEOUT_MS < 2000, "total must stay under Lambda's 2s deadline");
-    }
-}
-
+#[path = "event_loop_tests.rs"]
+mod tests;
