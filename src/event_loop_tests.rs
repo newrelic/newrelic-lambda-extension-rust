@@ -55,6 +55,7 @@ fn shutdown_drop_log_carries_ids_and_counts_as_attributes() {
     let diag = ShutdownDropDiagnostic {
         message: "APM telemetry DROPPED at shutdown".to_string(),
         arn: "arn".to_string(),
+        request_id: "last-req".to_string(),
         request_ids: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         request_id_count: 3,
         item_count: 5,
@@ -70,6 +71,12 @@ fn shutdown_drop_log_carries_ids_and_counts_as_attributes() {
         serde_json::json!(3)
     );
     assert_eq!(log.attributes["dropped.item_count"], serde_json::json!(5));
+    // The diagnostic carries the last request_id (aws.lambda_request_id + faas.execution).
+    assert_eq!(
+        log.attributes["aws"]["lambda_request_id"],
+        serde_json::json!("last-req")
+    );
+    assert_eq!(log.attributes["faas.execution"], serde_json::json!("last-req"));
     assert!(
         !log.message.contains("request_ids"),
         "ids belong in attributes, not the message"
@@ -81,12 +88,16 @@ fn shutdown_drop_log_omits_ids_attribute_when_empty() {
     let diag = ShutdownDropDiagnostic {
         message: "m".to_string(),
         arn: "arn".to_string(),
+        request_id: String::new(),
         request_ids: vec![],
         request_id_count: 0,
         item_count: 0,
     };
     let log = build_shutdown_drop_log(&diag);
     assert!(!log.attributes.contains_key("dropped.request_ids"));
+    // No request_id available → no aws/faas.execution stamped.
+    assert!(!log.attributes.contains_key("aws"));
+    assert!(!log.attributes.contains_key("faas.execution"));
     assert_eq!(
         log.attributes["dropped.request_id_count"],
         serde_json::json!(0)

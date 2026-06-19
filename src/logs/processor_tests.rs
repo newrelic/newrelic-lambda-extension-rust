@@ -1544,6 +1544,56 @@ mod tests {
         assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 1, "INIT log stays buffered until context valid");
     }
 
+    // During shutdown, the extension's OWN logs are NOT forwarded to NR (the structured
+    // drop diagnostic is sent directly instead). Function/platform logs are unaffected.
+    #[tokio::test]
+    #[serial]
+    async fn test_extension_logs_dropped_during_shutdown() {
+        use crate::config::{ExtensionConfig, ExtensionSettings, NewRelicConfig};
+        use crate::telemetry::listener::TelemetryRecord;
+
+        // Processor with send_extension_logs = true so the gate under test is reached.
+        let mut config = ExtensionConfig::default();
+        config.extension = ExtensionSettings {
+            send_extension_logs: true,
+            ..ExtensionSettings::default()
+        };
+        config.new_relic = NewRelicConfig { ..NewRelicConfig::default() };
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new(&Arc::new(
+            ExtensionConfig::default(),
+        )));
+        let ctx = Arc::new(Mutex::new(crate::context::InvocationContext::default()));
+        let p = LogProcessor::new(client, Arc::new(config), ctx, None);
+
+        let rec = TelemetryRecord {
+            time: chrono::Utc::now(),
+            record_type: "extension".to_string(),
+            record: serde_json::json!("[NR_EXT] ERROR APM telemetry DROPPED at shutdown"),
+        };
+
+        // Not shutting down → accepted (lands in pre_invoke_buffer; no ARN yet).
+        crate::IS_SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+        p.process_record(rec.clone()).await;
+        assert_eq!(
+            p.pre_invoke_buffer.lock().unwrap().len(),
+            1,
+            "extension log accepted when not shutting down"
+        );
+
+        // Shutting down → dropped before any buffering/batching (no new entry).
+        crate::IS_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        p.process_record(rec).await;
+        assert_eq!(
+            p.pre_invoke_buffer.lock().unwrap().len(),
+            1,
+            "extension log dropped during shutdown — no new entry"
+        );
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+
+        // Reset the one-way latch so other tests aren't affected.
+        crate::IS_SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // ========================================================================
     // PHASE 8: SendError classification + log_type_from_message
     // ========================================================================

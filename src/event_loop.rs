@@ -515,6 +515,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+                // Stop forwarding the extension's own shutdown-sequence logs to NR
+                // (set before any shutdown log is emitted). The structured drop
+                // diagnostic is sent directly below as the single NR record.
+                crate::IS_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
                 let shutdown_start_time = std::time::Instant::now();
                 info!("APM mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
@@ -733,15 +737,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     // shutdown.
                     error!("{}", summary);
 
-                    let arn = LAST_REQUEST_CONTEXT
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|(_, arn)| arn.clone()))
+                    let last_ctx = LAST_REQUEST_CONTEXT.lock().ok().and_then(|g| g.clone());
+                    let last_request_id =
+                        last_ctx.as_ref().map(|(rid, _)| rid.clone()).unwrap_or_default();
+                    let arn = last_ctx
+                        .map(|(_, arn)| arn)
                         .filter(|a| !a.is_empty())
                         .unwrap_or_else(crate::get_global_fallback_arn);
                     shutdown_diagnostic = Some(ShutdownDropDiagnostic {
                         message: summary,
                         arn,
+                        request_id: last_request_id,
                         request_ids: ids,
                         request_id_count: affected,
                         item_count: remaining_count,
@@ -1068,6 +1074,9 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 }
             }
             runtime::LambdaRuntimeEvent::Shutdown { shutdown_reason } => {
+                // Stop forwarding the extension's own shutdown-sequence logs to NR
+                // (set before any shutdown log is emitted).
+                crate::IS_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
                 let shutdown_start_time = std::time::Instant::now();
                 info!("Serverless mode: Extension shutting down with reason: {} (started at {:?})", shutdown_reason, std::time::SystemTime::now());
 
@@ -2160,6 +2169,10 @@ async fn process_and_send_agent_payload(
 struct ShutdownDropDiagnostic {
     message: String,
     arn: String,
+    /// The last/current request_id (the invocation during which shutdown occurred);
+    /// stamped as aws.lambda_request_id / faas.execution for consistency with other
+    /// extension logs. The full dropped set is in `request_ids`.
+    request_id: String,
     /// Distinct request_ids whose telemetry was dropped (the affected invocations).
     request_ids: Vec<String>,
     /// = request_ids.len() (distinct invocations affected).
@@ -2210,6 +2223,19 @@ fn build_shutdown_drop_log(diag: &ShutdownDropDiagnostic) -> crate::newrelic::pa
         "ERROR",
         format!("[NR_EXT] ERROR {}", diag.message),
     );
+    // Stamp request_id (last invocation) so the diagnostic carries the same
+    // aws.lambda_request_id / faas.execution as other extension logs.
+    if !diag.request_id.is_empty() {
+        let mut aws_attrs = serde_json::Map::new();
+        aws_attrs.insert(
+            "lambda_request_id".to_string(),
+            serde_json::json!(diag.request_id),
+        );
+        log.attributes
+            .insert("aws".to_string(), serde_json::Value::Object(aws_attrs));
+        log.attributes
+            .insert("faas.execution".to_string(), serde_json::json!(diag.request_id));
+    }
     if !diag.request_ids.is_empty() {
         let joined = if diag.request_ids.len() > MAX_DROPPED_IDS_IN_ATTR {
             format!(

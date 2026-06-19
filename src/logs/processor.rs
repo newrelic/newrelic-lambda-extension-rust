@@ -786,6 +786,14 @@ impl LogProcessor {
                 if !self.config.extension.send_extension_logs {
                     return;
                 }
+                // During shutdown, don't forward the extension's OWN logs to New Relic.
+                // The authoritative "telemetry dropped" record is sent directly as one
+                // structured diagnostic, so these re-ingested stdout copies (e.g. the
+                // reconnect-failure error and the drop summary) would just be duplicates.
+                // CloudWatch still has them; function/platform logs are unaffected.
+                if crate::IS_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
             }
             "platform" => {
                 if !self.config.extension.send_platform_logs {
