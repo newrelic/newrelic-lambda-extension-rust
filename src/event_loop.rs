@@ -729,14 +729,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         crate::apm::connection::connect_attempts_total(),
                     );
 
-                    // CloudWatch gets the counts-only summary. New Relic gets the same
-                    // summary as the log message PLUS the dropped request_ids and counts as
-                    // queryable attributes (dropped.request_ids / dropped.request_id_count /
-                    // dropped.item_count) — POSTed after this block in its reserved budget,
-                    // since the extension's own stdout can't round-trip the Logs API before
-                    // shutdown.
-                    error!("{}", summary);
-
+                    // The drop diagnostic is sent ONLY to New Relic (directly, after this
+                    // block, in its reserved budget) — as the log message plus queryable
+                    // attributes (dropped.request_ids / dropped.request_id_count /
+                    // dropped.item_count). We deliberately do NOT also print it to stdout:
+                    // that CloudWatch copy was redundant with the NR record (and was the
+                    // source of the duplicate the operator saw). Other shutdown errors
+                    // (e.g. the reconnect failure) are still logged to CloudWatch.
                     let last_ctx = LAST_REQUEST_CONTEXT.lock().ok().and_then(|g| g.clone());
                     let last_request_id =
                         last_ctx.as_ref().map(|(rid, _)| rid.clone()).unwrap_or_default();
