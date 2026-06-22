@@ -19,7 +19,7 @@ use tracing::{debug, error, warn};
 pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
 
 /// Hard cap on buffered telemetry items to bound memory during a sustained
-/// collector outage on a high-traffic function. When full, the oldest is evicted.
+/// collector failure on a high-traffic function. When full, the oldest is evicted.
 const MAX_BUFFERED_ITEMS: usize = 500;
 
 /// Failed telemetry data that needs to be retried
@@ -216,6 +216,18 @@ pub fn get_buffer_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Distinct request_ids that still have un-sent buffered telemetry. Used by the
+/// shutdown summary to report how many invocations' data was dropped.
+pub fn buffered_request_ids() -> Vec<String> {
+    let mut ids: Vec<String> = FAILED_TELEMETRY_BUFFER
+        .lock()
+        .map(|buffer| buffer.iter().map(|item| item.request_id.clone()).collect())
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 #[cfg(test)]
 mod telemetry_buffer_tests {
     use super::*;
@@ -240,6 +252,18 @@ mod telemetry_buffer_tests {
             "host".into(),
         );
         assert_eq!(get_buffer_count(), 1);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn buffered_request_ids_are_distinct_and_sorted() {
+        clear();
+        // Two items for req-b, one for req-a → distinct {req-a, req-b}.
+        for (id, ty) in [("req-b", "metric_data"), ("req-a", "span_event_data"), ("req-b", "log_event_data")] {
+            buffer_failed_telemetry(ty.into(), vec![json!({})], id.into(), "run".into(), "host".into());
+        }
+        assert_eq!(buffered_request_ids(), vec!["req-a".to_string(), "req-b".to_string()]);
         clear();
     }
 

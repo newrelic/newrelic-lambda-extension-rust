@@ -9,7 +9,8 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, info};
 use flate2::write::GzEncoder;
@@ -61,6 +62,76 @@ pub fn is_handshake_fatal() -> bool {
 #[cfg(test)]
 pub fn reset_handshake_fatal_for_test() {
     HANDSHAKE_FATAL.store(false, Ordering::Relaxed);
+}
+
+// ── Handshake diagnostics ────────────────────────────────────────────────────
+// Track how hard we tried to connect and why we last failed, so the shutdown
+// summary can tell the customer (and us) exactly what happened — e.g. "30 total
+// attempts across 12 reconnect cycles, last failure: HTTP 503". All reset on a
+// successful connect via `reset_connect_stats()`.
+
+/// Total individual PreConnect/Connect attempts that have failed since the last
+/// successful connect (3 per `ApmApp::new` burst).
+static CONNECT_ATTEMPTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Number of reconnect cycles (one per `ApmApp::new` call: startup, per-invoke, shutdown).
+static CONNECT_CYCLES: AtomicU64 = AtomicU64::new(0);
+/// Concise reason for the most recent handshake failure, including the HTTP
+/// status when the collector responded (e.g. "HTTP 503"), or the network cause
+/// otherwise (e.g. "timeout after 5s", "connection error").
+static LAST_HANDSHAKE_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Record one failed handshake attempt (call per PreConnect/Connect try).
+pub fn record_connect_attempt() {
+    CONNECT_ATTEMPTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one reconnect cycle (call once per `ApmApp::new`).
+pub fn record_connect_cycle() {
+    CONNECT_CYCLES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Store the most recent handshake failure reason (set at the failure site so
+/// the HTTP status is preserved).
+pub fn record_failure_reason(reason: impl Into<String>) {
+    if let Ok(mut g) = LAST_HANDSHAKE_FAILURE.lock() {
+        *g = Some(reason.into());
+    }
+}
+
+pub fn connect_attempts_total() -> u64 {
+    CONNECT_ATTEMPTS_TOTAL.load(Ordering::Relaxed)
+}
+
+pub fn connect_cycles() -> u64 {
+    CONNECT_CYCLES.load(Ordering::Relaxed)
+}
+
+pub fn last_failure_reason() -> Option<String> {
+    LAST_HANDSHAKE_FAILURE.lock().ok().and_then(|g| g.clone())
+}
+
+/// Reset all handshake diagnostics — called after a successful connect so the
+/// counters reflect only the current disconnected streak.
+pub fn reset_connect_stats() {
+    CONNECT_ATTEMPTS_TOTAL.store(0, Ordering::Relaxed);
+    CONNECT_CYCLES.store(0, Ordering::Relaxed);
+    if let Ok(mut g) = LAST_HANDSHAKE_FAILURE.lock() {
+        *g = None;
+    }
+}
+
+/// Build a failure reason from an HTTP status + the collector's response body.
+/// Uses the collector's actual error message (not a hardcoded phrase); falls
+/// back to just the code when the body is empty. Body is trimmed/truncated so a
+/// verbose response can't bloat the log line.
+fn http_failure_reason(code: u16, body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        format!("HTTP {code}")
+    } else {
+        let truncated: String = body.chars().take(300).collect();
+        format!("HTTP {code}: {truncated}")
+    }
 }
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
@@ -171,7 +242,7 @@ pub async fn preconnect(
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
-        .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
+        .header("User-Agent", crate::version::user_agent())
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
         .timeout(Duration::from_secs(timeout_secs))
@@ -182,13 +253,15 @@ pub async fn preconnect(
         // These are transient and retried by the caller, so log at debug, not error.
         .map_err(|e| {
             let sanitized = e.without_url();
-            if sanitized.is_timeout() {
-                debug!("PreConnect timeout after {}s - sandbox may have been frozen during handshake", timeout_secs);
+            let reason = if sanitized.is_timeout() {
+                format!("timeout after {timeout_secs}s")
             } else if sanitized.is_connect() {
-                debug!("PreConnect connection error - cannot reach collector at {}", base_host);
+                "connection error".to_string()
             } else {
-                debug!("PreConnect request failed: {}", sanitized);
-            }
+                "network error".to_string()
+            };
+            debug!("PreConnect {} - cannot reach collector at {}", reason, base_host);
+            record_failure_reason(format!("PreConnect {reason}"));
             sanitized
         })?;
 
@@ -196,6 +269,8 @@ pub async fn preconnect(
     if !status.is_success() {
         let code = status.as_u16();
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
+        // Record the collector's actual error response (not a hardcoded phrase).
+        record_failure_reason(http_failure_reason(code, &error_body));
         // 401/403 are permanent (bad license key / no permission) — do not retry.
         if code == 401 || code == 403 {
             return Err(anyhow::Error::new(PermanentAuthError { status: code }));
@@ -262,7 +337,7 @@ pub async fn connect(
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
-        .header("User-Agent", "NewRelic-Rust-Lambda-Extension/0.1.0")
+        .header("User-Agent", crate::version::user_agent())
         .header("Accept-Encoding", "identity, deflate")
         .body(compressed_body)
         .timeout(Duration::from_secs(timeout_secs))
@@ -272,13 +347,15 @@ pub async fn connect(
         // Transient failure retried by the caller, so log at debug, not error.
         .map_err(|e| {
             let sanitized = e.without_url();
-            if sanitized.is_timeout() {
-                debug!("Connect timeout after {}s", timeout_secs);
+            let reason = if sanitized.is_timeout() {
+                format!("timeout after {timeout_secs}s")
             } else if sanitized.is_connect() {
-                debug!("Connect connection error - cannot reach collector at {}", collector_host);
+                "connection error".to_string()
             } else {
-                debug!("Connect request failed: {}", sanitized);
-            }
+                "network error".to_string()
+            };
+            debug!("Connect {} - cannot reach collector at {}", reason, collector_host);
+            record_failure_reason(format!("Connect {reason}"));
             sanitized
         })?;
 
@@ -286,6 +363,8 @@ pub async fn connect(
     if !status.is_success() {
         let code = status.as_u16();
         let error_body = response.text().await.unwrap_or_else(|_| "Unable to read response body".to_string());
+        // Record the collector's actual error response (not a hardcoded phrase).
+        record_failure_reason(http_failure_reason(code, &error_body));
         // 401/403 are permanent (bad license key / no permission) — do not retry.
         if code == 401 || code == 403 {
             return Err(anyhow::Error::new(PermanentAuthError { status: code }));
@@ -384,5 +463,39 @@ mod connection_tests {
         assert!(is_handshake_fatal());
         reset_handshake_fatal_for_test();
         assert!(!is_handshake_fatal());
+    }
+
+    #[test]
+    #[serial]
+    fn connect_stats_accumulate_and_reset() {
+        reset_connect_stats();
+        record_connect_cycle();
+        record_connect_attempt();
+        record_connect_attempt();
+        record_failure_reason("HTTP 503");
+        assert_eq!(connect_cycles(), 1);
+        assert_eq!(connect_attempts_total(), 2);
+        assert_eq!(last_failure_reason().as_deref(), Some("HTTP 503"));
+        // A successful connect resets the disconnected-streak diagnostics.
+        reset_connect_stats();
+        assert_eq!(connect_cycles(), 0);
+        assert_eq!(connect_attempts_total(), 0);
+        assert_eq!(last_failure_reason(), None);
+    }
+
+    #[test]
+    fn http_failure_reason_uses_api_body_and_truncates() {
+        // Empty body → just the code.
+        assert_eq!(http_failure_reason(503, "   "), "HTTP 503");
+        // Real collector message is surfaced (trimmed), not a hardcoded phrase.
+        assert_eq!(
+            http_failure_reason(401, "  Invalid license key.  "),
+            "HTTP 401: Invalid license key."
+        );
+        // A verbose body is truncated so it can't bloat the log line.
+        let long = "x".repeat(500);
+        let r = http_failure_reason(500, &long);
+        assert!(r.starts_with("HTTP 500: "));
+        assert!(r.len() <= "HTTP 500: ".len() + 300);
     }
 }

@@ -24,10 +24,10 @@ pub const CMD_LOG_EVENTS: &str = "log_event_data";
 pub const CMD_SLOW_SQLS: &str = "sql_trace_data";
 
 const PROTOCOL_VERSION: u8 = 17;
-const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn get_user_agent() -> String {
-    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
+    // Single source of truth (tracks Cargo.toml); shared with the handshake path.
+    crate::version::user_agent()
 }
 
 /// APM collector error types
