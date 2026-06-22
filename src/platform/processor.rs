@@ -106,9 +106,14 @@ impl PlatformProcessor {
         };
         
         if self.config.extension.send_platform_logs {
-            // Stamp AWS attributes (request_id, ARN) before adding to batch
-            // This prevents logs from being requeued with wrong request_id
-            let stamped_log = self.log_processor.apply_current_invocation_metadata(log_message);
+            // Stamp AWS attributes (request_id, ARN) before adding to batch.
+            // This prevents logs from being requeued with wrong request_id.
+            // platform.* records carry `requestId`; pass it so LMI correlates per-record
+            // (ignored on Normal Lambda, which stamps from the current-invocation context).
+            let per_record_request_id = self.extract_request_id_from_record(&record);
+            let stamped_log = self
+                .log_processor
+                .apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
             self.log_processor.add_log_to_batch(stamped_log);
         }
     }

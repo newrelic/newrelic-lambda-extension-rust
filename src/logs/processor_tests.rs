@@ -1459,3 +1459,92 @@ mod tests {
         assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
     }
 }
+
+/// NR-579360: per-record request-id attribution under LMI, and proof that
+/// Normal Lambda stamping is unchanged. These assert *attribution* (which
+/// request a log is stamped with), not liveness.
+#[cfg(test)]
+mod lmi_request_id_attribution_tests {
+    use super::super::LogProcessor;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::newrelic::payload::LogMessage;
+    use crate::request::TELEMETRY_CURRENT_REQUEST_ID;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    fn processor_with(deployment: DeploymentContext, ctx_request_id: &str) -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.deployment = deployment;
+        let config = Arc::new(config);
+        let newrelic_client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: ctx_request_id.to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(newrelic_client, config, ctx, None)
+    }
+
+    fn empty_msg() -> LogMessage {
+        LogMessage { timestamp: 0, message: "m".to_string(), attributes: serde_json::Map::new() }
+    }
+
+    fn stamped_request_id(msg: &LogMessage) -> Option<String> {
+        msg.attributes.get("faas.execution").and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
+
+    fn set_global(id: Option<&str>) {
+        if let Ok(mut g) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
+            *g = id.map(|s| s.to_string());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn lmi_uses_per_record_id_not_the_global() {
+        // Even with the (Normal-era) global pointing at a different request,
+        // LMI must stamp from the per-record id.
+        set_global(Some("global-B"));
+        let p = processor_with(DeploymentContext::Lmi, "");
+        let out = p.apply_current_invocation_metadata(empty_msg(), Some("rec-A"));
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("rec-A"));
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn lmi_without_request_id_ships_uncorrelated() {
+        set_global(Some("global-B"));
+        let p = processor_with(DeploymentContext::Lmi, "");
+        let out = p.apply_current_invocation_metadata(empty_msg(), None);
+        // No request-id attributes — uncorrelated, never mis-stamped from the global.
+        assert_eq!(stamped_request_id(&out), None);
+        assert!(out.attributes.get("aws").is_none());
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn normal_unchanged_prefers_global_and_ignores_per_record() {
+        // Regression guard: Normal Lambda keeps stamping from the global and
+        // IGNORES the new per-record argument.
+        set_global(Some("global-T"));
+        let p = processor_with(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "ctx-X");
+        let out = p.apply_current_invocation_metadata(empty_msg(), Some("rec-IGNORED"));
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("global-T"));
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn normal_falls_back_to_context_when_global_empty() {
+        // Regression guard: Normal falls back to the invocation context, unchanged.
+        set_global(None);
+        let p = processor_with(DeploymentContext::Normal { mode: TelemetryMode::Apm }, "ctx-Y");
+        let out = p.apply_current_invocation_metadata(empty_msg(), None);
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("ctx-Y"));
+    }
+}

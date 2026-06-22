@@ -809,11 +809,38 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // record_request_id: per-record correlation source (NR-579360)
+    // ========================================================================
 
+    #[test]
+    fn record_request_id_reads_request_id_field() {
+        let rec = serde_json::json!({ "requestId": "abc-123", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("abc-123"));
+    }
 
+    #[test]
+    fn record_request_id_falls_back_to_aws_request_id() {
+        let rec = serde_json::json!({ "AWSRequestId": "aws-456", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("aws-456"));
+    }
 
+    #[test]
+    fn record_request_id_prefers_request_id_over_aws_request_id() {
+        let rec = serde_json::json!({ "requestId": "primary", "AWSRequestId": "fallback" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("primary"));
+    }
 
+    #[test]
+    fn record_request_id_none_for_plaintext_string_record() {
+        // Plain-text log records are a bare JSON string - no requestId to correlate by.
+        let rec = serde_json::Value::String("ERROR something failed".to_string());
+        assert_eq!(record_request_id(&rec), None);
+    }
 
-
-
+    #[test]
+    fn record_request_id_none_when_absent_or_empty() {
+        assert_eq!(record_request_id(&serde_json::json!({ "message": "hi" })), None);
+        assert_eq!(record_request_id(&serde_json::json!({ "requestId": "" })), None);
+    }
 }
