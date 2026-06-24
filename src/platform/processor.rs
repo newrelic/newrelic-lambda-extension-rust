@@ -3,6 +3,7 @@
 
 use crate::{
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     context::InvocationContext,
     newrelic::{client::NewRelicClient, flush::Flush},
     telemetry::listener::TelemetryRecord,
@@ -206,22 +207,47 @@ impl PlatformProcessor {
     pub fn convert_platform_report_to_log_line(&self, record: &TelemetryRecord) -> Option<String> {
         let request_id = record.record.get("requestId")?.as_str()?;
         let metrics = record.record.get("metrics")?;
-        
+
         let duration_ms = metrics.get("durationMs")?.as_f64()?;
-        let billed_duration_ms = metrics.get("billedDurationMs")?.as_u64()?;
-        let memory_size_mb = metrics.get("memorySizeMB")?.as_u64()?;
-        let max_memory_used_mb = metrics.get("maxMemoryUsedMB")?.as_u64()?;
-        
+
         let init_duration_part = if let Some(init_duration) = metrics.get("initDurationMs").and_then(|v| v.as_f64()) {
             format!("\tInit Duration: {:.2} ms", init_duration)
         } else {
             String::new()
         };
-        
-        Some(format!(
-            "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\tMax Memory Used: {} MB{}",
-            request_id, duration_ms, billed_duration_ms, memory_size_mb, max_memory_used_mb, init_duration_part
-        ))
+
+        // Type-driven so Standard Lambda is provably untouched (LMI_SUPPORT.md §6).
+        match self.config.deployment {
+            // Normal Lambda: platform.report always carries the full metric set —
+            // keep the original strict behavior verbatim (all fields required).
+            DeploymentContext::Normal { .. } => {
+                let billed_duration_ms = metrics.get("billedDurationMs")?.as_u64()?;
+                let memory_size_mb = metrics.get("memorySizeMB")?.as_u64()?;
+                let max_memory_used_mb = metrics.get("maxMemoryUsedMB")?.as_u64()?;
+                Some(format!(
+                    "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\tMax Memory Used: {} MB{}",
+                    request_id, duration_ms, billed_duration_ms, memory_size_mb, max_memory_used_mb, init_duration_part
+                ))
+            }
+            // LMI: AWS strips billedDurationMs / memorySizeMB / maxMemoryUsedMB
+            // ("not applicable in the concurrent execution environment"). Require only
+            // durationMs and append whatever else is present, so the report still yields
+            // a REPORT line instead of being dropped as "missing required fields".
+            DeploymentContext::Lmi => {
+                let mut line = format!("REPORT RequestId: {}\tDuration: {:.2} ms", request_id, duration_ms);
+                if let Some(billed_duration_ms) = metrics.get("billedDurationMs").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tBilled Duration: {} ms", billed_duration_ms));
+                }
+                if let Some(memory_size_mb) = metrics.get("memorySizeMB").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tMemory Size: {} MB", memory_size_mb));
+                }
+                if let Some(max_memory_used_mb) = metrics.get("maxMemoryUsedMB").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tMax Memory Used: {} MB", max_memory_used_mb));
+                }
+                line.push_str(&init_duration_part);
+                Some(line)
+            }
+        }
     }
 
    
