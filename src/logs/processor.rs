@@ -828,7 +828,7 @@ impl LogProcessor {
                 let context = match self.invocation_context.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
-                        warn!("Invocation context mutex poisoned — dropping log record");
+                        error!("Invocation context mutex poisoned — dropping log record");
                         return;
                     }
                 };
@@ -1219,7 +1219,7 @@ impl LogProcessor {
                         }
                         Err((e, returned_logs)) => {
                             if returned_logs.is_empty() {
-                                warn!("Invocation retry: non-retryable error, {} logs permanently dropped (origin req: {}): {}", chunk.len(), origin_req, e);
+                                error!("Invocation retry: non-retryable error, {} logs permanently dropped (origin req: {}): {}", chunk.len(), origin_req, e);
                             } else {
                                 warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
                                 for entry in chunk {
@@ -1866,7 +1866,7 @@ impl LogProcessor {
                     if failed_logs.is_empty() {
                         error!("Log batch send failed ({} logs), non-retryable — logs dropped: {}", chunk_len, e);
                     } else {
-                        error!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
+                        warn!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
                         for log_message in failed_logs {
                             let entry = FailedLogEntry {
                                 log_type: Self::log_type_from_message(&log_message),

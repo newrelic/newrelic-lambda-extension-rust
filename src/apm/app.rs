@@ -403,7 +403,7 @@ impl ApmApp {
             Ok(()) => Ok(()),
             // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
             Err(e) if e.is_permanent() => {
-                warn!("Platform metrics dropped (permanent): {}", e);
+                error!("Platform metrics dropped (permanent): {}", e);
                 Ok(())
             }
             // Transient/network failures: buffer for retry on a later invoke / at shutdown.

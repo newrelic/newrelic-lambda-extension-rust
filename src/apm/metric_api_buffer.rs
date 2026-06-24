@@ -132,7 +132,7 @@ pub async fn retry_buffered_metric_api(client: &reqwest::Client, license_key: &s
             }
             Err(e) if e.is_permanent() => {
                 still_failed += 1;
-                warn!("Dropping platform metrics after permanent error on retry: {}", e);
+                error!("Dropping platform metrics after permanent error on retry: {}", e);
             }
             Err(e) => {
                 still_failed += 1;
