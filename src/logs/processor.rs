@@ -828,7 +828,7 @@ impl LogProcessor {
                 let context = match self.invocation_context.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
-                        warn!("Invocation context mutex poisoned — dropping log record");
+                        error!("Invocation context mutex poisoned — dropping log record");
                         return;
                     }
                 };

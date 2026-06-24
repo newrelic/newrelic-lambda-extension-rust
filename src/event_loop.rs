@@ -680,6 +680,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &license_key,
                 )
                 .await;
+                // Final attempt for failed agent payloads too (APM collector), so the
+                // drop count below reflects only what genuinely couldn't be delivered.
+                // Keeps FAILED_AGENT_PAYLOADS symmetric with the two buffers above.
+                retry_failed_agent_payloads(components.apm_app.clone()).await;
 
                 // Gather every request_id whose data is still un-delivered:
                 //  - agent payloads buffered while disconnected (the main bucket),
@@ -1324,6 +1328,7 @@ pub async fn process_apm_request(
         let global_log_processor_clone = global_log_processor.clone();
         let apm_app_clone = apm_app.clone();
         let agent_payloads_clone = agent_payloads.clone();
+        let invoked_function_arn_clone = invoked_function_arn.clone();
 
         Some(tokio::spawn(async move {
             let mut all_sent = true;
@@ -1336,20 +1341,18 @@ pub async fn process_apm_request(
                 )
                 .await;
 
-                match send_to_apm_collector(
+                // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
+                // (never silently dropped); the global retry loop resends it on a
+                // later invoke / at shutdown. Mirrors process_and_send_agent_payload.
+                if !send_agent_payload_or_buffer(
                     payload_bytes,
                     &request_id_clone,
+                    &invoked_function_arn_clone,
                     &apm_app_clone,
                 )
                 .await
                 {
-                    Ok(()) => {
-                        info!("APM mode: Agent payload sent successfully");
-                    }
-                    Err(e) => {
-                        error!("Failed to send agent payload to APM collector: {}", e);
-                        all_sent = false;
-                    }
+                    all_sent = false;
                 }
             }
             (all_sent, agent_payloads_clone)
@@ -1388,7 +1391,7 @@ pub async fn process_apm_request(
             match handle.await {
                 Ok((success, payloads)) => {
                     if !success && !payloads.is_empty() {
-                        debug!("Agent send completed with failures - payloads will be retried in next invocation");
+                        debug!("APM mode: agent send had failures — unsent payloads buffered for retry (next invoke / shutdown)");
                     }
                 }
                 Err(e) => {
@@ -1483,6 +1486,30 @@ async fn send_to_apm_collector(
         return Err("APM connection not ready yet - payload buffered for retry".into());
     }
     Ok(())
+}
+
+/// Send one agent payload to the APM collector; on failure buffer it into
+/// `FAILED_AGENT_PAYLOADS` so `retry_failed_agent_payloads` resends it on the
+/// next invoke / at shutdown. Returns `true` on success, `false` on a
+/// (now-buffered) failure. Mirrors `process_and_send_agent_payload` so the
+/// Flow-1 immediate-send path can never silently drop a payload.
+async fn send_agent_payload_or_buffer(
+    payload_bytes: &[u8],
+    request_id: &str,
+    invoked_function_arn: &str,
+    apm_app: &crate::apm::SharedApmApp,
+) -> bool {
+    match send_to_apm_collector(payload_bytes, request_id, apm_app).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!(
+                "APM mode: Agent payload send failed for {}, buffering for retry: {}",
+                request_id, e
+            );
+            buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
+            false
+        }
+    }
 }
 
 /// Wait for `platform.runtimeDone` for this request, then give a short grace for
@@ -2134,7 +2161,7 @@ async fn process_and_send_agent_payload(
                 info!("APM mode: Agent payload sent successfully for request: {}", request_id);
             }
             Err(e) => {
-                error!("APM mode: Failed to send agent payload to APM collector: {}", e);
+                warn!("APM mode: Failed to send agent payload to APM collector: {}", e);
                 buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
                 warn!(
                     "APM mode: Agent payload buffered for retry (size: {} bytes)",
@@ -2260,7 +2287,7 @@ fn build_shutdown_drop_log(diag: &ShutdownDropDiagnostic) -> crate::newrelic::pa
 }
 
 /// Buffer failed agent payload for retry across invocations
-fn buffer_failed_agent_payload(
+pub(crate) fn buffer_failed_agent_payload(
     payload_bytes: &[u8],
     request_id: &str,
     invoked_function_arn: &str,

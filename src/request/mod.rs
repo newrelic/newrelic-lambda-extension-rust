@@ -355,27 +355,42 @@ pub async fn cleanup_old_request_buffers(
         };
 
         if !payloads.is_empty() {
-            info!(
-                "Periodic cleanup: Sending {} stale agent payload(s) for request {} before removal",
-                payloads.len(),
-                request_id
-            );
+            if config.new_relic.apm_lambda_mode {
+                // APM mode MUST NOT touch the serverless ingest endpoint. Hand any
+                // stranded payloads to the APM retry buffer so the per-invoke retry
+                // loop (retry_failed_agent_payloads) resends them to the APM
+                // collector. Closes an APM->serverless leak edge.
+                info!(
+                    "Periodic cleanup (APM mode): re-queuing {} stale agent payload(s) for request {} to the APM retry buffer",
+                    payloads.len(),
+                    request_id
+                );
+                for payload_bytes in &payloads {
+                    crate::event_loop::buffer_failed_agent_payload(payload_bytes, request_id, &arn);
+                }
+            } else {
+                info!(
+                    "Periodic cleanup: Sending {} stale agent payload(s) for request {} before removal",
+                    payloads.len(),
+                    request_id
+                );
 
-            for payload_bytes in &payloads {
-                if let Err(e) = send_agent_payload_to_newrelic(
-                    payload_bytes,
-                    request_id,
-                    &arn,
-                    &newrelic_client,
-                    &config,
-                    None,
-                )
-                .await
-                {
-                    error!(
-                        "Periodic cleanup: Failed to send stale agent payload for {}: {}",
-                        request_id, e
-                    );
+                for payload_bytes in &payloads {
+                    if let Err(e) = send_agent_payload_to_newrelic(
+                        payload_bytes,
+                        request_id,
+                        &arn,
+                        &newrelic_client,
+                        &config,
+                        None,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Periodic cleanup: Failed to send stale agent payload for {}: {}",
+                            request_id, e
+                        );
+                    }
                 }
             }
         }
@@ -444,7 +459,7 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                     orphaned.len()
                 );
             } else {
-                warn!("Failed to lock orphaned buffer - agent payload lost!");
+                error!("Failed to lock orphaned buffer - agent payload lost!");
             }
         }
     }
