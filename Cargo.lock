@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "newrelic-lambda-extension"
-version = "2.6.2"
+version = "2.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
