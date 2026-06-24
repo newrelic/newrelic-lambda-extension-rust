@@ -2365,7 +2365,7 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
             }
             Some(Err(e)) => {
                 retry_failed_count += 1;
-                error!("Failed to retry agent payload to APM collector: {}", e);
+                warn!("Failed to retry agent payload to APM collector: {}", e);
                 // Keep it buffered (capped) so it retries on the next invoke / reconnect.
                 if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
                     push_failed_payload_capped(&mut failed_payloads, failed_payload);

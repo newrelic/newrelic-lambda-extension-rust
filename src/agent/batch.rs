@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ExtensionConfig,
@@ -246,7 +246,7 @@ pub async fn send_batched_payloads_with_reports_only(
             clear_batch_with_reports(&batch_items);
         }
         Err(e) => {
-            error!(
+            warn!(
                 "Failed to send batched payloads with reports after all retries: {} - Keeping {} payloads in buffer for next attempt",
                 e,
                 batch_items.len()
