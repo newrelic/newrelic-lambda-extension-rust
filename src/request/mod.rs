@@ -211,6 +211,21 @@ pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
 pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
     Lazy::new(DashMap::new);
 
+/// Extract the per-record request id from a telemetry record body.
+///
+/// JSON `function`/`extension`/`platform.*` records carry `requestId` (schema
+/// >= `2022-12-13`); some runtimes emit `AWSRequestId`. Plain-text log records
+/// are a bare string and carry neither — those return `None` and are shipped
+/// uncorrelated rather than mis-attributed (LMI concurrency, NR-579360).
+pub fn record_request_id(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("requestId")
+        .or_else(|| record.get("AWSRequestId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 /// LMI: create a minimal RequestData slot driven by platform.start (no INVOKE in LMI).
 /// No-op if a full entry already exists (normal APM mode where INVOKE fires first).
 pub fn ensure_lmi_request_slot(request_id: &str) {

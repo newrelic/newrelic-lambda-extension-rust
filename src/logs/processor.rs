@@ -5,6 +5,7 @@
 use tracing::{debug, error, info, trace, warn};
 use crate::{
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     context::InvocationContext,
     newrelic::{client::NewRelicClient, flush::Flush, payload},
     telemetry::listener::TelemetryRecord,
@@ -576,33 +577,56 @@ impl LogProcessor {
     }
 
    
-    pub fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
-        if let Some(context) = self.invocation_context.safe_lock() {
-            // REQUEST_ID: Prefer TELEMETRY_CURRENT_REQUEST_ID over invocation context.
-            //
-            // WHY: The event loop updates invocation context immediately when GET /next returns
-            // with the NEW invoke, but telemetry API delivers function logs asynchronously.
-            // Late logs from request_A can arrive AFTER the context has been updated to request_B.
-            //
-            // platform.start always arrives BEFORE function logs for that request in the telemetry
-            // stream, so TELEMETRY_CURRENT_REQUEST_ID gives us the correct request_id association.
-            // Falls back to invocation context if telemetry tracking hasn't started yet.
-            let effective_request_id = crate::request::TELEMETRY_CURRENT_REQUEST_ID
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| context.request_id.clone());
+    /// Stamp the AWS request-id attributes (`lambda_request_id` + `faas.execution`)
+    /// onto a log. No-op for empty / `"unknown"` ids so an uncorrelated log ships
+    /// without a request id rather than with a placeholder.
+    fn stamp_request_id_attrs(log_message: &mut payload::LogMessage, request_id: &str) {
+        if request_id.is_empty() || request_id == "unknown" {
+            return;
+        }
+        let mut aws_attrs = serde_json::Map::new();
+        aws_attrs.insert(
+            ATTR_LAMBDA_REQUEST_ID.to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        log_message
+            .attributes
+            .insert(ATTR_AWS.to_string(), serde_json::Value::Object(aws_attrs));
+        log_message.attributes.insert(
+            ATTR_FAAS_EXECUTION.to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+    }
 
-            if !effective_request_id.is_empty() && effective_request_id != "unknown" {
-                let mut aws_attrs = serde_json::Map::new();
-                aws_attrs.insert(ATTR_LAMBDA_REQUEST_ID.to_string(),
-                    serde_json::Value::String(effective_request_id.clone()));
-                log_message.attributes.insert(ATTR_AWS.to_string(),
-                    serde_json::Value::Object(aws_attrs));
-                log_message.attributes.insert(ATTR_FAAS_EXECUTION.to_string(),
-                    serde_json::Value::String(effective_request_id));
-            }
+    pub fn apply_current_invocation_metadata(
+        &self,
+        mut log_message: payload::LogMessage,
+        per_record_request_id: Option<&str>,
+    ) -> payload::LogMessage {
+        if let Some(context) = self.invocation_context.safe_lock() {
+            // REQUEST_ID resolution is deployment-dependent (type-driven; LMI_SUPPORT.md §6).
+            //
+            // Normal Lambda: one invocation in flight at a time. The event loop updates the
+            // context on INVOKE, but telemetry logs arrive asynchronously, so a late log from
+            // request_A could otherwise be stamped with request_B. We prefer
+            // TELEMETRY_CURRENT_REQUEST_ID (set on platform.start) and fall back to the
+            // context. THIS BRANCH IS UNCHANGED — `per_record_request_id` is ignored.
+            //
+            // LMI: invocations run concurrently and there is NO INVOKE, so any process-wide
+            // "current request" is wrong. Correlate strictly by the requestId carried on THIS
+            // record; if the record has none (plain-text logs), ship uncorrelated rather than
+            // mis-stamp. See NR-579360.
+            let effective_request_id = match self.config.deployment {
+                DeploymentContext::Lmi => per_record_request_id.unwrap_or("").to_string(),
+                DeploymentContext::Normal { .. } => crate::request::TELEMETRY_CURRENT_REQUEST_ID
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| context.request_id.clone()),
+            };
+
+            Self::stamp_request_id_attrs(&mut log_message, &effective_request_id);
 
             // Always use best available ARN (prefer invoked_function_arn, fallback to global context ARN)
             let arn = if !context.invoked_function_arn.is_empty() {
@@ -693,7 +717,26 @@ impl LogProcessor {
         };
         let message_str = message_owned.as_str();
 
-        if let Some(log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+        if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+            // Per-record request id (JSON logs >= 2022-12-13 carry `requestId`; some runtimes
+            // use `AWSRequestId`). Plain-text logs carry neither → None → shipped uncorrelated.
+            let per_record_request_id = crate::request::record_request_id(&record.record);
+
+            // LMI: stamp the request id NOW, before any buffering. Under LMI the global
+            // invocation context is never populated (no INVOKE), so logs flow through
+            // pre_invoke_buffer and never reach the apply_current_invocation_metadata call
+            // below — stamping here ensures the correct per-record id ships with the log.
+            // Normal Lambda is untouched (this arm is a no-op; Normal still stamps at the
+            // apply_current_invocation_metadata call site as before).
+            match self.config.deployment {
+                DeploymentContext::Lmi => {
+                    if let Some(ref rid) = per_record_request_id {
+                        Self::stamp_request_id_attrs(&mut log_message, rid);
+                    }
+                }
+                DeploymentContext::Normal { .. } => {}
+            }
+
             // Read context ONCE — avoids 4 separate mutex lock/unlock cycles per record.
             let (has_arn, has_valid_request_id, ctx_request_id, ctx_arn) = {
                 let context = match self.invocation_context.lock() {
@@ -717,12 +760,21 @@ impl LogProcessor {
                 return;
             }
 
+            // request_id_buffer holds a log until the INVOKE-populated context gains a
+            // request_id. Under LMI there is no INVOKE, so this hold would never drain — and
+            // the per-record id was already stamped above. Park only on Normal Lambda; under
+            // LMI fall through so the (already-stamped, possibly-uncorrelated) log ships.
             if !has_valid_request_id {
-                let mut request_buffer = self.request_id_buffer.lock().unwrap();
-                request_buffer.push(log_message);
-                return;
+                match self.config.deployment {
+                    DeploymentContext::Normal { .. } => {
+                        let mut request_buffer = self.request_id_buffer.lock().unwrap();
+                        request_buffer.push(log_message);
+                        return;
+                    }
+                    DeploymentContext::Lmi => {}
+                }
             }
-            
+
             // Check if we're actually in APM mode (both outer and inner Option must be Some)
             let is_apm_mode = self.apm_app.as_ref().and_then(|apm_arc| {
                 apm_arc.try_read().ok().and_then(|guard| {
@@ -745,7 +797,15 @@ impl LogProcessor {
                 let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
                     .replace('\n', "\\n").replace('\r', "\\r");
 
-                let (request_id, function_arn) = (ctx_request_id.clone(), ctx_arn.clone());
+                // Attribute the synthesized error to the owning request. On LMI the context
+                // request_id is empty (no INVOKE), so use the per-record id; Normal is unchanged.
+                let (request_id, function_arn) = match self.config.deployment {
+                    DeploymentContext::Lmi => (
+                        per_record_request_id.clone().unwrap_or_default(),
+                        ctx_arn.clone(),
+                    ),
+                    DeploymentContext::Normal { .. } => (ctx_request_id.clone(), ctx_arn.clone()),
+                };
 
                 // Store error details for potential platform fault correlation
                 let error_type = if message_str.contains("Task timed out") {
@@ -830,7 +890,7 @@ impl LogProcessor {
                 }
             }
     
-            let log_message = self.apply_current_invocation_metadata(log_message);
+            let log_message = self.apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
     
             if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
                 (&self.trace_extraction_state, &self.buffered_logs) {
