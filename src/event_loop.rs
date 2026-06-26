@@ -259,6 +259,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let account_id = components.config.aws.account_id.clone();
                         let region = components.config.aws.region.clone();
                         let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
+                        // Copy out before the move closure (don't borrow `components`).
+                        let deployment = components.config.deployment;
 
                         tokio::spawn(async move {
                             let _guard = ReconnectGuard(reconnect_flag);
@@ -274,6 +276,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 account_id,
                                 region,
                                 timeout_secs,
+                                deployment,
                             )
                             .await
                             {
@@ -533,6 +536,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             components.config.aws.region.clone(),
                             // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
                             components.config.new_relic.apm_handshake_timeout_secs.min(2),
+                            components.config.deployment,
                         )
                         .await;
 
@@ -2232,6 +2236,7 @@ mod tests {
             license_key: "test-license-key".to_string(),
             metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
             client: reqwest::Client::new(),
+            deployment: crate::config::deployment::DeploymentContext::Lmi,
         }
     }
 

@@ -18,6 +18,7 @@ use crate::{
     context::InvocationContext,
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     newrelic::client::NewRelicClient,
     agent::payload::send_agent_payload_to_newrelic,
 };
@@ -440,10 +441,25 @@ pub async fn cleanup_old_request_buffers(
     }
 }
 
-/// Route agent payload to the currently active request's buffer
-/// Agent payloads come from named pipe without request_id, so we route to the active request
-/// This is the same logic as 2.4.1 which worked correctly
-pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
+/// Route an agent payload (which arrives on the named pipe without a request id) into a
+/// per-request buffer. **Type-driven on `DeploymentContext`** so Normal Lambda and LMI
+/// never share a code path:
+///
+/// - **Normal** — unchanged 2.4.1 behavior: route to the process-global
+///   `CURRENT_ACTIVE_REQUEST_ID` (one invocation at a time, so it's correct there).
+/// - **LMI** — concurrent invocations share one environment, so the global is racy.
+///   Instead, attribute each payload by the `aws.requestId` the agent **embedded inside
+///   it** (NR-579361). The LMI path never reads `CURRENT_ACTIVE_REQUEST_ID`.
+pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>, deployment: DeploymentContext) {
+    match deployment {
+        DeploymentContext::Normal { .. } => route_payload_to_active_request(payload_bytes),
+        DeploymentContext::Lmi => route_payload_by_embedded_request_id(payload_bytes),
+    }
+}
+
+/// Normal Lambda routing (verbatim 2.4.1 logic): one invocation runs at a time, so the
+/// process-global `CURRENT_ACTIVE_REQUEST_ID` correctly names the owning request.
+fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
     use tracing::{debug, error, info, warn};
 
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
@@ -501,6 +517,54 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                 );
             } else {
                 warn!("Failed to lock orphaned buffer - agent payload lost!");
+            }
+        }
+    }
+}
+
+/// LMI routing: attribute the payload by the `aws.requestId` the agent embedded in it,
+/// independent of any "current request" global. Concurrent invocations therefore never
+/// cross-attribute. `ensure_lmi_request_slot` creates the slot if the payload beat its
+/// `platform.start` to the pipe (cold-start race). Payloads with no transaction id
+/// (metrics-only / log-only harvest — nothing to mis-attribute) are parked in the
+/// orphaned buffer and drained into the next slot; the global is never consulted.
+fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
+    use tracing::{debug, error, warn};
+
+    match crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes) {
+        Some(request_id) => {
+            ensure_lmi_request_slot(&request_id);
+            if let Some(entry) = REQUEST_DATA.get(&request_id) {
+                match entry.agent_buffer.lock() {
+                    Ok(mut buffer) => {
+                        buffer.push(payload_bytes);
+                        debug!(
+                            "LMI: routed agent payload to its own request {} (buffer size: {})",
+                            request_id,
+                            buffer.len()
+                        );
+                    }
+                    Err(e) => error!(
+                        "LMI: failed to lock buffer for {}: {} - payload lost!",
+                        request_id, e
+                    ),
+                }
+            } else {
+                error!(
+                    "LMI: request slot missing for {} after ensure - payload lost!",
+                    request_id
+                );
+            }
+        }
+        None => {
+            if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+                orphaned.push(payload_bytes);
+                debug!(
+                    "LMI: agent payload without transaction requestId parked in orphaned buffer (size: {})",
+                    orphaned.len()
+                );
+            } else {
+                warn!("LMI: failed to lock orphaned buffer - agent payload lost!");
             }
         }
     }

@@ -444,7 +444,7 @@ async fn perform_one_time_initialization(
         extension_id
     );
 
-    start_agent_payload_collector_background_task(agent_telemetry_rx);
+    start_agent_payload_collector_background_task(agent_telemetry_rx, config.deployment);
 
     cleanup_old_failed_payloads();
 
@@ -512,6 +512,9 @@ async fn perform_one_time_initialization(
             let flag_clone = reconnect_in_flight.clone();
             let apm_app_clone = Arc::clone(&apm_app);
             let apm_client_clone = apm_client.clone();
+            // DeploymentContext is Copy — capture it before the move closure so we don't
+            // move/borrow `config` (still used after the spawn).
+            let deployment = config.deployment;
             tokio::spawn(async move {
                 debug!("Background APM connection started...");
                 match apm::ApmApp::new(
@@ -525,6 +528,7 @@ async fn perform_one_time_initialization(
                     account_id,
                     region,
                     handshake_timeout,
+                    deployment,
                 )
                 .await
                 {
@@ -775,12 +779,20 @@ async fn initialize_agent_telemetry_ipc_channel(
 }
 
 /// Start agent payload collector as background task with request handling
-fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Receiver<Vec<u8>>) {
-    start_concurrent_agent_payload_collector(agent_telemetry_rx);
+fn start_agent_payload_collector_background_task(
+    agent_telemetry_rx: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
+    start_concurrent_agent_payload_collector(agent_telemetry_rx, deployment);
 }
 
-/// Channel-based agent payload collector with immediate processing and notification
-fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
+/// Channel-based agent payload collector with immediate processing and notification.
+/// `deployment` (Copy) selects the routing strategy: Normal uses the active-request global,
+/// LMI routes each payload by its own embedded `aws.requestId` (NR-579361).
+fn start_concurrent_agent_payload_collector(
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
     tokio::spawn(async move {
         debug!("Agent payload collector started - continuously listening for agent payloads");
         let mut payload_count = 0;
@@ -801,8 +813,9 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 debug!("Agent Payload (complete): {}", sanitized);
             }
 
-            // Route to currently active request using 2.4.1 approach (simple and reliable)
-            request::route_payload_to_request_buffer(payload_bytes).await;
+            // Route per deployment context: Normal → active-request global (2.4.1);
+            // LMI → the payload's own embedded aws.requestId (NR-579361, race-free).
+            request::route_payload_to_request_buffer(payload_bytes, deployment).await;
         }
 
         debug!("Agent payload collector channel closed. No more agent payloads will be received");

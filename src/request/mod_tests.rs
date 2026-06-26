@@ -18,6 +18,12 @@ mod tests {
 
     use crate::request::*;
     use crate::context::InvocationContext;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+
+    /// Normal-Lambda context for routing tests (mode is irrelevant to routing).
+    const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Serverless };
+    /// LMI context — routes agent payloads by their embedded aws.requestId.
+    const LMI: DeploymentContext = DeploymentContext::Lmi;
 
     /// Helper: clear all global request state between tests
     fn clear_request_state() {
@@ -203,7 +209,7 @@ mod tests {
             *active = Some("req-1".to_string());
         }
 
-        route_payload_to_request_buffer(vec![10, 20, 30]).await;
+        route_payload_to_request_buffer(vec![10, 20, 30], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -230,7 +236,7 @@ mod tests {
                 invoked_function_arn: String::new(),
         });
 
-        route_payload_to_request_buffer(vec![99]).await;
+        route_payload_to_request_buffer(vec![99], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -247,13 +253,139 @@ mod tests {
         clear_request_state();
 
         // No active request, no buffers → orphaned
-        route_payload_to_request_buffer(vec![42]).await;
+        route_payload_to_request_buffer(vec![42], NORMAL).await;
 
         {
             let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
             assert_eq!(orphaned.len(), 1);
             assert_eq!(orphaned[0], vec![42]);
         }
+
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // NR-579361: LMI routes agent payloads by their OWN embedded aws.requestId
+    // (never the racy CURRENT_ACTIVE_REQUEST_ID global). Normal stays unchanged.
+    // ========================================================================
+
+    /// Build a v2 wire agent payload carrying a Transaction event with `aws.requestId`.
+    /// `None` → an id-less, metrics-only harvest (no transaction event).
+    fn lmi_wire_payload(request_id: Option<&str>) -> Vec<u8> {
+        use base64::Engine as _;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let data = match request_id {
+            Some(rid) => serde_json::json!({
+                "analytic_event_data": [null, { "reservoir_size": 10 },
+                    [ [ { "type": "Transaction" }, {}, { "aws.requestId": rid } ] ]]
+            }),
+            None => serde_json::json!({
+                "metric_data": [null, [["Custom/x", [1, 2.0, 2.0, 2.0, 2.0, 4.0]]]]
+            }),
+        };
+        let json_bytes = serde_json::to_vec(&data).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{}"]"#, encoded).into_bytes()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_routes_by_embedded_request_id_ignoring_global() {
+        clear_request_state();
+
+        // Global points at the WRONG request (the racy concurrency case).
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // Payload self-identifies as req-A.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
+
+        // It landed in req-A's slot (auto-created), NOT the global's req-B.
+        let a_len = get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0);
+        assert_eq!(a_len, 1, "payload must be attributed to its own request req-A");
+        assert!(
+            REQUEST_DATA.get("req-B").is_none(),
+            "the CURRENT_ACTIVE_REQUEST_ID global must not be used under LMI"
+        );
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_interleaved_requests_no_cross_contamination() {
+        clear_request_state();
+
+        // Two concurrent invocations' payloads arrive interleaved.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-C")), LMI).await;
+
+        assert_eq!(get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+        assert_eq!(get_agent_buffer("req-C").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_idless_payload_parks_in_orphaned_without_global() {
+        clear_request_state();
+
+        // Even with the global set, an id-less harvest must NOT consult it.
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-Z".to_string());
+        }
+
+        route_payload_to_request_buffer(lmi_wire_payload(None), LMI).await;
+
+        {
+            let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
+            assert_eq!(orphaned.len(), 1, "id-less harvest is parked in the orphaned buffer");
+        }
+        assert!(
+            REQUEST_DATA.get("req-Z").is_none(),
+            "LMI must not route id-less payloads via the global"
+        );
+
+        clear_request_state();
+    }
+
+    /// Normal-Lambda regression: the embedded id is IGNORED; routing uses the active global.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_ignores_embedded_id_uses_active_global() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-B".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // Payload embeds req-A, but NORMAL routes by the active global (req-B).
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
+
+        assert_eq!(buffer.lock().unwrap().len(), 1, "Normal routes to active req-B");
+        assert!(
+            REQUEST_DATA.get("req-A").is_none(),
+            "Normal must not parse or route by the embedded id"
+        );
 
         clear_request_state();
     }
@@ -600,7 +732,7 @@ mod tests {
         }
 
         // Late payload should fall back to any existing buffer
-        route_payload_to_request_buffer(vec![88]).await;
+        route_payload_to_request_buffer(vec![88], NORMAL).await;
 
         // Should be in req-old's buffer (fallback to any existing buffer)
         let stored = get_agent_buffer("req-old")

@@ -149,6 +149,40 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     map
 }
 
+/// Extract the Lambda invocation request id (`aws.requestId`) the agent embedded in the
+/// transaction analytic event of an agent payload.
+///
+/// Under LMI we route agent payloads by this **self-describing** id instead of a
+/// process-global "current request", so concurrent invocations never cross-attribute
+/// (NR-579361). We read **only** `analytic_event_data` (transaction analytic events);
+/// we deliberately never look at `span_event_data`, whose external/AWS-SDK spans carry
+/// their own unrelated `aws.requestId`.
+///
+/// `analytic_event_data = [ harvest_meta_or_null, { reservoir }, [ EVENT, … ] ]` where
+/// `EVENT = [ intrinsics, userAttributes, agentAttributes ]`; `aws.requestId` lives in
+/// `agentAttributes` (the 3rd tuple element). Every level is guarded — returns `None`
+/// on any shape mismatch (Zero-Panic).
+pub fn extract_transaction_request_id(data_map: &HashMap<String, Vec<Value>>) -> Option<String> {
+    let events = data_map.get("analytic_event_data")?.get(2)?.as_array()?;
+    events.iter().find_map(|event| {
+        event
+            .as_array()?
+            .get(2)
+            .and_then(|agent_attributes| agent_attributes.get("aws.requestId"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+/// Parse a raw wire agent payload and extract its embedded transaction `aws.requestId`.
+/// Returns `None` on any parse failure or when no transaction event carries the id
+/// (e.g. metrics-only / log-only harvest). Reuses [`parse_agent_payload`].
+pub fn extract_request_id_from_payload_bytes(payload_bytes: &[u8]) -> Option<String> {
+    let (data_map, _version) = parse_agent_payload(payload_bytes).ok()?;
+    extract_transaction_request_id(&data_map)
+}
+
 /// Implement Deserialize for LambdaData manually to handle flexible field names
 /// Supports both snake_case and camelCase field names for compatibility
 impl<'de> serde::Deserialize<'de> for LambdaData {
@@ -186,6 +220,7 @@ mod tests {
     use super::*;
     use flate2::write::GzEncoder;
     use flate2::Compression;
+    use serde_json::json;
     use std::io::Write;
 
     fn create_test_payload(version: &str) -> Vec<u8> {
@@ -224,5 +259,107 @@ mod tests {
         assert_eq!(version, 1);
         assert!(data_map.contains_key("metric_data"));
         assert!(data_map.contains_key("span_event_data"));
+    }
+
+    // ------------------------------------------------------------------
+    // NR-579361: extract_transaction_request_id / *_from_payload_bytes
+    // ------------------------------------------------------------------
+
+    /// Build a data_map whose `analytic_event_data` holds the given events array.
+    fn data_map_with_analytic(events: Value) -> HashMap<String, Vec<Value>> {
+        let mut m = HashMap::new();
+        m.insert(
+            "analytic_event_data".to_string(),
+            vec![Value::Null, json!({ "reservoir_size": 10, "events_seen": 1 }), events],
+        );
+        m
+    }
+
+    /// A v2 wire payload carrying a single Transaction event with `aws.requestId`,
+    /// plus an external span carrying a DIFFERENT id (the trap we must not read).
+    fn wire_payload_with_ids(txn_request_id: Option<&str>, span_request_id: &str) -> Vec<u8> {
+        let data = match txn_request_id {
+            Some(rid) => json!({
+                "analytic_event_data": [null, { "reservoir_size": 10 },
+                    [ [ { "type": "Transaction" }, {}, { "aws.requestId": rid } ] ]],
+                "span_event_data": [null, { "reservoir_size": 10 },
+                    [ [ { "type": "Span", "name": "External/secretsmanager" }, {},
+                        { "aws.requestId": span_request_id } ] ]],
+            }),
+            // Id-less harvest: metrics only, no transaction.
+            None => json!({ "metric_data": [null, [["Custom/x", [1, 2.0, 2.0, 2.0, 2.0, 4.0]]]] }),
+        };
+        let json_bytes = serde_json::to_vec(&data).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{}"]"#, encoded).into_bytes()
+    }
+
+    #[test]
+    fn extract_returns_transaction_request_id() {
+        let m = data_map_with_analytic(json!([
+            [ { "type": "Transaction" }, {}, { "aws.requestId": "req-A" } ]
+        ]));
+        assert_eq!(extract_transaction_request_id(&m), Some("req-A".to_string()));
+    }
+
+    #[test]
+    fn extract_returns_first_when_multiple_transactions() {
+        let m = data_map_with_analytic(json!([
+            [ { "type": "Transaction" }, {}, { "aws.requestId": "req-1" } ],
+            [ { "type": "Transaction" }, {}, { "aws.requestId": "req-2" } ]
+        ]));
+        assert_eq!(extract_transaction_request_id(&m), Some("req-1".to_string()));
+    }
+
+    #[test]
+    fn extract_none_when_no_analytic_event_data() {
+        // metrics-only harvest → no analytic_event_data key
+        let mut m = HashMap::new();
+        m.insert("metric_data".to_string(), vec![json!([1, 2, 3])]);
+        assert_eq!(extract_transaction_request_id(&m), None);
+    }
+
+    #[test]
+    fn extract_ignores_empty_request_id() {
+        let m = data_map_with_analytic(json!([
+            [ { "type": "Transaction" }, {}, { "aws.requestId": "" } ]
+        ]));
+        assert_eq!(extract_transaction_request_id(&m), None);
+    }
+
+    #[test]
+    fn extract_no_panic_on_malformed_shapes() {
+        // events element is not an array
+        let m = data_map_with_analytic(json!(["not-an-array", 42]));
+        assert_eq!(extract_transaction_request_id(&m), None);
+        // analytic_event_data missing the events slot entirely
+        let mut short = HashMap::new();
+        short.insert("analytic_event_data".to_string(), vec![Value::Null]);
+        assert_eq!(extract_transaction_request_id(&short), None);
+    }
+
+    #[test]
+    fn extract_from_bytes_reads_transaction_not_span() {
+        // Transaction id is req-A; the external span carries 3e8a... — must pick req-A.
+        let payload = wire_payload_with_ids(Some("req-A"), "3e8a166c-span-id");
+        assert_eq!(
+            extract_request_id_from_payload_bytes(&payload),
+            Some("req-A".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_from_bytes_none_for_idless_harvest() {
+        let payload = wire_payload_with_ids(None, "");
+        assert_eq!(extract_request_id_from_payload_bytes(&payload), None);
+    }
+
+    #[test]
+    fn extract_from_bytes_none_for_garbage() {
+        assert_eq!(extract_request_id_from_payload_bytes(b"not a payload"), None);
+        assert_eq!(extract_request_id_from_payload_bytes(b""), None);
     }
 }
