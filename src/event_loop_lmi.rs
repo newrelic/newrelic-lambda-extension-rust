@@ -31,6 +31,7 @@
 //! `perform_one_time_initialization` sets up — both run as background tasks
 //! and are mode-agnostic. The LMI loop never touches them directly.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -54,14 +55,27 @@ use crate::{
 /// exit before AWS terminates us mid-flight.
 const LMI_SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
-/// Cloneable handles for the LMI flush path. All `Arc`, so the heartbeat task
-/// can own its own copy without borrowing the event loop's `&mut components`.
+/// After this many failed retries an agent payload is dropped to bound memory.
+/// Higher than Normal Lambda's 5 to account for the longer LMI lifetime (~14 days).
+const LMI_AGENT_RETRY_MAX: usize = 10;
+
+/// Cloneable handles for the LMI flush path. All fields are either `Arc` or
+/// cheaply-clonable (`reqwest::Client` is internally `Arc`-wrapped), so the
+/// heartbeat task can own its own copy without borrowing `&mut components`.
 #[derive(Clone)]
 struct LmiFlushHandles {
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
+    /// Lambda runtime client — talks to localhost Extensions API only (`no_proxy()`).
+    /// Used for `/event/next`. Do NOT use for outbound APM collector calls.
     client: Arc<Client>,
+    /// Proxy-aware outbound client with correct timeout for NR APM collector calls.
+    /// Built by `build_outbound_client(proxy_url)`. Cloned from `ExtensionComponents`.
+    apm_client: Client,
+    /// Prevents concurrent reconnect spawns. Set to `true` when a reconnect task is
+    /// in flight; cleared by `LmiReconnectGuard` on task exit (success or failure).
+    reconnect_in_flight: Arc<AtomicBool>,
 }
 
 impl LmiFlushHandles {
@@ -71,7 +85,18 @@ impl LmiFlushHandles {
             global_log_processor: Arc::clone(&c.global_log_processor),
             apm_app: Arc::clone(&c.apm_app),
             client: Arc::clone(&c.client),
+            apm_client: c.apm_client.clone(),
+            reconnect_in_flight: Arc::new(AtomicBool::new(false)),
         }
+    }
+}
+
+/// Drop guard that clears `reconnect_in_flight` on any exit path (success, error, or panic).
+struct LmiReconnectGuard(Arc<AtomicBool>);
+
+impl Drop for LmiReconnectGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -86,8 +111,101 @@ impl LmiFlushHandles {
 /// flush (pre-invoke buffer + `flush_on_shutdown`) on the final drain. When the
 /// buffers are empty these calls perform no network I/O, so idle ticks are
 /// effectively a no-op.
+///
+/// Also handles APM reconnect: if the collector signalled that the cached
+/// `run_id` is stale (401/409/410), the APM app is invalidated and a fresh
+/// handshake is spawned in the background using the proxy-aware `apm_client`.
+/// `FAILED_AGENT_PAYLOADS` are retried via the APM endpoint once connected.
 async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
     process_pending_agent_payloads(&h.config, &h.global_log_processor, &h.apm_app, "").await;
+
+    // Invalidate the cached APM session if the collector returned 401/409/410
+    // during a recent send. Under Normal Lambda this check happens at every INVOKE;
+    // under LMI there are no INVOKE events so we check here on every heartbeat tick.
+    if crate::apm::collector::take_reconnect_needed() {
+        let mut w = h.apm_app.write().await;
+        if w.is_some() {
+            *w = None;
+            warn!("LMI: APM run_id invalidated (collector restart/disconnect) — will reconnect on next tick");
+        }
+    }
+
+    // Spawn a fresh APM handshake if not connected and no reconnect is already in
+    // flight. Uses `compare_exchange` so only one heartbeat tick can claim the slot.
+    // The spawned task uses `apm_client` (proxy-aware, bounded timeout) — NOT the
+    // Lambda runtime client (localhost-only, no proxy, no timeout).
+    {
+        let is_connected = h.apm_app.read().await.is_some();
+        if !is_connected
+            && !crate::apm::connection::is_handshake_fatal()
+            && h.reconnect_in_flight
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let apm_app = Arc::clone(&h.apm_app);
+            let reconnect_flag = Arc::clone(&h.reconnect_in_flight);
+            let license_key = h.config.new_relic.license_key.clone().unwrap_or_default();
+            let apm_host = h.config.new_relic.apm_host.clone();
+            let metric_endpoint = h.config.new_relic.metric_endpoint.clone();
+            let apm_client = h.apm_client.clone();
+            let lambda_function_name = h.config.aws.function_name.clone();
+            let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| lambda_function_name.clone());
+            let function_version = h
+                .config
+                .aws
+                .function_version
+                .clone()
+                .unwrap_or_else(|| "$LATEST".to_string());
+            let account_id = h.config.aws.account_id.clone();
+            let region = h.config.aws.region.clone();
+            let timeout_secs = h.config.new_relic.apm_handshake_timeout_secs;
+            let deployment = h.config.deployment;
+
+            tokio::spawn(async move {
+                let _guard = LmiReconnectGuard(reconnect_flag);
+                debug!("LMI: APM reconnect attempt started");
+                match crate::apm::ApmApp::new(
+                    license_key,
+                    apm_host,
+                    metric_endpoint,
+                    apm_client,
+                    function_name,
+                    lambda_function_name,
+                    function_version,
+                    account_id,
+                    region,
+                    timeout_secs,
+                    deployment,
+                )
+                .await
+                {
+                    Ok(app) => {
+                        info!(
+                            "LMI: APM reconnect succeeded — Entity GUID: {}",
+                            app.get_entity_guid()
+                        );
+                        *apm_app.write().await = Some(app);
+                    }
+                    Err(e) => {
+                        if !crate::apm::connection::is_handshake_fatal() {
+                            warn!(
+                                "LMI: APM reconnect attempt failed: {} — will retry next heartbeat",
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Retry agent payloads that were buffered while the APM session was down
+    // (reconnect window). Uses the APM endpoint directly. If apm_app is still
+    // None (reconnect in progress) the payloads stay buffered until next tick.
+    retry_lmi_failed_agent_payloads(&h.apm_app).await;
 
     let license_key = h.config.new_relic.license_key.as_deref().unwrap_or("");
 
@@ -252,6 +370,117 @@ pub async fn execute_lmi_mode_event_loop(components: &mut ExtensionComponents) -
     event_counter
 }
 
+/// Retry agent payloads that failed while the APM session was unavailable (reconnect
+/// window). Drains `FAILED_AGENT_PAYLOADS` atomically so concurrent sends during
+/// processing don't get lost: any new items appended while we run are merged back in.
+///
+/// Uses `ApmApp::process_agent_payload` (APM collector endpoint) — correct for LMI.
+/// Normal Lambda's `retry_failed_agent_payloads` uses the serverless endpoint, which
+/// is wrong here. Payloads are dropped after `LMI_AGENT_RETRY_MAX` retries or 24h TTL.
+async fn retry_lmi_failed_agent_payloads(apm_app: &crate::apm::SharedApmApp) {
+    // Atomically drain the buffer so concurrent sends during our loop don't get lost.
+    let payloads = match crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(_) => {
+            error!("LMI: failed to lock FAILED_AGENT_PAYLOADS for retry");
+            return;
+        }
+    };
+
+    if payloads.is_empty() {
+        return;
+    }
+
+    let apm_guard = apm_app.read().await;
+    let app = match apm_guard.as_ref() {
+        Some(a) => a,
+        None => {
+            // Not connected yet — put payloads back; they will be retried once the
+            // reconnect spawned by flush_lmi_telemetry succeeds.
+            drop(apm_guard);
+            if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+                let mut restored = payloads;
+                restored.extend(guard.drain(..));
+                *guard = restored;
+            }
+            return;
+        }
+    };
+
+    debug!(
+        "LMI: retrying {} failed agent payload(s) via APM endpoint",
+        payloads.len()
+    );
+
+    let now = chrono::Utc::now();
+    let mut remaining: Vec<crate::event_loop::FailedAgentPayload> = Vec::new();
+    let mut succeeded = 0usize;
+    let mut dropped = 0usize;
+
+    for mut payload in payloads {
+        let age_hours = now
+            .signed_duration_since(payload.failed_at)
+            .num_hours();
+        if age_hours >= 24 {
+            warn!(
+                "LMI: dropping agent payload for request {} ({}h old, exceeds 24h TTL)",
+                payload.request_id, age_hours
+            );
+            dropped += 1;
+            continue;
+        }
+        if payload.retry_count >= LMI_AGENT_RETRY_MAX {
+            warn!(
+                "LMI: dropping agent payload for request {} after {} retries",
+                payload.request_id, payload.retry_count
+            );
+            dropped += 1;
+            continue;
+        }
+
+        match app
+            .process_agent_payload(payload.payload_bytes.clone(), &payload.request_id)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    "LMI: agent payload retry succeeded for request {} (attempt {})",
+                    payload.request_id,
+                    payload.retry_count + 1
+                );
+                succeeded += 1;
+            }
+            Err(e) => {
+                payload.retry_count += 1;
+                warn!(
+                    "LMI: agent payload retry failed for request {} (attempt {}): {}",
+                    payload.request_id, payload.retry_count, e
+                );
+                remaining.push(payload);
+            }
+        }
+    }
+
+    if succeeded > 0 || dropped > 0 {
+        debug!(
+            "LMI: agent payload retry: {} succeeded, {} dropped, {} re-queued",
+            succeeded,
+            dropped,
+            remaining.len()
+        );
+    }
+
+    // Merge re-queued items with any new failures that arrived during processing,
+    // then store back. Drop the read guard first to avoid holding it across the lock.
+    drop(apm_guard);
+    if !remaining.is_empty() {
+        if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            remaining.extend(guard.drain(..));
+            *guard = remaining;
+        }
+    }
+}
+
 /// Drain all pending telemetry within the SHUTDOWN budget.
 ///
 /// Subset of the APM-mode shutdown handler — skips the platform.report
@@ -299,5 +528,106 @@ async fn drain_on_shutdown_with_timeout(
             "LMI shutdown: drain timed out after {}ms — Lambda will terminate remaining work",
             LMI_SHUTDOWN_TIMEOUT_MS
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn clear_failed_agent_payloads() {
+        if let Ok(mut guard) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            guard.clear();
+        }
+    }
+
+    /// `LmiReconnectGuard` must clear the flag on drop regardless of exit path.
+    #[test]
+    fn lmi_reconnect_guard_clears_flag_on_drop() {
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _guard = LmiReconnectGuard(Arc::clone(&flag));
+            assert!(flag.load(Ordering::Acquire), "flag must still be true inside guard scope");
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "LmiReconnectGuard::drop must set flag to false"
+        );
+    }
+
+    /// `compare_exchange` must reject a second concurrent reconnect spawn.
+    #[test]
+    fn lmi_reconnect_in_flight_prevents_double_spawn() {
+        let flag = Arc::new(AtomicBool::new(false));
+
+        // First claim succeeds.
+        let first = flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        assert!(first.is_ok(), "first compare_exchange must succeed");
+
+        // Second claim must fail while flag is held.
+        let second = flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        assert!(second.is_err(), "second compare_exchange must fail while in-flight");
+
+        // After guard drops the flag, a new claim must succeed.
+        flag.store(false, Ordering::Release);
+        let third = flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire);
+        assert!(third.is_ok(), "compare_exchange must succeed after flag cleared");
+    }
+
+    /// When `apm_app` is `None` the payloads are restored to `FAILED_AGENT_PAYLOADS`
+    /// (LMI cannot send without a live APM session — wait for reconnect).
+    #[tokio::test]
+    #[serial]
+    async fn retry_lmi_failed_agent_payloads_restores_when_no_app() {
+        clear_failed_agent_payloads();
+
+        // Push a payload.
+        let payload = crate::event_loop::FailedAgentPayload {
+            payload_bytes: b"test-payload".to_vec(),
+            request_id: "req-001".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:fn".to_string(),
+            retry_count: 0,
+            failed_at: chrono::Utc::now(),
+        };
+        crate::event_loop::FAILED_AGENT_PAYLOADS
+            .lock()
+            .unwrap()
+            .push(payload);
+
+        // apm_app = None simulates a reconnect window.
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+        retry_lmi_failed_agent_payloads(&apm_app).await;
+
+        let remaining = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "payload must be restored when apm_app is None (wait for reconnect)"
+        );
+        assert_eq!(remaining[0].request_id, "req-001");
+
+        drop(remaining);
+        clear_failed_agent_payloads();
+    }
+
+    /// Empty buffer must be a no-op (no panic, no lock contention).
+    #[tokio::test]
+    #[serial]
+    async fn retry_lmi_failed_agent_payloads_no_op_when_empty() {
+        clear_failed_agent_payloads();
+
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+        // Should return immediately without error.
+        retry_lmi_failed_agent_payloads(&apm_app).await;
+
+        let count = crate::event_loop::FAILED_AGENT_PAYLOADS
+            .lock()
+            .unwrap()
+            .len();
+        assert_eq!(count, 0, "empty buffer must remain empty after no-op retry");
     }
 }
