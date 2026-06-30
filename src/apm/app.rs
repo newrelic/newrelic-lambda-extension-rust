@@ -15,6 +15,7 @@ use super::connection::{
 };
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
+use crate::config::deployment::DeploymentContext;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
@@ -30,6 +31,9 @@ pub struct ApmApp {
     pub license_key: String,
     pub metric_endpoint: String,
     pub client: Client,
+    /// Deployment context (detected once at startup). Drives type-driven LMI vs Normal
+    /// behavior in this app — e.g. strict vs lenient `platform.report` parsing.
+    pub deployment: DeploymentContext,
 }
 
 impl ApmApp {
@@ -44,6 +48,7 @@ impl ApmApp {
         account_id: Option<String>,
         region: Option<String>,
         timeout_secs: u64,
+        deployment: DeploymentContext,
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
@@ -73,6 +78,7 @@ impl ApmApp {
                 &account_id,
                 &region,
                 timeout_secs,
+                deployment,
             )
             .await
             {
@@ -118,6 +124,7 @@ impl ApmApp {
     }
 
     /// Attempt a single connection
+    #[allow(clippy::too_many_arguments)]
     async fn try_connect(
         license_key: &str,
         apm_host: &str,
@@ -129,6 +136,7 @@ impl ApmApp {
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
         timeout_secs: u64,
+        deployment: DeploymentContext,
     ) -> Result<ApmApp> {
         // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
@@ -216,6 +224,7 @@ impl ApmApp {
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
             client: client.clone(),
+            deployment,
         })
     }
 
@@ -357,7 +366,7 @@ impl ApmApp {
             return Ok(());
         }
 
-        let metrics_data = match parse_lambda_report_log(log_line) {
+        let metrics_data = match parse_lambda_report_log(log_line, self.deployment) {
             Some(data) => data,
             None => {
                 debug!("Not a REPORT log or parse failed");
@@ -803,6 +812,9 @@ mod tests {
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             client,
+            deployment: DeploymentContext::Normal {
+                mode: crate::config::deployment::TelemetryMode::Apm,
+            },
         };
 
         assert_eq!(app.run_id, "test_run_id");

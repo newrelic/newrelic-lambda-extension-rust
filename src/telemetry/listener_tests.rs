@@ -251,6 +251,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener should start");
@@ -270,6 +271,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -310,6 +312,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -342,6 +345,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -388,6 +392,7 @@ mod tests {
             log_processor,
             platform_processor,
             false, // standard mode
+            false,
         )
         .await
         .expect("listener");
@@ -449,6 +454,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -501,6 +507,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -534,6 +541,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -569,6 +577,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -599,6 +608,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -653,6 +663,7 @@ mod tests {
             log_processor,
             platform_processor,
             true, // APM mode
+            false,
         )
         .await
         .expect("listener");
@@ -715,6 +726,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -766,6 +778,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -796,6 +809,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -852,6 +866,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -922,6 +937,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -968,6 +984,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1011,6 +1028,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1049,6 +1067,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -1102,6 +1121,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1144,6 +1164,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -1188,7 +1209,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
             .await
             .expect("listener");
 
@@ -1232,7 +1253,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
             .await
             .expect("listener");
 
@@ -1278,7 +1299,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, false)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
             .await
             .expect("listener");
 
@@ -1321,7 +1342,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
             .await
             .expect("listener");
 
@@ -1376,7 +1397,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
             .await
             .expect("listener");
 
@@ -1406,6 +1427,115 @@ mod tests {
         assert_eq!(meta.instance_max_memory, Some(2147483648));
 
         clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    // ========================================================================
+    // LMI dual-mode invariant tests (per LMI_SUPPORT.md §5)
+    // ========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_report_returns_ok_without_apm_app() {
+        // LMI + APM mode: platform.report arrives, APM_APP is None (not yet connected).
+        // drain_lmi_request_on_report is gated on `if let Some(ref app)` so it is
+        // skipped; the report is stored for retry. Must complete with 200 and no panic.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_apm_mode=true, is_lmi=true
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": "lmi-report-no-app-001",
+                "metrics": {"durationMs": 45.0}
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "LMI platform.report must return 200 even without APM_APP");
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_start_creates_request_slot() {
+        // LMI + APM mode: platform.start must create a request slot so the per-report
+        // drain has somewhere to look for buffered agent payloads.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.start",
+            "record": {"requestId": "lmi-slot-req-001", "version": "$LATEST"}
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        // Verify the slot was created so drain_lmi_request_on_report can find the buffer.
+        assert!(
+            crate::request::get_agent_buffer("lmi-slot-req-001").is_some(),
+            "platform.start under LMI must create a request buffer slot"
+        );
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_lambda_platform_report_does_not_drain_on_report() {
+        // Normal Lambda (is_lmi=false, is_apm_mode=true): platform.report must NOT
+        // attempt the LMI drain path. APM_APP=None, so the report is simply stored.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_apm_mode=true, is_lmi=false — Normal Lambda APM
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": "normal-apm-report-001",
+                "metrics": {"durationMs": 100.0, "billedDurationMs": 100, "memorySizeMB": 128, "maxMemoryUsedMB": 64}
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "Normal Lambda APM platform.report must return 200");
+
         clear_telemetry_state();
     }
 }

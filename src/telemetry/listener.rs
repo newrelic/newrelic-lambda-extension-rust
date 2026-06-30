@@ -39,6 +39,7 @@ pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     is_apm_mode: bool,
+    is_lmi: bool,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
     let listener = TcpListener::bind(addr).await.map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
@@ -51,6 +52,7 @@ pub async fn setup_telemetry_listener(
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
                     let is_apm_mode_clone = is_apm_mode;
+                    let is_lmi_clone = is_lmi;
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -60,6 +62,7 @@ pub async fn setup_telemetry_listener(
                                 log_processor.clone(),
                                 platform_processor.clone(),
                                 is_apm_mode_clone,
+                                is_lmi_clone,
                             )
                         });
                         
@@ -88,6 +91,7 @@ async fn handle_telemetry_request(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     is_apm_mode: bool,
+    is_lmi: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -170,13 +174,20 @@ async fn handle_telemetry_request(
                                         let apm_app_read = crate::APM_APP.read().await;
                                         let current_arn = crate::get_global_fallback_arn();
                                         let send_failed = if let Some(ref app) = *apm_app_read {
-                                            if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn).await {
+                                            let failed = if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn).await {
                                                 warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id_str, e);
                                                 true
                                             } else {
                                                 debug!("APM mode: Sent platform.report metrics for request: {}", request_id_str);
                                                 false
+                                            };
+                                            // LMI: platform.runtimeDone never fires under LMI, so drain
+                                            // this request's agent buffer now that the invocation has
+                                            // ended. Also rebinds stale run_id failures to the live session.
+                                            if is_lmi {
+                                                drain_lmi_request_on_report(request_id_str, app).await;
                                             }
+                                            failed
                                         } else {
                                             warn!("APM mode: APM app not ready - storing report for retry");
                                             true
@@ -300,4 +311,50 @@ async fn handle_telemetry_request(
         .status(StatusCode::OK)
         .body(Full::new(Bytes::from("OK")))
         .unwrap())
+}
+
+/// Drain all buffered agent payloads for `request_id` and retry any previously-failed
+/// telemetry with the live `run_id`/`collector_host`.
+///
+/// Called on `platform.report` under LMI because `platform.runtimeDone` is never
+/// delivered in that context (AWS only sends `platform.report` + `SHUTDOWN`).
+/// Without this drain the per-request buffers stay full until the next heartbeat flush.
+///
+/// The caller must already hold a reference to `app` from `APM_APP.read()`.
+async fn drain_lmi_request_on_report(request_id: &str, app: &crate::apm::ApmApp) {
+    let payloads = match crate::request::get_agent_buffer(request_id) {
+        Some(buffer_arc) => match buffer_arc.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => {
+                warn!("LMI drain: failed to lock agent buffer for request {}", request_id);
+                return;
+            }
+        },
+        None => {
+            debug!("LMI drain: no agent buffer slot for request {}", request_id);
+            return;
+        }
+    };
+
+    if !payloads.is_empty() {
+        debug!("LMI drain: processing {} buffered payload(s) for request {}", payloads.len(), request_id);
+        for payload in payloads {
+            if let Err(e) = app.process_agent_payload(payload, request_id).await {
+                // Payload is now in FAILED_TELEMETRY_BUFFER; retry below will rebind it
+                // to the live run_id so it doesn't fail forever on a stale session.
+                warn!("LMI drain: payload send failed for request {}: {}", request_id, e);
+            }
+        }
+    }
+
+    // Rebind any previously-failed telemetry (from prior reconnects) to the
+    // current live run_id and collector_host so stale-session items don't sit
+    // in the buffer indefinitely.
+    crate::apm::telemetry_buffer::retry_buffered_telemetry(
+        &app.client,
+        &app.license_key,
+        Some(&app.run_id),
+        Some(&app.collector_host),
+    )
+    .await;
 }
