@@ -570,5 +570,15 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
     }
 }
 
+/// Clear all per-request global state. Only compiled in test builds.
+#[cfg(test)]
+pub fn clear_request_state_for_test() {
+    REQUEST_PROCESSORS.clear();
+    REQUEST_DATA.clear();
+    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() { g.clear(); }
+    if let Ok(mut g) = CURRENT_ACTIVE_REQUEST_ID.lock() { *g = None; }
+    if let Ok(mut g) = TELEMETRY_CURRENT_REQUEST_ID.lock() { *g = None; }
+}
+
 #[cfg(test)]
 mod mod_tests;

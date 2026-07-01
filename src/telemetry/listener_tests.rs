@@ -1538,4 +1538,100 @@ mod tests {
 
         clear_telemetry_state();
     }
+
+    /// LMI + APM: when a buffer slot has payloads and APM_APP is populated,
+    /// platform.report must drain (take) those payloads from the slot.
+    /// The payloads reach `process_agent_payload` which silently no-ops on
+    /// non-`[` bytes, so the slot ends up empty regardless of network.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_report_drains_agent_buffer_when_app_present() {
+        use reqwest::Client as ReqwestClient;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::request::{ensure_lmi_request_slot, get_agent_buffer};
+
+        clear_telemetry_state();
+        crate::request::clear_request_state_for_test();
+
+        let request_id = "lmi-drain-with-app-001";
+
+        // ── 1. Populate APM_APP with a fake app (unreachable host, short timeout) ──
+        {
+            let fake_app = crate::apm::ApmApp {
+                run_id: "drain-run-id".to_string(),
+                entity_guid: "drain-entity-guid".to_string(),
+                collector_host: "http://unreachable.invalid.test".to_string(),
+                license_key: "fake-license-for-drain-test".to_string(),
+                metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+                client: ReqwestClient::builder().timeout(Duration::from_millis(50)).build().unwrap_or_default(),
+                deployment: DeploymentContext::Lmi,
+            };
+            let mut guard = crate::APM_APP.write().await;
+            *guard = Some(fake_app);
+        }
+
+        // ── 2. Create LMI slot and pre-load sentinel bytes ──
+        ensure_lmi_request_slot(request_id);
+        if let Some(buf) = get_agent_buffer(request_id) {
+            let mut guard = buf.lock().unwrap();
+            guard.push(b"sentinel-payload-1".to_vec());
+            guard.push(b"sentinel-payload-2".to_vec());
+        }
+        assert_eq!(
+            get_agent_buffer(request_id).map(|b| b.lock().unwrap().len()).unwrap_or(0),
+            2,
+            "pre-condition: 2 payloads in buffer before report"
+        );
+
+        // ── 3. Start LMI listener and POST platform.report ──
+        // Use LMI deployment context so convert_platform_report_to_log_line
+        // accepts a stripped report (only durationMs required under LMI).
+        let mut cfg = ExtensionConfig::default();
+        cfg.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(cfg);
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let context = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            nr_client.clone(), config.clone(), context.clone(), None,
+        ));
+        let platform_processor = Arc::new(crate::platform::processor::PlatformProcessor::new(
+            nr_client, config, context, log_processor.clone(),
+        ));
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-07-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": request_id,
+                "metrics": {"durationMs": 55.5}
+            }
+        }]);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "LMI platform.report with APM_APP must return 200");
+
+        // ── 4. Buffer must now be drained (taken) ──
+        let remaining = get_agent_buffer(request_id)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(remaining, 0, "drain_lmi_request_on_report must empty the buffer slot");
+
+        // ── 5. Clean up APM_APP ──
+        {
+            let mut guard = crate::APM_APP.write().await;
+            *guard = None;
+        }
+        crate::request::clear_request_state_for_test();
+        clear_telemetry_state();
+    }
 }
