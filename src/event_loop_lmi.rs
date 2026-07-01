@@ -1032,4 +1032,380 @@ mod tests {
 
         clear_failed_agent_payloads();
     }
+
+    // ── LmiFlushHandles::from_components ─────────────────────────────────────
+
+    /// `from_components` must clone all shared Arcs and set `reconnect_in_flight = false`.
+    #[test]
+    fn from_components_initializes_correctly() {
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::context::InvocationContext;
+        use crate::request::ProcessorFactory;
+
+        let mut cfg = ExtensionConfig::default();
+        cfg.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(cfg);
+
+        let apm_app: crate::apm::SharedApmApp =
+            Arc::new(tokio::sync::RwLock::new(None));
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            None,
+        ));
+        let processor_factory = Arc::new(ProcessorFactory::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::clone(&apm_app),
+        ));
+
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+        let components = crate::event_loop::ExtensionComponents {
+            client: Arc::new(Client::new()),
+            extension_id: "test-ext-id".to_string(),
+            processor_factory,
+            newrelic_client: nr_client,
+            config: Arc::clone(&config),
+            global_log_processor: Arc::clone(&log_processor),
+            apm_app: Arc::clone(&apm_app),
+            apm_mode_enabled: true,
+            apm_client: Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap_or_default(),
+            reconnect_in_flight: Arc::new(cancel_tx),
+            deployment: DeploymentContext::Lmi,
+        };
+
+        let handles = LmiFlushHandles::from_components(&components);
+
+        assert!(
+            !handles.reconnect_in_flight.load(Ordering::Acquire),
+            "from_components must initialize reconnect_in_flight to false"
+        );
+        assert!(
+            Arc::ptr_eq(&handles.config, &config),
+            "from_components must clone the config Arc (pointer equality)"
+        );
+        assert!(
+            Arc::ptr_eq(&handles.apm_app, &apm_app),
+            "from_components must clone the apm_app Arc (pointer equality)"
+        );
+    }
+
+    // ── LAST_REQUEST_CONTEXT lifecycle ────────────────────────────────────────
+
+    /// LAST_REQUEST_CONTEXT is a global Mutex used by drain_on_shutdown_with_timeout.
+    /// Verify write, read, and clear behaviour.
+    #[test]
+    #[serial]
+    fn last_request_context_write_read_clear() {
+        let clear = || {
+            if let Ok(mut g) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+                *g = None;
+            }
+        };
+        clear();
+
+        // Write a value.
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-ctx-001".to_string(), "arn:test:fn".to_string()));
+        }
+
+        // Extract before asserting to avoid mutex poisoning on failure.
+        let value = crate::event_loop::LAST_REQUEST_CONTEXT
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            value,
+            Some(("req-ctx-001".to_string(), "arn:test:fn".to_string())),
+            "LAST_REQUEST_CONTEXT must return the written value"
+        );
+
+        // Clear and verify.
+        clear();
+        let cleared = crate::event_loop::LAST_REQUEST_CONTEXT
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(cleared, None, "LAST_REQUEST_CONTEXT must be None after clearing");
+    }
+
+    // ── drain_on_shutdown_with_timeout — helpers ──────────────────────────────
+
+    fn clear_last_request_context() {
+        if let Ok(mut g) = crate::event_loop::LAST_REQUEST_CONTEXT.lock() {
+            *g = None;
+        }
+    }
+
+    /// Build a minimal `ExtensionComponents` suitable for `drain_on_shutdown_with_timeout` tests.
+    /// Uses noop clients and an LMI deployment context.
+    fn build_test_extension_components(
+        apm_app: crate::apm::SharedApmApp,
+    ) -> crate::event_loop::ExtensionComponents {
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::context::InvocationContext;
+        use crate::request::ProcessorFactory;
+
+        let mut cfg = ExtensionConfig::default();
+        cfg.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(cfg);
+
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            None,
+        ));
+        let processor_factory = Arc::new(ProcessorFactory::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::clone(&apm_app),
+        ));
+        let (cancel_tx, _cancel_rx) = tokio::sync::watch::channel(false);
+
+        crate::event_loop::ExtensionComponents {
+            client: Arc::new(Client::new()),
+            extension_id: "test-ext-id".to_string(),
+            processor_factory,
+            newrelic_client: nr_client,
+            config,
+            global_log_processor: log_processor,
+            apm_app,
+            apm_mode_enabled: true,
+            apm_client: Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap_or_default(),
+            reconnect_in_flight: Arc::new(cancel_tx),
+            deployment: crate::config::deployment::DeploymentContext::Lmi,
+        }
+    }
+
+    // ── drain_on_shutdown_with_timeout — all 4 paths ──────────────────────────
+
+    /// Path A: `shutdown_reason = None` — skips error-event block, performs the final drain.
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_no_reason_completes() {
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        // Block reconnect spawn (no real network) via fatal-handshake gate.
+        crate::apm::connection::signal_handshake_fatal();
+
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+        let components = build_test_extension_components(apm_app);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_on_shutdown_with_timeout(&components, None),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(None) must complete within 2s");
+
+        crate::apm::connection::reset_handshake_fatal_for_test();
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path B: `shutdown_reason = Some(Timeout)` but `LAST_REQUEST_CONTEXT = None`
+    /// → "no last-request context" debug path — skips error event.
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_with_reason_no_context() {
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::signal_handshake_fatal();
+
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+        let components = build_test_extension_components(apm_app);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Timeout),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Timeout, no context) must complete within 2s");
+
+        crate::apm::connection::reset_handshake_fatal_for_test();
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path C: `shutdown_reason = Some`, `LAST_REQUEST_CONTEXT` populated, `apm_app = None`
+    /// → "APM app not connected — skipping shutdown error event" debug path.
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_with_reason_context_but_no_app() {
+        clear_failed_agent_payloads();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::signal_handshake_fatal();
+
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-shutdown-c".to_string(), "arn:test:fn".to_string()));
+        }
+
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+        let components = build_test_extension_components(apm_app);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Failure),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Failure, no app) must complete within 2s");
+
+        crate::apm::connection::reset_handshake_fatal_for_test();
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path D: `shutdown_reason = Some(Timeout)`, `LAST_REQUEST_CONTEXT` populated,
+    /// `apm_app = Some` → calls `send_error_for_shutdown_reason`. Network call to
+    /// unreachable host times out in 50 ms; the function must not panic or block.
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_with_reason_context_and_app_timeout_reason() {
+        clear_failed_agent_payloads();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::reset_handshake_fatal_for_test();
+
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-shutdown-d".to_string(), "arn:test:fn".to_string()));
+        }
+
+        // apm_app = Some, with unreachable host + 50ms timeout so network calls fail fast.
+        let fake_app = build_fake_apm_app();
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(fake_app)));
+        let components = build_test_extension_components(Arc::clone(&apm_app));
+
+        // Generous outer timeout — the fake client's 50ms network timeout is the bottleneck.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Timeout),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Timeout, with app) must complete within 3s");
+
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path D2: `shutdown_reason = Some(Failure)` — exercises the Failure arm of
+    /// `send_error_for_shutdown_reason` (distinct error class from Timeout).
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_with_reason_context_and_app_failure_reason() {
+        clear_failed_agent_payloads();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::reset_handshake_fatal_for_test();
+
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-shutdown-failure".to_string(), "arn:test:fn".to_string()));
+        }
+
+        let fake_app = build_fake_apm_app();
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(fake_app)));
+        let components = build_test_extension_components(Arc::clone(&apm_app));
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Failure),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Failure, with app) must complete within 3s");
+
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path D3: `shutdown_reason = Some(Spindown)` — `send_error_for_shutdown_reason`
+    /// must take the `Spindown` arm (no error event sent). Must complete promptly.
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_spindown_skips_error_event() {
+        clear_failed_agent_payloads();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::reset_handshake_fatal_for_test();
+
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-spindown".to_string(), "arn:test:fn".to_string()));
+        }
+
+        // Even with an app present, Spindown must NOT fire a network send.
+        let fake_app = build_fake_apm_app();
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(fake_app)));
+        let components = build_test_extension_components(Arc::clone(&apm_app));
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Spindown),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Spindown) must complete within 2s without sending");
+
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
+
+    /// Path D4: `shutdown_reason = Some(Unknown)` — exercises the Unknown arm of
+    /// `send_error_for_shutdown_reason` (generic shutdown error class).
+    #[tokio::test]
+    #[serial]
+    async fn drain_on_shutdown_with_reason_unknown() {
+        clear_failed_agent_payloads();
+        let _ = crate::apm::collector::take_reconnect_needed();
+        crate::apm::connection::reset_handshake_fatal_for_test();
+
+        {
+            let mut g = crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap();
+            *g = Some(("req-unknown-shutdown".to_string(), "arn:test:fn".to_string()));
+        }
+
+        let fake_app = build_fake_apm_app();
+        let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(fake_app)));
+        let components = build_test_extension_components(Arc::clone(&apm_app));
+
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            drain_on_shutdown_with_timeout(
+                &components,
+                Some(crate::runtime::ShutdownReason::Unknown),
+            ),
+        )
+        .await
+        .expect("drain_on_shutdown_with_timeout(Unknown, with app) must complete within 3s");
+
+        clear_failed_agent_payloads();
+        clear_last_request_context();
+    }
 }
