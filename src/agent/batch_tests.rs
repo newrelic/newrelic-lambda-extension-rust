@@ -487,7 +487,7 @@ mod tests {
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
 
         // Nothing in batch buffer or request buffers
-        send_all_pending_payloads_on_shutdown(newrelic_client, config).await;
+        send_all_pending_payloads_on_shutdown(newrelic_client, config, None).await;
 
         // Should complete without error
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);
@@ -507,7 +507,7 @@ mod tests {
         add_to_batch("req-1".into(), vec![1, 2, 3], Some("report".into()), "arn:test".into());
         add_to_batch("req-2".into(), vec![4, 5, 6], None, "arn:test".into());
 
-        send_all_pending_payloads_on_shutdown(newrelic_client, config).await;
+        send_all_pending_payloads_on_shutdown(newrelic_client, config, None).await;
 
         // Batch buffer should be cleared by get_and_clear_batch
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);
@@ -543,7 +543,7 @@ mod tests {
                 invoked_function_arn: String::new(),
         });
 
-        send_all_pending_payloads_on_shutdown(newrelic_client, config).await;
+        send_all_pending_payloads_on_shutdown(newrelic_client, config, None).await;
 
         // Batch buffer should be empty
         assert_eq!(AGENT_BATCH_BUFFER.len(), 0);

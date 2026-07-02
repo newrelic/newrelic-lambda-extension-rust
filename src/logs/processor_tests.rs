@@ -13,7 +13,7 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::{LogProcessor, LogType, FailedLogEntry, TraceIdExtractionState};
+    use super::super::{LogProcessor, LogType, FailedLogEntry, RequestTraceMap, RequestLogBuffer, MAX_TRACE_ID_MAP};
     use crate::newrelic::flush::Flush;
     use crate::config::ExtensionConfig;
     use crate::context::InvocationContext;
@@ -793,90 +793,106 @@ mod tests {
         }
     }
 
-    // Fix 1 — reset_trace_id_state rescues buffered logs into log_batch instead of dropping them.
+    // Helper: hold a log under a request_id in the per-request pending buffer.
+    fn hold_log(p: &LogProcessor, request_id: &str, msg: &str) {
+        let evicted = p
+            .pending_logs
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .push(request_id, make_log_msg(msg));
+        assert!(evicted.is_empty(), "test setup should not overflow the buffer");
+    }
+
+    // flush_pending_logs_unstamped routes still-held logs to log_batch (untagged).
     #[test]
-    fn test_reset_trace_id_state_rescues_buffered_logs() {
+    fn test_flush_pending_logs_unstamped_routes_to_batch() {
         let p = create_trace_processor();
+        hold_log(&p, "req-x", "log-a");
+        hold_log(&p, "req-x", "log-b");
 
-        // Manually push logs into buffered_logs (simulates logs received while waiting for trace ID)
-        {
-            let buffered = p.buffered_logs.as_ref().unwrap();
-            let mut guard = buffered.lock().unwrap();
-            guard.push(make_log_msg("log-a"));
-            guard.push(make_log_msg("log-b"));
-        }
-
-        // Sanity: batch is empty before rescue
         assert_eq!(p.log_batch.lock().unwrap().len(), 0);
 
-        p.reset_trace_id_state();
+        p.flush_pending_logs_unstamped();
 
-        // After reset, buffered_logs must be empty
-        let buffered_after = p.buffered_logs.as_ref().unwrap().lock().unwrap().len();
-        assert_eq!(buffered_after, 0, "buffered_logs must be drained by reset_trace_id_state");
-
-        // Rescued logs must appear in log_batch
+        assert_eq!(
+            p.pending_logs.as_ref().unwrap().lock().unwrap().total(),
+            0,
+            "pending buffer must be drained by flush_pending_logs_unstamped"
+        );
         let batch = p.log_batch.lock().unwrap();
-        assert_eq!(batch.len(), 2, "both rescued logs must be in log_batch");
+        assert_eq!(batch.len(), 2, "both held logs must be in log_batch");
         assert!(batch.iter().any(|m| m.message == "log-a"));
         assert!(batch.iter().any(|m| m.message == "log-b"));
     }
 
     #[test]
-    fn test_reset_trace_id_state_no_op_when_buffer_empty() {
+    fn test_flush_pending_logs_unstamped_no_op_when_empty() {
         let p = create_trace_processor();
-        p.reset_trace_id_state();
+        p.flush_pending_logs_unstamped();
         assert_eq!(p.log_batch.lock().unwrap().len(), 0,
-            "reset with empty buffer must not add anything to log_batch");
+            "flush with empty buffer must not add anything to log_batch");
     }
 
     #[test]
-    fn test_reset_trace_id_state_no_op_without_trace_collection() {
-        // Processor with collect_trace_id=false has no buffered_logs — must be a no-op.
+    fn test_flush_pending_logs_unstamped_no_op_without_trace_collection() {
+        // collect_trace_id=false has no pending buffer — must be a no-op.
         let p = create_test_processor();
-        assert!(p.buffered_logs.is_none());
-        p.reset_trace_id_state(); // must not panic
+        assert!(p.pending_logs.is_none());
+        p.flush_pending_logs_unstamped(); // must not panic
         assert_eq!(p.log_batch.lock().unwrap().len(), 0);
     }
 
-    // Fix 3 — on_trace_id_extracted routes stamped logs through log_batch (not direct send).
+    // on_trace_id_extracted stamps + routes ONLY the matching request's held logs.
     #[tokio::test]
     async fn test_on_trace_id_extracted_stamps_trace_id_and_routes_to_batch() {
         let p = create_trace_processor();
         let trace_id = "abc-trace-123";
+        hold_log(&p, "req-1", "msg-1");
+        hold_log(&p, "req-1", "msg-2");
 
-        // Pre-load buffered_logs with two entries (no trace.id yet)
-        {
-            let buffered = p.buffered_logs.as_ref().unwrap();
-            let mut guard = buffered.lock().unwrap();
-            guard.push(make_log_msg("msg-1"));
-            guard.push(make_log_msg("msg-2"));
-        }
+        p.on_trace_id_extracted("req-1", trace_id).await.unwrap();
 
-        p.on_trace_id_extracted(trace_id).await.unwrap();
-
-        // buffered_logs must be drained
-        let remaining = p.buffered_logs.as_ref().unwrap().lock().unwrap().len();
-        assert_eq!(remaining, 0, "buffered_logs must be empty after on_trace_id_extracted");
-
-        // Logs must be in log_batch (not sent directly)
+        assert_eq!(
+            p.pending_logs.as_ref().unwrap().lock().unwrap().len_for("req-1"),
+            0,
+            "req-1's held logs must be drained"
+        );
         let batch = p.log_batch.lock().unwrap();
         assert_eq!(batch.len(), 2, "both logs must be routed to log_batch");
-
-        // Each log must carry the trace.id attribute
         for log in batch.iter() {
-            let tid = log.attributes.get("trace.id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            assert_eq!(tid, trace_id,
-                "trace.id attribute must be stamped on log '{}'", log.message);
+            let tid = log.attributes.get("trace.id").and_then(|v| v.as_str()).unwrap_or("");
+            assert_eq!(tid, trace_id, "trace.id must be stamped on log '{}'", log.message);
         }
+    }
+
+    // Cross-request isolation: extracting one request's trace must not touch another's.
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_drains_only_matching_request() {
+        let p = create_trace_processor();
+        hold_log(&p, "A", "a1");
+        hold_log(&p, "B", "b1");
+
+        p.on_trace_id_extracted("A", "trace-A").await.unwrap();
+
+        {
+            let pl = p.pending_logs.as_ref().unwrap().lock().unwrap();
+            assert_eq!(pl.len_for("A"), 0, "A drained");
+            assert_eq!(pl.len_for("B"), 1, "B's logs must remain held with no trace yet");
+        }
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1, "only A's log routed");
+        assert_eq!(
+            batch[0].attributes.get("trace.id").and_then(|v| v.as_str()),
+            Some("trace-A")
+        );
     }
 
     #[tokio::test]
     async fn test_on_trace_id_extracted_no_op_when_buffer_empty() {
         let p = create_trace_processor();
-        p.on_trace_id_extracted("some-trace").await.unwrap();
+        p.on_trace_id_extracted("req-1", "some-trace").await.unwrap();
         assert_eq!(p.log_batch.lock().unwrap().len(), 0,
             "empty buffer must produce no log_batch entries");
     }
@@ -885,8 +901,136 @@ mod tests {
     async fn test_on_trace_id_extracted_no_op_without_trace_collection() {
         // collect_trace_id=false — must return Ok(()) silently.
         let p = create_test_processor();
-        assert!(p.buffered_logs.is_none());
-        p.on_trace_id_extracted("some-trace").await.unwrap();
+        assert!(p.pending_logs.is_none());
+        p.on_trace_id_extracted("req-1", "some-trace").await.unwrap();
+    }
+
+    #[test]
+    fn test_request_log_buffer_evicts_oldest_request_on_overflow() {
+        let mut b = RequestLogBuffer::new(2);
+        assert!(b.push("A", make_log_msg("a1")).is_empty());
+        assert!(b.push("B", make_log_msg("b1")).is_empty());
+        // max_total=2 reached; next push evicts the oldest request (A) entirely.
+        let evicted = b.push("C", make_log_msg("c1"));
+        assert_eq!(evicted.len(), 1, "A's bucket evicted on overflow");
+        assert_eq!(evicted[0].message, "a1");
+        assert_eq!(b.len_for("A"), 0);
+        assert_eq!(b.total(), 2, "buffer stays within max_total");
+    }
+
+    // ========================================================================
+    // request_id -> trace.id map: every log of a request gets its trace.id
+    // ========================================================================
+
+    #[test]
+    fn test_request_trace_map_insert_get_and_update() {
+        let mut m = RequestTraceMap::new();
+        assert_eq!(m.get("r1"), None);
+        m.insert("r1", "t1");
+        m.insert("r2", "t2");
+        assert_eq!(m.get("r1"), Some("t1"));
+        assert_eq!(m.get("r2"), Some("t2"));
+        // Re-inserting an existing request updates the value without growing.
+        m.insert("r1", "t1b");
+        assert_eq!(m.get("r1"), Some("t1b"));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn test_request_trace_map_evicts_oldest_past_cap() {
+        let mut m = RequestTraceMap::new();
+        let cap = MAX_TRACE_ID_MAP;
+        for i in 0..cap {
+            m.insert(&format!("r{i}"), &format!("t{i}"));
+        }
+        assert_eq!(m.len(), cap);
+        assert_eq!(m.get("r0"), Some("t0"));
+        // One past cap evicts the oldest (r0); never grows beyond cap.
+        m.insert("r-new", "t-new");
+        assert_eq!(m.len(), cap, "map must stay bounded (leak-proof)");
+        assert_eq!(m.get("r0"), None, "oldest entry must be evicted past cap");
+        assert_eq!(m.get("r1"), Some("t1"), "second-oldest must survive");
+        assert_eq!(m.get("r-new"), Some("t-new"));
+    }
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_records_map_even_with_empty_buffer() {
+        // Even when no logs were parked, the request->trace association must be
+        // recorded so post-extraction / late logs can be stamped.
+        let p = create_trace_processor();
+        p.on_trace_id_extracted("req-9", "trace-9").await.unwrap();
+        let m = p.request_trace_ids.as_ref().unwrap().lock().unwrap();
+        assert_eq!(m.get("req-9"), Some("trace-9"));
+    }
+
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_apply_metadata_stamps_trace_id_from_map() {
+        let p = create_trace_processor();
+        if let Some(ref m) = p.request_trace_ids {
+            m.lock().unwrap().insert("req-apply", "trace-apply");
+        }
+        // Force effective_request_id deterministically.
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("req-apply".to_string());
+
+        let out = p.apply_current_invocation_metadata(make_log_msg("hello"));
+
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
+
+        assert_eq!(
+            out.attributes.get("trace.id").and_then(|v| v.as_str()),
+            Some("trace-apply"),
+            "trace.id must be stamped from the request->trace map"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_metadata_cross_request_uses_correct_trace() {
+        // A late log for request A, processed while "current" is request B, must
+        // get A's trace — not B's.
+        let p = create_trace_processor();
+        if let Some(ref m) = p.request_trace_ids {
+            let mut g = m.lock().unwrap();
+            g.insert("A", "trace-A");
+            g.insert("B", "trace-B");
+        }
+        p.invocation_context.lock().unwrap().request_id = "B".to_string();
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("A".to_string());
+
+        let out = p.apply_current_invocation_metadata(make_log_msg("late-A"));
+
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
+
+        assert_eq!(
+            out.attributes.get("trace.id").and_then(|v| v.as_str()),
+            Some("trace-A"),
+            "late log for request A must be stamped with trace-A, not the current request's trace"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_apply_metadata_no_trace_when_request_absent_from_map() {
+        let p = create_trace_processor();
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("unknown-req".to_string());
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
+        assert!(
+            out.attributes.get("trace.id").is_none(),
+            "no trace.id when the request has no recorded trace"
+        );
+    }
+
+    #[test]
+    fn test_apply_metadata_no_trace_when_collection_off() {
+        // collect_trace_id=false → no map allocated, never stamps trace.id.
+        let p = create_test_processor();
+        assert!(p.request_trace_ids.is_none());
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        assert!(out.attributes.get("trace.id").is_none());
     }
 
     // ========================================================================
@@ -1253,14 +1397,10 @@ mod tests {
     #[tokio::test]
     async fn test_on_trace_id_extracted_stamps_entity_guid() {
         let p = create_apm_processor("test-entity-guid");
-        {
-            let buffered = p.buffered_logs.as_ref().unwrap();
-            let mut guard = buffered.lock().unwrap();
-            guard.push(make_log_msg("apm-log-1"));
-            guard.push(make_log_msg("apm-log-2"));
-        }
+        hold_log(&p, "req-abc", "apm-log-1");
+        hold_log(&p, "req-abc", "apm-log-2");
 
-        p.on_trace_id_extracted("trace-abc").await.unwrap();
+        p.on_trace_id_extracted("req-abc", "trace-abc").await.unwrap();
 
         let batch = p.log_batch.lock().unwrap();
         assert_eq!(batch.len(), 2);
@@ -1275,34 +1415,28 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_trace_id_state_stamps_entity_guid() {
-        let p = create_apm_processor("reset-entity-guid");
-        {
-            let buffered = p.buffered_logs.as_ref().unwrap();
-            let mut guard = buffered.lock().unwrap();
-            guard.push(make_log_msg("rescued-log-1"));
-        }
+    fn test_flush_pending_logs_unstamped_stamps_entity_guid() {
+        let p = create_apm_processor("flush-entity-guid");
+        hold_log(&p, "req-orphan", "orphan-log-1");
 
-        p.reset_trace_id_state();
+        p.flush_pending_logs_unstamped();
 
         let batch = p.log_batch.lock().unwrap();
         assert_eq!(batch.len(), 1);
         let guid = batch[0].attributes.get("entity.guid").and_then(|v| v.as_str()).unwrap_or("");
-        assert_eq!(guid, "reset-entity-guid",
-            "entity.guid must be stamped on rescued log");
+        assert_eq!(guid, "flush-entity-guid",
+            "entity.guid must be stamped on flushed orphan log");
+        assert!(!batch[0].attributes.contains_key("trace.id"),
+            "orphan log has no trace.id (no payload arrived)");
     }
 
     #[test]
     fn test_process_buffered_logs_stamps_entity_guid_and_trace_id() {
-        
         let p = create_apm_processor("direct-path-guid");
 
-        // Put a trace ID into invocation_context so the log takes the direct path.
-        p.invocation_context.lock().unwrap().trace_id = Some("trace-xyz".to_string());
-
-        // Set extraction state to Extracted so routing goes direct to log_batch.
-        if let Some(ref state_arc) = p.trace_extraction_state {
-            *state_arc.lock().unwrap() = TraceIdExtractionState::Extracted;
+        // Record the request's trace.id in the map so the direct path stamps it.
+        if let Some(ref m) = p.request_trace_ids {
+            m.lock().unwrap().insert("req-001", "trace-xyz");
         }
 
         // Push a log into request_id_buffer.
@@ -1323,18 +1457,142 @@ mod tests {
 
     #[tokio::test]
     async fn test_entity_guid_not_panic_when_apm_app_none() {
-        // When apm_app is None, all three paths must complete without panic and
+        // When apm_app is None, the drain path must complete without panic and
         // entity.guid must simply be absent from the output.
         let p = create_trace_processor(); // no apm_app
+        hold_log(&p, "req-t1", "no-apm-log");
 
-        {
-            let buffered = p.buffered_logs.as_ref().unwrap();
-            buffered.lock().unwrap().push(make_log_msg("no-apm-log"));
-        }
-        p.on_trace_id_extracted("t1").await.unwrap();
+        p.on_trace_id_extracted("req-t1", "t1").await.unwrap();
         let batch = p.log_batch.lock().unwrap();
         assert!(!batch[0].attributes.contains_key("entity.guid"),
             "entity.guid must not appear when apm_app is None");
+    }
+
+    // Cold-start INIT (pre-invoke) logs: held until the request's trace arrives, then
+    // stamped — but ALWAYS carrying ARN + request_id (never sent without them).
+    #[tokio::test]
+    async fn test_pre_invoke_logs_held_then_stamped_with_trace() {
+        let p = create_apm_processor("guid-init");
+        {
+            let mut ctx = p.invocation_context.lock().unwrap();
+            ctx.invoked_function_arn = "arn:aws:lambda:us-east-1:111:function:f".to_string();
+            ctx.request_id = "req-init".to_string();
+        }
+        {
+            let mut buf = p.pre_invoke_buffer.lock().unwrap();
+            buf.push(make_log_msg("init-1"));
+            buf.push(make_log_msg("init-2"));
+        }
+
+        // Trace not known yet → logs held, NOT batched.
+        p.process_pre_invoke_logs();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "held until trace, not batched");
+        assert_eq!(
+            p.pending_logs.as_ref().unwrap().lock().unwrap().len_for("req-init"),
+            2,
+            "both INIT logs held under their request_id"
+        );
+
+        // Trace arrives → held INIT logs stamped + flushed.
+        p.on_trace_id_extracted("req-init", "trace-init").await.unwrap();
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2);
+        for log in batch.iter() {
+            // ARN + request_id present (no placeholder) AND trace.id now stamped.
+            assert_eq!(log.attributes.get("faas.arn").and_then(|v| v.as_str()),
+                Some("arn:aws:lambda:us-east-1:111:function:f"));
+            assert_eq!(log.attributes.get("faas.execution").and_then(|v| v.as_str()), Some("req-init"));
+            let rid = log.attributes.get("aws").and_then(|v| v.as_object())
+                .and_then(|a| a.get("lambda_request_id")).and_then(|v| v.as_str());
+            assert_eq!(rid, Some("req-init"));
+            assert_eq!(log.attributes.get("trace.id").and_then(|v| v.as_str()), Some("trace-init"));
+        }
+    }
+
+    #[test]
+    fn test_pre_invoke_logs_batched_directly_when_trace_collection_off() {
+        // collect_trace_id=false → unchanged behavior: stamped with ARN+request_id and
+        // batched immediately (no holding, no trace.id).
+        let p = create_test_processor();
+        assert!(p.pending_logs.is_none());
+        {
+            let mut ctx = p.invocation_context.lock().unwrap();
+            ctx.invoked_function_arn = "arn:aws:lambda:us-east-1:111:function:f".to_string();
+            ctx.request_id = "req-x".to_string();
+        }
+        {
+            let mut buf = p.pre_invoke_buffer.lock().unwrap();
+            buf.push(make_log_msg("init-1"));
+        }
+        p.process_pre_invoke_logs();
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1, "batched immediately when collection off");
+        assert_eq!(batch[0].attributes.get("faas.execution").and_then(|v| v.as_str()), Some("req-x"));
+        assert!(!batch[0].attributes.contains_key("trace.id"));
+    }
+
+    #[test]
+    fn test_pre_invoke_logs_stay_buffered_when_context_invalid() {
+        // No ARN/request_id yet → must NOT be sent or held; stay in pre_invoke_buffer.
+        let p = create_trace_processor();
+        {
+            let mut buf = p.pre_invoke_buffer.lock().unwrap();
+            buf.push(make_log_msg("init-1"));
+        }
+        p.process_pre_invoke_logs();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "nothing sent without context");
+        assert_eq!(p.pending_logs.as_ref().unwrap().lock().unwrap().total(), 0, "nothing held without context");
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 1, "INIT log stays buffered until context valid");
+    }
+
+    // During shutdown, the extension's OWN logs are NOT forwarded to NR (the structured
+    // drop diagnostic is sent directly instead). Function/platform logs are unaffected.
+    #[tokio::test]
+    #[serial]
+    async fn test_extension_logs_dropped_during_shutdown() {
+        use crate::config::{ExtensionConfig, ExtensionSettings, NewRelicConfig};
+        use crate::telemetry::listener::TelemetryRecord;
+
+        // Processor with send_extension_logs = true so the gate under test is reached.
+        let mut config = ExtensionConfig::default();
+        config.extension = ExtensionSettings {
+            send_extension_logs: true,
+            ..ExtensionSettings::default()
+        };
+        config.new_relic = NewRelicConfig { ..NewRelicConfig::default() };
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new(&Arc::new(
+            ExtensionConfig::default(),
+        )));
+        let ctx = Arc::new(Mutex::new(crate::context::InvocationContext::default()));
+        let p = LogProcessor::new(client, Arc::new(config), ctx, None);
+
+        let rec = TelemetryRecord {
+            time: chrono::Utc::now(),
+            record_type: "extension".to_string(),
+            record: serde_json::json!("[NR_EXT] ERROR APM telemetry DROPPED at shutdown"),
+        };
+
+        // Not shutting down → accepted (lands in pre_invoke_buffer; no ARN yet).
+        crate::IS_SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
+        p.process_record(rec.clone()).await;
+        assert_eq!(
+            p.pre_invoke_buffer.lock().unwrap().len(),
+            1,
+            "extension log accepted when not shutting down"
+        );
+
+        // Shutting down → dropped before any buffering/batching (no new entry).
+        crate::IS_SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+        p.process_record(rec).await;
+        assert_eq!(
+            p.pre_invoke_buffer.lock().unwrap().len(),
+            1,
+            "extension log dropped during shutdown — no new entry"
+        );
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+
+        // Reset the one-way latch so other tests aren't affected.
+        crate::IS_SHUTTING_DOWN.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     // ========================================================================

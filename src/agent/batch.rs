@@ -15,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ExtensionConfig,
@@ -246,7 +246,7 @@ pub async fn send_batched_payloads_with_reports_only(
             clear_batch_with_reports(&batch_items);
         }
         Err(e) => {
-            error!(
+            warn!(
                 "Failed to send batched payloads with reports after all retries: {} - Keeping {} payloads in buffer for next attempt",
                 e,
                 batch_items.len()
@@ -262,6 +262,7 @@ pub async fn send_batched_payloads_with_reports_only(
 pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
+    log_processor: Option<&Arc<crate::logs::processor::LogProcessor>>,
 ) {
     use crate::request::{REQUEST_DATA, get_request_context, remove_pending_report};
 
@@ -324,6 +325,24 @@ pub async fn send_all_pending_payloads_on_shutdown(
     }
 
     debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
+
+    // Last chance to stamp trace.id: a request whose payload never paired before
+    // shutdown still has logs held in pending_logs. Extract its trace here so those
+    // logs are stamped + flushed (by flush_pending_logs_unstamped after this) rather
+    // than shipped untagged. Read-only on the payload; no effect on the send below.
+    if let Some(lp) = log_processor {
+        if config.new_relic.collect_trace_id {
+            for item in &all_payloads {
+                if let Ok(Some(trace_id)) =
+                    crate::trace::extract_trace_id_from_payload(&item.agent_payload_bytes)
+                {
+                    let _ = lp
+                        .on_trace_id_extracted(&item.request_id, &trace_id)
+                        .await;
+                }
+            }
+        }
+    }
 
     // 3. Split into 1MB chunks while keeping each payload + report together
     const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB

@@ -15,6 +15,13 @@ pub mod deployment;
 
 use deployment::{DeploymentContext, TelemetryMode};
 
+/// Default per-invocation cap on logs parked while waiting for the trace.id.
+const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
+/// Lower/upper clamp for `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` to avoid 0 (drop
+/// everything) and pathological values that could exhaust sandbox memory.
+const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
+const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -41,6 +48,12 @@ pub struct NewRelicConfig {
     #[allow(dead_code)]
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
+    /// Max number of logs parked per invocation while waiting for the agent
+    /// payload (the `trace.id` source) to arrive. Only used when
+    /// `collect_trace_id` is true. Configurable via
+    /// `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` (default 2000). On overflow, logs are
+    /// sent without `trace.id` (we cannot stamp a trace we don't yet have).
+    pub trace_id_log_buffer_max: usize,
     pub add_version_detail_tags: bool,
     pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
@@ -139,6 +152,7 @@ impl Default for NewRelicConfig {
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
             harvest_interval: Duration::from_secs(2),
             collect_trace_id: false,
+            trace_id_log_buffer_max: DEFAULT_TRACE_ID_LOG_BUFFER_MAX,
             add_version_detail_tags: false,
             layer_version: None,
             apm_lambda_mode: false,
@@ -328,6 +342,16 @@ impl ExtensionConfig {
         }
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
+
+        // Per-invocation parking cap for trace.id buffering. Only meaningful when
+        // collect_trace_id is on; clamped to a sane range so a typo can't drop all
+        // logs (0) or exhaust memory.
+        config.new_relic.trace_id_log_buffer_max = env::var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(DEFAULT_TRACE_ID_LOG_BUFFER_MAX, |n| {
+                n.clamp(MIN_TRACE_ID_LOG_BUFFER_MAX, MAX_TRACE_ID_LOG_BUFFER_MAX)
+            });
 
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);

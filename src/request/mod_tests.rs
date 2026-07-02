@@ -641,6 +641,60 @@ mod tests {
         clear_request_state();
     }
 
+    // In APM mode the periodic cleanup must NOT use the serverless ingest
+    // endpoint. A stranded stale payload must be re-queued to the APM retry
+    // buffer (FAILED_AGENT_PAYLOADS) so retry_failed_agent_payloads resends it
+    // to the APM collector — never leaked to serverless.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_apm_mode_routes_stale_payload_to_apm_retry_buffer() {
+        clear_request_state();
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
+
+        // Stale request (created 10 invocations ago) holding an un-drained payload.
+        REQUEST_DATA.insert("apm-old-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: "apm-old-req".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 9, 9]])),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            invoked_function_arn: "arn:test".to_string(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        // APM mode ON.
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(cfg);
+
+        cleanup_old_request_buffers(client, config).await;
+
+        // Entry removed, and its payload routed to the APM retry buffer.
+        assert!(REQUEST_DATA.get("apm-old-req").is_none());
+        let routed_to_apm = crate::event_loop::FAILED_AGENT_PAYLOADS
+            .lock()
+            .map(|b| b.iter().any(|p| p.request_id == "apm-old-req"))
+            .unwrap_or(false);
+        assert!(
+            routed_to_apm,
+            "APM-mode stale payload must be re-queued to the APM retry buffer, not sent to serverless"
+        );
+
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
+        clear_request_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_cleanup_old_preserves_recent_removes_old() {
