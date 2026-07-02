@@ -83,6 +83,15 @@ pub fn get_global_fallback_arn() -> String {
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
+/// Set once a SHUTDOWN event is being handled. While set, the extension stops
+/// forwarding its OWN (`extension`-type) logs to New Relic: the authoritative
+/// "telemetry dropped" record is sent directly as a single structured diagnostic, so
+/// the re-ingested stdout copies of the extension's shutdown lines would only be
+/// duplicates. CloudWatch still receives everything (stdout is unaffected); function
+/// and platform logs are still forwarded. One-way latch — never reset.
+pub(crate) static IS_SHUTTING_DOWN: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
 /// Global APM app instance (for sending platform.report metrics in APM mode)
 static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));

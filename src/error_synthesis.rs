@@ -8,7 +8,7 @@
 
 use once_cell::sync::Lazy;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use crate::{
     config::ExtensionConfig,
     newrelic::client::NewRelicClient,
@@ -237,7 +237,7 @@ pub async fn send_timeout_error(
             }
         }
         Err(e) => {
-            error!("Failed to send timeout error for {}: {} - will retry on next invoke", request_id, e);
+            warn!("Failed to send timeout error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 failed_errors.push(FailedError {
@@ -316,7 +316,7 @@ pub async fn send_platform_fault_error(
             }
         }
         Err(e) => {
-            error!("Failed to send platform fault error for {}: {} - will retry on next invoke", request_id, e);
+            warn!("Failed to send platform fault error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 failed_errors.push(FailedError {
@@ -389,7 +389,7 @@ pub async fn send_lambda_error(
             }
         }
         Err(e) => {
-            error!("Failed to send Lambda error for {}: {} - will retry on next invoke", request_id, e);
+            warn!("Failed to send Lambda error for {}: {} - will retry on next invoke", request_id, e);
             // Store for retry on next invocation
             if let Ok(mut failed_errors) = FAILED_ERRORS.lock() {
                 failed_errors.push(FailedError {
