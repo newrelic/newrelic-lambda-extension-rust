@@ -280,6 +280,17 @@ async fn handle_telemetry_request(
                         // for surfacing platform.initStart as a log entry.
                         platform_processor.process_record(record);
                     }
+                    "platform.initReport" => {
+                        // Fires only on cold start (never on warm invocations).
+                        // On LMI, INVOKE is never delivered, so this is the only reliable
+                        // cold-start signal. Set LMI_COLD_START_SEEN so the heartbeat can
+                        // fire version-detail tagging exactly once.
+                        if is_lmi {
+                            crate::LMI_COLD_START_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                            debug!("LMI: platform.initReport received — cold start detected, version tagging eligible");
+                        }
+                        platform_processor.process_record(record);
+                    }
                     _ => {
                         platform_count += 1;
                         platform_processor.process_record(record);

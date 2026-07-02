@@ -83,6 +83,12 @@ pub fn get_global_fallback_arn() -> String {
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
+/// Set to true when platform.initReport is received under LMI — the only reliable
+/// cold-start signal available when INVOKE events are not delivered.
+/// Used to trigger version-detail tagging exactly once per execution environment.
+static LMI_COLD_START_SEEN: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
 /// Global APM app instance (for sending platform.report metrics in APM mode)
 static APM_APP: Lazy<Arc<tokio::sync::RwLock<Option<apm::ApmApp>>>> =
     Lazy::new(|| Arc::new(tokio::sync::RwLock::new(None)));
@@ -389,8 +395,19 @@ async fn perform_one_time_initialization(
         
         Some(arn)
     } else {
-        warn!("Account ID not provided by Lambda runtime (local testing?) - ARN will be populated from first INVOKE event");
-        None
+        // On LMI, INVOKE never fires so the ARN would never be populated from an INVOKE event.
+        // AWS_LAMBDA_FUNCTION_ARN is always set by the Lambda runtime — use it as the fallback ARN.
+        let env_arn = std::env::var("AWS_LAMBDA_FUNCTION_ARN").unwrap_or_default();
+        if !env_arn.is_empty() {
+            info!("Account ID not in registration response; using AWS_LAMBDA_FUNCTION_ARN as fallback ARN: {}", env_arn);
+            if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
+                global_context.invoked_function_arn = env_arn.clone();
+            }
+            Some(env_arn)
+        } else {
+            warn!("Account ID not provided by Lambda runtime and AWS_LAMBDA_FUNCTION_ARN not set (local testing?) - ARN will be populated from first INVOKE event");
+            None
+        }
     };
 
     debug!(

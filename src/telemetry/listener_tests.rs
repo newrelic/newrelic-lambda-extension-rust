@@ -1634,4 +1634,123 @@ mod tests {
         crate::request::clear_request_state_for_test();
         clear_telemetry_state();
     }
+
+    // ========================================================================
+    // platform.initReport — LMI_COLD_START_SEEN tests
+    // ========================================================================
+
+    /// Helper: reset the LMI cold-start flag between tests that touch it.
+    fn reset_lmi_cold_start_seen() {
+        crate::LMI_COLD_START_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Under LMI (`is_lmi=true`), receiving `platform.initReport` must set
+    /// `LMI_COLD_START_SEEN` so that the next heartbeat can trigger version tagging.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_set_when_lmi_receives_init_report() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.initReport",
+            "record": {"initializationType": "on-demand", "metrics": {"initDurationMs": 120.0}}
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status(), 200);
+        assert!(
+            crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.initReport must set LMI_COLD_START_SEEN=true on LMI"
+        );
+
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+    }
+
+    /// On Normal Lambda (`is_lmi=false`), `platform.initReport` must NOT set
+    /// `LMI_COLD_START_SEEN` — the flag is LMI-only.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_not_set_when_normal_lambda_receives_init_report() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_lmi = false → Normal Lambda path
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.initReport",
+            "record": {"initializationType": "on-demand", "metrics": {"initDurationMs": 80.0}}
+        }]);
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert!(
+            !crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.initReport must NOT set LMI_COLD_START_SEEN on Normal Lambda"
+        );
+
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+    }
+
+    /// `platform.start` must NOT set `LMI_COLD_START_SEEN` — only `platform.initReport`
+    /// is the cold-start signal under LMI.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_not_set_by_platform_start() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.start",
+            "record": {"requestId": "req-lmi-123", "version": "$LATEST"}
+        }]);
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert!(
+            !crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.start must NOT set LMI_COLD_START_SEEN (only platform.initReport does)"
+        );
+
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+    }
 }

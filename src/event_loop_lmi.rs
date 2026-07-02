@@ -117,6 +117,19 @@ impl Drop for LmiReconnectGuard {
 /// handshake is spawned in the background using the proxy-aware `apm_client`.
 /// `FAILED_AGENT_PAYLOADS` are retried via the APM endpoint once connected.
 async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
+    // Version detail tagging: on Normal Lambda this fires in the first INVOKE arm.
+    // On LMI, INVOKE is never delivered, so fire here once platform.initReport has
+    // confirmed a cold start (LMI_COLD_START_SEEN = true). The Once guard inside
+    // tag_lambda_function_once ensures a single tag even if multiple heartbeat ticks race.
+    if crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+        && h.config.new_relic.add_version_detail_tags
+    {
+        let arn = crate::get_global_fallback_arn();
+        if !arn.is_empty() {
+            crate::event_loop::tag_lambda_function_once(arn, &h.config);
+        }
+    }
+
     process_pending_agent_payloads(&h.config, &h.global_log_processor, &h.apm_app, "").await;
 
     // Invalidate the cached APM session if the collector returned 401/409/410
@@ -530,6 +543,10 @@ async fn drain_on_shutdown_with_timeout(
         );
     }
 }
+
+#[cfg(test)]
+#[path = "event_loop_lmi_tests.rs"]
+mod lmi_tagging_tests;
 
 #[cfg(test)]
 mod tests {

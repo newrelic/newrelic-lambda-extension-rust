@@ -1660,8 +1660,14 @@ pub async fn process_request_concurrently(
     );
 }
 
-/// Tag Lambda function once on first invocation
-fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
+/// Tag Lambda function once on first invocation (or first LMI cold start).
+///
+/// On Normal Lambda this is called from the INVOKE arm on the first event.
+/// On LMI, INVOKE is never delivered; the LMI heartbeat calls this after
+/// `LMI_COLD_START_SEEN` is set by `platform.initReport`.
+/// The internal `Once` guard ensures tagging fires exactly once regardless of
+/// which path gets here first.
+pub(crate) fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
     static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
     TAGGING_DONE.call_once(|| {
         debug!("Spawning background task to tag Lambda function with version information");
