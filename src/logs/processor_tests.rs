@@ -975,7 +975,7 @@ mod tests {
         // Force effective_request_id deterministically.
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("req-apply".to_string());
 
-        let out = p.apply_current_invocation_metadata(make_log_msg("hello"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("hello"), None);
 
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
 
@@ -1000,7 +1000,7 @@ mod tests {
         p.invocation_context.lock().unwrap().request_id = "B".to_string();
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("A".to_string());
 
-        let out = p.apply_current_invocation_metadata(make_log_msg("late-A"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("late-A"), None);
 
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
 
@@ -1016,7 +1016,7 @@ mod tests {
     fn test_apply_metadata_no_trace_when_request_absent_from_map() {
         let p = create_trace_processor();
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("unknown-req".to_string());
-        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"), None);
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
         assert!(
             out.attributes.get("trace.id").is_none(),
@@ -1029,7 +1029,7 @@ mod tests {
         // collect_trace_id=false → no map allocated, never stamps trace.id.
         let p = create_test_processor();
         assert!(p.request_trace_ids.is_none());
-        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"), None);
         assert!(out.attributes.get("trace.id").is_none());
     }
 
