@@ -202,6 +202,18 @@ impl NewRelicClient {
             return Ok(());
         }
 
+        // Defensive: `function_arn` is written verbatim into the common `faas.arn`
+        // attribute below. Every caller resolves a real/fallback ARN (and re-buffers
+        // rather than send when none is available), so this is unreachable today — but
+        // guard here so a future refactor can never silently emit `faas.arn:""`.
+        if function_arn.is_empty() {
+            warn!(
+                "send_logs called with empty ARN — skipping {} log(s) to avoid emitting an empty faas.arn",
+                batch.len()
+            );
+            return Ok(());
+        }
+
         let log_count = batch.len();
         debug!("Sending {} log messages to NR", log_count);
 

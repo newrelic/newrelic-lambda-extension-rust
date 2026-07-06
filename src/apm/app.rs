@@ -11,7 +11,8 @@ use super::collector::{
     CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
 use super::connection::{
-    connect, is_handshake_fatal, is_permanent_auth_error, preconnect, signal_handshake_fatal,
+    connect, is_handshake_fatal, is_permanent_auth_error, last_failure_reason, preconnect,
+    record_connect_attempt, record_connect_cycle, reset_connect_stats, signal_handshake_fatal,
 };
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
@@ -60,6 +61,9 @@ impl ApmApp {
             ));
         }
 
+        // Count this reconnect cycle (one per new(): startup / per-invoke / shutdown).
+        record_connect_cycle();
+
         let backoff_ms = [200, 500, 900];
         let total_attempts = backoff_ms.len();
         let mut last_error = None;
@@ -87,28 +91,35 @@ impl ApmApp {
                         "APM connection successful: run_id={}, entity_guid={}",
                         app.run_id, app.entity_guid
                     );
+                    // Connected — clear the disconnected-streak diagnostics.
+                    reset_connect_stats();
                     return Ok(app);
                 }
                 Err(e) => {
-                    // Permanent auth failure (401/403): stop immediately and latch APM
-                    // off so the per-invoke loop won't retry. This is a real config
-                    // error the customer must fix, so log it at error level — once.
-                    if let Some(status) = is_permanent_auth_error(&e) {
+                    record_connect_attempt();
+                    // Reason captured at the failure site — the collector's actual
+                    // response (e.g. "HTTP 401: {body}") or the network cause.
+                    let reason = last_failure_reason().unwrap_or_else(|| format!("{e:#}"));
+
+                    // Permanent auth failure (401/403) is the ONLY case we stop on:
+                    // latch APM off so the per-invoke loop won't keep retrying.
+                    // Every other failure (timeout, 5xx, connection error) retries.
+                    if is_permanent_auth_error(&e).is_some() {
                         error!(
-                            "APM handshake rejected (HTTP {}) - invalid license key or insufficient permissions. Disabling APM connection attempts for this container.",
-                            status
+                            "APM handshake rejected ({}) - disabling APM connection attempts for this container.",
+                            reason
                         );
                         signal_handshake_fatal();
                         return Err(e);
                     }
 
-                    // Transient failure: this is a retry, not a fatal error — warn with
-                    // the attempt count so it's clear the extension is still trying.
+                    // Transient failure: this is a retry — warn with the attempt count
+                    // and the actual reason (incl. HTTP code) so it's clearly a retry.
                     warn!(
-                        "APM handshake attempt {}/{} failed: {} - retrying",
+                        "APM handshake attempt {}/{} failed ({}) - retrying",
                         attempt + 1,
                         total_attempts,
-                        e
+                        reason
                     );
                     last_error = Some(e);
 
@@ -401,7 +412,7 @@ impl ApmApp {
             Ok(()) => Ok(()),
             // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
             Err(e) if e.is_permanent() => {
-                warn!("Platform metrics dropped (permanent): {}", e);
+                error!("Platform metrics dropped (permanent): {}", e);
                 Ok(())
             }
             // Transient/network failures: buffer for retry on a later invoke / at shutdown.

@@ -50,6 +50,7 @@ where
         "NEW_RELIC_LICENSE_KEY_SSM_PARAMETER_NAME",
         "NEW_RELIC_LAMBDA_HANDLER",
         "NEW_RELIC_COLLECT_TRACE_ID",
+        "NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX",
         "NEW_RELIC_ADD_VERSION_DETAIL_TAGS",
         "NEW_RELIC_LAYER_VERSION",
         "NEW_RELIC_APM_LAMBDA_MODE",
@@ -811,8 +812,46 @@ fn test_from_env_collect_trace_id() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_COLLECT_TRACE_ID", "true");
         let config = ExtensionConfig::from_env();
-        
+
         assert!(config.new_relic.collect_trace_id);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_trace_id_log_buffer_max_default() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.trace_id_log_buffer_max, 2000,
+            "default buffer cap must be 2000 when env unset");
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_trace_id_log_buffer_max_custom() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX", "500");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.trace_id_log_buffer_max, 500);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_trace_id_log_buffer_max_clamped_and_invalid() {
+    with_full_clean_env(|| {
+        // 0 clamps up to the minimum (never drop everything).
+        env::set_var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX", "0");
+        assert_eq!(ExtensionConfig::from_env().new_relic.trace_id_log_buffer_max, 1);
+
+        // Above the ceiling clamps down.
+        env::set_var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX", "99999999");
+        assert_eq!(ExtensionConfig::from_env().new_relic.trace_id_log_buffer_max, 100_000);
+
+        // Non-numeric falls back to the default.
+        env::set_var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX", "not-a-number");
+        assert_eq!(ExtensionConfig::from_env().new_relic.trace_id_log_buffer_max, 2000);
     });
 }
 
@@ -1118,6 +1157,7 @@ fn test_new_relic_config_all_fields() {
         log_endpoint: "http://logs".to_string(),
         harvest_interval: Duration::from_secs(5),
         collect_trace_id: true,
+        trace_id_log_buffer_max: 2000,
         add_version_detail_tags: true,
         layer_version: Some("1.0.0".to_string()),
         apm_lambda_mode: true,

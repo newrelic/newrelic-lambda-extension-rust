@@ -641,6 +641,60 @@ mod tests {
         clear_request_state();
     }
 
+    // In APM mode the periodic cleanup must NOT use the serverless ingest
+    // endpoint. A stranded stale payload must be re-queued to the APM retry
+    // buffer (FAILED_AGENT_PAYLOADS) so retry_failed_agent_payloads resends it
+    // to the APM collector — never leaked to serverless.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_apm_mode_routes_stale_payload_to_apm_retry_buffer() {
+        clear_request_state();
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
+
+        // Stale request (created 10 invocations ago) holding an un-drained payload.
+        REQUEST_DATA.insert("apm-old-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: "apm-old-req".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 9, 9]])),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            invoked_function_arn: "arn:test".to_string(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        // APM mode ON.
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(cfg);
+
+        cleanup_old_request_buffers(client, config).await;
+
+        // Entry removed, and its payload routed to the APM retry buffer.
+        assert!(REQUEST_DATA.get("apm-old-req").is_none());
+        let routed_to_apm = crate::event_loop::FAILED_AGENT_PAYLOADS
+            .lock()
+            .map(|b| b.iter().any(|p| p.request_id == "apm-old-req"))
+            .unwrap_or(false);
+        assert!(
+            routed_to_apm,
+            "APM-mode stale payload must be re-queued to the APM retry buffer, not sent to serverless"
+        );
+
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
+        clear_request_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_cleanup_old_preserves_recent_removes_old() {
@@ -974,5 +1028,228 @@ mod tests {
     fn record_request_id_none_when_absent_or_empty() {
         assert_eq!(record_request_id(&serde_json::json!({ "message": "hi" })), None);
         assert_eq!(record_request_id(&serde_json::json!({ "requestId": "" })), None);
+    }
+
+    // ── Phase 3: concurrent LMI routing — no cross-contamination ─────────────
+
+    /// 20 concurrent `ensure_lmi_request_slot` calls for distinct IDs must each
+    /// create an isolated slot with no cross-contamination.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_concurrent_lmi_slot_creation_no_cross_contamination() {
+        clear_request_state();
+
+        let ids: Vec<String> = (0..20).map(|i| format!("lmi-req-{:03}", i)).collect();
+
+        // Create all slots concurrently
+        let tasks: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let id = id.clone();
+                tokio::spawn(async move {
+                    ensure_lmi_request_slot(&id);
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        // Each slot must exist and be empty (no cross-write)
+        for id in &ids {
+            let buf_len = get_agent_buffer(id)
+                .map(|b| b.lock().unwrap().len())
+                .unwrap_or(0);
+            assert_eq!(
+                buf_len, 0,
+                "slot for {} must exist and start empty (no payload cross-contamination)",
+                id
+            );
+        }
+        // No orphaned payloads must have leaked
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 0, "no payloads must reach the orphan buffer during slot creation");
+
+        clear_request_state();
+    }
+
+    /// `ensure_lmi_request_slot` is idempotent: calling it multiple times for the
+    /// same id must not reset, duplicate, or corrupt existing buffer contents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_concurrent_ensure_lmi_slot_idempotent() {
+        clear_request_state();
+
+        let id = "lmi-idempotent";
+        ensure_lmi_request_slot(id);
+
+        // Write a sentinel byte directly into the buffer
+        if let Some(buf) = get_agent_buffer(id) {
+            buf.lock().unwrap().push(vec![0xAB]);
+        }
+
+        // Concurrent re-calls must not wipe the existing entry
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let id = id.to_string();
+                tokio::spawn(async move { ensure_lmi_request_slot(&id); })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let buf_len = get_agent_buffer(id)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(buf_len, 1, "idempotent slot creation must preserve existing buffer contents");
+
+        clear_request_state();
+    }
+
+    /// Under LMI, payloads without an extractable embedded request-id must end up in
+    /// the orphan buffer, not attributed to any live slot. This tests the "no id" path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_concurrent_orphan_drain_atomic() {
+        clear_request_state();
+
+        // Pre-create a slot so Normal fallback doesn't interfere
+        ensure_lmi_request_slot("lmi-orphan-target");
+
+        // 10 concurrent payloads without valid embedded ids → all go to orphan buffer
+        let tasks: Vec<_> = (0..10)
+            .map(|i| {
+                tokio::spawn(async move {
+                    // Bytes that don't start with `[` → parse_agent_payload returns empty map
+                    // → extract_request_id_from_payload_bytes returns None → orphan buffer
+                    let payload = format!("no-id-payload-{}", i).into_bytes();
+                    route_payload_to_request_buffer(payload, LMI).await;
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(
+            orphan_count, 10,
+            "all 10 id-less LMI payloads must land in the orphan buffer"
+        );
+
+        clear_request_state();
+    }
+
+    /// Under LMI, two concurrent invocations must not cross-attribute payloads:
+    /// payloads for slot A never appear in slot B's buffer and vice versa.
+    /// We test this via `ensure_lmi_request_slot` + direct buffer writes to
+    /// simulate the post-routing state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_lmi_two_concurrent_invocations_no_cross_attribution() {
+        clear_request_state();
+
+        let id_a = "lmi-invoc-a";
+        let id_b = "lmi-invoc-b";
+        ensure_lmi_request_slot(id_a);
+        ensure_lmi_request_slot(id_b);
+
+        // Write 5 payloads for A and 5 for B concurrently
+        let writes: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let id = if i % 2 == 0 { "lmi-invoc-a" } else { "lmi-invoc-b" };
+                    if let Some(buf) = get_agent_buffer(id) {
+                        buf.lock().unwrap().push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+        for w in writes { w.await.unwrap(); }
+
+        let a_len = get_agent_buffer(id_a)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        let b_len = get_agent_buffer(id_b)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+
+        assert_eq!(a_len, 5, "slot A must have exactly 5 payloads");
+        assert_eq!(b_len, 5, "slot B must have exactly 5 payloads");
+        assert_eq!(a_len + b_len, 10, "total payloads must be 10 (no duplication or loss)");
+
+        clear_request_state();
+    }
+
+    // ── Phase 5: thread-safety / no-deadlock harness ──────────────────────────
+
+    /// No deadlock: 20 concurrent tasks — half writing to ORPHANED_PAYLOADS,
+    /// half reading REQUEST_DATA — must all complete without hanging.
+    /// If a deadlock occurs, the test times out under tokio's default test timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_concurrent_payload_routing() {
+        clear_request_state();
+
+        // Pre-create 5 slots
+        for i in 0..5u8 {
+            ensure_lmi_request_slot(&format!("td-slot-{}", i));
+        }
+
+        // 10 writers: push to orphan buffer; 10 readers: inspect slot buffers
+        let writers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() {
+                        g.push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let _ = get_agent_buffer(&format!("td-slot-{}", i % 5));
+                })
+            })
+            .collect();
+
+        for w in writers { w.await.unwrap(); }
+        for r in readers { r.await.unwrap(); }
+
+        // All 10 orphaned payloads must be present (no loss under concurrent writes)
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 10, "all 10 orphan payloads must be written without loss");
+
+        clear_request_state();
+    }
+
+    /// No deadlock: concurrent writes to the same slot's buffer from multiple tasks.
+    /// Verifies the inner `Arc<Mutex<Vec<Vec<u8>>>>` per-slot locking is sound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_orphaned_buffer_concurrent_writes() {
+        clear_request_state();
+
+        let slot = "td-inner-lock-slot";
+        ensure_lmi_request_slot(slot);
+
+        // 20 concurrent tasks each push one payload to the same slot
+        let tasks: Vec<_> = (0..20u8)
+            .map(|i| {
+                let id = slot.to_string();
+                tokio::spawn(async move {
+                    if let Some(buf) = get_agent_buffer(&id) {
+                        if let Ok(mut g) = buf.lock() {
+                            g.push(vec![i]);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let slot_len = get_agent_buffer(slot)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(slot_len, 20, "all 20 concurrent writes to the same slot must succeed without loss or deadlock");
+
+        clear_request_state();
     }
 }

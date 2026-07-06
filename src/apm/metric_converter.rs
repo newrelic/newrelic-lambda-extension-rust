@@ -123,27 +123,64 @@ fn parse_report_normal_strict(log_line: &str) -> Option<LambdaMetrics> {
 
 /// LMI — lenient extraction: RequestId + Duration required; Billed/Memory/Max optional
 /// (AWS strips them from the LMI report). LMI-only path; never runs for Normal Lambda.
+///
+/// When the report is stripped (the normal LMI case), memory fields are back-filled:
+/// - `memory_size`    ← `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` env var (always set by runtime)
+/// - `max_memory_used` ← cgroup memory stats (total container usage, cgroupsv2 first)
+///
+/// `billed_duration` is intentionally left as `None`: LMI billing is by vCPU-hour for
+/// the execution-environment lifetime, not per-invocation milliseconds. There is no
+/// meaningful per-request "billed duration" to report.
 fn parse_report_lmi_lenient(log_line: &str) -> Option<LambdaMetrics> {
     let captures = REPORT_CORE_REGEX_LMI.captures(log_line)?;
     let request_id = captures.get(1)?.as_str().to_string();
     let duration = captures.get(2)?.as_str().parse::<f64>().ok();
 
+    // billed_duration: parse from log if present (shouldn't appear on real LMI); stays
+    // None otherwise. See doc comment above — no per-invocation billed duration on LMI.
     let billed_duration = BILLED_DURATION_REGEX.captures(log_line)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<i64>().ok())
         .map(|v| v as f64);
+
+    // memory_size: parse from log if present; fall back to the runtime env var.
     let memory_size = MEMORY_SIZE_REGEX.captures(log_line)
         .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<i64>().ok());
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+        .or_else(|| {
+            let mb = read_env_memory_size_mb();
+            if let Some(v) = mb {
+                debug!("LMI: memory_size from AWS_LAMBDA_FUNCTION_MEMORY_SIZE: {} MB", v);
+            }
+            mb
+        });
+
+    // max_memory_used: parse from log if present; fall back to live cgroup stats.
     let max_memory_used = MAX_MEMORY_USED_REGEX.captures(log_line)
         .and_then(|c| c.get(1))
-        .and_then(|m| m.as_str().parse::<i64>().ok());
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+        .or_else(|| {
+            let mb = read_cgroup_memory_mb();
+            match mb {
+                Some(v) => {
+                    debug!("LMI: max_memory_used from cgroup: {} MB", v);
+                    Some(v)
+                }
+                None => {
+                    debug!("LMI: cgroup memory unavailable (non-Lambda environment?)");
+                    None
+                }
+            }
+        });
 
     let init_duration = INIT_DURATION_REGEX.captures(log_line)
         .and_then(|c| c.get(1))
         .and_then(|m| m.as_str().parse::<f64>().ok());
 
-    debug!("LMI: parsed stripped REPORT log: request_id={}, duration={:?}", request_id, duration);
+    debug!(
+        "LMI: parsed REPORT: request_id={}, duration={:?}ms, memory_size={:?}MB, max_memory_used={:?}MB",
+        request_id, duration, memory_size, max_memory_used
+    );
 
     Some(LambdaMetrics {
         request_id,
@@ -155,6 +192,33 @@ fn parse_report_lmi_lenient(log_line: &str) -> Option<LambdaMetrics> {
         error: None,
         error_type: None,
     })
+}
+
+/// Reads the configured Lambda memory allocation (MB) from the runtime environment.
+/// `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` is always set by the Lambda runtime for every
+/// execution environment including LMI.
+pub(crate) fn read_env_memory_size_mb() -> Option<i64> {
+    std::env::var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// Reads the current container memory usage (MB) from the Linux cgroup hierarchy.
+///
+/// Tries cgroupsv2 (`/sys/fs/cgroup/memory.current`) first (Amazon Linux 2023 /
+/// newer Lambda runtimes), then falls back to cgroupsv1
+/// (`/sys/fs/cgroup/memory/memory.usage_in_bytes`). The value is the total bytes
+/// used by the Lambda execution environment (function + extension + runtime),
+/// which corresponds to "Max Memory Used" on Normal Lambda REPORT lines.
+///
+/// Returns `None` in non-Lambda environments (local tests, CI) where cgroup files
+/// are absent.
+pub(crate) fn read_cgroup_memory_mb() -> Option<i64> {
+    let bytes_str = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+        .ok()?;
+    let bytes = bytes_str.trim().parse::<i64>().ok()?;
+    Some(bytes / (1024 * 1024))
 }
 
 /// Shared fault-log parse (`Status: error  ErrorType: …`). Same for both deployments.
@@ -284,6 +348,10 @@ pub fn convert_to_apm_metrics(
 }
 
 #[cfg(test)]
+#[path = "metric_converter_tests.rs"]
+mod memory_fallback_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::deployment::{DeploymentContext, TelemetryMode};
@@ -324,8 +392,12 @@ mod tests {
 
     /// LMI strips Billed Duration / Memory Size / Max Memory Used from the report —
     /// only Duration survives. This previously failed to parse on every LMI invoke.
+    ///
+    /// Unsets the fallback env var so memory fields remain None, testing the
+    /// bare-parse path in isolation (env-var back-fill is tested separately).
     #[test]
     fn test_parse_report_log_lmi_stripped_duration_only() {
+        std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
         let log = "REPORT RequestId: abc123\tDuration: 21.33 ms";
         let metrics = parse_lambda_report_log(log, LMI).expect("stripped LMI report must parse");
 
@@ -351,9 +423,11 @@ mod tests {
         assert!(parse_lambda_report_log(stripped, LMI).is_some());
     }
 
-    /// A stripped LMI report converts to exactly one metric (duration), no billed/memory.
+    /// A stripped LMI report converts to exactly one metric (duration) when the
+    /// fallback env var is absent.  (Env-var back-fill is tested in metric_converter_tests.rs.)
     #[test]
     fn test_lmi_stripped_report_yields_duration_metric_only() {
+        std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
         let metrics = parse_lambda_report_log("REPORT RequestId: abc123\tDuration: 21.33 ms", LMI).unwrap();
         let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "arn");
         let names: Vec<&str> = apm.iter().filter_map(|m| m["name"].as_str()).collect();
@@ -361,7 +435,7 @@ mod tests {
         assert!(names.contains(&"apm.lambda.transaction.duration"), "duration metric expected");
         assert!(
             !names.iter().any(|n| n.contains("billed_duration") || n.contains("memory")),
-            "no billed/memory metrics when those fields are stripped: {names:?}"
+            "no billed/memory metrics when env var absent: {names:?}"
         );
     }
 

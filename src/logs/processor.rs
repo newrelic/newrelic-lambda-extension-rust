@@ -99,15 +99,6 @@ impl<T> SafeMutexOps<T> for Mutex<T> {
     }
 }
 
-/// State of trace ID extraction for the current invocation
-#[derive(Debug, Clone, PartialEq)]
-enum TraceIdExtractionState {
-
-    Waiting,
-
-    Extracted,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogType {
     Function,
@@ -133,9 +124,14 @@ pub struct LogProcessor {
     config: Arc<ExtensionConfig>,
     invocation_context: Arc<Mutex<InvocationContext>>,
 
-    buffered_logs: Option<Arc<Mutex<Vec<payload::LogMessage>>>>,
+    /// Per-request hold buffer for logs awaiting their `trace.id`. `Some` only when
+    /// `collect_trace_id` is enabled. Drained per-request by `on_trace_id_extracted`.
+    pending_logs: Option<Arc<Mutex<RequestLogBuffer>>>,
 
-    trace_extraction_state: Option<Arc<Mutex<TraceIdExtractionState>>>,
+    /// Recent `request_id -> trace.id` associations. Lets post-extraction and
+    /// late-delivered logs (any type) be stamped with the correct trace for their
+    /// request. `Some` only when `collect_trace_id` is enabled.
+    request_trace_ids: Option<Arc<Mutex<RequestTraceMap>>>,
 
     request_id_buffer: Arc<Mutex<Vec<payload::LogMessage>>>,
 
@@ -178,7 +174,143 @@ const MAX_RETRIES: usize = 3;
 /// the original total. With per-type queues, eviction is O(1) (pop_front on the
 /// type's own VecDeque) instead of O(n) scan across a shared buffer.
 const MAX_FAILED_BUFFER_PER_TYPE: usize = 100;
-const MAX_TRACE_BUFFER: usize = 200;
+
+/// Max number of recent `request_id -> trace.id` associations retained so that
+/// logs delivered late (out of order, or during a later invocation) can still be
+/// stamped with the correct trace for their request. Bounded to stay leak-proof
+/// across a warm sandbox's lifetime; sized well above realistic Logs-API
+/// delivery lag. Only allocated when `collect_trace_id` is enabled.
+const MAX_TRACE_ID_MAP: usize = 128;
+
+/// Bounded, insertion-ordered `request_id -> trace.id` map.
+///
+/// FIFO eviction past `MAX_TRACE_ID_MAP`: once that many newer requests have been
+/// seen, the oldest request's logs are assumed fully delivered and its entry is
+/// dropped. Lookup is O(1); the only per-log cost on the stamping path.
+#[derive(Debug, Default)]
+struct RequestTraceMap {
+    by_request: std::collections::HashMap<String, String>,
+    order: VecDeque<String>,
+}
+
+impl RequestTraceMap {
+    fn new() -> Self {
+        Self {
+            by_request: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Record (or refresh) the trace.id for a request. New keys are appended to
+    /// the eviction order; on overflow the oldest key is evicted.
+    fn insert(&mut self, request_id: &str, trace_id: &str) {
+        if let Some(existing) = self.by_request.get_mut(request_id) {
+            *existing = trace_id.to_string();
+            return;
+        }
+        if self.order.len() >= MAX_TRACE_ID_MAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_request.remove(&oldest);
+            }
+        }
+        self.order.push_back(request_id.to_string());
+        self.by_request.insert(request_id.to_string(), trace_id.to_string());
+    }
+
+    fn get(&self, request_id: &str) -> Option<&str> {
+        self.by_request.get(request_id).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.by_request.len()
+    }
+}
+
+/// Per-request hold buffer for logs awaiting their `trace.id`.
+///
+/// In APM (and deferred serverless) mode a request's agent payload — the only source
+/// of its `trace.id` — is processed one invocation late, and multiple requests overlap
+/// (request N's logs are still arriving while N+1 runs, and N+1's payload is processed
+/// while N+2 runs). A single global "waiting/extracted" flag cannot model that: it gets
+/// flipped by the *previous* request's extraction and the *current* request's logs then
+/// bypass buffering. Keying by request_id makes each request independent and removes the
+/// race entirely — `on_trace_id_extracted(req)` drains only `req`'s bucket.
+///
+/// Bounded by total log count (`max_total`, from `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX`):
+/// when exceeded, the oldest request's whole bucket is evicted and returned to the caller
+/// to send unstamped (a trace that never arrived can't be stamped). Only allocated when
+/// `collect_trace_id` is enabled.
+#[derive(Debug)]
+struct RequestLogBuffer {
+    by_request: std::collections::HashMap<String, Vec<payload::LogMessage>>,
+    order: VecDeque<String>,
+    total: usize,
+    max_total: usize,
+}
+
+impl RequestLogBuffer {
+    fn new(max_total: usize) -> Self {
+        Self {
+            by_request: std::collections::HashMap::new(),
+            order: VecDeque::new(),
+            total: 0,
+            max_total: max_total.max(1),
+        }
+    }
+
+    /// Hold `log` under `request_id`. Returns any logs evicted to stay within
+    /// `max_total` (oldest request first) so the caller can route them to the batch
+    /// unstamped.
+    fn push(&mut self, request_id: &str, log: payload::LogMessage) -> Vec<payload::LogMessage> {
+        if !self.by_request.contains_key(request_id) {
+            self.order.push_back(request_id.to_string());
+            self.by_request.insert(request_id.to_string(), Vec::new());
+        }
+        // unwrap: key inserted above if absent
+        self.by_request.get_mut(request_id).unwrap().push(log);
+        self.total += 1;
+
+        let mut evicted = Vec::new();
+        while self.total > self.max_total {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(logs) = self.by_request.remove(&oldest) {
+                self.total -= logs.len();
+                evicted.extend(logs);
+            }
+        }
+        evicted
+    }
+
+    /// Remove and return all logs held for `request_id` (for stamping on extraction).
+    fn take(&mut self, request_id: &str) -> Vec<payload::LogMessage> {
+        match self.by_request.remove(request_id) {
+            Some(logs) => {
+                self.total -= logs.len();
+                self.order.retain(|r| r != request_id);
+                logs
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove and return every held log (for shutdown / final flush).
+    fn drain_all(&mut self) -> Vec<payload::LogMessage> {
+        self.total = 0;
+        self.order.clear();
+        self.by_request.drain().flat_map(|(_, v)| v).collect()
+    }
+
+    #[cfg(test)]
+    fn len_for(&self, request_id: &str) -> usize {
+        self.by_request.get(request_id).map_or(0, Vec::len)
+    }
+
+    #[cfg(test)]
+    fn total(&self) -> usize {
+        self.total
+    }
+}
 
 /// Per-LogType failed-send retry queues. Splitting by type gives O(1) eviction
 /// on overflow (FIFO per queue) and guarantees that a flood of one type's
@@ -295,10 +427,12 @@ impl LogProcessor {
         invocation_context: Arc<Mutex<InvocationContext>>,
         apm_app: Option<Arc<tokio::sync::RwLock<Option<ApmApp>>>>,
     ) -> Self {
-        let (buffered_logs, trace_extraction_state) = if config.new_relic.collect_trace_id {
+        let (pending_logs, request_trace_ids) = if config.new_relic.collect_trace_id {
             (
-                Some(Arc::new(Mutex::new(Vec::new()))),
-                Some(Arc::new(Mutex::new(TraceIdExtractionState::Waiting))),
+                Some(Arc::new(Mutex::new(RequestLogBuffer::new(
+                    config.new_relic.trace_id_log_buffer_max,
+                )))),
+                Some(Arc::new(Mutex::new(RequestTraceMap::new()))),
             )
         } else {
             (None, None)
@@ -309,8 +443,8 @@ impl LogProcessor {
             newrelic_client,
             config,
             invocation_context,
-            buffered_logs,
-            trace_extraction_state,
+            pending_logs,
+            request_trace_ids,
             request_id_buffer: Arc::new(Mutex::new(Vec::new())),
             invocation_start_time: Arc::new(Mutex::new(chrono::Utc::now())),
             failed_logs_buffer: Arc::new(Mutex::new(FailedBuffer::new())),
@@ -628,6 +762,19 @@ impl LogProcessor {
 
             Self::stamp_request_id_attrs(&mut log_message, &effective_request_id);
 
+            // Stamp trace.id from the recent request->trace map (populated when the
+            // agent payload for this request was parsed). Covers post-extraction and
+            // late-delivered logs of any type; keyed by request so a straggler from an
+            // earlier request gets ITS trace, not the current invocation's.
+            if !effective_request_id.is_empty() && effective_request_id != "unknown" {
+                if let Some(ref trace_map) = self.request_trace_ids {
+                    if let Some(trace_id) = trace_map.lock().unwrap().get(&effective_request_id) {
+                        log_message.attributes.insert(ATTR_TRACE_ID.to_string(),
+                            serde_json::Value::String(trace_id.to_string()));
+                    }
+                }
+            }
+
             // Always use best available ARN (prefer invoked_function_arn, fallback to global context ARN)
             let arn = if !context.invoked_function_arn.is_empty() {
                 context.invoked_function_arn.clone()
@@ -639,11 +786,6 @@ impl LogProcessor {
             if !arn.is_empty() {
                 log_message.attributes.insert(ATTR_FAAS_ARN.to_string(),
                     serde_json::Value::String(arn));
-            }
-
-            if let Some(ref trace_id) = context.trace_id {
-                log_message.attributes.insert(ATTR_TRACE_ID.to_string(),
-                    serde_json::Value::String(trace_id.clone()));
             }
         } else {
             warn!("Cannot apply invocation metadata - context mutex poisoned, log will be sent without metadata");
@@ -687,6 +829,14 @@ impl LogProcessor {
             }
             "extension" => {
                 if !self.config.extension.send_extension_logs {
+                    return;
+                }
+                // During shutdown, don't forward the extension's OWN logs to New Relic.
+                // The authoritative "telemetry dropped" record is sent directly as one
+                // structured diagnostic, so these re-ingested stdout copies (e.g. the
+                // reconnect-failure error and the drop summary) would just be duplicates.
+                // CloudWatch still has them; function/platform logs are unaffected.
+                if crate::IS_SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
             }
@@ -742,7 +892,7 @@ impl LogProcessor {
                 let context = match self.invocation_context.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
-                        warn!("Invocation context mutex poisoned — dropping log record");
+                        error!("Invocation context mutex poisoned — dropping log record");
                         return;
                     }
                 };
@@ -891,35 +1041,40 @@ impl LogProcessor {
             }
     
             let log_message = self.apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
-    
-            if let (Some(ref extraction_state), Some(ref buffered_logs)) = 
-                (&self.trace_extraction_state, &self.buffered_logs) {
-                
-                let state = extraction_state.lock().unwrap();
-                let has_trace_id = {
-                    let context = match self.invocation_context.lock() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            warn!("Invocation context mutex poisoned — skipping trace buffer check");
-                            return;
+
+            // trace.id buffering (only when collect_trace_id is on). Hold each log under
+            // its own request_id until that request's trace.id is known, then stamp + send.
+            // apply_current_invocation_metadata already stamped trace.id if the request's
+            // trace was known (late log for an already-extracted request) — those skip the
+            // hold and go straight to the batch.
+            if let Some(ref pending) = self.pending_logs {
+                let already_stamped = log_message.attributes.contains_key(ATTR_TRACE_ID);
+                if !already_stamped {
+                    // The request this log belongs to (stamped by apply as faas.execution).
+                    let req = log_message
+                        .attributes
+                        .get(ATTR_FAAS_EXECUTION)
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+
+                    if let Some(req) = req {
+                        // Hold it; capacity overflow evicts the oldest request's logs,
+                        // which we route to the batch unstamped (no trace available yet).
+                        let evicted = pending.lock().unwrap().push(&req, log_message);
+                        if !evicted.is_empty() {
+                            debug!(
+                                "pending_logs at capacity — routing {} log(s) to log_batch without trace.id",
+                                evicted.len()
+                            );
+                            self.log_batch.lock().unwrap().extend(evicted);
+                            self.try_spawn_auto_flush();
                         }
-                    };
-                    context.trace_id.is_some()
-                };
-                
-                if *state == TraceIdExtractionState::Waiting && !has_trace_id {
-                    drop(state);
-                    let mut buffered = buffered_logs.lock().unwrap();
-                    if buffered.len() < MAX_TRACE_BUFFER {
-                        buffered.push(log_message);
                         return;
                     }
-                    drop(buffered);
-                    debug!("buffered_logs overflow ({} cap) — routing log to log_batch without trace.id", MAX_TRACE_BUFFER);
-                    // fall through to log_batch push + auto-flush below
+                    // No request id yet (shouldn't happen post-apply): fall through to batch.
                 }
             }
-            
+
             {
                 let mut batch = self.log_batch.lock().unwrap();
                 batch.push(log_message);
@@ -1145,7 +1300,7 @@ impl LogProcessor {
                         }
                         Err((e, returned_logs)) => {
                             if returned_logs.is_empty() {
-                                warn!("Invocation retry: non-retryable error, {} logs permanently dropped (origin req: {}): {}", chunk.len(), origin_req, e);
+                                error!("Invocation retry: non-retryable error, {} logs permanently dropped (origin req: {}): {}", chunk.len(), origin_req, e);
                             } else {
                                 warn!("Invocation retry send failed after in-task retries: {} — re-buffering {} logs (origin req: {})", e, chunk.len(), origin_req);
                                 for entry in chunk {
@@ -1236,13 +1391,16 @@ impl LogProcessor {
                 log.attributes.insert("faas.execution".to_string(),
                     serde_json::Value::String(context.request_id.clone()));
                 
-                // Stamp trace_id if available
-                if let Some(ref trace_id) = context.trace_id {
-                    log.attributes.insert("trace.id".to_string(),
-                        serde_json::Value::String(trace_id.clone()));
+                // Stamp trace.id from the request->trace map if this request's
+                // trace is already known (usually not yet for INIT-phase logs).
+                if let Some(ref trace_map) = self.request_trace_ids {
+                    if let Some(trace_id) = trace_map.lock().unwrap().get(&context.request_id) {
+                        log.attributes.insert("trace.id".to_string(),
+                            serde_json::Value::String(trace_id.to_string()));
+                    }
                 }
             }
-            
+
             // Stamp entity.guid if APM app available
             if let Some(ref apm_app_arc) = self.apm_app {
                 if let Ok(apm_guard) = apm_app_arc.try_read() {
@@ -1257,9 +1415,49 @@ impl LogProcessor {
             }
         }
         
-        // All logs are now complete - move to batch for sending
-        if let Ok(mut batch) = self.log_batch.lock() {
-            batch.extend(pre_invoke_logs);
+        // Every log above now carries faas.arn + aws.lambda_request_id + faas.execution
+        // (context was validated non-empty before we started) — they are NEVER routed
+        // without ARN + request_id, and no placeholders are used.
+        //
+        // Routing of the now-stamped logs:
+        //  - trace.id already present (map hit), or trace collection disabled → batch now.
+        //  - trace.id still missing AND collection enabled → HOLD under this request_id
+        //    (the log already has ARN + request_id) so on_trace_id_extracted stamps
+        //    trace.id and flushes it when this request's agent payload is processed.
+        //    This is what gives cold-start INIT logs their trace.id.
+        let mut to_batch: Vec<payload::LogMessage> = Vec::new();
+        for log in pre_invoke_logs {
+            let hold_for_trace = self.pending_logs.is_some()
+                && !log.attributes.contains_key(ATTR_TRACE_ID);
+
+            if hold_for_trace {
+                // Key on the request_id we just stamped onto the log itself, so the
+                // hold bucket can never disagree with what the log carries.
+                let req = log
+                    .attributes
+                    .get(ATTR_FAAS_EXECUTION)
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match (req, self.pending_logs.as_ref()) {
+                    (Some(req), Some(pending)) => {
+                        // Overflow eviction (if any) still carries ARN + request_id.
+                        let evicted = pending.lock().unwrap().push(&req, log);
+                        to_batch.extend(evicted);
+                    }
+                    // Defensive: faas.execution was just stamped, so this is unreachable;
+                    // if it ever happens the log already has ARN + request_id, so batching
+                    // it is still safe (just without trace.id).
+                    (_, _) => to_batch.push(log),
+                }
+            } else {
+                to_batch.push(log);
+            }
+        }
+
+        if !to_batch.is_empty() {
+            if let Ok(mut batch) = self.log_batch.lock() {
+                batch.extend(to_batch);
+            }
         }
     }
 
@@ -1425,85 +1623,90 @@ impl LogProcessor {
     }
 
    
-    pub async fn on_trace_id_extracted(&self, trace_id: &str) -> std::io::Result<()> {
-        let (Some(ref extraction_state), Some(ref buffered_logs_arc)) = 
-            (&self.trace_extraction_state, &self.buffered_logs) else {
+    /// Whether trace.id collection is enabled (the per-request buffer is allocated).
+    /// Lets callers skip payload parsing entirely when the feature is off.
+    pub fn is_trace_collection_enabled(&self) -> bool {
+        self.pending_logs.is_some()
+    }
+
+    /// Best-effort current APM `entity.guid`; `None` when unavailable or not APM mode.
+    fn current_entity_guid(&self) -> Option<String> {
+        self.apm_app.as_ref().and_then(|arc| match arc.try_read() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|app| app.get_entity_guid().to_string())
+                .filter(|g| !g.is_empty()),
+            Err(_) => None,
+        })
+    }
+
+    /// A request's `trace.id` has been extracted from its agent payload. Record it (so
+    /// late logs of this request stamp via `apply_current_invocation_metadata`) and
+    /// stamp + flush every log held for THIS request. Keyed by request, so it never
+    /// touches another request's held logs — no global state, no race.
+    pub async fn on_trace_id_extracted(&self, request_id: &str, trace_id: &str) -> std::io::Result<()> {
+        // Record request -> trace.id FIRST, before any early return.
+        if let Some(ref trace_map) = self.request_trace_ids {
+            trace_map.lock().unwrap().insert(request_id, trace_id);
+        }
+
+        let Some(ref pending) = self.pending_logs else {
             return Ok(());
         };
 
-        *extraction_state.lock().unwrap() = TraceIdExtractionState::Extracted;
-        
-        let mut buffered_logs = {
-            let mut buffered = buffered_logs_arc.lock().unwrap();
-            std::mem::take(&mut *buffered)
-        };
-        
-        if buffered_logs.is_empty() {
+        let mut logs = pending.lock().unwrap().take(request_id);
+        if logs.is_empty() {
             return Ok(());
         }
 
-        debug!("Applied trace ID to {} buffered logs; routing to log_batch", buffered_logs.len());
+        debug!(
+            "Applied trace ID to {} buffered log(s) for request {}; routing to log_batch",
+            logs.len(),
+            request_id
+        );
 
-        let entity_guid_opt: Option<String> = self.apm_app.as_ref().and_then(|arc| {
-            match arc.try_read() {
-                Ok(guard) => guard.as_ref().map(|app| app.get_entity_guid().to_string()).filter(|g| !g.is_empty()),
-                Err(_) => {
-                    debug!("on_trace_id_extracted: entity.guid unavailable (apm_app write lock held); logs routed without it");
-                    None
-                }
-            }
-        });
-
-        for log in &mut buffered_logs {
-            log.attributes.insert("trace.id".to_string(), trace_id.into());
+        let entity_guid_opt = self.current_entity_guid();
+        for log in &mut logs {
+            log.attributes.insert(ATTR_TRACE_ID.to_string(), trace_id.into());
             if let Some(ref guid) = entity_guid_opt {
-                log.attributes.insert("entity.guid".to_string(),
-                    serde_json::Value::String(guid.clone()));
+                log.attributes.insert(
+                    ATTR_ENTITY_GUID.to_string(),
+                    serde_json::Value::String(guid.clone()),
+                );
             }
         }
 
-        // Route through log_batch so ARN fallback chain and deduplication apply
-        self.log_batch.lock().unwrap().extend(buffered_logs);
-        // Bulk push can push the batch past FLUSH_THRESHOLD without triggering the
-        // per-record auto-flush path; explicitly check so the trace-buffer drain
-        // doesn't silently inflate batch-in-memory peak.
+        // Route through log_batch so ARN fallback chain, dedup, and chunked send apply.
+        self.log_batch.lock().unwrap().extend(logs);
         self.try_spawn_auto_flush();
         Ok(())
     }
 
-   
-    pub fn reset_trace_id_state(&self) {
-        if let (Some(ref extraction_state), Some(ref buffered_logs)) =
-            (&self.trace_extraction_state, &self.buffered_logs)
-        {
-            *extraction_state.lock().unwrap() = TraceIdExtractionState::Waiting;
-            let mut rescued: Vec<_> = {
-                let mut buf = buffered_logs.lock().unwrap();
-                std::mem::take(&mut *buf)
-            };
-            if !rescued.is_empty() {
-                debug!("reset_trace_id_state: rescuing {} trace-waiting logs into log_batch", rescued.len());
-                let entity_guid_opt: Option<String> = self.apm_app.as_ref().and_then(|arc| {
-                    match arc.try_read() {
-                        Ok(guard) => guard.as_ref().map(|app| app.get_entity_guid().to_string()).filter(|g| !g.is_empty()),
-                        Err(_) => {
-                            debug!("reset_trace_id_state: entity.guid unavailable (apm_app write lock held); logs rescued without it");
-                            None
-                        }
-                    }
-                });
-                if let Some(ref guid) = entity_guid_opt {
-                    for log in &mut rescued {
-                        log.attributes.insert("entity.guid".to_string(),
-                            serde_json::Value::String(guid.clone()));
-                    }
-                }
-                self.log_batch.lock().unwrap().extend(rescued);
-                // Same rationale as on_trace_id_extracted: bulk push can exceed the
-                // auto-flush threshold, so probe after extending.
-                self.try_spawn_auto_flush();
+    /// Flush every still-held (trace-waiting) log to the batch WITHOUT a trace.id.
+    /// Used on shutdown / final flush, where no further agent payload will arrive to
+    /// supply the missing traces — better to send them untagged than drop them.
+    pub fn flush_pending_logs_unstamped(&self) {
+        let Some(ref pending) = self.pending_logs else {
+            return;
+        };
+        let mut logs = pending.lock().unwrap().drain_all();
+        if logs.is_empty() {
+            return;
+        }
+        debug!(
+            "flush_pending_logs_unstamped: routing {} trace-waiting log(s) to log_batch",
+            logs.len()
+        );
+        if let Some(ref guid) = self.current_entity_guid() {
+            for log in &mut logs {
+                log.attributes.insert(
+                    ATTR_ENTITY_GUID.to_string(),
+                    serde_json::Value::String(guid.clone()),
+                );
             }
         }
+        self.log_batch.lock().unwrap().extend(logs);
+        self.try_spawn_auto_flush();
     }
 
    
@@ -1552,33 +1755,30 @@ impl LogProcessor {
                         serde_json::Value::String(buffered_arn.clone()));
                 }
                 
-                if let (Some(ref extraction_state), Some(ref buffered_logs_arc)) =
-                    (&self.trace_extraction_state, &self.buffered_logs) {
+                if let Some(ref pending) = self.pending_logs {
+                    // Resolve this request's trace.id from the request->trace map
+                    // (populated when its agent payload was parsed).
+                    let trace_id_opt: Option<String> = self.request_trace_ids.as_ref().and_then(|m| {
+                        m.lock().unwrap().get(request_id).map(|s| s.to_string())
+                    });
 
-                    let state = extraction_state.lock().unwrap();
-                    let trace_id_opt = {
-                        let context = match self.invocation_context.lock() {
-                            Ok(guard) => guard,
-                            Err(_) => {
-                                warn!("Invocation context mutex poisoned — skipping buffered log trace check");
-                                continue;
+                    match trace_id_opt {
+                        // Trace already known — stamp now and fall through to the batch.
+                        Some(trace_id) => {
+                            log_message.attributes.insert(
+                                ATTR_TRACE_ID.to_string(),
+                                serde_json::Value::String(trace_id),
+                            );
+                        }
+                        // Not known yet — hold under this request until its trace arrives.
+                        None => {
+                            let evicted = pending.lock().unwrap().push(request_id, log_message);
+                            if !evicted.is_empty() {
+                                self.log_batch.lock().unwrap().extend(evicted);
+                                self.try_spawn_auto_flush();
                             }
-                        };
-                        context.trace_id.clone()
-                    };
-
-                    if *state == TraceIdExtractionState::Waiting && trace_id_opt.is_none() {
-                        drop(state);
-                        let mut buffered = buffered_logs_arc.lock().unwrap();
-                        buffered.push(log_message);
-                        continue;
-                    }
-                    drop(state);
-
-                    // We're going to log_batch directly — stamp trace.id if already known.
-                    if let Some(ref trace_id) = trace_id_opt {
-                        log_message.attributes.insert("trace.id".to_string(),
-                            serde_json::Value::String(trace_id.clone()));
+                            continue;
+                        }
                     }
                 }
 
@@ -1790,7 +1990,7 @@ impl LogProcessor {
                     if failed_logs.is_empty() {
                         error!("Log batch send failed ({} logs), non-retryable — logs dropped: {}", chunk_len, e);
                     } else {
-                        error!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
+                        warn!("Log batch send failed ({} logs), buffering for next-invoke retry: {}", chunk_len, e);
                         for log_message in failed_logs {
                             let entry = FailedLogEntry {
                                 log_type: Self::log_type_from_message(&log_message),
