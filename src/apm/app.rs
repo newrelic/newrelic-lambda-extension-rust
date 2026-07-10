@@ -180,6 +180,19 @@ impl ApmApp {
 
         debug!("PreConnect returned collector host: {}", collector_host);
 
+        // When the user explicitly set a non-default host (e.g. staging-collector.newrelic.com),
+        // honor that override for connect instead of following the preconnect redirect.
+        // Staging preconnect redirects to prod collector; following it silently breaks staging tests.
+        let connect_host = if apm_host != "collector.newrelic.com" {
+            debug!(
+                "Honoring explicit apm_host ({}) for connect, ignoring preconnect redirect to {}",
+                apm_host, collector_host
+            );
+            apm_host.to_string()
+        } else {
+            collector_host
+        };
+
         // Use provided config data instead of environment variables
         // Environment variables like AWS_LAMBDA_FUNCTION_ARN are not available during INIT
         let region = region_opt
@@ -205,10 +218,12 @@ impl ApmApp {
             function_name, account_id, region
         );
 
+        let lmi_metadata = crate::telemetry::managed_instance::try_read_metadata();
+
         let connect_resp = connect(
             client,
             license_key,
-            &collector_host,
+            &connect_host,
             &function_name,
             &function_arn,
             &account_id,
@@ -217,6 +232,7 @@ impl ApmApp {
             &runtime,
             &agent_version,
             timeout_secs,
+            lmi_metadata,
         )
         .await
         .context("Connect failed")?;
@@ -231,7 +247,7 @@ impl ApmApp {
         Ok(ApmApp {
             run_id,
             entity_guid,
-            collector_host,
+            collector_host: connect_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
             client: client.clone(),
@@ -289,7 +305,7 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        for (telemetry_type, data) in telemetry_map {
+        for (telemetry_type, mut data) in telemetry_map {
             if data.is_empty() {
                 continue;
             }
@@ -299,6 +315,27 @@ impl ApmApp {
                 debug!("Telemetry type {} disabled - skipping", telemetry_type);
                 continue;
             }
+
+            // metric_data[1] and [2] are the harvest epoch window (start, end).
+            // The Java agent serverless mode writes these in milliseconds; the APM
+            // collector protocol expects seconds. Values above this threshold are
+            // unambiguously milliseconds (the year ~33658 as seconds — no real epoch
+            // will exceed this in seconds for centuries).
+            const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
+            if telemetry_type == "metric_data" && data.len() >= 3 {
+                for i in 1..=2usize {
+                    if let Some(ts) = data[i].as_f64() {
+                        if ts > JAVA_AGENT_MS_EPOCH_THRESHOLD {
+                            data[i] = serde_json::Value::from((ts / 1000.0) as i64);
+                        }
+                    }
+                }
+                debug!(
+                    "metric_data epoch range after normalisation: [{}, {}]",
+                    data[1], data[2]
+                );
+            }
+
 
             debug!(
                 "Sending {} telemetry items as {}",
