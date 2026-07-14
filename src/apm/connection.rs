@@ -194,6 +194,12 @@ pub struct AwsLambdaInfo {
     pub account_id: String,
     #[serde(rename = "aws.functionName")]
     pub function_name: String,
+    /// LMI instance identifier from `platform.initStart`. Absent on Standard Lambda.
+    #[serde(rename = "aws.lambda.managedInstance.instanceId", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_id: Option<String>,
+    /// LMI maximum memory (raw AWS uint64, bytes). Absent on Standard Lambda or when AWS omits it.
+    #[serde(rename = "aws.lambda.managedInstance.instanceMaxMemory", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_max_memory: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -299,10 +305,16 @@ pub async fn connect(
     runtime: &str,
     agent_version: &str,
     timeout_secs: u64,
+    lmi_metadata: Option<crate::telemetry::managed_instance::ManagedInstanceMetadata>,
 ) -> Result<ConnectResponse> {
     let url = format!(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
     );
+
+    let (managed_instance_id, managed_instance_max_memory) = match lmi_metadata {
+        Some(meta) => (Some(meta.instance_id), meta.instance_max_memory),
+        None => (None, None),
+    };
 
     let connect_req = vec![ConnectRequest {
         pid: std::process::id(),
@@ -319,6 +331,8 @@ pub async fn connect(
                     region: region.to_string(),
                     account_id: account_id.to_string(),
                     function_name: function_name.to_string(),
+                    managed_instance_id,
+                    managed_instance_max_memory,
                 },
             },
         },

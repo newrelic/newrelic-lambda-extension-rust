@@ -39,9 +39,12 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
 const LAYER_AGENT_PATHS_JAVA: &[&str] = &[
+    "/opt/newrelic",  // NR Java agent layer (newrelic.jar + java-agent-version.txt)
     "/opt/java/lib",  // Directory to scan for newrelic JARs
     "/opt/lib",       // Alternative directory to scan
 ];
+/// Fast-path version file installed by the NR Java agent layer at /opt/newrelic/
+const JAVA_AGENT_VERSION_FILE: &str = "/opt/newrelic/java-agent-version.txt";
 const LAYER_AGENT_JAR_NAMES: &[&str] = &[
     "newrelic-java-lambda",  // Prefix for layer JAR (e.g., newrelic-java-lambda-2.2.5.jar)
     "newrelic.jar",          // Generic name
@@ -214,6 +217,16 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
     if let Some(version) = read_ruby_version(VENDOR_AGENT_PATH_RUBY) {
         debug!("✓ Detected Ruby agent version: {} from {}", version, VENDOR_AGENT_PATH_RUBY);
         return (Some(version), Some("Ruby".to_string()));
+    }
+
+    // Fast path: /opt/newrelic/java-agent-version.txt written by the NR Java agent layer
+    debug!("Checking Java version file: {}", JAVA_AGENT_VERSION_FILE);
+    if let Ok(content) = fs::read_to_string(JAVA_AGENT_VERSION_FILE) {
+        let version = content.trim();
+        if !version.is_empty() {
+            debug!("✓ Detected Java agent version: {} from {}", version, JAVA_AGENT_VERSION_FILE);
+            return (Some(version.to_string()), Some("Java".to_string()));
+        }
     }
 
     for path in LAYER_AGENT_PATHS_JAVA {
