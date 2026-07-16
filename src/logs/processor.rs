@@ -1944,10 +1944,19 @@ impl LogProcessor {
                 }
                 return Ok(());
             }
-            warn!(
-                "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
-                fallback, context.request_id
-            );
+            // In LMI heartbeat flushes there is no active invocation, so request_id is
+            // legitimately empty. Only include it in the message when it carries a value.
+            if context.request_id.is_empty() {
+                warn!(
+                    "Log flush: Using fallback ARN '{}' (heartbeat flush — no active invocation context)",
+                    fallback
+                );
+            } else {
+                warn!(
+                    "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
+                    fallback, context.request_id
+                );
+            }
             fallback
         };
         

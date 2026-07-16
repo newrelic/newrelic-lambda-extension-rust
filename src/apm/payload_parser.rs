@@ -28,14 +28,17 @@ pub struct LambdaData {
     pub transaction_sample_data: Vec<Value>,
 }
 
-/// Protocol v1 wrapper with metadata and data fields
+/// Protocol v1 wrapper with metadata and data fields.
+/// Note: metadata (agent_version, agent_language) is available in the payload
+/// but arrives AFTER APM Connect has already been made — too late to use.
+/// We only deserialize `data`; metadata is intentionally ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LambdaRawData {
     pub data: LambdaData,
 }
 
-/// Parse agent payload and return telemetry data by type
-/// Returns (data_map, protocol_version)
+/// Parse agent payload and return telemetry data by type.
+/// Returns (data_map, protocol_version).
 pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<Value>>, u8)> {
     let payload_str = std::str::from_utf8(payload_bytes)?;
     
@@ -60,7 +63,7 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
 
     let (data_map, version) = match protocol_version {
         "2" => {
-            // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+            // Protocol v2: no metadata wrapper — data is the root object
             let sanitized_payload = String::from_utf8_lossy(&uncompressed_json)
                 .replace('\n', "\\n")
                 .replace('\r', "\\r");

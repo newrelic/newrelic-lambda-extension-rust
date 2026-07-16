@@ -10,13 +10,14 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Global cache for version information (detected once, reused everywhere)
 static VERSION_INFO_CACHE: OnceCell<Arc<VersionInfo>> = OnceCell::new();
 
 /// Global cache for runtime version from platform.initStart event
 static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
+
 
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -253,8 +254,77 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         }
     }
 
-    warn!("No agent version detected from any known paths");
+    // Go agent: compiled into the handler binary — no layer files to read.
+    // Scan the Go binary's embedded build info for the NR go-agent module version.
+    // This runs BEFORE the APM connect so the version reaches the Connect payload.
+    if let Some(version) = detect_go_agent_version_from_binary() {
+        debug!("✓ Detected Go agent version from binary build info: {}", version);
+        return (Some(version), Some("Go".to_string()));
+    }
+
+    debug!("No agent version detected from any known paths (expected for Go/custom runtimes)");
     (None, None)
+}
+
+/// Scan the Go handler binary for the NR go-agent module version embedded in build info.
+///
+/// Go encodes module dependency versions in a `go.buildinfo` section as human-readable
+/// tab-separated text, e.g.:
+///   `dep\tgithub.com/newrelic/go-agent/v3\tv3.39.0\th1:...`
+///
+/// We search for the byte pattern and extract the semver string. This is done once at
+/// startup — before the APM Connect — so the version appears in the Connect payload.
+fn detect_go_agent_version_from_binary() -> Option<String> {
+    let task_root = std::env::var("LAMBDA_TASK_ROOT")
+        .unwrap_or_else(|_| "/var/task".to_string());
+
+    // Candidate binary names for Go Lambda handlers
+    let candidates = {
+        let mut v = vec![
+            format!("{}/bootstrap", task_root),
+            format!("{}/handler", task_root),
+        ];
+        // _HANDLER may be "mypackage.Handler" — the binary name is the part before the dot
+        if let Ok(h) = std::env::var("_HANDLER") {
+            let bin = h.split('.').next().unwrap_or(&h);
+            v.push(format!("{}/{}", task_root, bin));
+        }
+        v
+    };
+
+    // Byte pattern: "github.com/newrelic/go-agent/v3\tv"
+    const NR_GO_AGENT_PREFIX: &[u8] = b"github.com/newrelic/go-agent/v3\tv";
+
+    for path in &candidates {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        debug!("Scanning Go binary for NR agent version: {}", path);
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Could not read binary {}: {}", path, e);
+                continue;
+            }
+        };
+        if let Some(pos) = bytes.windows(NR_GO_AGENT_PREFIX.len())
+            .position(|w| w == NR_GO_AGENT_PREFIX)
+        {
+            let ver_start = pos + NR_GO_AGENT_PREFIX.len();
+            let ver_end = bytes[ver_start..]
+                .iter()
+                .position(|&b| b == b'\t' || b == b'\n' || b == b'\r' || b == b'\0')
+                .map(|e| ver_start + e)
+                .unwrap_or((ver_start + 20).min(bytes.len()));
+            if let Ok(ver) = std::str::from_utf8(&bytes[ver_start..ver_end]) {
+                let ver = ver.trim();
+                if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read Node.js agent version from package.json
