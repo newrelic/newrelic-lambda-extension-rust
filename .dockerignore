@@ -1,0 +1,17 @@
+# Exclude bulk directories — keeps build context small
+target/
+.git/
+.claude/
+.code-review-graph/
+scripts/
+release/
+docs/
+.github/
+.idea/
+.vscode/
+*.swp
+*.swo
+.env*
+
+# Re-include the cross-compiled extension binary
+!target/aarch64-unknown-linux-musl/release/newrelic-lambda-extension

@@ -1,0 +1,15 @@
+# Minimal Python image for the mock New Relic endpoint.
+# No external dependencies — uses only the stdlib http.server.
+
+# Local alias for public.ecr.aws/lambda/python:3.12 — avoids remote manifest fetch.
+# Run once: docker tag public.ecr.aws/lambda/python:3.12 nr-rie-base:python312
+FROM nr-rie-base:python312
+
+WORKDIR /app
+COPY tests/rie/mock_nr_server.py /app/mock_nr_server.py
+
+EXPOSE 9999
+
+# Override Lambda runtime entrypoint — mock server is plain HTTP, not a Lambda handler
+ENTRYPOINT []
+CMD ["python3", "-u", "/app/mock_nr_server.py"]

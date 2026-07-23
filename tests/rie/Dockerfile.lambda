@@ -1,0 +1,27 @@
+# Lambda extension container for local integration testing.
+#
+# Runs the extension binary alongside a mock Lambda runtime (mock_lambda_runtime.py)
+# which fully implements the Extensions API and Telemetry API, including actual
+# event forwarding — unlike the open-source RIE which stubs out the Telemetry API.
+#
+# Build context is the repo root.
+
+FROM nr-rie-base:python312-arm64
+
+# Extension binary produced by cargo zigbuild (arm64 musl — no glibc dep)
+COPY target/aarch64-unknown-linux-musl/release/newrelic-lambda-extension \
+     /opt/extensions/newrelic-lambda-extension
+RUN chmod +x /opt/extensions/newrelic-lambda-extension
+
+# Mock Lambda runtime (implements Extensions + Telemetry APIs)
+COPY tests/rie/mock_lambda_runtime.py /mock_lambda_runtime.py
+
+# Startup script: launch runtime first, then the extension
+COPY tests/rie/start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 9000 9001
+
+# Override Lambda runtime entrypoint entirely
+ENTRYPOINT []
+CMD ["/start.sh"]

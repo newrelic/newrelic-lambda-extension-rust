@@ -1,0 +1,53 @@
+name: nr-ext-rie-test
+
+services:
+
+  # ── Mock New Relic endpoint ────────────────────────────────────────────────
+  mock-nr:
+    build:
+      context: ../..          # repo root — so COPY tests/rie/... works
+      dockerfile: tests/rie/Dockerfile.mock
+    ports:
+      - "9999:9999"
+    environment:
+      - FAIL_FIRST_N=${FAIL_FIRST_N:-0}
+      - ALWAYS_FAIL=${ALWAYS_FAIL:-}
+      - PORT=9999
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:9999/stats')"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # ── Lambda function + NR extension via RIE ────────────────────────────────
+  lambda:
+    build:
+      context: ../..
+      dockerfile: tests/rie/Dockerfile.lambda
+    platform: linux/arm64
+    ports:
+      - "9000:9000"
+    environment:
+      # NR extension config
+      - NEW_RELIC_LICENSE_KEY=test-fake-key-for-rie
+      - NEW_RELIC_LOG_ENDPOINT=http://mock-nr:9999/log/v1
+      - NEW_RELIC_TELEMETRY_ENDPOINT=http://mock-nr:9999/aws/lambda/v1
+      - NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=true
+      - NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS=true
+      - NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS=false
+      - NEW_RELIC_EXTENSION_LOG_LEVEL=debug
+      - NEW_RELIC_EXTENSION_LOGS_ENABLED=true
+      # Lambda runtime env
+      - AWS_REGION=us-east-1
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_LAMBDA_FUNCTION_NAME=rie-test-function
+      - AWS_LAMBDA_FUNCTION_MEMORY_SIZE=512
+      - AWS_LAMBDA_FUNCTION_VERSION=\$LATEST
+    # In production Lambda, 'sandbox' resolves to the extension's loopback.
+    # RIE containers need this mapped explicitly so the Telemetry API callback works.
+    extra_hosts:
+      - "sandbox:127.0.0.1"
+    depends_on:
+      mock-nr:
+        condition: service_healthy
