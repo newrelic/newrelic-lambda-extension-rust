@@ -1512,6 +1512,28 @@ async fn send_agent_payload_or_buffer(
     }
 }
 
+/// Lambda's hard ceiling on a function's timeout. The runtime.done wait is never
+/// allowed to exceed this even absent a cap.
+const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
+/// Wait used when the INVOKE event carried no usable `deadlineMs`.
+const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
+
+/// Compute how long to wait for `platform.runtimeDone`, given the invoke's
+/// `deadline_ms`, the current time `now_ms`, and the configured cap.
+///
+/// The result is `min(deadline_budget, cap, MAX)`, where `deadline_budget` is the
+/// time left until the function deadline (or `FALLBACK_RUNTIME_DONE_WAIT_MS` when
+/// the deadline is missing/already past). Pure and side-effect-free so the cap
+/// behavior is unit-testable without touching the clock or config.
+fn runtime_done_wait_ms(deadline_ms: i64, now_ms: i64, cap_ms: u64) -> u64 {
+    let deadline_budget_ms: u64 = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).min(MAX_RUNTIME_DONE_WAIT_MS)
+    } else {
+        FALLBACK_RUNTIME_DONE_WAIT_MS
+    };
+    deadline_budget_ms.min(cap_ms)
+}
+
 /// Wait for `platform.runtimeDone` for this request, then give a short grace for
 /// trailing telemetry, then return. Used by both serverless mode and APM mode before
 /// the end-of-invocation flush so late logs land in `log_batch` before it drains.
@@ -1538,19 +1560,26 @@ async fn wait_for_runtime_done_with_grace(
         return;
     };
 
-    const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
-    const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
-
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let remaining_ms: u64 = if deadline_ms > now_ms {
-        ((deadline_ms - now_ms) as u64).min(MAX_RUNTIME_DONE_WAIT_MS)
-    } else {
+    let stale_deadline = deadline_ms <= now_ms;
+    if stale_deadline {
         warn!(
             "INVOKE for request {} missing/stale deadlineMs ({}); using {}ms fallback for runtime.done wait",
             request_id, deadline_ms, FALLBACK_RUNTIME_DONE_WAIT_MS
         );
-        FALLBACK_RUNTIME_DONE_WAIT_MS
-    };
+    }
+    // Cap the wait well below the function deadline. platform.runtimeDone
+    // normally arrives within a few ms of the handler returning, so under
+    // normal operation the notify below fires long before this cap. The cap
+    // exists so a silent/absent Telemetry API (the local RIE never emits
+    // telemetry; a platform stall could also do it) cannot park the invocation
+    // for the whole deadline — which would gate the next GET /next and hang the
+    // invoke response until the sandbox is torn down.
+    let remaining_ms = runtime_done_wait_ms(
+        deadline_ms,
+        now_ms,
+        config.extension.runtime_done_wait_cap_ms,
+    );
 
     let signal = tokio::select! {
         _ = notify.notified() => true,
@@ -1603,7 +1632,9 @@ async fn wait_for_runtime_done_with_grace(
         }
     } else {
         debug!(
-            "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
+            "runtime.done not received within {}ms for request: {} - flushing anyway \
+             (if this is the deadline budget, the function timed out; if it matches \
+             NEW_RELIC_RUNTIME_DONE_WAIT_CAP_MS, the Telemetry API may be silent, e.g. local RIE)",
             remaining_ms, request_id
         );
     }

@@ -85,6 +85,17 @@ pub struct ExtensionSettings {
     /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
     /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
     pub runtime_done_grace_ms: u64,
+    /// NEW_RELIC_RUNTIME_DONE_WAIT_CAP_MS — hard upper bound (ms) on how long
+    /// the end-of-invocation flush waits for `platform.runtimeDone` before
+    /// giving up and flushing anyway. On real Lambda `platform.runtimeDone`
+    /// arrives within a few ms of the handler returning, so this cap is never
+    /// hit in normal operation. Its purpose is to keep a silent/absent
+    /// Telemetry API (e.g. the local RIE, which never emits telemetry, or a
+    /// platform stall) from parking the invocation for the entire function
+    /// deadline — which gates the extension's next GET /next and hangs the
+    /// invoke response. Default 3000, clamped to `[100, 60000]`. Read once at
+    /// startup by `init_config()`.
+    pub runtime_done_wait_cap_ms: u64,
     /// NEW_RELIC_EXTENSION_PIPELINE_FLUSH — when true, the extension calls
     /// GET /next immediately after runtimeDone and flushes telemetry in the
     /// background during the freeze/thaw gap. Reduces billed duration but
@@ -224,6 +235,7 @@ impl Default for ExtensionSettings {
             log_level: "info".to_string(),
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
+            runtime_done_wait_cap_ms: 3000,
             pipeline_flush: false,
         }
     }
@@ -401,6 +413,16 @@ impl ExtensionConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(25)
             .min(2000);
+
+        // Parse NEW_RELIC_RUNTIME_DONE_WAIT_CAP_MS once at startup. Clamp to
+        // [100, 60000]. Default 3000 ms — well above the few-ms latency of
+        // platform.runtimeDone on real Lambda, but far below the function
+        // deadline so a silent Telemetry API can't hang the invoke response.
+        config.extension.runtime_done_wait_cap_ms = env::var("NEW_RELIC_RUNTIME_DONE_WAIT_CAP_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3000)
+            .clamp(100, 60_000);
 
         // NEW_RELIC_EXTENSION_PIPELINE_FLUSH: opt-in to pipeline GET /next pattern.
         // When enabled, the extension calls GET /next immediately after runtimeDone

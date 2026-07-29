@@ -469,3 +469,55 @@ async fn flow1_failure_buffers_exactly_one_per_failed_payload() {
         b.clear();
     }
 }
+
+// --- runtime.done wait cap -------------------------------------------------
+
+#[test]
+fn runtime_done_wait_is_capped_when_deadline_is_far_out() {
+    // A long-running function: 10 minutes of deadline budget left.
+    let now = 1_000_000_000_000;
+    let deadline = now + 10 * 60 * 1_000; // +600s
+    // With a 3s cap, we must wait at most 3s for runtime.done — NOT the full
+    // 10-minute deadline. This is the regression guard for the RIE hang.
+    assert_eq!(runtime_done_wait_ms(deadline, now, 3_000), 3_000);
+}
+
+#[test]
+fn runtime_done_wait_uses_deadline_when_below_cap() {
+    // A short function whose remaining deadline is under the cap: wait the
+    // deadline budget, never longer than what the function itself has left.
+    let now = 1_000_000_000_000;
+    let deadline = now + 800; // +800ms
+    assert_eq!(runtime_done_wait_ms(deadline, now, 3_000), 800);
+}
+
+#[test]
+fn runtime_done_wait_falls_back_when_deadline_missing_or_past() {
+    let now = 1_000_000_000_000;
+    // deadline_ms == 0 (unset) → fallback, still capped.
+    assert_eq!(
+        runtime_done_wait_ms(0, now, 3_000),
+        FALLBACK_RUNTIME_DONE_WAIT_MS.min(3_000)
+    );
+    // deadline already in the past → fallback, still capped.
+    assert_eq!(
+        runtime_done_wait_ms(now - 5_000, now, 3_000),
+        FALLBACK_RUNTIME_DONE_WAIT_MS.min(3_000)
+    );
+    // With a cap above the fallback, the fallback is returned unchanged.
+    assert_eq!(
+        runtime_done_wait_ms(0, now, 10_000),
+        FALLBACK_RUNTIME_DONE_WAIT_MS
+    );
+}
+
+#[test]
+fn runtime_done_wait_never_exceeds_lambda_ceiling() {
+    // Even with an absurd deadline and cap, never exceed the 15-minute ceiling.
+    let now = 1_000_000_000_000;
+    let deadline = now + 60 * 60 * 1_000; // +1h
+    assert_eq!(
+        runtime_done_wait_ms(deadline, now, u64::MAX),
+        MAX_RUNTIME_DONE_WAIT_MS
+    );
+}
