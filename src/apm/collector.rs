@@ -235,11 +235,16 @@ pub async fn send_error_events(
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", CMD_ERROR_EVENTS)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, CMD_ERROR_EVENTS)));
+                .context(format!("Collector returned 409 for {}", CMD_ERROR_EVENTS)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", CMD_ERROR_EVENTS)));
         }
         
         warn!(
@@ -336,11 +341,16 @@ pub async fn send_apm_telemetry(
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", command)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, command)));
+                .context(format!("Collector returned 409 for {}", command)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", command)));
         }
         
         warn!(

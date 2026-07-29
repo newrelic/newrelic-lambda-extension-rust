@@ -233,7 +233,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // on the healthy hot path (two cheap atomic-guarded count checks instead).
                 let has_buffered = crate::apm::telemetry_buffer::get_buffer_count() > 0
                     || crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0;
-                if components.apm_mode_enabled && has_buffered {
+                if components.apm_mode_enabled && has_buffered && components.apm_app.read().await.is_some() {
                     let (cur_run_id, cur_collector_host) = {
                         let guard = components.apm_app.read().await;
                         match guard.as_ref() {
