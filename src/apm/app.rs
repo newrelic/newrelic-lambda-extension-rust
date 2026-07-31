@@ -285,46 +285,55 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        // Extract and forward OTLP payloads before the APM telemetry loop
-        let otlp_entries: Vec<String> = telemetry_map
-            .remove("otlp_payload")
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(String::from))
-            .collect();
+        // OTLP metrics forwarding is opt-in via NEW_RELIC_OTLP_ENABLED. When disabled,
+        // drop any otlp_payload entries here (before the generic telemetry loop below,
+        // which would otherwise log them as an "Unknown telemetry type").
+        if super::collector::is_otlp_enabled() {
+            let otlp_entries: Vec<String> = telemetry_map
+                .remove("otlp_payload")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
 
-        if !otlp_entries.is_empty() {
-            info!(
-                "Sending {} OTLP payload(s) to OTLP endpoint (entity.guid={})",
-                otlp_entries.len(),
-                self.entity_guid,
-            );
+            if !otlp_entries.is_empty() {
+                info!(
+                    "Sending {} OTLP payload(s) to OTLP endpoint (entity.guid={})",
+                    otlp_entries.len(),
+                    self.entity_guid,
+                );
+                debug!(
+                    "OTLP endpoint: {}",
+                    self.otlp_endpoint,
+                );
+                let client = self.client.clone();
+                let otlp_endpoint = self.otlp_endpoint.clone();
+                let license_key = self.license_key.clone();
+                let entity_guid = self.entity_guid.clone();
+                let request_id_owned = request_id.to_string();
+
+                send_tasks.push(tokio::spawn(async move {
+                    if let Err(e) = send_otlp_payload(
+                        &client,
+                        &otlp_endpoint,
+                        &license_key,
+                        &otlp_entries,
+                        &entity_guid,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Failed to send otlp_payload for request {}: {}",
+                            request_id_owned, e
+                        );
+                    }
+                }));
+            }
+        } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
             debug!(
-                "OTLP endpoint: {}",
-                self.otlp_endpoint,
+                "Dropping {} OTLP payload(s) - NEW_RELIC_OTLP_ENABLED is not set",
+                dropped.len()
             );
-            let client = self.client.clone();
-            let otlp_endpoint = self.otlp_endpoint.clone();
-            let license_key = self.license_key.clone();
-            let entity_guid = self.entity_guid.clone();
-            let request_id_owned = request_id.to_string();
-
-            send_tasks.push(tokio::spawn(async move {
-                if let Err(e) = send_otlp_payload(
-                    &client,
-                    &otlp_endpoint,
-                    &license_key,
-                    &otlp_entries,
-                    &entity_guid,
-                )
-                .await
-                {
-                    warn!(
-                        "Failed to send otlp_payload for request {}: {}",
-                        request_id_owned, e
-                    );
-                }
-            }));
         }
 
         for (telemetry_type, data) in telemetry_map {

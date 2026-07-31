@@ -477,6 +477,9 @@ async fn perform_one_time_initialization(
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
+    // OTLP metrics forwarding is opt-in — mirror the flag the same way.
+    apm::collector::set_otlp_enabled(config.new_relic.otlp_enabled);
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
             // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
