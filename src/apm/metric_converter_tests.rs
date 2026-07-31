@@ -1,119 +1,127 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for LMI memory fallback helpers (`read_env_memory_size_mb`,
-//! `read_cgroup_memory_mb`) and their integration with `parse_report_lmi_lenient`
-//! via `parse_lambda_report_log`.
-//!
-//! These tests cover the back-fill paths that populate `memory_size` and
-//! `max_memory_used` when AWS strips them from the LMI `platform.report`.
-
 use super::*;
-use crate::config::deployment::DeploymentContext;
-use serial_test::serial;
+use crate::config::deployment::{DeploymentContext, TelemetryMode};
 
+const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Apm };
 const LMI: DeploymentContext = DeploymentContext::Lmi;
 
-// ── read_env_memory_size_mb ───────────────────────────────────────────────────
-
-/// When the runtime env var is set to a valid integer, the helper must return it.
 #[test]
-#[serial]
-fn env_memory_size_returns_value_when_var_set() {
-    std::env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1024");
-    let result = read_env_memory_size_mb();
+fn test_parse_report_log_basic() {
+    let log = "REPORT RequestId: abc123\tDuration: 123.45 ms\tBilled Duration: 124 ms\tMemory Size: 512 MB\tMax Memory Used: 256 MB";
+    let metrics = parse_lambda_report_log(log, NORMAL).unwrap();
+
+    assert_eq!(metrics.request_id, "abc123");
+    assert_eq!(metrics.duration, Some(123.45));
+    assert_eq!(metrics.billed_duration, Some(124.0));
+    assert_eq!(metrics.memory_size, Some(512));
+    assert_eq!(metrics.max_memory_used, Some(256));
+    assert_eq!(metrics.init_duration, None);
+}
+
+#[test]
+fn test_parse_report_log_with_init() {
+    let log = "REPORT RequestId: abc123\tDuration: 123.45 ms\tBilled Duration: 124 ms\tMemory Size: 512 MB\tMax Memory Used: 256 MB\tInit Duration: 456.78 ms";
+    let metrics = parse_lambda_report_log(log, NORMAL).unwrap();
+
+    assert_eq!(metrics.init_duration, Some(456.78));
+}
+
+#[test]
+fn test_parse_fault_log() {
+    let log = "RequestId: abc123 Status: error ErrorType: Runtime.ExitError";
+    let metrics = parse_lambda_report_log(log, NORMAL).unwrap();
+
+    assert_eq!(metrics.request_id, "abc123");
+    assert_eq!(metrics.error, Some("error".to_string()));
+    assert_eq!(metrics.error_type, Some("Runtime.ExitError".to_string()));
+}
+
+/// LMI strips Billed Duration / Memory Size / Max Memory Used from the report —
+/// only Duration survives. This previously failed to parse on every LMI invoke.
+///
+/// Unsets the fallback env var so memory fields remain None, testing the
+/// bare-parse path in isolation (env-var back-fill is tested separately).
+#[test]
+fn test_parse_report_log_lmi_stripped_duration_only() {
     std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-    assert_eq!(result, Some(1024));
-}
-
-/// When the env var is absent, the helper must return None (no panic).
-#[test]
-#[serial]
-fn env_memory_size_returns_none_when_var_absent() {
-    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-    assert_eq!(read_env_memory_size_mb(), None);
-}
-
-/// When the env var contains a non-numeric value, the helper must return None.
-#[test]
-#[serial]
-fn env_memory_size_returns_none_when_var_not_numeric() {
-    std::env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "not-a-number");
-    let result = read_env_memory_size_mb();
-    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-    assert_eq!(result, None);
-}
-
-// ── read_cgroup_memory_mb ─────────────────────────────────────────────────────
-
-/// In a non-Lambda environment (CI, local dev), cgroup files are absent.
-/// The helper must return None without panicking.
-#[test]
-fn cgroup_memory_returns_none_when_files_absent() {
-    // On macOS / most CI environments neither cgroup path exists.
-    // This test is vacuously true on Linux Lambda but guards against panics everywhere.
-    let result = read_cgroup_memory_mb();
-    // We can't assert Some(v) because we don't know if we're on a real Lambda,
-    // but we can assert the call completes and returns an Option (not a panic).
-    let _ = result; // use the value so the compiler doesn't warn
-}
-
-// ── parse_report_lmi_lenient integration ─────────────────────────────────────
-
-/// When the stripped LMI report has no memory fields AND the env var is set,
-/// `parse_lambda_report_log` must back-fill `memory_size` from the env var.
-#[test]
-#[serial]
-fn lmi_stripped_report_backfills_memory_size_from_env() {
-    std::env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "512");
-    let log = "REPORT RequestId: req-1\tDuration: 50.0 ms";
-    let metrics = parse_lambda_report_log(log, LMI).expect("stripped LMI report must parse");
-    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-
-    assert_eq!(metrics.memory_size, Some(512),
-        "memory_size must be back-filled from AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-}
-
-/// When `memory_size` IS present in the log (e.g. a test REPORT line that
-/// still carries the field), the log value must win over the env var.
-#[test]
-#[serial]
-fn lmi_report_with_memory_size_field_wins_over_env() {
-    std::env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "999");
-    let log = "REPORT RequestId: req-2\tDuration: 50.0 ms\tBilled Duration: 50 ms\tMemory Size: 256 MB\tMax Memory Used: 128 MB";
-    let metrics = parse_lambda_report_log(log, LMI).expect("full LMI report must parse");
-    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
-
-    assert_eq!(metrics.memory_size, Some(256),
-        "log value (256) must win over env var (999)");
-}
-
-/// `billed_duration` must remain `None` on a stripped LMI report.
-/// LMI billing is vCPU-hour (EE lifetime), not per-invocation milliseconds.
-#[test]
-fn lmi_stripped_report_leaves_billed_duration_none() {
-    let log = "REPORT RequestId: req-3\tDuration: 33.0 ms";
+    let log = "REPORT RequestId: abc123\tDuration: 21.33 ms";
     let metrics = parse_lambda_report_log(log, LMI).expect("stripped LMI report must parse");
 
-    assert_eq!(metrics.billed_duration, None,
-        "billed_duration must be None on LMI — vCPU-hour billing, not per-invocation");
+    assert_eq!(metrics.request_id, "abc123");
+    assert_eq!(metrics.duration, Some(21.33));
+    assert_eq!(metrics.billed_duration, None);
+    assert_eq!(metrics.memory_size, None);
+    assert_eq!(metrics.max_memory_used, None);
+    assert_eq!(metrics.init_duration, None);
+    assert_eq!(metrics.error, None);
 }
 
-/// The APM metric output for a stripped LMI report back-filled with env memory
-/// must include `apm.lambda.transaction.memory_size` once `memory_size` is populated.
+/// CRITICAL guarantee — Standard Lambda is NOT relaxed: the strict `Normal` path
+/// must REJECT a stripped report (only the `Lmi` path accepts it).
 #[test]
-#[serial]
-fn lmi_stripped_report_with_env_memory_emits_memory_size_metric() {
-    std::env::set_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", "1024");
-    let log = "REPORT RequestId: req-4\tDuration: 100.0 ms";
-    let metrics = parse_lambda_report_log(log, LMI).expect("stripped LMI report must parse");
-    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
+fn test_normal_rejects_stripped_report() {
+    let stripped = "REPORT RequestId: abc123\tDuration: 21.33 ms";
+    assert!(
+        parse_lambda_report_log(stripped, NORMAL).is_none(),
+        "Normal Lambda must keep the strict full-format parse (no relaxation)"
+    );
+    // Same line parses on LMI.
+    assert!(parse_lambda_report_log(stripped, LMI).is_some());
+}
 
+/// A stripped LMI report converts to exactly one metric (duration) when the
+/// fallback env var is absent.  (Env-var back-fill is tested in metric_converter_tests.rs.)
+#[test]
+fn test_lmi_stripped_report_yields_duration_metric_only() {
+    std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
+    let metrics = parse_lambda_report_log("REPORT RequestId: abc123\tDuration: 21.33 ms", LMI).unwrap();
     let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "arn");
     let names: Vec<&str> = apm.iter().filter_map(|m| m["name"].as_str()).collect();
 
-    assert!(names.contains(&"apm.lambda.transaction.memory_size"),
-        "memory_size metric must appear when back-filled from env var; got: {names:?}");
-    assert!(!names.iter().any(|n| n.contains("billed_duration")),
-        "billed_duration metric must NOT appear on LMI; got: {names:?}");
+    assert!(names.contains(&"apm.lambda.transaction.duration"), "duration metric expected");
+    assert!(
+        !names.iter().any(|n| n.contains("billed_duration") || n.contains("memory")),
+        "no billed/memory metrics when env var absent: {names:?}"
+    );
+}
+
+/// Regression: a FULL report parses identically on BOTH paths (all fields populated).
+#[test]
+fn test_parse_report_log_full_unchanged_both_modes() {
+    let log = "REPORT RequestId: abc123\tDuration: 123.45 ms\tBilled Duration: 124 ms\tMemory Size: 512 MB\tMax Memory Used: 256 MB\tInit Duration: 456.78 ms";
+    for ctx in [NORMAL, LMI] {
+        let metrics = parse_lambda_report_log(log, ctx).unwrap();
+        assert_eq!(metrics.request_id, "abc123");
+        assert_eq!(metrics.duration, Some(123.45));
+        assert_eq!(metrics.billed_duration, Some(124.0));
+        assert_eq!(metrics.memory_size, Some(512));
+        assert_eq!(metrics.max_memory_used, Some(256));
+        assert_eq!(metrics.init_duration, Some(456.78));
+    }
+}
+
+#[test]
+fn test_convert_to_apm_metrics() {
+    let metrics = LambdaMetrics {
+        request_id: "abc123".to_string(),
+        duration: Some(123.45),
+        billed_duration: Some(124.0),
+        memory_size: Some(512),
+        max_memory_used: Some(256),
+        init_duration: Some(456.78),
+        error: None,
+        error_type: None,
+    };
+
+    let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid-123", "my-function", "arn:aws:lambda:us-east-1:123456789012:function:my-function");
+
+    assert_eq!(apm_metrics.len(), 5);
+
+    let first_metric = &apm_metrics[0];
+    assert_eq!(first_metric["name"], "apm.lambda.transaction.duration");
+    assert_eq!(first_metric["type"], "gauge");
+    assert_eq!(first_metric["value"], 123.45);
+    assert_eq!(first_metric["attributes"]["entity.guid"], "entity-guid-123");
 }
