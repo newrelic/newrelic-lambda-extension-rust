@@ -13,19 +13,58 @@ cd "$ROOT_DIR"
 LAYER_NAME_PREFIX=${LAYER_NAME_PREFIX:-"NRTestDotnetRustExtension"}
 
 BUCKET_PREFIX=${BUCKET_PREFIX:-"nr-extension-test-layers"}
-REGIONS_X86_64=${REGIONS_X86_64:-"us-west-1"}
-REGIONS_ARM64=${REGIONS_ARM64:-"us-west-1"}
+REGIONS_X86_64=${REGIONS_X86_64-"us-west-2"}
+REGIONS_ARM64=${REGIONS_ARM64-"us-west-2"}
 
 # .NET agent configuration
-# Auto-fetch latest version from GitHub if not specified
-if [ -z "${NEWRELIC_DOTNET_AGENT_VERSION:-}" ]; then
-  echo "Fetching latest .NET agent version from GitHub..." >&2
-  NEWRELIC_DOTNET_AGENT_VERSION=$(curl -fsSL https://api.github.com/repos/newrelic/newrelic-dotnet-agent/releases/latest | jq -r '.tag_name' | sed 's/^v//')
-  if [ -z "$NEWRELIC_DOTNET_AGENT_VERSION" ] || [ "$NEWRELIC_DOTNET_AGENT_VERSION" = "null" ]; then
-    echo "Error: Failed to fetch latest .NET agent version from GitHub" >&2
+#
+# To use a local build instead of downloading, set one or more of these:
+#
+#   LOCAL_DOTNET_AGENT_TARBALL_AMD64  — path to newrelic-dotnet-agent_X.Y.Z_amd64.tar.gz
+#   LOCAL_DOTNET_AGENT_TARBALL_ARM64  — path to newrelic-dotnet-agent_X.Y.Z_arm64.tar.gz
+#   LOCAL_DOTNET_AGENT_ZIP_AMD64      — path to NewRelicDotNetAgent_x64.zip (Windows-style zip)
+#   LOCAL_DOTNET_AGENT_ZIP_ARM64      — path to NewRelicDotNetAgent_arm64.zip
+#
+# Unset variables fall back to remote download. Tarball takes precedence over zip per arch.
+#
+# Examples:
+#   LOCAL_DOTNET_AGENT_TARBALL_AMD64=/Downloads/newrelic-dotnet-agent_10.50.0_amd64.tar.gz \
+#     ./scripts/dotnetTestLayer.sh
+
+LOCAL_DOTNET_AGENT_TARBALL_AMD64=${LOCAL_DOTNET_AGENT_TARBALL_AMD64:-""}
+LOCAL_DOTNET_AGENT_TARBALL_ARM64=${LOCAL_DOTNET_AGENT_TARBALL_ARM64:-""}
+LOCAL_DOTNET_AGENT_ZIP_AMD64=${LOCAL_DOTNET_AGENT_ZIP_AMD64:-""}
+LOCAL_DOTNET_AGENT_ZIP_ARM64=${LOCAL_DOTNET_AGENT_ZIP_ARM64:-""}
+
+_validate_local_file() {
+  local path="$1" label="$2"
+  if [ ! -f "$path" ]; then
+    echo "Error: ${label} '${path}' not found" >&2
     exit 1
   fi
-  echo "Latest .NET agent version: ${NEWRELIC_DOTNET_AGENT_VERSION}" >&2
+}
+
+[ -n "$LOCAL_DOTNET_AGENT_TARBALL_AMD64" ] && _validate_local_file "$LOCAL_DOTNET_AGENT_TARBALL_AMD64" "LOCAL_DOTNET_AGENT_TARBALL_AMD64"
+[ -n "$LOCAL_DOTNET_AGENT_TARBALL_ARM64" ] && _validate_local_file "$LOCAL_DOTNET_AGENT_TARBALL_ARM64" "LOCAL_DOTNET_AGENT_TARBALL_ARM64"
+[ -n "$LOCAL_DOTNET_AGENT_ZIP_AMD64" ]     && _validate_local_file "$LOCAL_DOTNET_AGENT_ZIP_AMD64"     "LOCAL_DOTNET_AGENT_ZIP_AMD64"
+[ -n "$LOCAL_DOTNET_AGENT_ZIP_ARM64" ]     && _validate_local_file "$LOCAL_DOTNET_AGENT_ZIP_ARM64"     "LOCAL_DOTNET_AGENT_ZIP_ARM64"
+
+# Determine version: explicit override > detect from local filename > fetch from GitHub
+if [ -z "${NEWRELIC_DOTNET_AGENT_VERSION:-}" ]; then
+  _detect_file="${LOCAL_DOTNET_AGENT_TARBALL_AMD64:-${LOCAL_DOTNET_AGENT_TARBALL_ARM64:-${LOCAL_DOTNET_AGENT_ZIP_AMD64:-$LOCAL_DOTNET_AGENT_ZIP_ARM64}}}"
+  if [ -n "$_detect_file" ]; then
+    _detected=$(basename "$_detect_file" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    NEWRELIC_DOTNET_AGENT_VERSION="${_detected:-local-build}"
+    echo "Using local .NET agent version: ${NEWRELIC_DOTNET_AGENT_VERSION}" >&2
+  else
+    echo "Fetching latest .NET agent version from GitHub..." >&2
+    NEWRELIC_DOTNET_AGENT_VERSION=$(curl -fsSL https://api.github.com/repos/newrelic/newrelic-dotnet-agent/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+    if [ -z "$NEWRELIC_DOTNET_AGENT_VERSION" ] || [ "$NEWRELIC_DOTNET_AGENT_VERSION" = "null" ]; then
+      echo "Error: Failed to fetch latest .NET agent version from GitHub" >&2
+      exit 1
+    fi
+    echo "Latest .NET agent version: ${NEWRELIC_DOTNET_AGENT_VERSION}" >&2
+  fi
 fi
 
 AGENT_DOWNLOAD_BASE_URL="https://download.newrelic.com/dot_net_agent/latest_release"
@@ -65,28 +104,56 @@ build_extension() {
   fi
 }
 
-# Downloads the .NET agent for the specified architecture
+# Installs the .NET agent for the specified architecture into $LAYER_DIR/$BUILD_DIR.
+# Priority: local tarball > local zip > remote download.
 download_dotnet_agent() {
   local arch="$1"  # amd64 or arm64
-  local agent_file="newrelic-dotnet-agent_${NEWRELIC_DOTNET_AGENT_VERSION}_${arch}.tar.gz"
-  local download_url="${AGENT_DOWNLOAD_BASE_URL}/${agent_file}"
-  
-  echo "Downloading .NET agent version ${NEWRELIC_DOTNET_AGENT_VERSION} for ${arch}" >&2
-  
+
   rm -rf "$LAYER_DIR/$BUILD_DIR"
   mkdir -p "$LAYER_DIR/$BUILD_DIR"
-  
-  local tmp_agent="/tmp/${agent_file}"
-  curl -fsSL "$download_url" -o "$tmp_agent"
-  
-  echo "Extracting .NET agent to $LAYER_DIR/$BUILD_DIR" >&2
-  tar -xzf "$tmp_agent" -C "$LAYER_DIR/$BUILD_DIR"
-  
-  # Create version.txt for tracking
+
+  local local_tarball="" local_zip=""
+  if [ "$arch" = "amd64" ]; then
+    local_tarball="$LOCAL_DOTNET_AGENT_TARBALL_AMD64"
+    local_zip="$LOCAL_DOTNET_AGENT_ZIP_AMD64"
+  else
+    local_tarball="$LOCAL_DOTNET_AGENT_TARBALL_ARM64"
+    local_zip="$LOCAL_DOTNET_AGENT_ZIP_ARM64"
+  fi
+
+  if [ -n "$local_tarball" ]; then
+    echo "Using local .NET agent tarball (${arch}): ${local_tarball}" >&2
+    tar -xzf "$local_tarball" -C "$LAYER_DIR/$BUILD_DIR"
+
+  elif [ -n "$local_zip" ]; then
+    echo "Using local .NET agent zip (${arch}): ${local_zip}" >&2
+    local tmp_extract="/tmp/nr-dotnet-agent-extract-$$"
+    rm -rf "$tmp_extract"
+    mkdir -p "$tmp_extract"
+    unzip -q "$local_zip" -d "$tmp_extract" -x "__MACOSX/*" "*.DS_Store"
+    local top_dir
+    top_dir=$(find "$tmp_extract" -mindepth 1 -maxdepth 1 -type d | head -1)
+    if [ -z "$top_dir" ]; then
+      echo "Error: Could not find top-level directory in ${local_zip}" >&2
+      rm -rf "$tmp_extract"
+      exit 1
+    fi
+    mv "$top_dir" "$LAYER_DIR/$BUILD_DIR/newrelic-dotnet-agent"
+    rm -rf "$tmp_extract"
+
+  else
+    local agent_file="newrelic-dotnet-agent_${NEWRELIC_DOTNET_AGENT_VERSION}_${arch}.tar.gz"
+    local download_url="${AGENT_DOWNLOAD_BASE_URL}/${agent_file}"
+    echo "Downloading .NET agent version ${NEWRELIC_DOTNET_AGENT_VERSION} for ${arch}" >&2
+    local tmp_agent="/tmp/${agent_file}"
+    curl -fsSL "$download_url" -o "$tmp_agent"
+    echo "Extracting .NET agent to $LAYER_DIR/$BUILD_DIR" >&2
+    tar -xzf "$tmp_agent" -C "$LAYER_DIR/$BUILD_DIR"
+    rm -f "$tmp_agent"
+  fi
+
   echo "$NEWRELIC_DOTNET_AGENT_VERSION" > "$LAYER_DIR/$BUILD_DIR/newrelic-dotnet-agent/version.txt"
-  
-  rm -f "$tmp_agent"
-  echo ".NET agent downloaded and extracted successfully" >&2
+  echo ".NET agent setup complete" >&2
 }
 
 # Builds a complete .NET layer with agent + extension
@@ -202,7 +269,21 @@ main() {
   echo "  Building .NET Lambda Layers            "
   echo "=========================================="
   echo "  .NET Agent Version: ${NEWRELIC_DOTNET_AGENT_VERSION}"
-  echo "  Layer Name Prefix: ${LAYER_NAME_PREFIX}"
+  if [ -n "$LOCAL_DOTNET_AGENT_TARBALL_AMD64" ]; then
+    echo "  amd64 source:       LOCAL tarball (${LOCAL_DOTNET_AGENT_TARBALL_AMD64})"
+  elif [ -n "$LOCAL_DOTNET_AGENT_ZIP_AMD64" ]; then
+    echo "  amd64 source:       LOCAL zip (${LOCAL_DOTNET_AGENT_ZIP_AMD64})"
+  else
+    echo "  amd64 source:       remote (${AGENT_DOWNLOAD_BASE_URL})"
+  fi
+  if [ -n "$LOCAL_DOTNET_AGENT_TARBALL_ARM64" ]; then
+    echo "  arm64 source:       LOCAL tarball (${LOCAL_DOTNET_AGENT_TARBALL_ARM64})"
+  elif [ -n "$LOCAL_DOTNET_AGENT_ZIP_ARM64" ]; then
+    echo "  arm64 source:       LOCAL zip (${LOCAL_DOTNET_AGENT_ZIP_ARM64})"
+  else
+    echo "  arm64 source:       remote (${AGENT_DOWNLOAD_BASE_URL})"
+  fi
+  echo "  Layer Name Prefix:  ${LAYER_NAME_PREFIX}"
   echo "=========================================="
   echo ""
 
@@ -218,18 +299,23 @@ main() {
     publish_layer "$zip_x86" "$region" "dotnet" "x86_64" "${LAYER_NAME_PREFIX}X86"
   done
 
-  # --- Build for arm64 ---
-  echo ""
-  echo "=== Building arm64 architecture ==="
-  local target_arm="aarch64-unknown-linux-musl"
-  build_extension "$target_arm"
-  
-  local zip_arm
-  zip_arm=$(build_dotnet_layer "$target_arm" "arm64" "arm64")
-  
-  for region in $REGIONS_ARM64; do
-    publish_layer "$zip_arm" "$region" "dotnet" "arm64" "${LAYER_NAME_PREFIX}ARM64"
-  done
+  # --- Build for arm64 (skipped when REGIONS_ARM64 is empty) ---
+  if [ -n "${REGIONS_ARM64}" ]; then
+    echo ""
+    echo "=== Building arm64 architecture ==="
+    local target_arm="aarch64-unknown-linux-musl"
+    build_extension "$target_arm"
+
+    local zip_arm
+    zip_arm=$(build_dotnet_layer "$target_arm" "arm64" "arm64")
+
+    for region in $REGIONS_ARM64; do
+      publish_layer "$zip_arm" "$region" "dotnet" "arm64" "${LAYER_NAME_PREFIX}ARM64"
+    done
+  else
+    echo ""
+    echo "=== Skipping arm64 (REGIONS_ARM64 is empty) ==="
+  fi
 
   echo ""
   echo "=========================================="
