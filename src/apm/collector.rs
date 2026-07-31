@@ -6,6 +6,7 @@
 //! Based on collector.go CollectorRequest() and SendAPMTelemetry()
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::Client;
@@ -504,4 +505,159 @@ mod collector_tests {
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"platform_metrics"));
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
     }
+}
+
+/// Decode, enrich with `entity.guid`, gzip, and POST a single base64-encoded OTLP payload.
+/// `payload_num` is a 1-based index used only for human-readable logging.
+async fn send_single_otlp_payload(
+    client: &Client,
+    otlp_endpoint: &str,
+    license_key: &str,
+    encoded_payload: &str,
+    entity_guid: &str,
+    payload_num: usize,
+) -> Result<()> {
+    let raw = general_purpose::STANDARD
+        .decode(encoded_payload)
+        .map_err(|e| anyhow::anyhow!("Failed to base64-decode OTLP payload {payload_num}: {e}"))?;
+
+    let enriched: Vec<u8> = super::otlp::inject_entity_guid(&raw, entity_guid)
+        .map_err(|e| anyhow::anyhow!("Failed to inject entity.guid into OTLP payload {payload_num}: {e}"))?;
+
+    debug!(
+        "OTLP payload {} enriched ({} bytes) base64={}",
+        payload_num,
+        enriched.len(),
+        general_purpose::STANDARD.encode(&enriched)
+    );
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&enriched)
+        .map_err(|e| anyhow::anyhow!("Failed to gzip OTLP payload {payload_num}: {e}"))?;
+    let compressed = encoder.finish()
+        .map_err(|e| anyhow::anyhow!("Failed to finish gzip OTLP payload {payload_num}: {e}"))?;
+
+    debug!(
+        "OTLP payload {} compressed: {} bytes -> {} bytes",
+        payload_num,
+        enriched.len(),
+        compressed.len()
+    );
+
+    let start_time = std::time::Instant::now();
+    let response = client
+        .post(otlp_endpoint)
+        .header("Content-Type", "application/x-protobuf")
+        .header("Content-Encoding", "gzip")
+        .header("api-key", license_key)
+        .body(compressed)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("OTLP request {payload_num} failed: {e}"))?;
+
+    let duration = start_time.elapsed();
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to read error response body for payload {}: {}", payload_num, e);
+                String::from("<unreadable>")
+            }
+        };
+
+        warn!(
+            "OTLP payload {} returned status {} in {}ms: {}",
+            payload_num,
+            status.as_u16(),
+            duration.as_millis(),
+            body
+        );
+
+        return Err(anyhow::anyhow!(
+            "OTLP endpoint returned status {}",
+            status.as_u16()
+        ));
+    }
+
+    let body_bytes = match response.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            // Non-fatal: payload was accepted, body read failed
+            warn!(
+                "OTLP payload {} accepted ({}ms) but failed to read response body: {}",
+                payload_num,
+                duration.as_millis(),
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    if body_bytes.is_empty() {
+        debug!(
+            "OTLP payload {} sent successfully in {}ms (empty response body)",
+            payload_num,
+            duration.as_millis()
+        );
+    } else {
+        let body_repr = if let Ok(text) = std::str::from_utf8(&body_bytes) {
+            // Safe char-boundary truncation — avoids panic on multi-byte UTF-8
+            let trimmed = text.trim();
+            let preview: String = trimmed.chars().take(256).collect();
+            let suffix = if trimmed.chars().count() > 256 { " ..." } else { "" };
+            format!("text: {preview}{suffix}")
+        } else {
+            let preview_len = body_bytes.len().min(64);
+            let hex: String = body_bytes[..preview_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let suffix = if body_bytes.len() > preview_len { " ..." } else { "" };
+            format!("binary ({} bytes): {hex}{suffix}", body_bytes.len())
+        };
+
+        debug!(
+            "OTLP payload {} sent successfully in {}ms, response {}",
+            payload_num,
+            duration.as_millis(),
+            body_repr
+        );
+    }
+
+    Ok(())
+}
+
+/// Forward base64-encoded OTLP `ExportMetricsServiceRequest` protobuf payloads to the OTLP
+/// endpoint.  Before sending, `entity.guid` is injected into every `ResourceMetrics.resource`
+/// so New Relic can correlate the metrics with the Lambda entity.  All metric data
+/// (`scope_metrics`, data points, histograms) is preserved bit-for-bit.
+pub async fn send_otlp_payload(
+    client: &Client,
+    otlp_endpoint: &str,
+    license_key: &str,
+    payloads: &[String],
+    entity_guid: &str,
+) -> Result<()> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Sending {} OTLP payload(s) to {} (entity.guid={})",
+        payloads.len(),
+        otlp_endpoint,
+        entity_guid,
+    );
+
+    for (i, encoded) in payloads.iter().enumerate() {
+        let payload_num = i + 1; // 1-based for human-readable logs
+        send_single_otlp_payload(client, otlp_endpoint, license_key, encoded, entity_guid, payload_num).await?;
+    }
+
+    info!("Successfully sent {} OTLP payload(s)", payloads.len());
+    Ok(())
 }

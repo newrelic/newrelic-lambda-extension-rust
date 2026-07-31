@@ -56,6 +56,7 @@ pub struct NewRelicConfig {
     pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
+    pub otlp_endpoint: String,
     pub proxy_url: Option<String>,
 }
 
@@ -142,6 +143,7 @@ impl Default for NewRelicConfig {
             apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             proxy_url: None,
         }
     }
@@ -205,9 +207,19 @@ impl AwsConfig {
         }
     }
 
+    /// Extracts the account ID from a Lambda function ARN, which has the form
+    /// `arn:<partition>:lambda:<region>:<account-id>:function:<name>`.
+    /// Requires the full 7-part shape and an `aws`-prefixed partition (`aws`,
+    /// `aws-cn`, `aws-us-gov`) to reject malformed or non-Lambda ARNs.
     fn extract_account_id_from_arn(arn: &str) -> Option<String> {
         let parts: Vec<&str> = arn.split(':').collect();
-        if parts.len() >= 5 && parts[0] == "arn" && parts[2] == "lambda" {
+        if parts.len() >= 7
+            && parts[0] == "arn"
+            && parts[1].starts_with("aws")
+            && parts[2] == "lambda"
+            && !parts[3].is_empty()
+            && !parts[4].is_empty()
+        {
             Some(parts[4].to_string())
         } else {
             None
@@ -496,58 +508,50 @@ pub fn get_nr_tags() -> &'static [(String, String)] {
 }
 
 /// Global configuration instance
-static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
-static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_CONFIG: OnceLock<ExtensionConfig> = OnceLock::new();
 
 /// Initialize the global configuration and logging
 pub fn init_config() -> &'static ExtensionConfig {
-    unsafe {
-        CONFIG_INIT.call_once(|| {
-            let config = ExtensionConfig::from_env();
+    GLOBAL_CONFIG.get_or_init(|| {
+        let config = ExtensionConfig::from_env();
 
-            let log_level = if config.extension.log_level.to_lowercase() == "all" {
-                "trace".to_string()
-            } else {
-                config.extension.log_level.clone()
-            };
+        let log_level = if config.extension.log_level.to_lowercase() == "all" {
+            "trace".to_string()
+        } else {
+            config.extension.log_level.clone()
+        };
 
-            let filter_directive = format!(
-                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
-                log_level,
-                log_level
-            );
+        let filter_directive = format!(
+            "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
+            log_level,
+            log_level
+        );
 
-            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
-            let env_filter = match EnvFilter::try_new(&filter_directive) {
-                Ok(filter) => filter,
-                Err(e) => {
-                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
-                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
-                    EnvFilter::try_new(fallback_directive)
-                        .expect("Fallback filter directive should always be valid")
-                }
-            };
+        // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+        let env_filter = match EnvFilter::try_new(&filter_directive) {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
+                EnvFilter::try_new(fallback_directive)
+                    .expect("Fallback filter directive should always be valid")
+            }
+        };
 
-            let subscriber = fmt::Subscriber::builder()
-                .with_env_filter(env_filter)
-                .event_format(CustomFormatter {
-                    enabled: config.extension.extension_logs_enabled,
-                })
-                .finish();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .event_format(CustomFormatter {
+                enabled: config.extension.extension_logs_enabled,
+            })
+            .finish();
 
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("setting default subscriber failed");
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
 
-            debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
+        debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
-            GLOBAL_CONFIG = Some(config);
-        });
-
-        #[allow(static_mut_refs)]
-        {
-            GLOBAL_CONFIG.as_ref().unwrap()
-        }
-    }
+        config
+    })
 }
 
 #[cfg(test)]

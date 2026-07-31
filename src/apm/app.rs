@@ -6,9 +6,9 @@
 //! Based on internal_app.go NewApp(), connectRoutine(), doHarvest()
 
 use super::collector::{
-    send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS,
-    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
-    CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
+    send_apm_telemetry, send_error_events, send_otlp_payload, send_platform_metrics,
+    CMD_ANALYTIC_EVENTS, CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS,
+    CMD_METRICS, CMD_SLOW_SQLS, CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
 use super::connection::{
     connect, is_handshake_fatal, is_permanent_auth_error, last_failure_reason, preconnect,
@@ -21,7 +21,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -30,6 +30,7 @@ pub struct ApmApp {
     pub collector_host: String,
     pub license_key: String,
     pub metric_endpoint: String,
+    pub otlp_endpoint: String,
     pub client: Client,
 }
 
@@ -38,6 +39,7 @@ impl ApmApp {
         license_key: String,
         apm_host: String,
         metric_endpoint: String,
+        otlp_endpoint: String,
         client: Client,
         function_name: String,
         lambda_function_name: String,
@@ -70,6 +72,7 @@ impl ApmApp {
                 &license_key,
                 &apm_host,
                 &metric_endpoint,
+                &otlp_endpoint,
                 &client,
                 &function_name,
                 &lambda_function_name,
@@ -133,6 +136,7 @@ impl ApmApp {
         license_key: &str,
         apm_host: &str,
         metric_endpoint: &str,
+        otlp_endpoint: &str,
         client: &Client,
         function_name: &str,
         lambda_function_name: &str,
@@ -226,6 +230,7 @@ impl ApmApp {
             collector_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
+            otlp_endpoint: otlp_endpoint.to_string(),
             client: client.clone(),
         })
     }
@@ -279,6 +284,48 @@ impl ApmApp {
         }
 
         let mut send_tasks = Vec::new();
+
+        // Extract and forward OTLP payloads before the APM telemetry loop
+        let otlp_entries: Vec<String> = telemetry_map
+            .remove("otlp_payload")
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        if !otlp_entries.is_empty() {
+            info!(
+                "Sending {} OTLP payload(s) to OTLP endpoint (entity.guid={})",
+                otlp_entries.len(),
+                self.entity_guid,
+            );
+            debug!(
+                "OTLP endpoint: {}",
+                self.otlp_endpoint,
+            );
+            let client = self.client.clone();
+            let otlp_endpoint = self.otlp_endpoint.clone();
+            let license_key = self.license_key.clone();
+            let entity_guid = self.entity_guid.clone();
+            let request_id_owned = request_id.to_string();
+
+            send_tasks.push(tokio::spawn(async move {
+                if let Err(e) = send_otlp_payload(
+                    &client,
+                    &otlp_endpoint,
+                    &license_key,
+                    &otlp_entries,
+                    &entity_guid,
+                )
+                .await
+                {
+                    warn!(
+                        "Failed to send otlp_payload for request {}: {}",
+                        request_id_owned, e
+                    );
+                }
+            }));
+        }
 
         for (telemetry_type, data) in telemetry_map {
             if data.is_empty() {
@@ -813,6 +860,7 @@ mod tests {
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             client,
         };
 

@@ -279,6 +279,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             .unwrap_or_default();
                         let apm_host = components.config.new_relic.apm_host.clone();
                         let metric_endpoint = components.config.new_relic.metric_endpoint.clone();
+                        let otlp_endpoint = components.config.new_relic.otlp_endpoint.clone();
                         let apm_client = components.apm_client.clone();
                         let lambda_function_name = components.config.aws.function_name.clone();
                         let function_name = std::env::var("NEW_RELIC_APP_NAME")
@@ -299,6 +300,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 license_key,
                                 apm_host,
                                 metric_endpoint,
+                                otlp_endpoint,
                                 apm_client,
                                 function_name,
                                 lambda_function_name,
@@ -564,6 +566,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             components.config.new_relic.license_key.clone().unwrap_or_default(),
                             components.config.new_relic.apm_host.clone(),
                             components.config.new_relic.metric_endpoint.clone(),
+                            components.config.new_relic.otlp_endpoint.clone(),
                             components.apm_client.clone(),
                             function_name,
                             lambda_function_name,

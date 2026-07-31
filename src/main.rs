@@ -348,15 +348,21 @@ async fn perform_one_time_initialization(
     let license_key_prefix = license_key.get(0..2);
 
     if let Ok(host) = env::var("NEW_RELIC_HOST") {
+        updated_config.new_relic.otlp_endpoint = format!("https://{}/v1/metrics", host);
         updated_config.new_relic.apm_host = host;
     } else if let Some("eu") = license_key_prefix {
         updated_config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+        updated_config.new_relic.otlp_endpoint = "https://collector.eu01.nr-data.net/v1/metrics".to_string();
     }
 
     if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
         updated_config.new_relic.metric_endpoint = endpoint;
     } else if let Some("eu") = license_key_prefix {
         updated_config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+    }
+
+    if let Ok(endpoint) = env::var("NEW_RELIC_OTLP_ENDPOINT") {
+        updated_config.new_relic.otlp_endpoint = endpoint;
     }
 
     if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
@@ -488,6 +494,7 @@ async fn perform_one_time_initialization(
 
             let apm_host = config.new_relic.apm_host.clone();
             let metric_endpoint = config.new_relic.metric_endpoint.clone();
+            let otlp_endpoint = config.new_relic.otlp_endpoint.clone();
             let function_name = std::env::var("NEW_RELIC_APP_NAME")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -525,6 +532,7 @@ async fn perform_one_time_initialization(
                     license_key,
                     apm_host,
                     metric_endpoint,
+                    otlp_endpoint,
                     apm_client_clone,
                     function_name,
                     lambda_function_name,

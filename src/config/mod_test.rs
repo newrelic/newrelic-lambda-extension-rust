@@ -1111,6 +1111,48 @@ fn test_extract_account_id_from_arn_empty_string() {
 }
 
 #[test]
+fn test_extract_account_id_from_arn_rejects_truncated_arn_with_enough_colons() {
+    // Only 5 parts and no "function" segment — must not be mistaken for a valid ARN
+    // just because parts.len() >= 5 and parts[0]/parts[2] happen to match.
+    let arn = "arn:evil:lambda:us-east-1:999999999999";
+    let account_id = AwsConfig::extract_account_id_from_arn(arn);
+    assert_eq!(account_id, None);
+}
+
+#[test]
+fn test_extract_account_id_from_arn_rejects_non_aws_partition() {
+    let arn = "arn:evil:lambda:us-east-1:123456789012:function:my-function";
+    let account_id = AwsConfig::extract_account_id_from_arn(arn);
+    assert_eq!(account_id, None);
+}
+
+#[test]
+fn test_extract_account_id_from_arn_accepts_govcloud_and_china_partitions() {
+    let gov = AwsConfig::extract_account_id_from_arn(
+        "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function",
+    );
+    assert_eq!(gov, Some("123456789012".to_string()));
+
+    let cn = AwsConfig::extract_account_id_from_arn(
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function",
+    );
+    assert_eq!(cn, Some("123456789012".to_string()));
+}
+
+#[test]
+fn test_extract_account_id_from_arn_rejects_empty_region_or_account() {
+    let empty_region = AwsConfig::extract_account_id_from_arn(
+        "arn:aws:lambda::123456789012:function:my-function",
+    );
+    assert_eq!(empty_region, None);
+
+    let empty_account = AwsConfig::extract_account_id_from_arn(
+        "arn:aws:lambda:us-east-1::function:my-function",
+    );
+    assert_eq!(empty_account, None);
+}
+
+#[test]
 #[serial]
 fn test_from_env_with_empty_string_values() {
     with_full_clean_env(|| {
@@ -1166,6 +1208,7 @@ fn test_new_relic_config_all_fields() {
         apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
+        otlp_endpoint: "http://otlp".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
     };
     
