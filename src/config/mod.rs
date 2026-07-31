@@ -57,6 +57,11 @@ pub struct NewRelicConfig {
     pub apm_host: String,
     pub metric_endpoint: String,
     pub otlp_endpoint: String,
+    /// `NEW_RELIC_OTLP_ENABLED` — feature-gates OTLP metrics forwarding
+    /// (protobuf `entity.guid` injection + send). Default: false. While
+    /// disabled, any `otlp_payload` entries the agent sends are dropped
+    /// without being decoded or forwarded.
+    pub otlp_enabled: bool,
     pub proxy_url: Option<String>,
 }
 
@@ -144,6 +149,7 @@ impl Default for NewRelicConfig {
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_enabled: false,
             proxy_url: None,
         }
     }
@@ -365,6 +371,10 @@ impl ExtensionConfig {
         // Comma-separated telemetry types the customer wants dropped (APM mode).
         config.new_relic.apm_disabled_telemetry =
             parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
+
+        // OTLP metrics forwarding is opt-in: default false until customers explicitly enable it.
+        let otlp_enabled_str = env::var("NEW_RELIC_OTLP_ENABLED").unwrap_or_default();
+        config.new_relic.otlp_enabled = parse_bool(&otlp_enabled_str);
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
