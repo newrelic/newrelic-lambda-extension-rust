@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use crate::config::deployment::DeploymentContext;
 use crate::newrelic::client::redact_url;
 
 /// Permanent APM handshake rejection (HTTP 401/403): the license key is invalid
@@ -293,6 +294,7 @@ pub async fn preconnect(
 }
 
 /// Execute Connect to get Run ID and Entity GUID
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     client: &Client,
     license_key: &str,
@@ -306,6 +308,7 @@ pub async fn connect(
     agent_version: &str,
     timeout_secs: u64,
     lmi_metadata: Option<crate::telemetry::managed_instance::ManagedInstanceMetadata>,
+    deployment: DeploymentContext,
 ) -> Result<ConnectResponse> {
     let url = format!(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
@@ -336,7 +339,7 @@ pub async fn connect(
                 },
             },
         },
-        labels: get_labels(function_arn, runtime),
+        labels: get_labels(function_arn, runtime, deployment),
     }];
 
     let body = serde_json::to_vec(&connect_req)?;
@@ -401,10 +404,10 @@ pub async fn connect(
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
 /// Get labels for Connect request
-fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
+fn get_labels(function_arn: &str, runtime: &str, deployment: DeploymentContext) -> Vec<Label> {
     let runtime_version = crate::version::get_runtime_version();
     let extension_version = env!("CARGO_PKG_VERSION");
-    
+
     let mut labels = vec![
         Label {
             label_type: "aws.arn".to_string(),
@@ -421,14 +424,22 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     ];
 
     // Only send runtime version if we have actual version info
-    if runtime != "unknown" 
-        && !runtime_version.contains("unknown") 
-        && runtime_version != runtime  
+    if runtime != "unknown"
+        && !runtime_version.contains("unknown")
+        && runtime_version != runtime
         && runtime_version.len() > runtime.len()
     {
         labels.push(Label {
             label_type: "lambda.runtime.version".to_string(),
             label_value: runtime_version,
+        });
+    }
+
+    // Only present on Lambda Managed Instances — absent (not "false") on Normal Lambda.
+    if deployment.is_lmi() {
+        labels.push(Label {
+            label_type: "isLMI".to_string(),
+            label_value: "true".to_string(),
         });
     }
 
@@ -445,7 +456,57 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
 #[cfg(test)]
 mod connection_tests {
     use super::*;
+    use crate::config::deployment::TelemetryMode;
     use serial_test::serial;
+
+    #[test]
+    fn labels_include_islmi_true_on_lmi() {
+        let labels = get_labels("arn:aws:lambda:us-east-1:123456789012:function:test", "python", DeploymentContext::Lmi);
+        assert!(
+            labels.iter().any(|l| l.label_type == "isLMI" && l.label_value == "true"),
+            "expected an isLMI:true label on LMI, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn labels_omit_islmi_on_normal_serverless() {
+        let deployment = DeploymentContext::Normal { mode: TelemetryMode::Serverless };
+        let labels = get_labels("arn:aws:lambda:us-east-1:123456789012:function:test", "python", deployment);
+        assert!(
+            !labels.iter().any(|l| l.label_type == "isLMI"),
+            "isLMI label must be absent on Normal Lambda, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn labels_omit_islmi_on_normal_apm() {
+        let deployment = DeploymentContext::Normal { mode: TelemetryMode::Apm };
+        let labels = get_labels("arn:aws:lambda:us-east-1:123456789012:function:test", "python", deployment);
+        assert!(
+            !labels.iter().any(|l| l.label_type == "isLMI"),
+            "isLMI label must be absent on Normal Lambda regardless of telemetry mode, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn labels_on_lmi_have_exactly_one_more_than_normal() {
+        // isLMI must be strictly additive: everything Normal Lambda sends
+        // (aws.arn, isLambdaFunction, newrelic.extension.version, ...) still
+        // goes out on LMI, plus exactly one new label.
+        let arn = "arn:aws:lambda:us-east-1:123456789012:function:test";
+        let normal = get_labels(arn, "python", DeploymentContext::Normal { mode: TelemetryMode::Apm });
+        let lmi = get_labels(arn, "python", DeploymentContext::Lmi);
+
+        assert_eq!(lmi.len(), normal.len() + 1, "LMI: {lmi:?}, Normal: {normal:?}");
+        for label in &normal {
+            assert!(
+                lmi.iter().any(|l| l.label_type == label.label_type && l.label_value == label.label_value),
+                "LMI labels are missing a label Normal Lambda sends: {} = {}",
+                label.label_type,
+                label.label_value
+            );
+        }
+    }
 
     #[test]
     fn permanent_auth_error_detected_through_context_chain() {

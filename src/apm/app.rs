@@ -233,6 +233,7 @@ impl ApmApp {
             &agent_version,
             timeout_secs,
             lmi_metadata,
+            deployment,
         )
         .await
         .context("Connect failed")?;
