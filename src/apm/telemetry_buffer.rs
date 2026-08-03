@@ -242,6 +242,7 @@ pub fn buffered_request_ids() -> Vec<String> {
 #[cfg(test)]
 mod telemetry_buffer_tests {
     use super::*;
+    use crate::apm::collector::CollectorError;
     use serde_json::json;
     use serial_test::serial;
 
@@ -300,5 +301,28 @@ mod telemetry_buffer_tests {
         // Must not collide with agent-originated error_event_data, which routes
         // through send_apm_telemetry with a different wire format.
         assert_ne!(SYNTHESIZED_ERROR_EVENTS, "error_event_data");
+    }
+
+    // ── 409 fix: is_restart detection ────────────────────────────────────────
+
+    #[test]
+    fn restart_exception_is_detected_by_downcast() {
+        let e = anyhow::Error::new(CollectorError::RestartException)
+            .context("Collector returned 409 for metric_data");
+        let is_restart = e
+            .downcast_ref::<CollectorError>()
+            .map(|ce| matches!(ce, CollectorError::RestartException))
+            .unwrap_or(false);
+        assert!(is_restart);
+    }
+
+    #[test]
+    fn non_collector_error_is_not_detected_as_restart() {
+        let e = anyhow::anyhow!("connection refused");
+        let is_restart = e
+            .downcast_ref::<CollectorError>()
+            .map(|ce| matches!(ce, CollectorError::RestartException))
+            .unwrap_or(false);
+        assert!(!is_restart);
     }
 }

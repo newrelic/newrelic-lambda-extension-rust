@@ -514,4 +514,23 @@ mod collector_tests {
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"platform_metrics"));
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
     }
+
+    #[test]
+    fn disconnect_is_not_restart_exception() {
+        // 410 returns CollectorError::Disconnect, not RestartException. This is
+        // intentional: telemetry_buffer::retry_buffered_telemetry only skips
+        // retry_count for RestartException (409/401). A 410 is a hard disconnect
+        // and must consume a retry slot like any other non-session error.
+        let restart = anyhow::Error::new(CollectorError::RestartException);
+        let disconnect = anyhow::Error::new(CollectorError::Disconnect);
+
+        let is_restart = |e: &anyhow::Error| {
+            e.downcast_ref::<CollectorError>()
+                .map(|ce| matches!(ce, CollectorError::RestartException))
+                .unwrap_or(false)
+        };
+
+        assert!(is_restart(&restart), "RestartException (409/401) must be detected");
+        assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
+    }
 }
