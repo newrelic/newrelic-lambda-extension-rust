@@ -310,23 +310,12 @@ impl ApmApp {
                 let otlp_endpoint = self.otlp_endpoint.clone();
                 let license_key = self.license_key.clone();
                 let entity_guid = self.entity_guid.clone();
-                let request_id_owned = request_id.to_string();
 
+                // send_otlp_payload sends every entry concurrently and logs per-payload
+                // failures itself (a transient failure on one payload never blocks or
+                // drops the rest of the batch), so there is no outer Result to handle here.
                 send_tasks.push(tokio::spawn(async move {
-                    if let Err(e) = send_otlp_payload(
-                        &client,
-                        &otlp_endpoint,
-                        &license_key,
-                        &otlp_entries,
-                        &entity_guid,
-                    )
-                    .await
-                    {
-                        warn!(
-                            "Failed to send otlp_payload for request {}: {}",
-                            request_id_owned, e
-                        );
-                    }
+                    send_otlp_payload(&client, &otlp_endpoint, &license_key, &otlp_entries, &entity_guid).await;
                 }));
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
@@ -869,7 +858,7 @@ mod tests {
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_endpoint: "https://otlp.nr-data.net/v1/metrics".to_string(),
             client,
         };
 
