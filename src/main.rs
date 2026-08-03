@@ -350,14 +350,13 @@ async fn perform_one_time_initialization(
     if let Ok(host) = env::var("NEW_RELIC_HOST") {
         updated_config.new_relic.apm_host = host;
     } else if let Some("eu") = license_key_prefix {
-        updated_config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+        updated_config.new_relic.apm_host = "collector.eu.newrelic.com".to_string();
     }
 
-    // OTLP has its own dedicated ingest host — distinct from the legacy APM
-    // collector (collector.*). Derived independently of NEW_RELIC_HOST/apm_host,
-    // the same way metric_endpoint derives metric-api.* independently below.
+    // otlp_endpoint is derived independently of NEW_RELIC_HOST/apm_host, the same
+    // way metric_endpoint derives metric-api.* independently below.
     if let Some("eu") = license_key_prefix {
-        updated_config.new_relic.otlp_endpoint = "https://otlp.eu01.nr-data.net/v1/metrics".to_string();
+        updated_config.new_relic.otlp_endpoint = "https://collector.eu.newrelic.com/v1/metrics".to_string();
     }
 
     if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
