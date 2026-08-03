@@ -148,7 +148,7 @@ impl Default for NewRelicConfig {
             apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_endpoint: "https://otlp.nr-data.net/v1/metrics".to_string(),
             otlp_enabled: false,
             proxy_url: None,
         }

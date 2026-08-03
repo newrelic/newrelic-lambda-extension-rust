@@ -664,15 +664,21 @@ async fn send_single_otlp_payload(
 /// endpoint.  Before sending, `entity.guid` is injected into every `ResourceMetrics.resource`
 /// so New Relic can correlate the metrics with the Lambda entity.  All metric data
 /// (`scope_metrics`, data points, histograms) is preserved bit-for-bit.
+///
+/// Payloads are sent concurrently and independently: one payload's failure (a transient
+/// 5xx, a timeout) does not abort or delay the others, matching the fan-out pattern used
+/// elsewhere in this codebase (see `event_loop.rs`'s late-agent-payload `JoinSet` usage).
+/// Failures are logged per-payload; this function itself never returns an error, since a
+/// partial-batch failure is not a reason to fail the whole send.
 pub async fn send_otlp_payload(
     client: &Client,
     otlp_endpoint: &str,
     license_key: &str,
     payloads: &[String],
     entity_guid: &str,
-) -> Result<()> {
+) {
     if payloads.is_empty() {
-        return Ok(());
+        return;
     }
 
     info!(
@@ -682,11 +688,31 @@ pub async fn send_otlp_payload(
         entity_guid,
     );
 
+    let mut set = tokio::task::JoinSet::new();
     for (i, encoded) in payloads.iter().enumerate() {
         let payload_num = i + 1; // 1-based for human-readable logs
-        send_single_otlp_payload(client, otlp_endpoint, license_key, encoded, entity_guid, payload_num).await?;
-    }
+        let client = client.clone();
+        let otlp_endpoint = otlp_endpoint.to_string();
+        let license_key = license_key.to_string();
+        let encoded = encoded.clone();
+        let entity_guid = entity_guid.to_string();
 
-    info!("Successfully sent {} OTLP payload(s)", payloads.len());
-    Ok(())
+        set.spawn(async move {
+            if let Err(e) = send_single_otlp_payload(
+                &client,
+                &otlp_endpoint,
+                &license_key,
+                &encoded,
+                &entity_guid,
+                payload_num,
+            )
+            .await
+            {
+                warn!("Failed to send OTLP payload {}: {}", payload_num, e);
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+
+    info!("Finished sending {} OTLP payload(s)", payloads.len());
 }

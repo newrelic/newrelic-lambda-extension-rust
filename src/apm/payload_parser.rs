@@ -175,8 +175,9 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             }
         }
 
-        fn get_string_array(map: &HashMap<String, Value>, key: &str) -> Vec<String> {
-            match map.get(key) {
+        fn get_string_array(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<String> {
+            let value = map.get(snake_case).or_else(|| map.get(camel_case));
+            match value {
                 Some(Value::Array(arr)) => arr
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
@@ -195,7 +196,7 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             span_event_data: get_field(&raw_map, "span_event_data", "spanEventData"),
             sql_trace_data: get_field(&raw_map, "sql_trace_data", "sqlTraceData"),
             transaction_sample_data: get_field(&raw_map, "transaction_sample_data", "transactionSampleData"),
-            otlp_payload: get_string_array(&raw_map, "otlp_payload"),
+            otlp_payload: get_string_array(&raw_map, "otlp_payload", "otlpPayload"),
         })
     }
 }
@@ -243,5 +244,52 @@ mod tests {
         assert_eq!(version, 1);
         assert!(data_map.contains_key("metric_data"));
         assert!(data_map.contains_key("span_event_data"));
+    }
+
+    fn create_test_payload_with_json(json_body: &str) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json_body.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{encoded}"]"#).into_bytes()
+    }
+
+    #[test]
+    fn test_otlp_payload_snake_case_key() {
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": ["abc123"]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing");
+        assert_eq!(entries, &vec![Value::String("abc123".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_camel_case_key_fallback() {
+        // .NET-style JSON serializers commonly default to camelCase — must not
+        // silently drop otlp_payload if the agent emits "otlpPayload" instead.
+        let payload = create_test_payload_with_json(r#"{"otlpPayload": ["def456"]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing (camelCase fallback failed)");
+        assert_eq!(entries, &vec![Value::String("def456".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_snake_case_takes_precedence_over_camel_case() {
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["snake"], "otlpPayload": ["camel"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").unwrap();
+        assert_eq!(entries, &vec![Value::String("snake".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_absent_key_yields_no_map_entry() {
+        let payload = create_test_payload_with_json(r#"{"metric_data": [[1, 2, 3]]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
     }
 }
