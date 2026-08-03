@@ -1381,7 +1381,7 @@ mod tests {
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test-key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            otlp_endpoint: "https://otlp.nr-data.net/v1/metrics".to_string(),
+            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             client: reqwest::Client::new(),
         };
         let apm_arc: Arc<tokio::sync::RwLock<Option<ApmApp>>> =
