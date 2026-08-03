@@ -177,6 +177,53 @@ impl std::fmt::Display for MetricApiError {
 
 impl std::error::Error for MetricApiError {}
 
+/// Outcome classification for an OTLP payload send failure. Mirrors `MetricApiError`
+/// (same license-key-only auth model, no `run_id`/collector reconnect semantics).
+#[derive(Debug)]
+pub enum OtlpError {
+    /// Transient failure (5xx/429/408) — safe to retry.
+    Retryable {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Permanent failure (4xx other than 429/408) — retrying will not help.
+    Permanent { status: u16 },
+    /// Transport/network/timeout error — safe to retry.
+    Network(anyhow::Error),
+    /// Malformed payload (bad base64, invalid protobuf) — retrying the same bytes
+    /// will never succeed.
+    MalformedPayload(anyhow::Error),
+}
+
+impl OtlpError {
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            OtlpError::Retryable { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, OtlpError::Permanent { .. } | OtlpError::MalformedPayload(_))
+    }
+}
+
+impl std::fmt::Display for OtlpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OtlpError::Retryable { status, .. } => {
+                write!(f, "OTLP transient error (status {status})")
+            }
+            OtlpError::Permanent { status } => {
+                write!(f, "OTLP permanent error (status {status})")
+            }
+            OtlpError::Network(e) => write!(f, "OTLP network error: {e}"),
+            OtlpError::MalformedPayload(e) => write!(f, "OTLP malformed payload: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OtlpError {}
+
 /// Send error event telemetry to APM collector
 /// Error events have a special structure: [run_id, {events_seen, reservoir_size}, [events]]
 pub async fn send_error_events(
@@ -538,20 +585,24 @@ mod collector_tests {
 
 /// Decode, enrich with `entity.guid`, gzip, and POST a single base64-encoded OTLP payload.
 /// `payload_num` is a 1-based index used only for human-readable logging.
-async fn send_single_otlp_payload(
+pub(super) async fn send_single_otlp_payload(
     client: &Client,
     otlp_endpoint: &str,
     license_key: &str,
     encoded_payload: &str,
     entity_guid: &str,
     payload_num: usize,
-) -> Result<()> {
+) -> std::result::Result<(), OtlpError> {
     let raw = general_purpose::STANDARD
         .decode(encoded_payload)
-        .map_err(|e| anyhow::anyhow!("Failed to base64-decode OTLP payload {payload_num}: {e}"))?;
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to base64-decode OTLP payload {payload_num}: {e}"
+        )))?;
 
     let enriched: Vec<u8> = super::otlp::inject_entity_guid(&raw, entity_guid)
-        .map_err(|e| anyhow::anyhow!("Failed to inject entity.guid into OTLP payload {payload_num}: {e}"))?;
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to inject entity.guid into OTLP payload {payload_num}: {e}"
+        )))?;
 
     debug!(
         "OTLP payload {} enriched ({} bytes) base64={}",
@@ -562,9 +613,13 @@ async fn send_single_otlp_payload(
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&enriched)
-        .map_err(|e| anyhow::anyhow!("Failed to gzip OTLP payload {payload_num}: {e}"))?;
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to gzip OTLP payload {payload_num}: {e}"
+        )))?;
     let compressed = encoder.finish()
-        .map_err(|e| anyhow::anyhow!("Failed to finish gzip OTLP payload {payload_num}: {e}"))?;
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to finish gzip OTLP payload {payload_num}: {e}"
+        )))?;
 
     debug!(
         "OTLP payload {} compressed: {} bytes -> {} bytes",
@@ -583,12 +638,18 @@ async fn send_single_otlp_payload(
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("OTLP request {payload_num} failed: {e}"))?;
+        .map_err(|e| {
+            let e = e.without_url();
+            warn!("OTLP request {} network error: {} - will retry", payload_num, e);
+            OtlpError::Network(anyhow::Error::new(e))
+        })?;
 
     let duration = start_time.elapsed();
     let status = response.status();
+    let status_code = status.as_u16();
 
     if !status.is_success() {
+        let retry_after = parse_retry_after(response.headers());
         let body = match response.text().await {
             Ok(t) => t,
             Err(e) => {
@@ -597,20 +658,29 @@ async fn send_single_otlp_payload(
             }
         };
 
-        warn!(
-            "OTLP payload {} returned status {} in {}ms: {}",
-            payload_num,
-            status.as_u16(),
-            duration.as_millis(),
-            body
-        );
+        if is_retryable_status(status_code) {
+            warn!(
+                "OTLP payload {} transient failure (status {}, retry_after {:?}) in {}ms - will retry: {}",
+                payload_num, status_code, retry_after, duration.as_millis(), body
+            );
+            return Err(OtlpError::Retryable { status: status_code, retry_after });
+        }
 
-        return Err(anyhow::anyhow!(
-            "OTLP endpoint returned status {}",
-            status.as_u16()
-        ));
+        warn!(
+            "OTLP payload {} permanent failure (status {}) in {}ms - dropping: {}",
+            payload_num, status_code, duration.as_millis(), body
+        );
+        return Err(OtlpError::Permanent { status: status_code });
     }
 
+    log_otlp_success_response(response, payload_num, duration).await;
+    Ok(())
+}
+
+/// Log the response body of a successful OTLP send (debug-level only). Split out of
+/// `send_single_otlp_payload` purely to keep that function under the line-count lint —
+/// this has no effect on control flow, since a successful send always returns `Ok(())`.
+async fn log_otlp_success_response(response: reqwest::Response, payload_num: usize, duration: std::time::Duration) {
     let body_bytes = match response.bytes().await {
         Ok(b) => b,
         Err(e) => {
@@ -621,7 +691,7 @@ async fn send_single_otlp_payload(
                 duration.as_millis(),
                 e
             );
-            return Ok(());
+            return;
         }
     };
 
@@ -656,8 +726,6 @@ async fn send_single_otlp_payload(
             body_repr
         );
     }
-
-    Ok(())
 }
 
 /// Forward base64-encoded OTLP `ExportMetricsServiceRequest` protobuf payloads to the OTLP
@@ -668,14 +736,18 @@ async fn send_single_otlp_payload(
 /// Payloads are sent concurrently and independently: one payload's failure (a transient
 /// 5xx, a timeout) does not abort or delay the others, matching the fan-out pattern used
 /// elsewhere in this codebase (see `event_loop.rs`'s late-agent-payload `JoinSet` usage).
-/// Failures are logged per-payload; this function itself never returns an error, since a
-/// partial-batch failure is not a reason to fail the whole send.
+/// Transient/network failures are buffered via [`super::otlp_buffer`] for retry on a later
+/// invoke or at shutdown, mirroring [`super::metric_api_buffer`]'s handling of platform
+/// metrics. Permanent failures (malformed payload, non-retryable 4xx) are dropped at the
+/// send site. This function itself never returns an error, since a partial-batch failure
+/// is not a reason to fail the whole send.
 pub async fn send_otlp_payload(
     client: &Client,
     otlp_endpoint: &str,
     license_key: &str,
     payloads: &[String],
     entity_guid: &str,
+    request_id: &str,
 ) {
     if payloads.is_empty() {
         return;
@@ -696,9 +768,10 @@ pub async fn send_otlp_payload(
         let license_key = license_key.to_string();
         let encoded = encoded.clone();
         let entity_guid = entity_guid.to_string();
+        let request_id = request_id.to_string();
 
         set.spawn(async move {
-            if let Err(e) = send_single_otlp_payload(
+            match send_single_otlp_payload(
                 &client,
                 &otlp_endpoint,
                 &license_key,
@@ -708,7 +781,20 @@ pub async fn send_otlp_payload(
             )
             .await
             {
-                warn!("Failed to send OTLP payload {}: {}", payload_num, e);
+                Ok(()) => {}
+                Err(e) if e.is_permanent() => {
+                    error!("OTLP payload {} dropped (permanent): {}", payload_num, e);
+                }
+                Err(e) => {
+                    let retry_after = e.retry_after();
+                    super::otlp_buffer::buffer_failed_otlp_payload(
+                        encoded,
+                        entity_guid,
+                        otlp_endpoint,
+                        request_id,
+                        retry_after,
+                    );
+                }
             }
         });
     }

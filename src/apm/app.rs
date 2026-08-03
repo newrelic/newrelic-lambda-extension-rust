@@ -310,12 +310,14 @@ impl ApmApp {
                 let otlp_endpoint = self.otlp_endpoint.clone();
                 let license_key = self.license_key.clone();
                 let entity_guid = self.entity_guid.clone();
+                let request_id_owned = request_id.to_string();
 
-                // send_otlp_payload sends every entry concurrently and logs per-payload
-                // failures itself (a transient failure on one payload never blocks or
-                // drops the rest of the batch), so there is no outer Result to handle here.
+                // send_otlp_payload sends every entry concurrently. Permanent failures are
+                // logged and dropped; transient/network failures are buffered for retry on
+                // a later invoke or at shutdown (see otlp_buffer). There is no outer Result
+                // to handle here.
                 send_tasks.push(tokio::spawn(async move {
-                    send_otlp_payload(&client, &otlp_endpoint, &license_key, &otlp_entries, &entity_guid).await;
+                    send_otlp_payload(&client, &otlp_endpoint, &license_key, &otlp_entries, &entity_guid, &request_id_owned).await;
                 }));
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {

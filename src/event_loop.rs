@@ -232,7 +232,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // Only spawn when something is actually buffered — avoids a per-invoke task
                 // on the healthy hot path (two cheap atomic-guarded count checks instead).
                 let has_buffered = crate::apm::telemetry_buffer::get_buffer_count() > 0
-                    || crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0;
+                    || crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0
+                    || crate::apm::otlp_buffer::get_otlp_buffer_count() > 0;
                 if components.apm_mode_enabled && has_buffered {
                     let (cur_run_id, cur_collector_host) = {
                         let guard = components.apm_app.read().await;
@@ -252,6 +253,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         )
                         .await;
                         crate::apm::metric_api_buffer::retry_buffered_metric_api(
+                            &http_client,
+                            &license_key,
+                        )
+                        .await;
+                        crate::apm::otlp_buffer::retry_buffered_otlp_payloads(
                             &http_client,
                             &license_key,
                         )
@@ -683,6 +689,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     &license_key,
                 )
                 .await;
+                crate::apm::otlp_buffer::retry_buffered_otlp_payloads(
+                    &components.client,
+                    &license_key,
+                )
+                .await;
                 // Final attempt for failed agent payloads too (APM collector), so the
                 // drop count below reflects only what genuinely couldn't be delivered.
                 // Keeps FAILED_AGENT_PAYLOADS symmetric with the two buffers above.
@@ -697,16 +708,20 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 for id in crate::apm::telemetry_buffer::buffered_request_ids() {
                     dropped_request_ids.insert(id);
                 }
-                // Metric-API items count toward remaining_count below, so their requests
-                // must count toward `affected` too — otherwise a metric-only request
-                // inflates item count without bumping the invocation count.
+                // Metric-API and OTLP items count toward remaining_count below, so their
+                // requests must count toward `affected` too — otherwise a metric/OTLP-only
+                // request inflates item count without bumping the invocation count.
                 for id in crate::apm::metric_api_buffer::buffered_request_ids() {
+                    dropped_request_ids.insert(id);
+                }
+                for id in crate::apm::otlp_buffer::buffered_request_ids() {
                     dropped_request_ids.insert(id);
                 }
 
                 let remaining_count = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0)
                     + crate::apm::telemetry_buffer::get_buffer_count()
-                    + crate::apm::metric_api_buffer::get_metric_api_buffer_count();
+                    + crate::apm::metric_api_buffer::get_metric_api_buffer_count()
+                    + crate::apm::otlp_buffer::get_otlp_buffer_count();
                 // Payloads already evicted/aged-out earlier (no longer in the buffer
                 // to count) — add them so the total loss is honest.
                 let dropped_earlier = dropped_agent_payload_count();
