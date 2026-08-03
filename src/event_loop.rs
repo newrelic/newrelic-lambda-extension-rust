@@ -225,15 +225,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     warn!("APM run_id invalidated (collector restart/disconnect) - will reconnect");
                 }
 
-                // Drain buffered telemetry (failed sends + platform metrics) on each invoke,
-                // not just at shutdown. Lambda freeze suspends these tasks cleanly; they resume
-                // on thaw. Passing the live run_id/collector_host lets items that were buffered
-                // against an expired run_id succeed after reconnect.
-                // Only spawn when something is actually buffered — avoids a per-invoke task
-                // on the healthy hot path (two cheap atomic-guarded count checks instead).
-                let has_buffered = crate::apm::telemetry_buffer::get_buffer_count() > 0
-                    || crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0;
-                if components.apm_mode_enabled && has_buffered && components.apm_app.read().await.is_some() {
+                // Retry buffered telemetry on each invoke. APM telemetry needs a live session
+                // (run_id), so it only fires when apm_app is Some. Metric API is license-key-only
+                // and retries unconditionally.
+                if components.apm_mode_enabled
+                    && crate::apm::telemetry_buffer::get_buffer_count() > 0
+                    && components.apm_app.read().await.is_some()
+                {
                     let (cur_run_id, cur_collector_host) = {
                         let guard = components.apm_app.read().await;
                         match guard.as_ref() {
@@ -251,6 +249,15 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             cur_collector_host.as_deref(),
                         )
                         .await;
+                    });
+                }
+
+                if components.apm_mode_enabled
+                    && crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0
+                {
+                    let http_client = components.client.clone();
+                    let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
+                    tokio::spawn(async move {
                         crate::apm::metric_api_buffer::retry_buffered_metric_api(
                             &http_client,
                             &license_key,

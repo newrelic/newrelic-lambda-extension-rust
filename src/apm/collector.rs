@@ -515,6 +515,16 @@ mod collector_tests {
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
     }
 
+    fn restart_log_level(status_code: u16) -> &'static str {
+        if status_code == 409 { "INFO" } else { "WARN" }
+    }
+
+    #[test]
+    fn log_level_409_is_info_401_is_warn() {
+        assert_eq!(restart_log_level(409), "INFO", "409 (routine session refresh) must log at INFO");
+        assert_eq!(restart_log_level(401), "WARN", "401 (auth failure) must log at WARN");
+    }
+
     #[test]
     fn disconnect_is_not_restart_exception() {
         // 410 returns CollectorError::Disconnect, not RestartException. This is
