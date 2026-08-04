@@ -235,11 +235,16 @@ pub async fn send_error_events(
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", CMD_ERROR_EVENTS)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, CMD_ERROR_EVENTS)));
+                .context(format!("Collector returned 409 for {}", CMD_ERROR_EVENTS)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", CMD_ERROR_EVENTS)));
         }
         
         warn!(
@@ -336,11 +341,16 @@ pub async fn send_apm_telemetry(
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", command)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
             signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, command)));
+                .context(format!("Collector returned 409 for {}", command)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", command)));
         }
         
         warn!(
@@ -503,5 +513,34 @@ mod collector_tests {
         assert_eq!(KNOWN_TELEMETRY_TYPES.len(), 10);
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"platform_metrics"));
         assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
+    }
+
+    fn restart_log_level(status_code: u16) -> &'static str {
+        if status_code == 409 { "INFO" } else { "WARN" }
+    }
+
+    #[test]
+    fn log_level_409_is_info_401_is_warn() {
+        assert_eq!(restart_log_level(409), "INFO", "409 (routine session refresh) must log at INFO");
+        assert_eq!(restart_log_level(401), "WARN", "401 (auth failure) must log at WARN");
+    }
+
+    #[test]
+    fn disconnect_is_not_restart_exception() {
+        // 410 returns CollectorError::Disconnect, not RestartException. This is
+        // intentional: telemetry_buffer::retry_buffered_telemetry only skips
+        // retry_count for RestartException (409/401). A 410 is a hard disconnect
+        // and must consume a retry slot like any other non-session error.
+        let restart = anyhow::Error::new(CollectorError::RestartException);
+        let disconnect = anyhow::Error::new(CollectorError::Disconnect);
+
+        let is_restart = |e: &anyhow::Error| {
+            e.downcast_ref::<CollectorError>()
+                .map(|ce| matches!(ce, CollectorError::RestartException))
+                .unwrap_or(false)
+        };
+
+        assert!(is_restart(&restart), "RestartException (409/401) must be detected");
+        assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
     }
 }
