@@ -604,12 +604,18 @@ pub(super) async fn send_single_otlp_payload(
             "Failed to inject entity.guid into OTLP payload {payload_num}: {e}"
         )))?;
 
-    debug!(
-        "OTLP payload {} enriched ({} bytes) base64={}",
-        payload_num,
-        enriched.len(),
-        general_purpose::STANDARD.encode(&enriched)
-    );
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let b64 = general_purpose::STANDARD.encode(&enriched);
+        let preview_len = b64.len().min(256);
+        let suffix = if b64.len() > preview_len { "..." } else { "" };
+        debug!(
+            "OTLP payload {} enriched ({} bytes) base64={}{}",
+            payload_num,
+            enriched.len(),
+            &b64[..preview_len],
+            suffix
+        );
+    }
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&enriched)

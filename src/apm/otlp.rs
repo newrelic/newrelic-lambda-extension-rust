@@ -16,7 +16,9 @@ pub struct ExportMetricsServiceRequest {
 }
 
 /// Mirrors `opentelemetry.proto.metrics.v1.ResourceMetrics`.
-/// `schema_url` (tag 3) is preserved as an unknown field.
+/// `schema_url` (tag 3) is not declared here, so prost's decode silently drops it
+/// (prost 0.13 has no unknown-field preservation — see `ScopeMetrics::metrics_raw`'s
+/// comment below for why that matters and how it's worked around for metric data).
 #[derive(Clone, PartialEq, Message)]
 pub struct ResourceMetrics {
     #[prost(message, optional, tag = "1")]
@@ -26,7 +28,8 @@ pub struct ResourceMetrics {
 }
 
 /// Mirrors `opentelemetry.proto.metrics.v1.ScopeMetrics`.
-/// `schema_url` (tag 3) is preserved as an unknown field.
+/// `schema_url` (tag 3) is not declared here, so it is silently dropped on decode
+/// (see the `metrics_raw` comment below — prost has no unknown-field preservation).
 #[derive(Clone, PartialEq, Message)]
 pub struct ScopeMetrics {
     #[prost(message, optional, tag = "1")]
@@ -50,7 +53,8 @@ pub struct InstrumentationScope {
 }
 
 /// Mirrors `opentelemetry.proto.resource.v1.Resource`.
-/// `dropped_attributes_count` (tag 2) is preserved as an unknown field.
+/// `dropped_attributes_count` (tag 2) is not declared here, so it is silently
+/// dropped on decode (prost has no unknown-field preservation).
 #[derive(Clone, PartialEq, Message)]
 pub struct Resource {
     #[prost(message, repeated, tag = "1")]
@@ -67,9 +71,12 @@ pub struct KeyValue {
 }
 
 /// Mirrors `opentelemetry.proto.common.v1.AnyValue`.
-/// Only the `string_value` oneof variant (tag 1) is decoded.
-/// Non-string values (bool=2, int64=3, double=4, array=5, kvlist=6, bytes=7)
-/// are preserved as unknown fields and re-encoded unchanged.
+/// Only the `string_value` oneof variant (tag 1) is decoded. Non-string values
+/// (bool=2, int64=3, double=4, array=5, kvlist=6, bytes=7) are NOT preserved: prost
+/// has no unknown-field preservation, so an attribute with a non-string value
+/// silently decodes to `value: None` and is dropped on re-encode. Known limitation,
+/// not yet fixed — only affects `Resource.attributes` metadata, not metric data
+/// points (gauge/sum/histogram), which are unaffected via `metrics_raw` below.
 #[derive(Clone, PartialEq, Message)]
 pub struct AnyValue {
     #[prost(oneof = "AnyValueKind", tags = "1")]
