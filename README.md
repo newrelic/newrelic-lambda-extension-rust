@@ -219,6 +219,16 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
 
+### Serverless Mode Configuration
+
+Serverless mode (the default, `NEW_RELIC_APM_LAMBDA_MODE=false`) pairs each agent payload with its Lambda `platform.report` before sending, batching complete pairs together. For low-invocation-frequency functions, whichever of the two arrives second can otherwise sit unpaired until the next invocation or `SHUTDOWN` — these variables close that gap.
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` | `false` | `true`, `false`, `1`, `0` | When `true`, the extension bound-waits for whichever of the agent payload / `platform.report` pair is still missing (up to `NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS` or `NEW_RELIC_REPORT_LINE_TIMEOUT_MS` respectively) instead of leaving it for the next invocation or `SHUTDOWN`. If the report specifically never arrives in time, the agent payload is sent **unpaired** right away — `billed_duration`/`memory_used` will be missing from that send, and a warning is logged. Distinct from `NEW_RELIC_APM_BLOCKING_HANDSHAKE`, which is APM-mode-only. Takes precedence over `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` on invocations where either wait is exercised. When `false` (default), behavior is unchanged. |
+| `NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS` | `200` | Number (0–2000) | Maximum milliseconds to wait for a late agent payload when the `platform.report` already arrived. Ignored unless `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is `true`. Clamped to `[0, 2000]`. |
+| `NEW_RELIC_REPORT_LINE_TIMEOUT_MS` | `200` | Number (0–2000) | Maximum milliseconds to wait for a late `platform.report` when the agent payload already arrived. Independently configurable from `NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS`. Ignored unless `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is `true`. Clamped to `[0, 2000]`. |
+
 ### Performance Optimization
 
 | Environment variable | Default value | Options | Description |

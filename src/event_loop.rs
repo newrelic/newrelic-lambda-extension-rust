@@ -37,6 +37,13 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
+/// Safety margin (ms) reserved before a function's own remaining deadline when
+/// bound-waiting for something within an invocation (an APM handshake, a late agent
+/// payload, or a late `platform.report`) — leaves headroom for the downstream
+/// flush/cleanup work that still has to run before the extension returns to `/next`.
+/// Shared by every bounded-wait helper so they can't drift apart on this value.
+const INVOKE_DEADLINE_SAFETY_MARGIN_MS: u64 = 500;
+
 /// Budget reserved (out of SHUTDOWN_TIMEOUT_MS) to POST the APM "telemetry
 /// dropped" diagnostic directly to New Relic Logs. The main shutdown work runs
 /// in `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`, then the diagnostic gets
@@ -1043,7 +1050,18 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .await;
                 });
 
-                if components.config.extension.pipeline_flush {
+                // blocking_agent_payload wins over pipeline_flush: process_request_concurrently
+                // (processing_handle) may contain a bound wait for a late agent payload or a
+                // late platform.report (wait_for_late_payload / wait_for_late_report). If
+                // pipeline_flush deferred processing_handle into the background here, that wait
+                // could be frozen mid-flight by the sandbox freeze — silently defeating the
+                // delivery guarantee the customer explicitly opted into.
+                let defer_via_pipeline_flush = should_defer_via_pipeline_flush(
+                    components.config.extension.pipeline_flush,
+                    components.config.new_relic.blocking_agent_payload,
+                );
+
+                if defer_via_pipeline_flush {
                     pending_flush_handles.push(processing_handle);
                 } else {
                     if let Err(e) = processing_handle.await {
@@ -1652,6 +1670,20 @@ async fn send_error_for_shutdown_reason(
 /// After `platform.runtimeDone`, use remaining deadline budget to let an in-flight
 /// APM handshake complete before calling /next. Sandbox stays active while the
 /// extension has not yet called /next — no freeze risk. Bounded by deadline_ms.
+/// Shared budget computation for every bounded wait in this file: how many
+/// milliseconds are left to wait for something within this invocation, capped by
+/// both the caller's configured timeout and the invocation's own remaining deadline
+/// (minus `INVOKE_DEADLINE_SAFETY_MARGIN_MS`). Never returns more than either input.
+fn bounded_wait_budget_ms(deadline_ms: i64, configured_timeout_ms: u64) -> u64 {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let deadline_budget_ms = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).saturating_sub(INVOKE_DEADLINE_SAFETY_MARGIN_MS)
+    } else {
+        0
+    };
+    configured_timeout_ms.min(deadline_budget_ms)
+}
+
 async fn wait_for_apm_handshake_within_budget(
     reconnect_sender: &watch::Sender<bool>,
     deadline_ms: i64,
@@ -1659,13 +1691,9 @@ async fn wait_for_apm_handshake_within_budget(
     if !*reconnect_sender.borrow() {
         return;
     }
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    const SAFETY_MARGIN_MS: u64 = 500;
-    let budget_ms = if deadline_ms > now_ms {
-        ((deadline_ms - now_ms) as u64).saturating_sub(SAFETY_MARGIN_MS)
-    } else {
-        0
-    };
+    // Handshake wait has no separate "configured timeout" of its own — it's bounded
+    // purely by the invocation deadline, so pass u64::MAX as the "no cap" timeout input.
+    let budget_ms = bounded_wait_budget_ms(deadline_ms, u64::MAX);
     if budget_ms == 0 {
         debug!("APM handshake in-flight but no deadline budget remaining — skipping wait");
         return;
@@ -1680,6 +1708,134 @@ async fn wait_for_apm_handshake_within_budget(
         rx.wait_for(|in_flight| !in_flight),
     )
     .await;
+}
+
+/// Whether `execute_standard_mode_event_loop` should defer `process_request_concurrently`
+/// into the background `pending_flush_handles` queue (the `pipeline_flush` optimization)
+/// rather than synchronously awaiting it before calling `/next` again.
+///
+/// `blocking_agent_payload` always wins: deferring would let the sandbox freeze
+/// mid-`wait_for_late_payload`/`wait_for_late_report`, silently defeating the delivery
+/// guarantee the customer explicitly opted into. Pure function so the precedence rule is
+/// unit-testable without spinning up the event loop.
+fn should_defer_via_pipeline_flush(pipeline_flush: bool, blocking_agent_payload: bool) -> bool {
+    pipeline_flush && !blocking_agent_payload
+}
+
+/// Serverless mode, direction 1: the request's `platform.report` already arrived, but the
+/// agent payload hasn't landed on the pipe yet. Bound-wait for it instead of leaving it
+/// for the next invocation's `drain_late_paired_payloads_serverless` or `SHUTDOWN`.
+///
+/// Only ever called when `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled. Uses the same
+/// "arm-before-recheck" idiom as `wait_for_runtime_done_with_grace`'s drain-notify wait to
+/// avoid a TOCTOU gap between the caller's own buffer snapshot and this await.
+async fn wait_for_late_payload(request_id: &str, deadline_ms: i64, timeout_ms: u64) -> Vec<Vec<u8>> {
+    let Some(notify) = request::get_agent_payload_notify(request_id) else {
+        return Vec::new();
+    };
+
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+
+    if let Some(payloads) = request::take_agent_buffer_if_nonempty(request_id) {
+        return payloads; // landed between the caller's snapshot and here
+    }
+
+    let budget_ms = bounded_wait_budget_ms(deadline_ms, timeout_ms);
+    if budget_ms == 0 {
+        debug!(
+            "Serverless mode: no deadline budget remaining to wait for late agent payload (request: {})",
+            request_id
+        );
+        return Vec::new();
+    }
+
+    debug!(
+        "Serverless mode: waiting up to {}ms within deadline for late agent payload (request: {})",
+        budget_ms, request_id
+    );
+
+    if tokio::time::timeout(Duration::from_millis(budget_ms), notified).await.is_ok() {
+        request::take_agent_buffer_if_nonempty(request_id).unwrap_or_default()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Serverless mode, direction 2: the agent payload already arrived, but its
+/// `platform.report` hasn't yet. Bound-wait for it; on timeout the caller must warn that
+/// `billed_duration`/`memory_used` will be missing and send the payload unpaired now
+/// instead of re-buffering it for the next invocation.
+///
+/// Only ever called when `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled. Same
+/// arm-before-recheck idiom as `wait_for_late_payload`.
+async fn wait_for_late_report(request_id: &str, deadline_ms: i64, timeout_ms: u64) -> Option<String> {
+    let notify = request::get_report_notify(request_id)?;
+
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+
+    if let Some(report) = request::remove_pending_report(request_id) {
+        return Some(report); // landed between the caller's snapshot and here
+    }
+
+    let budget_ms = bounded_wait_budget_ms(deadline_ms, timeout_ms);
+    if budget_ms == 0 {
+        debug!(
+            "Serverless mode: no deadline budget remaining to wait for late platform.report (request: {})",
+            request_id
+        );
+        return None;
+    }
+
+    debug!(
+        "Serverless mode: waiting up to {}ms within deadline for late platform.report (request: {})",
+        budget_ms, request_id
+    );
+
+    if tokio::time::timeout(Duration::from_millis(budget_ms), notified).await.is_ok() {
+        request::remove_pending_report(request_id)
+    } else {
+        None
+    }
+}
+
+/// Add every payload in `payloads` to `AGENT_BATCH_BUFFER`, each paired with a clone of
+/// `report_line` (or unpaired, if `None`). Shared by every arm of
+/// `process_request_concurrently`'s send decision so the batching call is made exactly
+/// the same way regardless of which arm supplied the payloads/report.
+fn batch_all_payloads(
+    request_id: &str,
+    payloads: Vec<Vec<u8>>,
+    report_line: Option<&str>,
+    invoked_function_arn: &str,
+) {
+    for payload_bytes in payloads {
+        add_to_batch(
+            request_id.to_string(),
+            payload_bytes,
+            report_line.map(str::to_string),
+            invoked_function_arn.to_string(),
+        );
+    }
+}
+
+/// Spawn the batch-send task if the count threshold has been reached, mirroring the
+/// original inline check that used to live directly in `process_request_concurrently`.
+fn maybe_spawn_batch_send(
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if should_send_batch_by_threshold() {
+        debug!("Batch threshold reached - sending payloads with report lines only");
+        Some(tokio::spawn(async move {
+            send_batched_payloads_with_reports_only(newrelic_client, config).await;
+        }))
+    } else {
+        None
+    }
 }
 
 pub async fn process_request_concurrently(
@@ -1763,40 +1919,89 @@ pub async fn process_request_concurrently(
         }
     }
 
-    // Smart batching: Only send complete payloads (with report)
+    // Smart batching: Only send complete payloads (with report), unless
+    // NEW_RELIC_BLOCKING_AGENT_PAYLOAD is enabled — see wait_for_late_payload /
+    // wait_for_late_report above.
     let send_agent_task = if agent_payloads.is_empty() {
-        debug!("Serverless mode: No agent payload for request: {}", request_id);
-        None
+        // No payload yet. If a report is already here, either bound-wait for the late
+        // payload (flag on) or restore the report so it isn't silently lost — restoring
+        // is an UNCONDITIONAL correctness fix, independent of the flag: report_line was
+        // already taken out of REQUEST_DATA via remove_pending_report() above, and
+        // without restoring it here it would vanish (never found by
+        // drain_late_paired_payloads_serverless or SHUTDOWN).
+        match report_line {
+            Some(report) if config.new_relic.blocking_agent_payload => {
+                let late_payloads = wait_for_late_payload(
+                    &request_id,
+                    deadline_ms,
+                    config.new_relic.agent_payload_timeout_ms,
+                )
+                .await;
+                if late_payloads.is_empty() {
+                    debug!(
+                        "Serverless mode: no agent payload within blocking-payload timeout for request: {} - restoring report for next invocation/shutdown",
+                        request_id
+                    );
+                    request::set_pending_report(&request_id, report);
+                    None
+                } else {
+                    debug!(
+                        "Serverless mode: late agent payload arrived within invocation window ({} payload(s)) for request: {} - adding to batch",
+                        late_payloads.len(), request_id
+                    );
+                    if config.new_relic.collect_trace_id {
+                        for payload_bytes in &late_payloads {
+                            extract_and_coordinate_trace_id(payload_bytes, &request_id, &config, &global_log_processor).await;
+                        }
+                    }
+                    batch_all_payloads(&request_id, late_payloads, Some(&report), &invoked_function_arn);
+                    maybe_spawn_batch_send(newrelic_client.clone(), config.clone())
+                }
+            }
+            Some(report) => {
+                debug!(
+                    "Serverless mode: No agent payload for request: {} - restoring report for next invocation",
+                    request_id
+                );
+                request::set_pending_report(&request_id, report);
+                None
+            }
+            None => {
+                debug!("Serverless mode: No agent payload for request: {}", request_id);
+                None
+            }
+        }
     } else if let Some(ref report) = report_line {
         // Both payload and report available - send now (complete data)
         debug!(
             "Serverless mode: Payload + report both ready for {} - adding to batch",
             request_id
         );
-
-        for payload_bytes in agent_payloads {
-            add_to_batch(
-                request_id.clone(),
-                payload_bytes,
-                Some(report.clone()),
-                invoked_function_arn.clone(),
-            );
-        }
-
-        // Check if batch threshold is met and send if needed (only payloads with report lines)
-        if should_send_batch_by_threshold() {
-            debug!("Batch threshold reached - sending payloads with report lines only");
-            let newrelic_client_clone = newrelic_client.clone();
-            let config_clone = config.clone();
-
-            Some(tokio::spawn(async move {
-                send_batched_payloads_with_reports_only(newrelic_client_clone, config_clone).await;
-            }))
-        } else {
-            None
+        batch_all_payloads(&request_id, agent_payloads, Some(report.as_str()), &invoked_function_arn);
+        maybe_spawn_batch_send(newrelic_client.clone(), config.clone())
+    } else if config.new_relic.blocking_agent_payload {
+        // Payload present, no report yet, flag on: direction 2 — bound-wait for the
+        // late report instead of leaving the payload buffered for the next invocation.
+        match wait_for_late_report(&request_id, deadline_ms, config.new_relic.report_line_timeout_ms).await {
+            Some(report) => {
+                debug!(
+                    "Serverless mode: late platform.report arrived within invocation window for request: {} - adding to batch",
+                    request_id
+                );
+                batch_all_payloads(&request_id, agent_payloads, Some(&report), &invoked_function_arn);
+                maybe_spawn_batch_send(newrelic_client.clone(), config.clone())
+            }
+            None => {
+                warn!(
+                    "Serverless mode: platform.report not received within {}ms for request: {} — billed_duration/memory_used will be missing from this send; sending agent payload now instead of leaving it for the next invocation",
+                    config.new_relic.report_line_timeout_ms, request_id
+                );
+                batch_all_payloads(&request_id, agent_payloads, None, &invoked_function_arn);
+                maybe_spawn_batch_send(newrelic_client.clone(), config.clone())
+            }
         }
     } else {
-        // Only payload, no report yet - put back in buffer for next invocation
+        // Only payload, no report yet, flag off (default) - put back in buffer for next invocation
         debug!(
             "Serverless mode: Payload ready but NO report yet for {} - keeping in buffer",
             request_id

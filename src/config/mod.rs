@@ -57,6 +57,27 @@ pub struct NewRelicConfig {
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
+    /// `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` — master switch for serverless-mode
+    /// delivery-within-the-invoke (standard/non-APM mode only). When `true`,
+    /// `process_request_concurrently` bound-waits for a late agent payload (when
+    /// the `platform.report` already arrived) or a late `platform.report` (when
+    /// the agent payload already arrived) instead of leaving either for the next
+    /// invocation or `SHUTDOWN`. Default `false` — no behavior change unless
+    /// explicitly enabled. Distinct from `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`,
+    /// which is APM-mode-only.
+    pub blocking_agent_payload: bool,
+    /// `NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS` — max milliseconds to wait for a late
+    /// agent payload when the `platform.report` already arrived. Ignored unless
+    /// `blocking_agent_payload` is `true`. Default 200, clamped `[0, 2000]`.
+    pub agent_payload_timeout_ms: u64,
+    /// `NEW_RELIC_REPORT_LINE_TIMEOUT_MS` — max milliseconds to wait for a late
+    /// `platform.report` when the agent payload already arrived. Independently
+    /// configurable from `agent_payload_timeout_ms` above. Ignored unless
+    /// `blocking_agent_payload` is `true`. On timeout, the extension warns that
+    /// `billed_duration`/`memory_used` will be missing from this send and sends
+    /// the agent payload unpaired immediately instead of re-buffering it for the
+    /// next invocation. Default 200, clamped `[0, 2000]`.
+    pub report_line_timeout_ms: u64,
 }
 
 /// AWS Lambda specific configuration
@@ -143,6 +164,9 @@ impl Default for NewRelicConfig {
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
+            blocking_agent_payload: false,
+            agent_payload_timeout_ms: 200,
+            report_line_timeout_ms: 200,
         }
     }
 }
@@ -407,6 +431,36 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        let blocking_agent_payload_str =
+            env::var("NEW_RELIC_BLOCKING_AGENT_PAYLOAD").unwrap_or_default();
+        config.new_relic.blocking_agent_payload = parse_bool(&blocking_agent_payload_str);
+
+        config.new_relic.agent_payload_timeout_ms = env::var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(200)
+            .min(2000);
+
+        config.new_relic.report_line_timeout_ms = env::var("NEW_RELIC_REPORT_LINE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(200)
+            .min(2000);
+
+        // blocking_agent_payload takes precedence over pipeline_flush on any invocation
+        // where either bounded wait is exercised (see event_loop.rs
+        // execute_standard_mode_event_loop) — the delivery guarantee the customer
+        // explicitly opted into must not be silently defeated by the deferred-send
+        // optimization. Surface that trade-off once at startup rather than leaving it silent.
+        if config.extension.pipeline_flush && config.new_relic.blocking_agent_payload {
+            warn!(
+                "NEW_RELIC_BLOCKING_AGENT_PAYLOAD=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
+                 deferred-send behavior on invocations where a payload/report wait is exercised — you \
+                 will not get pipeline_flush's billed-duration savings on those invocations. This is \
+                 intentional: the delivery guarantee takes precedence over the throughput optimization."
+            );
+        }
 
         config
     }

@@ -379,6 +379,8 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+            report_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -644,6 +646,8 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+            report_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -706,6 +710,8 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+            report_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -844,6 +850,8 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+            report_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 

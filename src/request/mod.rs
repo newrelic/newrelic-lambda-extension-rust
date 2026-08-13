@@ -96,6 +96,18 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
+    /// Fired by `route_payload_to_request_buffer()` whenever an agent payload is pushed
+    /// into this request's `agent_buffer`. Awaited (bounded, only when
+    /// `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled) by `event_loop::wait_for_late_payload`
+    /// to catch a payload that arrives after the request's own processing already found
+    /// the buffer empty.
+    pub agent_payload_notify: Arc<Notify>,
+    /// Fired by `set_pending_report()` whenever a `platform.report` line is stored for
+    /// this request. Awaited (bounded, only when `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is
+    /// enabled) by `event_loop::wait_for_late_report` to catch a report that arrives
+    /// after the agent payload already did — the serverless-mode mirror of
+    /// `agent_payload_notify`.
+    pub report_notify: Arc<Notify>,
     /// Cached ARN for this request. Avoids locking `context` just to read the ARN
     /// on hot paths like cleanup_old_request_buffers and drain_late_paired_payloads.
     pub invoked_function_arn: String,
@@ -123,10 +135,14 @@ pub fn get_pending_report(request_id: &str) -> Option<String> {
     REQUEST_DATA.get(request_id).and_then(|entry| entry.pending_report.clone())
 }
 
-/// Set the pending platform.report for a request.
+/// Set the pending platform.report for a request. Fires `report_notify` so a
+/// bounded `event_loop::wait_for_late_report` waiter (only armed when
+/// `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled) picks it up immediately instead of
+/// only on the next invocation's drain or at SHUTDOWN.
 pub fn set_pending_report(request_id: &str, report: String) {
     if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
         entry.pending_report = Some(report);
+        entry.report_notify.notify_one();
     }
 }
 
@@ -140,6 +156,39 @@ pub fn remove_pending_report(request_id: &str) -> Option<String> {
 /// callers must then record the pre-fire in PREFIRED_RUNTIME_DONE.
 pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
     REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
+}
+
+/// Get the agent-payload notify for a request (used by
+/// `event_loop::wait_for_late_payload` to wait, and by `route_payload_to_request_buffer`
+/// to signal). Returns None if the request is not registered — unlike
+/// `runtime_done_notify`, no pre-fire map is needed here: an agent payload can only be
+/// routed to a `request_id` after `create_request_processing_state()` has already run
+/// synchronously for it (the language agent doesn't start until the runtime hands off
+/// control), so the Notify always exists before any payload can race it.
+pub fn get_agent_payload_notify(request_id: &str) -> Option<Arc<Notify>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.agent_payload_notify.clone())
+}
+
+/// Get the report notify for a request (used by `event_loop::wait_for_late_report` to
+/// wait, and by `set_pending_report` to signal). Same no-pre-fire-map reasoning as
+/// `get_agent_payload_notify`: a `platform.report` can only be stored for a `request_id`
+/// after `create_request_processing_state()` has already run for it.
+pub fn get_report_notify(request_id: &str) -> Option<Arc<Notify>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.report_notify.clone())
+}
+
+/// Atomically take the agent buffer's contents if non-empty. Returns `None` if the
+/// request is unregistered or its buffer is currently empty — used by
+/// `event_loop::wait_for_late_payload` to avoid a TOCTOU gap between checking emptiness
+/// and draining.
+pub fn take_agent_buffer_if_nonempty(request_id: &str) -> Option<Vec<Vec<u8>>> {
+    let entry = REQUEST_DATA.get(request_id)?;
+    let mut buf = entry.agent_buffer.lock().ok()?;
+    if buf.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(&mut *buf))
+    }
 }
 
 /// Record that platform.runtimeDone fired before the request state existed.
@@ -265,6 +314,8 @@ pub fn create_request_processing_state(
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
+        agent_payload_notify: Arc::new(Notify::new()),
+        report_notify: Arc::new(Notify::new()),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
 
@@ -294,12 +345,14 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         // (create_request_processing_state for a completed request_id is never called again).
         REQUEST_DATA.remove(request_id);
         PREFIRED_RUNTIME_DONE.remove(request_id);
-    } else {
-        // Partial cleanup: keep context/buffer/creation_invocation, clear pending_report
-        if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
-            entry.pending_report = None;
-        }
     }
+    // Partial cleanup (skip_buffer_cleanup=true): keep context/buffer/creation_invocation
+    // AND pending_report — do not clear it here. It was already .take()n by
+    // remove_pending_report() at the start of the caller's processing, so it's normally
+    // None by now; but process_request_concurrently's blocking_agent_payload path can
+    // legitimately re-set it mid-function (restoring a report whose payload never showed
+    // up within the wait window) so the next invocation or SHUTDOWN can still find it.
+    // Unconditionally clearing it here would silently undo that restoration.
 }
 
 /// Periodic cleanup of stale request buffers that have survived more than 5 invocations
@@ -420,6 +473,10 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
+                    // Wake any bounded wait_for_late_payload() waiter for this request
+                    // (only armed when NEW_RELIC_BLOCKING_AGENT_PAYLOAD is enabled). A
+                    // no-op permit if nobody is waiting.
+                    entry.agent_payload_notify.notify_one();
                 }
                 Err(e) => {
                     error!(
@@ -447,6 +504,11 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
+                    // Same defense-in-depth wake as the active branch above. Note: this
+                    // fallback picks an arbitrary REQUEST_DATA entry (.iter().next()) when
+                    // multiple stale buffers exist — a pre-existing ambiguity this notify
+                    // doesn't resolve, only wakes whichever waiter (if any) is attached.
+                    entry.agent_payload_notify.notify_one();
                 }
             }
         } else {
