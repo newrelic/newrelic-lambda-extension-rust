@@ -105,18 +105,18 @@ pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
 }
 
 /// Process-wide OTLP feature gate, populated once at startup from
-/// `NEW_RELIC_OTLP_ENABLED` (default false). Lets code paths without
+/// `NEW_RELIC_OTLP_METRIC_ENABLED` (default false). Lets code paths without
 /// `ExtensionConfig` in scope check whether OTLP forwarding is opted in.
-static OTLP_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OTLP_METRIC_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record whether OTLP metrics forwarding is enabled (called once at startup).
-pub fn set_otlp_enabled(enabled: bool) {
-    OTLP_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+pub fn set_otlp_metric_enabled(enabled: bool) {
+    OTLP_METRIC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether OTLP metrics forwarding has been enabled via `NEW_RELIC_OTLP_ENABLED`.
-pub fn is_otlp_enabled() -> bool {
-    OTLP_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+/// Whether OTLP metrics forwarding has been enabled via `NEW_RELIC_OTLP_METRIC_ENABLED`.
+pub fn is_otlp_metric_enabled() -> bool {
+    OTLP_METRIC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// HTTP status codes worth retrying — transient server/throttle conditions.
@@ -572,16 +572,16 @@ mod collector_tests {
 
     #[test]
     #[serial]
-    fn otlp_enabled_defaults_to_false_and_roundtrips() {
+    fn otlp_metric_enabled_defaults_to_false_and_roundtrips() {
         // Process-wide static: don't assume a fresh false here (another test may have
         // run first), but do confirm the flag actually flips both ways.
-        set_otlp_enabled(false);
-        assert!(!is_otlp_enabled());
-        set_otlp_enabled(true);
-        assert!(is_otlp_enabled());
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
+        set_otlp_metric_enabled(true);
+        assert!(is_otlp_metric_enabled());
         // Reset so other serial tests see a clean state.
-        set_otlp_enabled(false);
-        assert!(!is_otlp_enabled());
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
     }
 
     #[test]
