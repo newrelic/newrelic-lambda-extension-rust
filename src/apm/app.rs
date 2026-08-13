@@ -30,7 +30,7 @@ pub struct ApmApp {
     pub collector_host: String,
     pub license_key: String,
     pub metric_endpoint: String,
-    pub otlp_endpoint: String,
+    pub otlp_metric_endpoint: String,
     pub client: Client,
 }
 
@@ -39,7 +39,7 @@ impl ApmApp {
         license_key: String,
         apm_host: String,
         metric_endpoint: String,
-        otlp_endpoint: String,
+        otlp_metric_endpoint: String,
         client: Client,
         function_name: String,
         lambda_function_name: String,
@@ -72,7 +72,7 @@ impl ApmApp {
                 &license_key,
                 &apm_host,
                 &metric_endpoint,
-                &otlp_endpoint,
+                &otlp_metric_endpoint,
                 &client,
                 &function_name,
                 &lambda_function_name,
@@ -136,7 +136,7 @@ impl ApmApp {
         license_key: &str,
         apm_host: &str,
         metric_endpoint: &str,
-        otlp_endpoint: &str,
+        otlp_metric_endpoint: &str,
         client: &Client,
         function_name: &str,
         lambda_function_name: &str,
@@ -230,7 +230,7 @@ impl ApmApp {
             collector_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
-            otlp_endpoint: otlp_endpoint.to_string(),
+            otlp_metric_endpoint: otlp_metric_endpoint.to_string(),
             client: client.clone(),
         })
     }
@@ -304,10 +304,10 @@ impl ApmApp {
                 );
                 debug!(
                     "OTLP endpoint: {}",
-                    self.otlp_endpoint,
+                    self.otlp_metric_endpoint,
                 );
                 let client = self.client.clone();
-                let otlp_endpoint = self.otlp_endpoint.clone();
+                let otlp_metric_endpoint = self.otlp_metric_endpoint.clone();
                 let license_key = self.license_key.clone();
                 let entity_guid = self.entity_guid.clone();
                 let request_id_owned = request_id.to_string();
@@ -317,7 +317,7 @@ impl ApmApp {
                 // a later invoke or at shutdown (see otlp_buffer). There is no outer Result
                 // to handle here.
                 send_tasks.push(tokio::spawn(async move {
-                    send_otlp_payload(&client, &otlp_endpoint, &license_key, &otlp_entries, &entity_guid, &request_id_owned).await;
+                    send_otlp_payload(&client, &otlp_metric_endpoint, &license_key, &otlp_entries, &entity_guid, &request_id_owned).await;
                 }));
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
@@ -860,7 +860,7 @@ mod tests {
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             client,
         };
 

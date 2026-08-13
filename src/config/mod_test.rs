@@ -1209,7 +1209,7 @@ fn test_new_relic_config_all_fields() {
         apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
-        otlp_endpoint: "http://otlp".to_string(),
+        otlp_metric_endpoint: "http://otlp".to_string(),
         otlp_enabled: true,
         proxy_url: Some("http://proxy:8080".to_string()),
     };

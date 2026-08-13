@@ -37,7 +37,7 @@ pub struct FailedOtlpPayload {
     /// retries, since `inject_entity_guid` is idempotent).
     pub encoded_payload: String,
     pub entity_guid: String,
-    pub otlp_endpoint: String,
+    pub otlp_metric_endpoint: String,
     pub request_id: String,
     pub failed_at: DateTime<Utc>,
     pub retry_count: usize,
@@ -53,7 +53,7 @@ pub static FAILED_OTLP_BUFFER: Lazy<Arc<Mutex<Vec<FailedOtlpPayload>>>> =
 pub fn buffer_failed_otlp_payload(
     encoded_payload: String,
     entity_guid: String,
-    otlp_endpoint: String,
+    otlp_metric_endpoint: String,
     request_id: String,
     retry_after: Option<Duration>,
 ) {
@@ -65,7 +65,7 @@ pub fn buffer_failed_otlp_payload(
     let item = FailedOtlpPayload {
         encoded_payload,
         entity_guid,
-        otlp_endpoint,
+        otlp_metric_endpoint,
         request_id,
         failed_at: Utc::now(),
         retry_count: 0,
@@ -135,7 +135,7 @@ pub async fn retry_buffered_otlp_payloads(client: &reqwest::Client, license_key:
 
         match super::collector::send_single_otlp_payload(
             client,
-            &item.otlp_endpoint,
+            &item.otlp_metric_endpoint,
             license_key,
             &item.encoded_payload,
             &item.entity_guid,

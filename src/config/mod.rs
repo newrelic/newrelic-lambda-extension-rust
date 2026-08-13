@@ -56,7 +56,7 @@ pub struct NewRelicConfig {
     pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
-    pub otlp_endpoint: String,
+    pub otlp_metric_endpoint: String,
     /// `NEW_RELIC_OTLP_ENABLED` — feature-gates OTLP metrics forwarding
     /// (protobuf `entity.guid` injection + send). Default: false. While
     /// disabled, any `otlp_payload` entries the agent sends are dropped
@@ -148,7 +148,7 @@ impl Default for NewRelicConfig {
             apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            otlp_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             otlp_enabled: false,
             proxy_url: None,
         }

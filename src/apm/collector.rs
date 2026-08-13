@@ -626,7 +626,7 @@ mod collector_tests {
 /// `payload_num` is a 1-based index used only for human-readable logging.
 pub(super) async fn send_single_otlp_payload(
     client: &Client,
-    otlp_endpoint: &str,
+    otlp_metric_endpoint: &str,
     license_key: &str,
     encoded_payload: &str,
     entity_guid: &str,
@@ -675,7 +675,7 @@ pub(super) async fn send_single_otlp_payload(
 
     let start_time = std::time::Instant::now();
     let response = client
-        .post(otlp_endpoint)
+        .post(otlp_metric_endpoint)
         .header("Content-Type", "application/x-protobuf")
         .header("Content-Encoding", "gzip")
         .header("api-key", license_key)
@@ -788,7 +788,7 @@ async fn log_otlp_success_response(response: reqwest::Response, payload_num: usi
 /// is not a reason to fail the whole send.
 pub async fn send_otlp_payload(
     client: &Client,
-    otlp_endpoint: &str,
+    otlp_metric_endpoint: &str,
     license_key: &str,
     payloads: &[String],
     entity_guid: &str,
@@ -801,7 +801,7 @@ pub async fn send_otlp_payload(
     info!(
         "Sending {} OTLP payload(s) to {} (entity.guid={})",
         payloads.len(),
-        otlp_endpoint,
+        otlp_metric_endpoint,
         entity_guid,
     );
 
@@ -809,7 +809,7 @@ pub async fn send_otlp_payload(
     for (i, encoded) in payloads.iter().enumerate() {
         let payload_num = i + 1; // 1-based for human-readable logs
         let client = client.clone();
-        let otlp_endpoint = otlp_endpoint.to_string();
+        let otlp_metric_endpoint = otlp_metric_endpoint.to_string();
         let license_key = license_key.to_string();
         let encoded = encoded.clone();
         let entity_guid = entity_guid.to_string();
@@ -818,7 +818,7 @@ pub async fn send_otlp_payload(
         set.spawn(async move {
             match send_single_otlp_payload(
                 &client,
-                &otlp_endpoint,
+                &otlp_metric_endpoint,
                 &license_key,
                 &encoded,
                 &entity_guid,
@@ -835,7 +835,7 @@ pub async fn send_otlp_payload(
                     super::otlp_buffer::buffer_failed_otlp_payload(
                         encoded,
                         entity_guid,
-                        otlp_endpoint,
+                        otlp_metric_endpoint,
                         request_id,
                         retry_after,
                     );
