@@ -6,7 +6,7 @@
 //! and are re-encoded byte-for-bit unchanged.
 
 use prost::Message;
-use tracing::{debug, info};
+use tracing::debug;
 
 /// Mirrors `opentelemetry.proto.collector.metrics.v1.ExportMetricsServiceRequest`.
 #[derive(Clone, PartialEq, Message)]
@@ -205,12 +205,12 @@ pub fn inject_entity_guid(bytes: &[u8], entity_guid: &str) -> Result<Vec<u8>, In
                 .unwrap_or("");
 
             if !existing_val.is_empty() {
-                info!("OTLP resource already has entity.guid='{}', skipping injection", existing_val);
+                debug!("OTLP resource already has entity.guid='{}', skipping injection", existing_val);
                 continue;
             }
 
             // Empty or null entity.guid — remove the placeholder and replace with ours
-            info!("OTLP resource has empty entity.guid, replacing with '{}'", entity_guid);
+            debug!("OTLP resource has empty entity.guid, replacing with '{}'", entity_guid);
             resource.attributes.retain(|kv| kv.key != "entity.guid");
         } else {
             debug!("Injecting entity.guid='{}' into OTLP resource attributes", entity_guid);
