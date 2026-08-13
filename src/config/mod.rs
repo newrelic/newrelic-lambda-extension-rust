@@ -22,6 +22,14 @@ const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
 const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
 const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 
+/// Default/clamp bounds for `NEW_RELIC_APM_BATCH_SIZE`. `1` preserves today's
+/// unbatched, per-invocation send behavior. The upper bound is a conservative
+/// starting cap on worst-case held-but-unsent telemetry volume / gzip'd POST body
+/// size — revisit against the APM collector's actual payload-size limit if raised.
+const DEFAULT_APM_BATCH_SIZE: usize = 1;
+const MIN_APM_BATCH_SIZE: usize = 1;
+const MAX_APM_BATCH_SIZE: usize = 20;
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -63,6 +71,12 @@ pub struct NewRelicConfig {
     /// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Excluded types are neither sent nor
     /// buffered. See `crate::apm::collector::KNOWN_TELEMETRY_TYPES`.
     pub apm_disabled_telemetry: HashSet<String>,
+    /// `NEW_RELIC_APM_BATCH_SIZE` — number of consecutive invocations' agent
+    /// telemetry (mergeable types only — see `crate::apm::batch_buffer::MERGEABLE_TYPES`;
+    /// `metric_data`/`log_event_data` always sent unbatched) merged into one POST
+    /// per telemetry type to the APM collector. Default `1` = today's per-invocation
+    /// behavior. Clamped to `[1, MAX_APM_BATCH_SIZE]`.
+    pub apm_batch_size: usize,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
@@ -159,6 +173,7 @@ impl Default for NewRelicConfig {
             apm_blocking_handshake: false,
             apm_handshake_timeout_secs: 5,
             apm_disabled_telemetry: HashSet::new(),
+            apm_batch_size: DEFAULT_APM_BATCH_SIZE,
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
@@ -382,6 +397,13 @@ impl ExtensionConfig {
         // Comma-separated telemetry types the customer wants dropped (APM mode).
         config.new_relic.apm_disabled_telemetry =
             parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
+
+        config.new_relic.apm_batch_size = env::var("NEW_RELIC_APM_BATCH_SIZE")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(DEFAULT_APM_BATCH_SIZE, |n| {
+                n.clamp(MIN_APM_BATCH_SIZE, MAX_APM_BATCH_SIZE)
+            });
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()

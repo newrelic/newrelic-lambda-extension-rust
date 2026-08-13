@@ -678,6 +678,18 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: No pending agent payloads to process");
                 }
 
+                // Force-flush any partial cross-invocation batch (NEW_RELIC_APM_BATCH_SIZE
+                // > 1) — the safety net for a batch that never reached its flush
+                // threshold. Runs before the retry pass below so a flush failure here
+                // still gets one retry in the same drain. No-op if batching is off or
+                // nothing is buffered.
+                {
+                    let apm_app_guard = components.apm_app.read().await;
+                    if let Some(ref app) = *apm_app_guard {
+                        app.flush_batched_telemetry().await;
+                    }
+                }
+
                 // Any logs still held for a request whose payload never arrived (true
                 // orphans) get flushed now, untagged — last chance before the sandbox dies.
                 components.global_log_processor.flush_pending_logs_unstamped();
@@ -1495,11 +1507,17 @@ async fn send_to_apm_collector(
             request_id,
             payload_bytes.len()
         );
-        app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
-        info!(
-            "APM mode: Agent payload sent successfully for request: {}",
-            request_id
-        );
+        let outcome = app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
+        match outcome {
+            crate::apm::ProcessOutcome::Sent => info!(
+                "APM mode: Agent payload sent successfully for request: {}",
+                request_id
+            ),
+            crate::apm::ProcessOutcome::Batched => debug!(
+                "APM mode: Agent payload batched (not yet sent) for request: {}",
+                request_id
+            ),
+        }
     } else {
         // APM connection still in progress - buffer will be kept for retry
         warn!(
@@ -2186,8 +2204,11 @@ async fn process_and_send_agent_payload(
             payload_bytes.len()
         );
         match app.process_agent_payload(payload_bytes.to_vec(), request_id).await {
-            Ok(()) => {
+            Ok(crate::apm::ProcessOutcome::Sent) => {
                 info!("APM mode: Agent payload sent successfully for request: {}", request_id);
+            }
+            Ok(crate::apm::ProcessOutcome::Batched) => {
+                debug!("APM mode: Agent payload batched (not yet sent) for request: {}", request_id);
             }
             Err(e) => {
                 warn!("APM mode: Failed to send agent payload to APM collector: {}", e);
@@ -2412,7 +2433,7 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
         };
 
         match send_result {
-            Some(Ok(())) => {
+            Some(Ok(_)) => {
                 retry_successful_count += 1;
                 info!(
                     "Successfully retried agent payload for request {} (APM collector)",

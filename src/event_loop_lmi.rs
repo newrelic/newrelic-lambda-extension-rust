@@ -248,6 +248,18 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
     crate::apm::metric_api_buffer::retry_buffered_metric_api(&h.client, license_key).await;
 
     if final_drain {
+        // Force-flush any partial cross-invocation batch (NEW_RELIC_APM_BATCH_SIZE
+        // > 1) on the terminal SHUTDOWN heartbeat only — deliberately NOT on every
+        // regular tick, so this stays a count-based flush rather than becoming a
+        // de facto timer just because LMI happens to have one. No-op if batching
+        // is off or nothing is buffered.
+        {
+            let apm_app_guard = h.apm_app.read().await;
+            if let Some(ref app) = *apm_app_guard {
+                app.flush_batched_telemetry().await;
+            }
+        }
+
         if let Err(e) = h
             .global_log_processor
             .flush_pre_invoke_buffer_on_shutdown()

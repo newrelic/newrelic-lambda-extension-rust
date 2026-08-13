@@ -490,6 +490,10 @@ async fn perform_one_time_initialization(
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
+    // Mirror NEW_RELIC_APM_BATCH_SIZE into the apm module for the same reason —
+    // process_agent_payload reads it without a config reference in scope.
+    apm::batch_buffer::set_batch_size(config.new_relic.apm_batch_size);
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
             // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)

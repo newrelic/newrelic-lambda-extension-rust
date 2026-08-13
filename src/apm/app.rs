@@ -24,6 +24,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
+/// Outcome of [`ApmApp::process_agent_payload`]: whether this call resulted in an
+/// actual network send, or was fully absorbed into an open cross-invocation batch
+/// (`NEW_RELIC_APM_BATCH_SIZE` > 1, batch still short of the flush threshold — see
+/// `super::batch_buffer`). Callers use this only to log accurately; no call site
+/// branches its control flow on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutcome {
+    Sent,
+    Batched,
+}
+
 #[derive(Debug)]
 pub struct ApmApp {
     pub run_id: String,
@@ -256,7 +267,7 @@ impl ApmApp {
         })
     }
 
-    pub async fn process_agent_payload(&self, payload: Vec<u8>, request_id: &str) -> Result<()> {
+    pub async fn process_agent_payload(&self, payload: Vec<u8>, request_id: &str) -> Result<ProcessOutcome> {
         debug!("Processing agent payload ({} bytes) for request {}", payload.len(), request_id);
 
         let (mut telemetry_map, protocol_version) =
@@ -274,29 +285,29 @@ impl ApmApp {
             let runtime = crate::version::get_runtime_name();
             if runtime == "ruby" {
                 debug!("Ruby v2 payload detected - normalizing transaction names");
-                
+
                 if let Some(data) = telemetry_map.get_mut("analytic_event_data") {
                     normalize_analytic_event_data(data);
                 }
-                
+
                 if let Some(data) = telemetry_map.get_mut("span_event_data") {
                     normalize_span_event_data(data);
                 }
-                
+
                 if let Some(data) = telemetry_map.get_mut("metric_data") {
                     normalize_metric_data(data);
                 }
-                
+
                 // Normalize error events - they may contain transaction names
                 if let Some(data) = telemetry_map.get_mut("error_event_data") {
                     normalize_error_event_data(data);
                 }
-                
+
                 // Normalize custom events - they may contain transaction names
                 if let Some(data) = telemetry_map.get_mut("custom_event_data") {
                     normalize_custom_event_data(data);
                 }
-                
+
                 // Normalize transaction samples - they contain transaction names
                 if let Some(data) = telemetry_map.get_mut("transaction_sample_data") {
                     normalize_transaction_sample_data(data);
@@ -304,45 +315,109 @@ impl ApmApp {
             }
         }
 
+        // Drop empty and customer-disabled entries once, up front — shared by both
+        // the always-immediate log_event_data path below and the batchable path
+        // (no send, no buffer for either case).
+        telemetry_map.retain(|telemetry_type, data| {
+            if data.is_empty() {
+                return false;
+            }
+            if super::collector::is_telemetry_disabled(telemetry_type) {
+                debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                return false;
+            }
+            true
+        });
+
+        if let Some(data) = telemetry_map.get_mut("metric_data") {
+            normalize_metric_data_epoch(data);
+        }
+
+        // log_event_data is never batched — see super::batch_buffer::MERGEABLE_TYPES
+        // for why (unconfirmed cross-invocation merge safety). Always sent
+        // immediately, one POST per request, regardless of NEW_RELIC_APM_BATCH_SIZE.
+        // metric_data DOES go through the batchable path below — merged via real
+        // per-metric stat aggregation (super::batch_buffer::merge_metric_data_shaped),
+        // not concatenation.
+        let mut immediate_map = std::collections::HashMap::new();
+        if let Some(data) = telemetry_map.remove("log_event_data") {
+            immediate_map.insert("log_event_data".to_string(), data);
+        }
+
+        // immediate_map (metric_data/log_event_data) and the batchable portion must
+        // be sent CONCURRENTLY, not sequentially — before batching existed, every
+        // telemetry type present was spawned as one flat set of concurrent tasks
+        // and awaited together, so total wall time was ~max(RTT), not sum(RTT).
+        // Awaiting immediate_map's send before even starting the batchable send
+        // would add a full extra serial round trip to every single invocation
+        // (measured regression: on a payload with little to batch, e.g. a trivial
+        // handler that only ever produces metric_data + one small analytic/span
+        // event, this serial tax fully ate the batching win). `tokio::join!`
+        // restores the original concurrent-send behavior for both call sites.
+        let batch_size = super::batch_buffer::get_batch_size();
+
+        let immediate_fut = async {
+            if immediate_map.is_empty() {
+                false
+            } else {
+                self.send_telemetry_map_now(immediate_map, request_id).await;
+                true
+            }
+        };
+
+        let batchable_fut = async {
+            if batch_size <= 1 {
+                // Backward-compat fast path: never touches the batch buffer's lock.
+                if telemetry_map.is_empty() {
+                    false
+                } else {
+                    self.send_telemetry_map_now(telemetry_map, request_id).await;
+                    true
+                }
+            } else if let Some(flushed) = super::batch_buffer::add_request_and_maybe_flush(
+                request_id,
+                telemetry_map,
+                batch_size,
+            ) {
+                // Called unconditionally (even with an empty map — e.g. a
+                // metric_data/log_event_data-only harvest) so every invocation
+                // counts toward the batch threshold, matching "batch size = N
+                // invocations" in the plain-English sense rather than "N
+                // invocations that happened to carry mergeable telemetry."
+                self.send_flushed_batch(flushed).await;
+                true
+            } else {
+                // batch_size > 1, returned None: absorbed into the open batch —
+                // no network I/O this call.
+                false
+            }
+        };
+
+        let (immediate_sent, batchable_sent) = tokio::join!(immediate_fut, batchable_fut);
+        let sent_anything = immediate_sent || batchable_sent;
+
+        Ok(if sent_anything {
+            ProcessOutcome::Sent
+        } else {
+            ProcessOutcome::Batched
+        })
+    }
+
+    /// Send every entry in `telemetry_map` immediately, one POST per type — the
+    /// same per-type `tokio::spawn` + `send_apm_telemetry` + buffer-on-failure logic
+    /// `process_agent_payload` always used before batching existed. Used for the
+    /// always-unbatched `metric_data`/`log_event_data` types, and for the whole map
+    /// when `NEW_RELIC_APM_BATCH_SIZE` <= 1 (the literal backward-compat guarantee —
+    /// this path never touches `super::batch_buffer`'s lock).
+    async fn send_telemetry_map_now(
+        &self,
+        telemetry_map: std::collections::HashMap<String, Vec<Value>>,
+        request_id: &str,
+    ) {
         let mut send_tasks = Vec::new();
 
-        for (telemetry_type, mut data) in telemetry_map {
-            if data.is_empty() {
-                continue;
-            }
-
-            // Customer opted out of this telemetry type — drop it (no send, no buffer).
-            if super::collector::is_telemetry_disabled(&telemetry_type) {
-                debug!("Telemetry type {} disabled - skipping", telemetry_type);
-                continue;
-            }
-
-            // metric_data[1] and [2] are the harvest epoch window (start, end).
-            // The Java agent serverless mode writes these in milliseconds; the APM
-            // collector protocol expects seconds. Values above this threshold are
-            // unambiguously milliseconds (the year ~33658 as seconds — no real epoch
-            // will exceed this in seconds for centuries).
-            const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
-            if telemetry_type == "metric_data" && data.len() >= 3 {
-                for i in 1..=2usize {
-                    if let Some(ts) = data[i].as_f64() {
-                        if ts > JAVA_AGENT_MS_EPOCH_THRESHOLD {
-                            data[i] = serde_json::Value::from((ts / 1000.0) as i64);
-                        }
-                    }
-                }
-                debug!(
-                    "metric_data epoch range after normalisation: [{}, {}]",
-                    data[1], data[2]
-                );
-            }
-
-
-            debug!(
-                "Sending {} telemetry items as {}",
-                data.len(),
-                telemetry_type
-            );
+        for (telemetry_type, data) in telemetry_map {
+            debug!("Sending {} telemetry items as {}", data.len(), telemetry_type);
 
             let client = self.client.clone();
             let license_key = self.license_key.clone();
@@ -395,8 +470,97 @@ impl ApmApp {
         for task in send_tasks {
             let _ = task.await;
         }
+    }
 
-        Ok(())
+    /// Send every merged type from a flushed cross-invocation batch, one POST per
+    /// type — fewer, larger POSTs than sending each contributing request
+    /// individually would have made. On failure, re-buffer the ORIGINAL per-request
+    /// arrays (not the merged blob) so `telemetry_buffer::buffered_request_ids()`
+    /// stays accurate for the shutdown drop-summary (see `super::batch_buffer` docs).
+    async fn send_flushed_batch(&self, flushed: super::batch_buffer::FlushedBatch) {
+        let mut send_tasks = Vec::new();
+
+        for merged in flushed.types {
+            let super::batch_buffer::MergedType {
+                telemetry_type,
+                merged_data,
+                contributors,
+            } = merged;
+
+            debug!(
+                "Sending batched {} telemetry: {} contributor(s) merged into one POST",
+                telemetry_type,
+                contributors.len()
+            );
+
+            let client = self.client.clone();
+            let license_key = self.license_key.clone();
+            let collector_host = self.collector_host.clone();
+            let run_id = self.run_id.clone();
+
+            let task = tokio::spawn(async move {
+                let command = match telemetry_type.as_str() {
+                    "metric_data" => CMD_METRICS,
+                    "span_event_data" => CMD_SPAN_EVENTS,
+                    "error_data" => CMD_ERROR_DATA,
+                    "error_event_data" => CMD_ERROR_EVENTS,
+                    "analytic_event_data" => CMD_ANALYTIC_EVENTS,
+                    "custom_event_data" => CMD_CUSTOM_EVENTS,
+                    "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
+                    "sql_trace_data" => CMD_SLOW_SQLS,
+                    _ => {
+                        warn!("Unknown mergeable telemetry type: {}", telemetry_type);
+                        return;
+                    }
+                };
+
+                let send_result = send_apm_telemetry(
+                    &client,
+                    &license_key,
+                    &collector_host,
+                    &run_id,
+                    command,
+                    &merged_data,
+                )
+                .await;
+
+                if let Err(e) = send_result {
+                    warn!(
+                        "Failed to send batched {} ({} contributor(s)): {} - re-buffering each original request's data for retry",
+                        telemetry_type,
+                        contributors.len(),
+                        e
+                    );
+                    for (contributor_request_id, data) in contributors {
+                        super::telemetry_buffer::buffer_failed_telemetry(
+                            telemetry_type.clone(),
+                            data,
+                            contributor_request_id,
+                            run_id.clone(),
+                            collector_host.clone(),
+                        );
+                    }
+                }
+            });
+
+            send_tasks.push(task);
+        }
+
+        for task in send_tasks {
+            let _ = task.await;
+        }
+    }
+
+    /// Force-flush any partially-filled cross-invocation batch and send it now.
+    /// Intended for the shutdown drain path only (Normal Lambda's final drain, LMI's
+    /// terminal `SHUTDOWN` heartbeat) — the safety net for a batch that never
+    /// reached `NEW_RELIC_APM_BATCH_SIZE`. No-op if nothing is buffered (including
+    /// when batching is disabled, since `batch_size <= 1` never populates the
+    /// buffer in the first place).
+    pub async fn flush_batched_telemetry(&self) {
+        if let Some(flushed) = super::batch_buffer::force_flush() {
+            self.send_flushed_batch(flushed).await;
+        }
     }
 
     /// Convert and send platform REPORT log metrics
@@ -670,6 +834,27 @@ fn normalize_span_event_data(data: &mut Vec<Value>) {
     }
 }
 
+/// metric_data[1] and [2] are the harvest epoch window (start, end). The Java agent
+/// serverless mode writes these in milliseconds; the APM collector protocol expects
+/// seconds. Values above this threshold are unambiguously milliseconds (the year
+/// ~33658 as seconds — no real epoch will exceed this in seconds for centuries).
+fn normalize_metric_data_epoch(data: &mut Vec<Value>) {
+    const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
+    if data.len() >= 3 {
+        for i in 1..=2usize {
+            if let Some(ts) = data[i].as_f64() {
+                if ts > JAVA_AGENT_MS_EPOCH_THRESHOLD {
+                    data[i] = serde_json::Value::from((ts / 1000.0) as i64);
+                }
+            }
+        }
+        debug!(
+            "metric_data epoch range after normalisation: [{}, {}]",
+            data[1], data[2]
+        );
+    }
+}
+
 /// Normalize transaction names in metric_data
 /// Structure: [run_id, timestamp_start, timestamp_end, [[[{name: "..."}, [values]]], ...]]
 fn normalize_metric_data(data: &mut Vec<Value>) {
@@ -850,3 +1035,7 @@ pub type SharedApmApp = Arc<RwLock<Option<ApmApp>>>;
 #[cfg(test)]
 #[path = "app_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "app_batch_tests.rs"]
+mod batch_tests;

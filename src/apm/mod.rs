@@ -7,6 +7,7 @@
 //! and sends them to the APM collector instead of the serverless ingest API.
 
 pub mod app;
+pub mod batch_buffer;
 pub mod collector;
 pub mod connection;
 pub mod error_event;
@@ -17,5 +18,5 @@ pub mod payload_parser;
 pub mod telemetry_buffer;
 mod id_generator_tests;
 
-pub use app::{ApmApp, SharedApmApp};
+pub use app::{ApmApp, ProcessOutcome, SharedApmApp};
 

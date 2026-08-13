@@ -57,6 +57,7 @@ where
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
+        "NEW_RELIC_APM_BATCH_SIZE",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -1164,6 +1165,7 @@ fn test_new_relic_config_all_fields() {
         apm_blocking_handshake: false,
         apm_handshake_timeout_secs: 5,
         apm_disabled_telemetry: std::collections::HashSet::new(),
+        apm_batch_size: 1,
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
@@ -1541,6 +1543,55 @@ fn test_apm_handshake_timeout_invalid_string_falls_back_to_default() {
         env::set_var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS", "not_a_number");
         let config = ExtensionConfig::from_env();
         assert_eq!(config.new_relic.apm_handshake_timeout_secs, 5);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_batch_size_default() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_batch_size, 1);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_batch_size_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BATCH_SIZE", "5");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_batch_size, 5);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_batch_size_clamped_to_max() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BATCH_SIZE", "500");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_batch_size, 20);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_batch_size_zero_clamped_to_one() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BATCH_SIZE", "0");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_batch_size, 1);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_batch_size_invalid_string_falls_back_to_default() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BATCH_SIZE", "not_a_number");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_batch_size, 1);
     });
 }
 
