@@ -540,6 +540,7 @@ mod tests {
             pending_report: Some("REPORT Duration: 50ms".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 

@@ -96,6 +96,12 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
+    /// Fired by `route_payload_to_request_buffer()` whenever an agent payload is pushed
+    /// into this request's `agent_buffer`. Awaited (bounded, only when
+    /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD` is enabled) by
+    /// `event_loop::wait_for_late_agent_payload` to catch a payload that arrives after
+    /// the Flow-1 snapshot in `process_apm_request` found the buffer empty.
+    pub agent_payload_notify: Arc<Notify>,
     /// Cached ARN for this request. Avoids locking `context` just to read the ARN
     /// on hot paths like cleanup_old_request_buffers and drain_late_paired_payloads.
     pub invoked_function_arn: String,
@@ -140,6 +146,31 @@ pub fn remove_pending_report(request_id: &str) -> Option<String> {
 /// callers must then record the pre-fire in PREFIRED_RUNTIME_DONE.
 pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
     REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
+}
+
+/// Get the agent-payload notify for a request (used by
+/// `event_loop::wait_for_late_agent_payload` to wait, and by
+/// `route_payload_to_request_buffer` to signal). Returns None if the request is not
+/// registered — unlike `runtime_done_notify`, no pre-fire map is needed here: an agent
+/// payload can only be routed to a `request_id` after `create_request_processing_state()`
+/// has already run synchronously for it (the language agent doesn't start until the
+/// runtime hands off control), so the Notify always exists before any payload can race it.
+pub fn get_agent_payload_notify(request_id: &str) -> Option<Arc<Notify>> {
+    REQUEST_DATA.get(request_id).map(|entry| entry.agent_payload_notify.clone())
+}
+
+/// Atomically take the agent buffer's contents if non-empty. Returns `None` if the
+/// request is unregistered or its buffer is currently empty — used by
+/// `event_loop::wait_for_late_agent_payload` to avoid a TOCTOU gap between checking
+/// emptiness and draining.
+pub fn take_agent_buffer_if_nonempty(request_id: &str) -> Option<Vec<Vec<u8>>> {
+    let entry = REQUEST_DATA.get(request_id)?;
+    let mut buf = entry.agent_buffer.lock().ok()?;
+    if buf.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(&mut *buf))
+    }
 }
 
 /// Record that platform.runtimeDone fired before the request state existed.
@@ -265,6 +296,7 @@ pub fn create_request_processing_state(
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
+        agent_payload_notify: Arc::new(Notify::new()),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
 
@@ -420,6 +452,10 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
+                    // Wake any bounded wait_for_late_agent_payload() waiter for this
+                    // request (only armed when NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD is
+                    // enabled). A no-op permit if nobody is waiting.
+                    entry.agent_payload_notify.notify_one();
                 }
                 Err(e) => {
                     error!(
@@ -447,6 +483,11 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
+                    // Same defense-in-depth wake as the active branch above. Note: this
+                    // fallback picks an arbitrary REQUEST_DATA entry (.iter().next()) when
+                    // multiple stale buffers exist — a pre-existing ambiguity this notify
+                    // doesn't resolve, only wakes whichever waiter (if any) is attached.
+                    entry.agent_payload_notify.notify_one();
                 }
             }
         } else {

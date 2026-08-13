@@ -195,6 +195,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -227,6 +228,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -280,6 +282,7 @@ mod tests {
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -302,6 +305,7 @@ mod tests {
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -437,6 +441,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -466,6 +471,7 @@ mod tests {
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
         // Advance counter to invocation 10
@@ -494,6 +500,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
         for _ in 0..10 {
@@ -532,6 +539,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
             invoked_function_arn: "arn:test".to_string(),
         });
         for _ in 0..10 {
@@ -580,6 +588,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
@@ -589,6 +598,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -644,6 +654,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -793,6 +804,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
@@ -801,6 +813,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -840,6 +853,7 @@ mod tests {
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
@@ -848,6 +862,7 @@ mod tests {
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
                 invoked_function_arn: String::new(),
         });
 
@@ -863,7 +878,163 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // agent_payload_notify tests (NR-600648: blocking-agent-payload feature)
+    // ========================================================================
 
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_agent_payload_notify_fires_on_active_route() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: notify.clone(),
+                invoked_function_arn: String::new(),
+        });
+
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-1".to_string());
+        }
+
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        route_payload_to_request_buffer(vec![1, 2, 3]).await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("notify should fire within timeout")
+            .expect("waiter task should not panic");
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_agent_payload_notify_fires_on_fallback_route() {
+        clear_request_state();
+
+        // No active request, but a buffer exists — exercises the fallback branch.
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        REQUEST_DATA.insert("some-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: notify.clone(),
+                invoked_function_arn: String::new(),
+        });
+
+        let waiter = tokio::spawn(async move {
+            notify.notified().await;
+        });
+
+        route_payload_to_request_buffer(vec![9, 9, 9]).await;
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
+            .await
+            .expect("notify should fire within timeout on the fallback route")
+            .expect("waiter task should not panic");
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_agent_payload_notify_returns_none_for_unknown_request() {
+        clear_request_state();
+
+        assert!(get_agent_payload_notify("does-not-exist").is_none());
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_get_agent_payload_notify_returns_some_for_known_request() {
+        clear_request_state();
+
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+                invoked_function_arn: String::new(),
+        });
+
+        assert!(get_agent_payload_notify("req-1").is_some());
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_take_agent_buffer_if_nonempty_drains_and_empties() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(vec![vec![1u8, 2, 3], vec![4, 5]]));
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+                invoked_function_arn: String::new(),
+        });
+
+        let taken = take_agent_buffer_if_nonempty("req-1");
+        assert_eq!(taken, Some(vec![vec![1, 2, 3], vec![4, 5]]));
+
+        // Buffer is now empty — a second take returns None.
+        assert!(take_agent_buffer_if_nonempty("req-1").is_none());
+        assert!(buffer.lock().unwrap().is_empty());
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_take_agent_buffer_if_nonempty_returns_none_when_empty() {
+        clear_request_state();
+
+        REQUEST_DATA.insert("req-1".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
+                invoked_function_arn: String::new(),
+        });
+
+        assert!(take_agent_buffer_if_nonempty("req-1").is_none());
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_take_agent_buffer_if_nonempty_returns_none_when_request_missing() {
+        clear_request_state();
+
+        assert!(take_agent_buffer_if_nonempty("does-not-exist").is_none());
+
+        clear_request_state();
+    }
 
 
 

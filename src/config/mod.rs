@@ -50,6 +50,21 @@ pub struct NewRelicConfig {
     pub apm_lambda_mode: bool,
     pub apm_blocking_handshake: bool,
     pub apm_handshake_timeout_secs: u64,
+    /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD` — when `true`, the extension holds
+    /// `/next` in the has_run_id-but-no-payload-yet case until the agent's
+    /// telemetry for this invocation arrives on the named pipe (or
+    /// `apm_agent_payload_timeout_ms` / the remaining invoke deadline is
+    /// exhausted). Delivers telemetry within the same invoke instead of
+    /// waiting for the next invocation or the SHUTDOWN event — closes the gap
+    /// `apm_blocking_handshake` doesn't cover. Useful for sparse-traffic
+    /// functions. Default `false` — no behavior change unless explicitly
+    /// enabled; trades some added billed duration (bounded by
+    /// `apm_agent_payload_timeout_ms`) for delivery within the invoke.
+    pub apm_blocking_agent_payload: bool,
+    /// `NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS` — maximum milliseconds to wait
+    /// for the agent payload when `apm_blocking_agent_payload` is enabled.
+    /// Ignored when that flag is `false`. Default 200, clamped `[0, 2000]`.
+    pub apm_agent_payload_timeout_ms: u64,
     /// Telemetry types the customer has opted to drop (APM mode only) via
     /// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Excluded types are neither sent nor
     /// buffered. See `crate::apm::collector::KNOWN_TELEMETRY_TYPES`.
@@ -139,6 +154,8 @@ impl Default for NewRelicConfig {
             apm_lambda_mode: false,
             apm_blocking_handshake: false,
             apm_handshake_timeout_secs: 5,
+            apm_blocking_agent_payload: false,
+            apm_agent_payload_timeout_ms: 200,
             apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
@@ -350,6 +367,16 @@ impl ExtensionConfig {
             .unwrap_or(5)
             .max(1);
 
+        let apm_blocking_agent_payload_str =
+            env::var("NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD").unwrap_or_default();
+        config.new_relic.apm_blocking_agent_payload = parse_bool(&apm_blocking_agent_payload_str);
+
+        config.new_relic.apm_agent_payload_timeout_ms = env::var("NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(200)
+            .min(2000);
+
         // Comma-separated telemetry types the customer wants dropped (APM mode).
         config.new_relic.apm_disabled_telemetry =
             parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
@@ -407,6 +434,21 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        // apm_blocking_agent_payload takes precedence over pipeline_flush on any
+        // invocation where the payload wait is exercised (see event_loop.rs
+        // execute_apm_mode_event_loop) — the delivery guarantee the customer
+        // explicitly opted into must not be silently defeated by the
+        // deferred-send optimization. Surface that trade-off once at startup
+        // rather than leaving it silent.
+        if config.extension.pipeline_flush && config.new_relic.apm_blocking_agent_payload {
+            warn!(
+                "NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
+                 deferred-send behavior on invocations where the payload wait is exercised — you will not \
+                 get pipeline_flush's billed-duration savings on those invocations. This is intentional: \
+                 the delivery guarantee takes precedence over the throughput optimization."
+            );
+        }
 
         config
     }

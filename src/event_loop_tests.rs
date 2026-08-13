@@ -440,6 +440,181 @@ async fn flow1_send_failure_buffers_payload_for_retry() {
     }
 }
 
+// ── spawn_send_agent_task (shared by Flow 1 and the recovered-Flow-2 path) ──
+
+fn make_noop_log_processor(config: Arc<config::ExtensionConfig>) -> Arc<LogProcessor> {
+    Arc::new(LogProcessor::new(
+        Arc::new(crate::newrelic::client::NewRelicClient::new_noop()),
+        config,
+        Arc::new(Mutex::new(crate::context::InvocationContext::default())),
+        None,
+    ))
+}
+
+// spawn_send_agent_task is the single send path shared by Flow 1's immediate send
+// and the recovered-Flow-2 late-catch send (NR-600648) — it was extracted verbatim
+// from Flow 1's old inline closure specifically so both call sites stay identical.
+// This test calls it directly (not through process_apm_request) to prove the
+// extraction preserved the never-drop-on-failure guarantee: a disconnected apm_app
+// (None) makes send_to_apm_collector fail deterministically without any network
+// call, so every payload must land in FAILED_AGENT_PAYLOADS, not be lost.
+#[tokio::test]
+#[serial]
+async fn spawn_send_agent_task_buffers_all_payloads_on_failure() {
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    let config = Arc::new(config::ExtensionConfig::default());
+    let log_processor = make_noop_log_processor(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let handle = spawn_send_agent_task(
+        "req-spawn-test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        vec![vec![1, 2, 3], vec![4, 5]],
+    );
+    let (all_sent, returned_payloads) = handle.await.expect("task must not panic");
+
+    assert!(!all_sent, "a disconnected apm_app must report failure");
+    assert_eq!(
+        returned_payloads,
+        vec![vec![1, 2, 3], vec![4, 5]],
+        "the exact input payloads must be returned unchanged"
+    );
+    let buffered_count = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().filter(|p| p.request_id == "req-spawn-test").count())
+        .unwrap_or(0);
+    assert_eq!(
+        buffered_count, 2,
+        "both payloads must be buffered for retry, not silently dropped"
+    );
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+}
+
+// ── process_apm_request's Flow-2 gate, exercised end-to-end (not just the ──
+// ── extracted helpers in isolation) — the actual wiring this ticket added ──
+
+/// Build a `SharedApmApp` that's already "connected" (`has_run_id == true`) without
+/// any network I/O — `ApmApp`'s fields are all `pub`, so a literal sidesteps
+/// `ApmApp::new()`'s real PreConnect/Connect handshake entirely.
+fn fake_connected_apm_app() -> crate::apm::SharedApmApp {
+    let app = crate::apm::ApmApp {
+        run_id: "test-run-id".to_string(),
+        entity_guid: "test-entity-guid".to_string(),
+        collector_host: "collector.newrelic.com".to_string(),
+        license_key: "fake-key".to_string(),
+        metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+        client: Client::new(),
+    };
+    Arc::new(tokio::sync::RwLock::new(Some(app)))
+}
+
+/// Register a bare, empty request (no agent payload ever pushed) so
+/// `process_apm_request` reaches its `has_run_id && !got_payload` arm — Flow 2 —
+/// deterministically. `is_cold_start: true` is passed at the call site to skip the
+/// warm-start pending-payload drain, which would otherwise touch unrelated
+/// `REQUEST_DATA` entries left by other tests.
+fn register_empty_request(
+    request_id: &str,
+    config: Arc<config::ExtensionConfig>,
+    apm_app: crate::apm::SharedApmApp,
+) {
+    let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+    let factory = Arc::new(request::ProcessorFactory::new(client, config, apm_app));
+    let state = create_request_processing_state(
+        request_id,
+        "arn:aws:lambda:us-east-1:123:function:test",
+        &factory,
+    );
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+}
+
+// The ticket's core wiring proof: with the flag enabled, a real call into
+// process_apm_request (not just wait_for_late_agent_payload in isolation) must
+// actually engage the bounded wait — proven by elapsed time landing near the
+// configured timeout — when has_run_id is true and no payload ever arrives.
+#[tokio::test]
+#[serial]
+async fn process_apm_request_flow2_waits_when_blocking_agent_payload_enabled() {
+    let request_id = "flow2-gate-enabled-test";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.apm_blocking_agent_payload = true;
+    cfg.new_relic.apm_agent_payload_timeout_ms = 120;
+    let config = Arc::new(cfg);
+    let apm_app = fake_connected_apm_app();
+
+    register_empty_request(request_id, config.clone(), apm_app.clone());
+    let log_processor = make_noop_log_processor(config.clone());
+
+    let t0 = std::time::Instant::now();
+    process_apm_request(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        true, // is_cold_start — skip the unrelated warm-start drain
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(5_000),
+    )
+    .await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed >= 100,
+        "flag enabled: process_apm_request must actually engage the ~120ms wait, not skip it (got {elapsed}ms)"
+    );
+    assert!(
+        elapsed < 1000,
+        "must not hang past the configured timeout (got {elapsed}ms)"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// The regression proof requested directly: with the flag left at its default
+// (false), process_apm_request's Flow-2 arm must behave exactly as it did before
+// this ticket — no wait at all, near-instant return — proven here by actually
+// calling process_apm_request, not just the pure should_defer_via_pipeline_flush
+// helper.
+#[tokio::test]
+#[serial]
+async fn process_apm_request_flow2_skips_wait_when_blocking_agent_payload_disabled() {
+    let request_id = "flow2-gate-disabled-test";
+    let config = Arc::new(config::ExtensionConfig::default()); // apm_blocking_agent_payload: false
+    let apm_app = fake_connected_apm_app();
+
+    register_empty_request(request_id, config.clone(), apm_app.clone());
+    let log_processor = make_noop_log_processor(config.clone());
+
+    let t0 = std::time::Instant::now();
+    process_apm_request(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        true,
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(5_000),
+    )
+    .await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed < 100,
+        "flag disabled (default): must return near-instantly with zero behavior change (got {elapsed}ms)"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
 // Success path: a connected, working collector returns Ok -> true and buffers
 // nothing. We can't stand up a real collector in a unit test, but we can assert
 // the inverse invariant cheaply: on the failure path above the buffer grew by
@@ -468,4 +643,184 @@ async fn flow1_failure_buffers_exactly_one_per_failed_payload() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
+}
+
+// ── wait_for_late_agent_payload tests (NR-600648: blocking-agent-payload feature) ──
+
+fn make_config_with_agent_payload_timeout(timeout_ms: u64) -> config::ExtensionConfig {
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.apm_agent_payload_timeout_ms = timeout_ms;
+    cfg
+}
+
+/// Insert a bare `RequestData` for `request_id` (no full processor setup, mirroring
+/// `request::mod_tests`'s construction style) and return its agent buffer + notify so
+/// the test can simulate a late payload arriving via `route_payload_to_request_buffer`'s
+/// same `notify_one()` call.
+type BareRequestData = (Arc<Mutex<Vec<Vec<u8>>>>, Arc<tokio::sync::Notify>);
+
+fn insert_bare_request_data(request_id: &str) -> BareRequestData {
+    let agent_buffer = Arc::new(Mutex::new(Vec::new()));
+    let agent_payload_notify = Arc::new(tokio::sync::Notify::new());
+    request::REQUEST_DATA.insert(
+        request_id.to_string(),
+        request::RequestData {
+            context: Arc::new(Mutex::new(crate::context::InvocationContext::default())),
+            agent_buffer: agent_buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            agent_payload_notify: agent_payload_notify.clone(),
+            invoked_function_arn: String::new(),
+        },
+    );
+    (agent_buffer, agent_payload_notify)
+}
+
+#[tokio::test]
+async fn test_late_payload_wait_returns_immediately_when_no_request_data() {
+    let cfg = make_config_with_agent_payload_timeout(200);
+    let t0 = std::time::Instant::now();
+    let result =
+        wait_for_late_agent_payload("no-such-request", deadline_ms_from_now(10_000), &cfg).await;
+    assert!(result.is_empty());
+    assert!(
+        t0.elapsed().as_millis() < 100,
+        "should return immediately when the request isn't registered, took {}ms",
+        t0.elapsed().as_millis()
+    );
+}
+
+// The ticket's proof test: a payload pushed 50-100ms after the wait starts (simulating
+// the agent's async harvest landing just after the Flow-1 snapshot found the buffer
+// empty) must be caught within the same invocation, not left for next-invoke/shutdown.
+#[tokio::test]
+#[serial]
+async fn test_late_payload_wait_catches_payload_arriving_after_snapshot() {
+    let request_id = "late-payload-catch-test";
+    let (agent_buffer, notify) = insert_bare_request_data(request_id);
+
+    let buffer_clone = agent_buffer.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        if let Ok(mut buf) = buffer_clone.lock() {
+            buf.push(vec![42, 42, 42]);
+        }
+        notify.notify_one();
+    });
+
+    let cfg = make_config_with_agent_payload_timeout(2000);
+    let t0 = std::time::Instant::now();
+    let result = wait_for_late_agent_payload(request_id, deadline_ms_from_now(5_000), &cfg).await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert_eq!(result, vec![vec![42, 42, 42]], "must return the late payload");
+    assert!(elapsed >= 50, "should have waited for the payload (got {elapsed}ms)");
+    assert!(elapsed < 2000, "should not wait beyond the configured budget (got {elapsed}ms)");
+
+    request::REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_late_payload_wait_times_out_when_nothing_arrives() {
+    let request_id = "late-payload-timeout-test";
+    insert_bare_request_data(request_id);
+
+    let cfg = make_config_with_agent_payload_timeout(150);
+    let t0 = std::time::Instant::now();
+    let result = wait_for_late_agent_payload(request_id, deadline_ms_from_now(5_000), &cfg).await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(result.is_empty());
+    assert!(elapsed >= 100, "should have waited near the configured timeout (got {elapsed}ms)");
+    assert!(elapsed < 600, "should not hang well beyond the configured timeout (got {elapsed}ms)");
+
+    request::REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_late_payload_wait_bounded_by_deadline_not_config_timeout() {
+    let request_id = "late-payload-deadline-bound-test";
+    insert_bare_request_data(request_id);
+
+    // Configured timeout (2000ms) far exceeds the remaining deadline (~600ms), so the
+    // deadline (minus the 500ms safety margin) must dominate: budget = 600 - 500 = 100ms.
+    let cfg = make_config_with_agent_payload_timeout(2000);
+    let t0 = std::time::Instant::now();
+    let result = wait_for_late_agent_payload(request_id, deadline_ms_from_now(600), &cfg).await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(result.is_empty());
+    assert!(
+        elapsed < 1000,
+        "must be bounded by the deadline budget, not the full configured timeout (got {elapsed}ms)"
+    );
+
+    request::REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_late_payload_wait_skips_when_deadline_already_expired() {
+    let request_id = "late-payload-expired-deadline-test";
+    insert_bare_request_data(request_id);
+
+    let cfg = make_config_with_agent_payload_timeout(2000);
+    let t0 = std::time::Instant::now();
+    let result =
+        wait_for_late_agent_payload(request_id, deadline_ms_from_now(-1_000), &cfg).await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(result.is_empty());
+    assert!(
+        elapsed < 100,
+        "should return immediately on an expired deadline, took {elapsed}ms"
+    );
+
+    request::REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_late_payload_wait_returns_zero_when_timeout_configured_zero() {
+    let request_id = "late-payload-zero-timeout-test";
+    insert_bare_request_data(request_id);
+
+    let cfg = make_config_with_agent_payload_timeout(0);
+    let t0 = std::time::Instant::now();
+    let result = wait_for_late_agent_payload(request_id, deadline_ms_from_now(5_000), &cfg).await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(result.is_empty());
+    assert!(
+        elapsed < 100,
+        "a configured timeout of 0 must not wait at all, took {elapsed}ms"
+    );
+
+    request::REQUEST_DATA.remove(request_id);
+}
+
+// ── should_defer_via_pipeline_flush precedence tests (Interactions §1, NR-600648) ──
+
+#[test]
+fn test_pipeline_flush_defers_when_blocking_agent_payload_disabled() {
+    // Existing pipeline_flush-only behavior must be unchanged for customers who
+    // don't touch the new flag.
+    assert!(should_defer_via_pipeline_flush(true, false));
+}
+
+#[test]
+fn test_pipeline_flush_does_not_defer_when_blocking_agent_payload_enabled() {
+    // The delivery guarantee wins: process_apm_request (and its bounded wait) must be
+    // synchronously joined, not deferred into the background, when the customer has
+    // opted into NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD — even if pipeline_flush is also set.
+    assert!(!should_defer_via_pipeline_flush(true, true));
+}
+
+#[test]
+fn test_no_defer_when_pipeline_flush_disabled_regardless_of_blocking_agent_payload() {
+    assert!(!should_defer_via_pipeline_flush(false, false));
+    assert!(!should_defer_via_pipeline_flush(false, true));
 }

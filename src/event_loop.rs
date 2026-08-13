@@ -37,6 +37,14 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
+/// Safety margin (ms) reserved before a function's own remaining deadline when
+/// bound-waiting for something within an invocation (an APM handshake, or a late
+/// agent payload) — leaves headroom for the downstream flush/cleanup work that
+/// still has to run before the extension returns to `/next`. Shared by
+/// `wait_for_apm_handshake_within_budget` and `wait_for_late_agent_payload` so the
+/// two bounded waits can't drift apart on this value.
+const INVOKE_DEADLINE_SAFETY_MARGIN_MS: u64 = 500;
+
 /// Budget reserved (out of SHUTDOWN_TIMEOUT_MS) to POST the APM "telemetry
 /// dropped" diagnostic directly to New Relic Logs. The main shutdown work runs
 /// in `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`, then the diagnostic gets
@@ -459,7 +467,20 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                if components.config.extension.pipeline_flush {
+                // apm_blocking_agent_payload wins over pipeline_flush: process_apm_request
+                // (current_task) contains the bound wait for a late agent payload
+                // (wait_for_late_agent_payload). If pipeline_flush deferred current_task into
+                // the background here, that wait could be frozen mid-flight by the sandbox
+                // freeze the same way it is today — silently defeating the delivery
+                // guarantee the customer explicitly opted into. So when the customer has
+                // asked for the guarantee, always take the synchronous-join path for this
+                // invocation, even if pipeline_flush is also enabled. See NR-600648.
+                let defer_via_pipeline_flush = should_defer_via_pipeline_flush(
+                    components.config.extension.pipeline_flush,
+                    components.config.new_relic.apm_blocking_agent_payload,
+                );
+
+                if defer_via_pipeline_flush {
                     let combined = tokio::spawn(async move {
                         let (r1, r2) = tokio::join!(current_task, pending_task);
                         if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
@@ -1323,71 +1344,70 @@ pub async fn process_apm_request(
     let got_payload = !agent_payloads.is_empty();
 
     // Flow 1: If run_id exists and payload arrived, send it immediately
-    // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
+    // Flow 2: If run_id exists but no payload, either bound-wait for it (when
+    //         NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD is enabled) or leave it for the
+    //         next invocation / shutdown (default)
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
     let send_agent_task = if has_run_id && got_payload {
         debug!(
             "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
             agent_payloads.len()
         );
-        let request_id_clone = request_id.clone();
-        let config_clone = config.clone();
-        let global_log_processor_clone = global_log_processor.clone();
-        let apm_app_clone = apm_app.clone();
-        let agent_payloads_clone = agent_payloads.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-
-        Some(tokio::spawn(async move {
-            let mut all_sent = true;
-            for payload_bytes in &agent_payloads_clone {
-                extract_and_coordinate_trace_id(
-                    payload_bytes,
-                    &request_id_clone,
-                    &config_clone,
-                    &global_log_processor_clone,
-                )
-                .await;
-
-                // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
-                // (never silently dropped); the global retry loop resends it on a
-                // later invoke / at shutdown. Mirrors process_and_send_agent_payload.
-                if !send_agent_payload_or_buffer(
-                    payload_bytes,
-                    &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &apm_app_clone,
-                )
-                .await
-                {
-                    all_sent = false;
-                }
+        Some(spawn_send_agent_task(
+            request_id.clone(),
+            config.clone(),
+            global_log_processor.clone(),
+            apm_app.clone(),
+            invoked_function_arn.clone(),
+            agent_payloads,
+        ))
+    } else if !has_run_id && got_payload {
+        debug!(
+            "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
+            agent_payloads.len()
+        );
+        // Put payloads back in buffer to send when run_id arrives
+        if let Some(buffer_ref) = get_agent_buffer(&request_id) {
+            if let Ok(mut buffer) = buffer_ref.lock() {
+                buffer.extend(agent_payloads);
             }
-            (all_sent, agent_payloads_clone)
-        }))
-    } else {
-        // Flow 2 or 3: Either no run_id yet, or no payload yet
-        if !has_run_id && got_payload {
-            debug!(
-                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
-                agent_payloads.len()
-            );
-            // Put payloads back in buffer to send when run_id arrives
-            if let Some(buffer_ref) = get_agent_buffer(&request_id) {
-                if let Ok(mut buffer) = buffer_ref.lock() {
-                    buffer.extend(agent_payloads);
-                }
+        }
+        None
+    } else if has_run_id && !got_payload {
+        if config.new_relic.apm_blocking_agent_payload {
+            let late_payloads = wait_for_late_agent_payload(&request_id, deadline_ms, &config).await;
+            if !late_payloads.is_empty() {
+                debug!(
+                    "APM mode: late agent payload arrived within invocation window ({} payload(s)) for request: {} - sending now",
+                    late_payloads.len(), request_id
+                );
+                Some(spawn_send_agent_task(
+                    request_id.clone(),
+                    config.clone(),
+                    global_log_processor.clone(),
+                    apm_app.clone(),
+                    invoked_function_arn.clone(),
+                    late_payloads,
+                ))
+            } else {
+                debug!(
+                    "APM mode: run_id available, no agent payload within blocking-payload timeout for request: {} - will catch on next invocation or shutdown",
+                    request_id
+                );
+                None
             }
-        } else if has_run_id && !got_payload {
+        } else {
             debug!(
                 "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
                 request_id
             );
-        } else {
-            debug!(
-                "APM mode: No run_id and no agent payload for request: {} - normal flow",
-                request_id
-            );
+            None
         }
+    } else {
+        debug!(
+            "APM mode: No run_id and no agent payload for request: {} - normal flow",
+            request_id
+        );
         None
     };
 
@@ -1516,6 +1536,120 @@ async fn send_agent_payload_or_buffer(
             buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
             false
         }
+    }
+}
+
+/// Whether `execute_apm_mode_event_loop` should defer `process_apm_request` into the
+/// background `pending_flush_handles` queue (the `pipeline_flush` optimization) rather
+/// than synchronously `tokio::join!`-ing it before calling `/next` again.
+///
+/// `apm_blocking_agent_payload` always wins: deferring would let the sandbox freeze
+/// mid-`wait_for_late_agent_payload`, silently defeating the delivery guarantee the
+/// customer explicitly opted into (NR-600648). Extracted as a pure function so the
+/// precedence rule is unit-testable without spinning up the event loop.
+fn should_defer_via_pipeline_flush(pipeline_flush: bool, apm_blocking_agent_payload: bool) -> bool {
+    pipeline_flush && !apm_blocking_agent_payload
+}
+
+/// Spawn a task that sends every payload in `agent_payloads` to the APM collector via
+/// `send_agent_payload_or_buffer` (never-drop-on-failure). Shared by Flow 1
+/// (`has_run_id && got_payload`) and the recovered-Flow-2 case in
+/// `wait_for_late_agent_payload`, so both build an identical `JoinHandle` and the
+/// caller's `if let Some(handle) = send_agent_task { tokio::spawn(...) }` dispatch
+/// needs no per-flow branching.
+fn spawn_send_agent_task(
+    request_id: String,
+    config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+    apm_app: crate::apm::SharedApmApp,
+    invoked_function_arn: String,
+    agent_payloads: Vec<Vec<u8>>,
+) -> tokio::task::JoinHandle<(bool, Vec<Vec<u8>>)> {
+    tokio::spawn(async move {
+        let mut all_sent = true;
+        for payload_bytes in &agent_payloads {
+            extract_and_coordinate_trace_id(
+                payload_bytes,
+                &request_id,
+                &config,
+                &global_log_processor,
+            )
+            .await;
+
+            // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
+            // (never silently dropped); the global retry loop resends it on a
+            // later invoke / at shutdown. Mirrors process_and_send_agent_payload.
+            if !send_agent_payload_or_buffer(
+                payload_bytes,
+                &request_id,
+                &invoked_function_arn,
+                &apm_app,
+            )
+            .await
+            {
+                all_sent = false;
+            }
+        }
+        (all_sent, agent_payloads)
+    })
+}
+
+/// Bound-wait for a late agent payload to arrive on the named pipe for `request_id`,
+/// only ever called when `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD` is enabled (see
+/// `process_apm_request`'s Flow 2 arm). Closes the gap where the agent's telemetry for
+/// this invocation lands on `agent_buffer` a few milliseconds after the Flow-1 snapshot
+/// already found it empty — without this wait, that payload would otherwise only be
+/// picked up on the next invocation's warm-start drain or at `SHUTDOWN` (NR-600648).
+///
+/// Modeled directly on `wait_for_apm_handshake_within_budget`: same `SAFETY_MARGIN_MS`
+/// deadline-budget pattern, so the wait can never exceed the invocation's own deadline
+/// regardless of how `NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS` is configured. Uses the
+/// same "arm-before-recheck" idiom as `wait_for_runtime_done_with_grace`'s drain-notify
+/// wait to avoid a TOCTOU gap between the Flow-1 snapshot and this await.
+async fn wait_for_late_agent_payload(
+    request_id: &str,
+    deadline_ms: i64,
+    config: &ExtensionConfig,
+) -> Vec<Vec<u8>> {
+    let Some(notify) = request::get_agent_payload_notify(request_id) else {
+        return Vec::new();
+    };
+
+    let notified = notify.notified();
+    tokio::pin!(notified);
+    // enable() registers the subscription so any concurrent notify_one() fired
+    // between here and the take_agent_buffer_if_nonempty() recheck below is captured,
+    // rather than being missed in the gap between the Flow-1 snapshot and this wait.
+    notified.as_mut().enable();
+
+    if let Some(payloads) = request::take_agent_buffer_if_nonempty(request_id) {
+        return payloads; // landed between the Flow-1 snapshot and here
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let deadline_budget_ms = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).saturating_sub(INVOKE_DEADLINE_SAFETY_MARGIN_MS)
+    } else {
+        0
+    };
+    let budget_ms = config.new_relic.apm_agent_payload_timeout_ms.min(deadline_budget_ms);
+    if budget_ms == 0 {
+        debug!(
+            "APM blocking-agent-payload: no deadline budget remaining to wait (request: {})",
+            request_id
+        );
+        return Vec::new();
+    }
+
+    debug!(
+        "APM mode: blocking-agent-payload waiting up to {}ms within deadline (request: {})",
+        budget_ms, request_id
+    );
+
+    if tokio::time::timeout(Duration::from_millis(budget_ms), notified).await.is_ok() {
+        request::take_agent_buffer_if_nonempty(request_id).unwrap_or_default()
+    } else {
+        Vec::new()
     }
 }
 
@@ -1660,9 +1794,8 @@ async fn wait_for_apm_handshake_within_budget(
         return;
     }
     let now_ms = chrono::Utc::now().timestamp_millis();
-    const SAFETY_MARGIN_MS: u64 = 500;
     let budget_ms = if deadline_ms > now_ms {
-        ((deadline_ms - now_ms) as u64).saturating_sub(SAFETY_MARGIN_MS)
+        ((deadline_ms - now_ms) as u64).saturating_sub(INVOKE_DEADLINE_SAFETY_MARGIN_MS)
     } else {
         0
     };

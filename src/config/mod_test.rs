@@ -56,6 +56,8 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
+        "NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD",
+        "NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
@@ -1163,6 +1165,8 @@ fn test_new_relic_config_all_fields() {
         apm_lambda_mode: true,
         apm_blocking_handshake: false,
         apm_handshake_timeout_secs: 5,
+        apm_blocking_agent_payload: false,
+        apm_agent_payload_timeout_ms: 200,
         apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
@@ -1174,6 +1178,8 @@ fn test_new_relic_config_all_fields() {
     assert_eq!(config.harvest_interval, Duration::from_secs(5));
     assert!(config.collect_trace_id);
     assert!(config.apm_lambda_mode);
+    assert!(!config.apm_blocking_agent_payload);
+    assert_eq!(config.apm_agent_payload_timeout_ms, 200);
 }
 
 #[test]
@@ -1556,5 +1562,114 @@ fn test_apm_blocking_handshake_truthy_variants() {
             );
         });
     }
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_agent_payload_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.apm_blocking_agent_payload);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_agent_payload_enabled_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_blocking_agent_payload);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_agent_payload_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.apm_blocking_agent_payload);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_agent_payload_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.apm_blocking_agent_payload,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn test_apm_agent_payload_timeout_ms_default() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_agent_payload_timeout_ms, 200);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_agent_payload_timeout_ms_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS", "500");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_agent_payload_timeout_ms, 500);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_agent_payload_timeout_ms_clamped_to_max() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS", "5000");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_agent_payload_timeout_ms, 2000);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_agent_payload_timeout_ms_zero_allowed() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS", "0");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_agent_payload_timeout_ms, 0);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_agent_payload_timeout_ms_invalid_string_falls_back_to_default() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_AGENT_PAYLOAD_TIMEOUT_MS", "not_a_number");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.apm_agent_payload_timeout_ms, 200);
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_blocking_agent_payload_and_pipeline_flush_both_enabled_is_representable() {
+    // Both flags can legally be set simultaneously — precedence is enforced at the
+    // event-loop level (execute_apm_mode_event_loop), not by rejecting the config.
+    // This just confirms parsing both together doesn't panic or clobber either value.
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD", "true");
+        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.apm_blocking_agent_payload);
+        assert!(config.extension.pipeline_flush);
+        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
+    });
 }
 
