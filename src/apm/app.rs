@@ -285,9 +285,10 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        // OTLP metrics forwarding is opt-in via NEW_RELIC_OTLP_METRIC_ENABLED. When disabled,
-        // drop any otlp_payload entries here (before the generic telemetry loop below,
-        // which would otherwise log them as an "Unknown telemetry type").
+        // OTLP metric forwarding requires NEW_RELIC_OTLP_METRIC_ENABLED *and* APM mode; the
+        // gate below reflects both (see ExtensionConfig::otlp_metric_forwarding_active). When
+        // it is off, drop any otlp_payload entries here — before the generic telemetry loop
+        // below, which would otherwise log them as an "Unknown telemetry type".
         if super::collector::is_otlp_metric_enabled() {
             let otlp_entries: Vec<String> = telemetry_map
                 .remove("otlp_payload")
@@ -296,7 +297,17 @@ impl ApmApp {
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
 
-            if !otlp_entries.is_empty() {
+            if otlp_entries.is_empty() {
+                // OTLP is switched on but the agent sent no otlp_payload. The customer opted
+                // in and is getting nothing, so surface it rather than staying silent — the
+                // usual cause is an agent that does not emit this field (only the .NET Hybrid
+                // Agent does today) or an app that never records OTEL metrics.
+                warn!(
+                    "NEW_RELIC_OTLP_METRIC_ENABLED=true but no otlp_payload found in the agent \
+                     payload for request {} - no OTLP metrics to forward",
+                    request_id
+                );
+            } else {
                 info!(
                     "Sending {} OTLP payload(s) to OTLP endpoint (entity.guid={})",
                     otlp_entries.len(),
@@ -321,8 +332,11 @@ impl ApmApp {
                 }));
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
+            // Not a misconfiguration on its own: the customer simply has not opted in, so
+            // this stays at debug. The "flag set but APM mode off" mismatch is warned about
+            // once at startup in main.rs instead of once per invocation here.
             debug!(
-                "Dropping {} OTLP payload(s) - NEW_RELIC_OTLP_METRIC_ENABLED is not set",
+                "Dropping {} OTLP payload(s) - OTLP forwarding is not enabled",
                 dropped.len()
             );
         }

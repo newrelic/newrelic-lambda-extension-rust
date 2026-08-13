@@ -487,8 +487,8 @@ async fn perform_one_time_initialization(
     // in serverless mode gets no metrics and no explanation.
     if config.new_relic.otlp_metric_enabled && !config.new_relic.apm_lambda_mode {
         warn!(
-            "NEW_RELIC_OTLP_METRIC_ENABLED is set but NEW_RELIC_APM_LAMBDA_MODE is not - \
-             OTLP metric forwarding requires APM mode and will be disabled"
+            "NEW_RELIC_OTLP_METRIC_ENABLED=true but APM mode is disabled - OTLP metric \
+             forwarding requires NEW_RELIC_APM_LAMBDA_MODE=true and will not run"
         );
     }
     apm::collector::set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
