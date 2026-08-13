@@ -61,6 +61,10 @@ pub struct NewRelicConfig {
     /// (protobuf `entity.guid` injection + send). Default: false. While
     /// disabled, any `otlp_payload` entries the agent sends are dropped
     /// without being decoded or forwarded.
+    ///
+    /// This is the raw env-var value. Forwarding additionally requires
+    /// `apm_lambda_mode`, since the send path lives in `ApmApp`; the effective
+    /// gate is `crate::apm::collector::is_otlp_metric_enabled()`.
     pub otlp_metric_enabled: bool,
     pub proxy_url: Option<String>,
 }
@@ -278,6 +282,17 @@ pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
 }
 
 impl ExtensionConfig {
+    /// Whether OTLP metric forwarding will actually run: the customer opted in via
+    /// `NEW_RELIC_OTLP_METRIC_ENABLED` **and** APM mode is on. APM mode is required
+    /// because the send path lives in `ApmApp::process_agent_payload`, and no `ApmApp`
+    /// is constructed in serverless mode — so the env var alone is not sufficient.
+    ///
+    /// This is the single source of truth mirrored into
+    /// `crate::apm::collector::set_otlp_metric_enabled()` at startup.
+    pub fn otlp_metric_forwarding_active(&self) -> bool {
+        self.new_relic.otlp_metric_enabled && self.new_relic.apm_lambda_mode
+    }
+
     /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
         let normalized = raw_level.to_lowercase();
