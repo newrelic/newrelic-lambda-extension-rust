@@ -201,7 +201,7 @@ fn ages_out_old_items_without_sending() {
         b.push(FailedOtlpPayload {
             encoded_payload: empty_otlp_payload_base64(),
             entity_guid: "guid1".to_string(),
-            otlp_endpoint: "http://127.0.0.1:1/never".to_string(),
+            otlp_metric_endpoint: "http://127.0.0.1:1/never".to_string(),
             request_id: "r1".to_string(),
             failed_at: Utc::now() - chrono::Duration::minutes(MAX_AGE_MINUTES + 5),
             retry_count: 0,
