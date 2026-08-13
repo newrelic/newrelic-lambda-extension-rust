@@ -481,8 +481,17 @@ async fn perform_one_time_initialization(
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
-    // OTLP metrics forwarding is opt-in — mirror the flag the same way.
-    apm::collector::set_otlp_metric_enabled(config.new_relic.otlp_metric_enabled);
+    // Mirror the *effective* OTLP capability (env var AND APM mode), not just the env var,
+    // so is_otlp_metric_enabled() answers "will OTLP actually be sent?" rather than "did the
+    // customer ask for it?". Warn on the mismatch — otherwise a customer who sets the flag
+    // in serverless mode gets no metrics and no explanation.
+    if config.new_relic.otlp_metric_enabled && !config.new_relic.apm_lambda_mode {
+        warn!(
+            "NEW_RELIC_OTLP_METRIC_ENABLED is set but NEW_RELIC_APM_LAMBDA_MODE is not - \
+             OTLP metric forwarding requires APM mode and will be disabled"
+        );
+    }
+    apm::collector::set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
 
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {

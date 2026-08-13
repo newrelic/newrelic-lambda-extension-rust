@@ -104,17 +104,21 @@ pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Process-wide OTLP feature gate, populated once at startup from
-/// `NEW_RELIC_OTLP_METRIC_ENABLED` (default false). Lets code paths without
-/// `ExtensionConfig` in scope check whether OTLP forwarding is opted in.
+/// Process-wide OTLP feature gate, populated once at startup (default false). True only
+/// when `NEW_RELIC_OTLP_METRIC_ENABLED` **and** `NEW_RELIC_APM_LAMBDA_MODE` are both set —
+/// the forwarding code lives in `ApmApp::process_agent_payload`, which does not exist in
+/// serverless mode, so the env var alone is not sufficient. Lets code paths without
+/// `ExtensionConfig` in scope check whether OTLP forwarding will actually happen.
 static OTLP_METRIC_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Record whether OTLP metrics forwarding is enabled (called once at startup).
+/// Callers pass the effective value (env var AND APM mode), not the raw env var.
 pub fn set_otlp_metric_enabled(enabled: bool) {
     OTLP_METRIC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether OTLP metrics forwarding has been enabled via `NEW_RELIC_OTLP_METRIC_ENABLED`.
+/// Whether OTLP metric forwarding is active: `NEW_RELIC_OTLP_METRIC_ENABLED` is set AND
+/// APM mode is on. False in serverless mode even if the env var is set.
 pub fn is_otlp_metric_enabled() -> bool {
     OTLP_METRIC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -579,6 +583,44 @@ mod collector_tests {
         assert!(!is_otlp_metric_enabled());
         set_otlp_metric_enabled(true);
         assert!(is_otlp_metric_enabled());
+        // Reset so other serial tests see a clean state.
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
+    }
+
+    /// Pins the full truth table for the effective OTLP gate, exercising the REAL
+    /// production function (`ExtensionConfig::otlp_metric_forwarding_active`) that main.rs
+    /// feeds into `set_otlp_metric_enabled` — not a re-implementation of the `&&`. Guards
+    /// against regressing to mirroring the env var alone, which would leave the flag "on"
+    /// in serverless mode where the OTLP send path does not exist.
+    #[test]
+    #[serial]
+    fn otlp_metric_enabled_requires_both_env_var_and_apm_mode() {
+        for (env_var, apm_mode, expected) in [
+            (true, true, true),    // both on -> OTLP sends
+            (true, false, false),  // flag set but serverless -> no send path exists
+            (false, true, false),  // APM mode but flag off -> opted out
+            (false, false, false), // neither
+        ] {
+            let mut config = crate::config::ExtensionConfig::default();
+            config.new_relic.otlp_metric_enabled = env_var;
+            config.new_relic.apm_lambda_mode = apm_mode;
+
+            assert_eq!(
+                config.otlp_metric_forwarding_active(),
+                expected,
+                "otlp_metric_forwarding_active: env_var={env_var}, apm_mode={apm_mode}"
+            );
+
+            // And confirm it round-trips through the process-wide gate main.rs sets.
+            set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
+            assert_eq!(
+                is_otlp_metric_enabled(),
+                expected,
+                "is_otlp_metric_enabled: env_var={env_var}, apm_mode={apm_mode}"
+            );
+        }
+
         // Reset so other serial tests see a clean state.
         set_otlp_metric_enabled(false);
         assert!(!is_otlp_metric_enabled());
