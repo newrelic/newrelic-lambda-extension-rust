@@ -285,10 +285,10 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        // OTLP metrics forwarding is opt-in via NEW_RELIC_OTLP_ENABLED. When disabled,
+        // OTLP metrics forwarding is opt-in via NEW_RELIC_OTLP_METRIC_ENABLED. When disabled,
         // drop any otlp_payload entries here (before the generic telemetry loop below,
         // which would otherwise log them as an "Unknown telemetry type").
-        if super::collector::is_otlp_enabled() {
+        if super::collector::is_otlp_metric_enabled() {
             let otlp_entries: Vec<String> = telemetry_map
                 .remove("otlp_payload")
                 .unwrap_or_default()
@@ -322,7 +322,7 @@ impl ApmApp {
             }
         } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
             debug!(
-                "Dropping {} OTLP payload(s) - NEW_RELIC_OTLP_ENABLED is not set",
+                "Dropping {} OTLP payload(s) - NEW_RELIC_OTLP_METRIC_ENABLED is not set",
                 dropped.len()
             );
         }

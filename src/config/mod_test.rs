@@ -57,7 +57,7 @@ where
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
-        "NEW_RELIC_OTLP_ENABLED",
+        "NEW_RELIC_OTLP_METRIC_ENABLED",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -1210,7 +1210,7 @@ fn test_new_relic_config_all_fields() {
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         otlp_metric_endpoint: "http://otlp".to_string(),
-        otlp_enabled: true,
+        otlp_metric_enabled: true,
         proxy_url: Some("http://proxy:8080".to_string()),
     };
     
@@ -1605,42 +1605,42 @@ fn test_apm_blocking_handshake_truthy_variants() {
 
 #[test]
 #[serial]
-fn test_otlp_enabled_default_false() {
+fn test_otlp_metric_enabled_default_false() {
     with_full_clean_env(|| {
         let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.otlp_enabled);
+        assert!(!config.new_relic.otlp_metric_enabled);
     });
 }
 
 #[test]
 #[serial]
-fn test_otlp_enabled_true_from_env() {
+fn test_otlp_metric_enabled_true_from_env() {
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_OTLP_ENABLED", "true");
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "true");
         let config = ExtensionConfig::from_env();
-        assert!(config.new_relic.otlp_enabled);
+        assert!(config.new_relic.otlp_metric_enabled);
     });
 }
 
 #[test]
 #[serial]
-fn test_otlp_enabled_explicit_false() {
+fn test_otlp_metric_enabled_explicit_false() {
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_OTLP_ENABLED", "false");
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "false");
         let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.otlp_enabled);
+        assert!(!config.new_relic.otlp_metric_enabled);
     });
 }
 
 #[test]
 #[serial]
-fn test_otlp_enabled_truthy_variants() {
+fn test_otlp_metric_enabled_truthy_variants() {
     for value in &["1", "yes", "on", "TRUE", "Yes"] {
         with_full_clean_env(|| {
-            env::set_var("NEW_RELIC_OTLP_ENABLED", value);
+            env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", value);
             let config = ExtensionConfig::from_env();
             assert!(
-                config.new_relic.otlp_enabled,
+                config.new_relic.otlp_metric_enabled,
                 "Expected true for value '{}'", value
             );
         });
@@ -1649,11 +1649,11 @@ fn test_otlp_enabled_truthy_variants() {
 
 #[test]
 #[serial]
-fn test_otlp_enabled_garbage_string_falls_back_to_false() {
+fn test_otlp_metric_enabled_garbage_string_falls_back_to_false() {
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_OTLP_ENABLED", "not_a_bool");
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "not_a_bool");
         let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.otlp_enabled);
+        assert!(!config.new_relic.otlp_metric_enabled);
     });
 }
 

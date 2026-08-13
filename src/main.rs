@@ -482,7 +482,7 @@ async fn perform_one_time_initialization(
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
     // OTLP metrics forwarding is opt-in — mirror the flag the same way.
-    apm::collector::set_otlp_enabled(config.new_relic.otlp_enabled);
+    apm::collector::set_otlp_metric_enabled(config.new_relic.otlp_metric_enabled);
 
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
