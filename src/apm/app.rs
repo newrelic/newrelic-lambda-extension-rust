@@ -566,7 +566,7 @@ fn get_custom_tag_attributes() -> &'static serde_json::Map<String, Value> {
 /// testable without needing the process-wide `OnceLock` cache - see `get_nr_tags`/
 /// `get_new_relic_labels` for why that cache can't be exercised more than once per
 /// test binary.
-fn inject_custom_tag_attributes(
+pub(crate) fn inject_custom_tag_attributes(
     data: &mut [Value],
     event_type: &str,
     tags: &serde_json::Map<String, Value>,
@@ -725,7 +725,7 @@ fn normalize_span_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in metric_data
 /// Structure: [run_id, timestamp_start, timestamp_end, [[[{name: "..."}, [values]]], ...]]
-fn normalize_metric_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_metric_data(data: &mut Vec<Value>) {
     // Check we have the expected structure: data[3] should be the metrics array
     if data.len() < 4 {
         return;
@@ -784,7 +784,7 @@ fn normalize_metric_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in error_event_data
 /// Structure: [run_id, {metadata}, [[[error_obj, {}, {}]], ...]]
-fn normalize_error_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_error_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -831,7 +831,7 @@ fn normalize_error_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in custom_event_data
 /// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
-fn normalize_custom_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_custom_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -867,7 +867,7 @@ fn normalize_custom_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in transaction_sample_data
 /// Structure: [run_id, [[transaction_id, timestamp, name, duration, encoded_data], ...]]
-fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
     if data.len() < 2 {
         return;
     }
@@ -900,174 +900,3 @@ fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
 /// Shared APM app state
 pub type SharedApmApp = Arc<RwLock<Option<ApmApp>>>;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_apm_app_creation() {
-        let client = Client::new();
-        let app = ApmApp {
-            run_id: "test_run_id".to_string(),
-            entity_guid: "test_guid".to_string(),
-            collector_host: "collector.newrelic.com".to_string(),
-            license_key: "test_key".to_string(),
-            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            client,
-        };
-
-        assert_eq!(app.run_id, "test_run_id");
-        assert_eq!(app.entity_guid, "test_guid");
-        assert_eq!(app.get_entity_guid(), "test_guid");
-    }
-
-    // ========================================================================
-    // inject_custom_tag_attributes (NR-600651) - exercised with an explicit tag
-    // map, never via get_custom_tag_attributes()'s process-wide OnceLock cache,
-    // for the same reason config::mod_test.rs tests parse_nr_tags() rather than
-    // get_nr_tags(): the cache can only be initialized once per test binary.
-    // ========================================================================
-
-    fn transaction_event(user_attrs: &Value) -> Value {
-        serde_json::json!([{"type": "Transaction", "name": "OtherTransaction/Function/test"}, user_attrs, {}])
-    }
-
-    fn span_event(user_attrs: &Value) -> Value {
-        serde_json::json!([{"type": "Span", "name": "test-span"}, user_attrs, {}])
-    }
-
-    fn payload_with_events(events: Vec<Value>) -> Vec<Value> {
-        vec![serde_json::json!("run_id"), serde_json::json!({}), Value::Array(events)]
-    }
-
-    fn tags_map(pairs: &[(&str, &str)]) -> serde_json::Map<String, Value> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), Value::String(v.to_string())))
-            .collect()
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_noop_when_tags_empty() {
-        let mut data = payload_with_events(vec![transaction_event(&serde_json::json!({}))]);
-        let before = data.clone();
-        inject_custom_tag_attributes(&mut data, "Transaction", &serde_json::Map::new());
-        assert_eq!(data, before);
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_basic_transaction() {
-        let mut data = payload_with_events(vec![transaction_event(&serde_json::json!({}))]);
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Transaction", &tags);
-
-        let user_attrs = data[2][0][1].as_object().expect("user_attrs should be an object");
-        assert_eq!(user_attrs.get("team"), Some(&Value::String("dev".to_string())));
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_basic_span() {
-        let mut data = payload_with_events(vec![span_event(&serde_json::json!({}))]);
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Span", &tags);
-
-        let user_attrs = data[2][0][1].as_object().expect("user_attrs should be an object");
-        assert_eq!(user_attrs.get("team"), Some(&Value::String("dev".to_string())));
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_agent_attribute_wins_on_collision() {
-        let mut data = payload_with_events(vec![transaction_event(&serde_json::json!({"team": "agent-set"}))]);
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Transaction", &tags);
-
-        let user_attrs = data[2][0][1].as_object().expect("user_attrs should be an object");
-        assert_eq!(
-            user_attrs.get("team"),
-            Some(&Value::String("agent-set".to_string())),
-            "the agent's own attribute must never be overwritten by the injected tag"
-        );
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_creates_missing_user_attrs_object() {
-        // user_attrs slot is `null`, not an object - the agent didn't set anything there.
-        let mut data = payload_with_events(vec![transaction_event(&Value::Null)]);
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Transaction", &tags);
-
-        let user_attrs = data[2][0][1].as_object().expect("user_attrs should now be an object");
-        assert_eq!(user_attrs.get("team"), Some(&Value::String("dev".to_string())));
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_skips_mismatched_type() {
-        // An event whose intrinsic type isn't "Transaction" must be left untouched,
-        // even though its user_attrs object already exists.
-        let mut data = payload_with_events(vec![span_event(&serde_json::json!({}))]);
-        let before = data.clone();
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Transaction", &tags);
-
-        assert_eq!(data, before);
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_only_touches_matching_events_in_a_batch() {
-        let mut data = payload_with_events(vec![
-            transaction_event(&serde_json::json!({})),
-            span_event(&serde_json::json!({})),
-        ]);
-        let tags = tags_map(&[("team", "dev")]);
-
-        inject_custom_tag_attributes(&mut data, "Transaction", &tags);
-
-        let txn_attrs = data[2][0][1].as_object().expect("transaction user_attrs should be an object");
-        assert_eq!(txn_attrs.get("team"), Some(&Value::String("dev".to_string())));
-
-        let span_attrs = data[2][1][1].as_object().expect("span user_attrs should be an object");
-        assert!(span_attrs.get("team").is_none(), "the Span event must not receive the Transaction-scoped injection");
-    }
-
-    #[test]
-    fn inject_custom_tag_attributes_handles_short_payload_without_panic() {
-        let tags = tags_map(&[("team", "dev")]);
-
-        let mut too_short = vec![serde_json::json!("run_id"), serde_json::json!({})];
-        inject_custom_tag_attributes(&mut too_short, "Transaction", &tags);
-        assert_eq!(too_short.len(), 2);
-
-        let mut events_not_array = vec![serde_json::json!("run_id"), serde_json::json!({}), Value::Null];
-        inject_custom_tag_attributes(&mut events_not_array, "Transaction", &tags);
-        assert_eq!(events_not_array[2], Value::Null);
-
-        let mut short_tuple = payload_with_events(vec![Value::Array(vec![serde_json::json!({"type": "Transaction"})])]);
-        inject_custom_tag_attributes(&mut short_tuple, "Transaction", &tags);
-        // A 1-element tuple has no user_attrs slot to inject into - must not panic, and
-        // must be left exactly as-is.
-        assert_eq!(short_tuple[2][0].as_array().map(Vec::len), Some(1));
-    }
-
-    #[test]
-    fn get_custom_tag_attributes_prefixes_keys_with_tags() {
-        // Uniformity with log-forwarding: Transaction/Span attribute keys are tags.-prefixed
-        // (tags.team), not raw (team) - unlike Entity Tags, which stay unprefixed.
-        // Exercises the build logic directly (mirrors get_custom_tag_attributes()) without
-        // touching the cached get_custom_tag_attributes()/get_new_relic_labels() functions
-        // themselves - same rationale as the tests above.
-        let new_relic_labels = [("team".to_string(), "dev".to_string())];
-
-        let mut map = serde_json::Map::new();
-        for (k, v) in &new_relic_labels {
-            map.insert(format!("tags.{k}"), Value::String(v.clone()));
-        }
-
-        assert_eq!(map.get("tags.team"), Some(&Value::String("dev".to_string())));
-        assert!(map.get("team").is_none(), "the raw, unprefixed key must not also be present");
-    }
-}
