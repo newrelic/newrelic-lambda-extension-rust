@@ -249,6 +249,14 @@ impl NewRelicClient {
                 debug!("Adding NR_TAGS to log payload: {}={}", key, value);
                 attrs.insert(key.clone(), serde_json::json!(value));
             }
+            // NEW_RELIC_LABELS (agent-specs/Labels.md) - additive, alongside NR_TAGS
+            // above. Per spec, forwarded-log attributes for labels are prefixed
+            // `tags.<label_type>`; NR_TAGS attributes stay unprefixed, unchanged.
+            for (key, value) in crate::config::get_new_relic_labels() {
+                let attr_key = format!("tags.{key}");
+                debug!("Adding NEW_RELIC_LABELS to log payload: {attr_key}={value}");
+                attrs.insert(attr_key, serde_json::json!(value));
+            }
             attrs
         });
 
@@ -453,6 +461,41 @@ impl NewRelicClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_get_extension_name_with_version() {
+        let name = get_extension_name_with_version();
+        assert!(name.starts_with("newrelic-lambda-extension:"));
+        assert_eq!(name, format!("{EXTENSION_NAME}:{EXTENSION_VERSION}"));
+    }
+
+    #[test]
+    fn test_get_backoff_delay_schedule() {
+        assert_eq!(get_backoff_delay(1), std::time::Duration::from_millis(200));
+        assert_eq!(get_backoff_delay(2), std::time::Duration::from_millis(400));
+        assert_eq!(get_backoff_delay(3), std::time::Duration::from_millis(900));
+        // Anything beyond the explicit schedule falls back to the same ceiling as attempt 3.
+        assert_eq!(get_backoff_delay(4), std::time::Duration::from_millis(900));
+        assert_eq!(get_backoff_delay(0), std::time::Duration::from_millis(900));
+    }
+
+    #[test]
+    fn test_build_outbound_client_without_proxy() {
+        // Must not panic - `.expect()` inside build_outbound_client would fail the test.
+        let _client = build_outbound_client(None);
+    }
+
+    #[test]
+    fn test_build_outbound_client_with_valid_proxy() {
+        let _client = build_outbound_client(Some("http://proxy.internal:8080"));
+    }
+
+    #[test]
+    fn test_build_outbound_client_with_invalid_proxy_falls_back_to_no_proxy() {
+        // An invalid proxy URL must not panic; build_proxy() logs a warning and
+        // build_outbound_client() proceeds without a proxy.
+        let _client = build_outbound_client(Some("not a valid url"));
+    }
 
     #[test]
     fn test_mask_proxy_url_with_credentials() {

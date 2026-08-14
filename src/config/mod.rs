@@ -495,6 +495,119 @@ pub fn get_nr_tags() -> &'static [(String, String)] {
     NR_TAGS_CACHE.get_or_init(parse_nr_tags)
 }
 
+/// Maximum length (in Unicode scalar values) allowed for a `NEW_RELIC_LABELS` type or
+/// value, per the cross-agent Labels spec (agent-specs/Labels.md). Longer values are
+/// truncated with a warning, not rejected.
+const MAX_LABEL_LEN: usize = 255;
+/// Maximum number of `NEW_RELIC_LABELS` type/value pairs sent per agent run, per the
+/// cross-agent Labels spec. Applied to `NEW_RELIC_LABELS`'s own output only — independent
+/// of the (uncapped, untouched) `NR_TAGS` output.
+const MAX_LABELS: usize = 64;
+
+/// Parse the `NEW_RELIC_LABELS` environment variable into key-value pairs.
+///
+/// Format: `type1:value1;type2:value2`, per the cross-agent Labels spec
+/// (agent-specs/Labels.md). Deliberately independent of `NR_TAGS`/`parse_nr_tags`, which
+/// this does not touch or share state with:
+/// - The delimiters are fixed (no `NR_ENV_DELIMITER`-style override).
+/// - A duplicate label type keeps only the value from its *last* occurrence.
+/// - A malformed pair (wrong delimiter count, empty type, or empty value — including a
+///   non-leading/trailing empty pair like `foo:bar;;zip:zap`) hard-fails the whole list
+///   to empty, with a warning. Purely leading/trailing separators (`;;foo:bar;;`) are
+///   stripped and not treated as malformed.
+/// - Each type/value longer than 255 chars is truncated, with a warning.
+/// - The list is capped at 64 entries, with a warning.
+///
+/// # Example
+/// ```
+/// std::env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+/// let labels = parse_new_relic_labels();
+/// assert_eq!(labels, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
+/// ```
+pub fn parse_new_relic_labels() -> Vec<(String, String)> {
+    let raw = match env::var("NEW_RELIC_LABELS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Vec::new(),
+    };
+
+    let raw_segments: Vec<&str> = raw.split(';').collect();
+
+    // Strip purely leading/trailing empty segments (stray `;` at either end); a middle
+    // empty segment is a malformed pair per spec, not tolerated the same way.
+    let Some(start) = raw_segments.iter().position(|s| !s.trim().is_empty()) else {
+        // Nothing but separators/whitespace (e.g. ";;;") - no labels configured, not an error.
+        return Vec::new();
+    };
+    let Some(end) = raw_segments.iter().rposition(|s| !s.trim().is_empty()) else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for segment in &raw_segments[start..=end] {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            warn!(
+                "NEW_RELIC_LABELS is malformed (empty label pair between valid entries); discarding all labels"
+            );
+            return Vec::new();
+        }
+
+        let parts: Vec<&str> = segment.split(':').collect();
+        let (label_type, label_value) = match parts.as_slice() {
+            [t, v] if !t.trim().is_empty() && !v.trim().is_empty() => (t.trim(), v.trim()),
+            _ => {
+                warn!(
+                    "NEW_RELIC_LABELS is malformed at \"{segment}\" (expected exactly one non-empty \"type:value\" pair); discarding all labels"
+                );
+                return Vec::new();
+            }
+        };
+
+        let label_type = truncate_label_part(label_type, "label type");
+        let label_value = truncate_label_part(label_value, "label value");
+
+        // Duplicate type: last occurrence wins, updating the value in place.
+        if let Some(existing) = pairs.iter_mut().find(|(t, _)| *t == label_type) {
+            existing.1 = label_value;
+        } else {
+            pairs.push((label_type, label_value));
+        }
+    }
+
+    if pairs.len() > MAX_LABELS {
+        warn!(
+            "NEW_RELIC_LABELS has {} entries, exceeding the {MAX_LABELS}-label limit; truncating",
+            pairs.len()
+        );
+        pairs.truncate(MAX_LABELS);
+    }
+
+    pairs
+}
+
+/// Truncate a `NEW_RELIC_LABELS` type/value to `MAX_LABEL_LEN` chars, warning if truncated.
+fn truncate_label_part(part: &str, kind: &str) -> String {
+    if part.chars().count() > MAX_LABEL_LEN {
+        let truncated: String = part.chars().take(MAX_LABEL_LEN).collect();
+        warn!(
+            "NEW_RELIC_LABELS {kind} \"{part}\" exceeds {MAX_LABEL_LEN} characters; truncating to \"{truncated}\""
+        );
+        truncated
+    } else {
+        part.to_string()
+    }
+}
+
+/// Cached `NEW_RELIC_LABELS` parsed once at cold start. Use `get_new_relic_labels()` to access.
+static NEW_RELIC_LABELS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Returns cached `NEW_RELIC_LABELS`, parsing from environment only on first call (cold
+/// start). Subsequent warm-start invocations reuse the cached result with zero allocation.
+pub fn get_new_relic_labels() -> &'static [(String, String)] {
+    NEW_RELIC_LABELS_CACHE.get_or_init(parse_new_relic_labels)
+}
+
 /// Global configuration instance
 static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
 static CONFIG_INIT: std::sync::Once = std::sync::Once::new();

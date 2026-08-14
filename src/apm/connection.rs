@@ -425,6 +425,20 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
         });
     }
 
+    // NEW_RELIC_LABELS (agent-specs/Labels.md) - additive, alongside NR_TAGS above.
+    // Sent unprefixed here, matching the connect payload's `label_type`/`label_value`
+    // shape - confirmed against the official Python agent (agent_protocol.py's
+    // _connect_payload sends settings["labels"] verbatim, built by config.py's
+    // _process_labels_setting as {"label_type": key, "label_value": value}, no
+    // prefix). The `tags.` prefix only applies to the log-forwarding path (client.rs),
+    // matching data_collector.py's `f"tags.{label['label_type']}"` construction there.
+    for (key, value) in crate::config::get_new_relic_labels() {
+        labels.push(Label {
+            label_type: key.clone(),
+            label_value: value.clone(),
+        });
+    }
+
     labels
 }
 
@@ -481,6 +495,33 @@ mod connection_tests {
         assert_eq!(connect_cycles(), 0);
         assert_eq!(connect_attempts_total(), 0);
         assert_eq!(last_failure_reason(), None);
+    }
+
+    #[test]
+    fn compress_inline_roundtrips_via_gzip_decoder() {
+        use std::io::Read;
+
+        let original = b"the quick brown fox jumps over the lazy dog ".repeat(50);
+        let compressed = compress_inline(&original).expect("compression should succeed");
+
+        let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).expect("decompression should succeed");
+
+        assert_eq!(decompressed, original);
+    }
+
+    #[test]
+    fn compress_inline_shrinks_repetitive_data() {
+        let original = vec![b'a'; 10_000];
+        let compressed = compress_inline(&original).expect("compression should succeed");
+        assert!(compressed.len() < original.len());
+    }
+
+    #[test]
+    fn compress_inline_handles_empty_input() {
+        let compressed = compress_inline(&[]).expect("compression of empty input should succeed");
+        assert!(!compressed.is_empty(), "gzip stream still has header/footer bytes");
     }
 
     #[test]
