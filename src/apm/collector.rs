@@ -662,10 +662,24 @@ mod collector_tests {
         assert!(is_restart(&restart), "RestartException (409/401) must be detected");
         assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
     }
+
+
 }
 
 /// Decode, enrich with `entity.guid`, gzip, and POST a single base64-encoded OTLP payload.
 /// `payload_num` is a 1-based index used only for human-readable logging.
+///
+/// Uses the same 20 s HTTP timeout as `send_error_events` / `send_apm_telemetry` /
+/// `send_platform_metrics`, on both the first attempt and buffered retries.
+///
+/// Note on the shutdown path: `retry_buffered_otlp_payloads` also runs from the SHUTDOWN
+/// handler, whose whole budget is `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`
+/// (1300 ms) shared with the telemetry- and metric-API drains that run first. A 20 s
+/// timeout exceeds that window, so a stalled endpoint means the shutdown drain is
+/// best-effort — the enclosing `tokio::time::timeout` cuts it off and anything undelivered
+/// stays buffered (bounded by `MAX_RETRY_ATTEMPTS` / `MAX_AGE_MINUTES`). That limitation is
+/// shared by all three buffers, not specific to OTLP; shortening only this one would make
+/// OTLP inconsistent with its siblings without fixing the budget.
 pub(super) async fn send_single_otlp_payload(
     client: &Client,
     otlp_metric_endpoint: &str,
@@ -760,59 +774,22 @@ pub(super) async fn send_single_otlp_payload(
         return Err(OtlpError::Permanent { status: status_code });
     }
 
-    log_otlp_success_response(response, payload_num, duration).await;
-    Ok(())
-}
-
-/// Log the response body of a successful OTLP send (debug-level only). Split out of
-/// `send_single_otlp_payload` purely to keep that function under the line-count lint —
-/// this has no effect on control flow, since a successful send always returns `Ok(())`.
-async fn log_otlp_success_response(response: reqwest::Response, payload_num: usize, duration: std::time::Duration) {
-    let body_bytes = match response.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            // Non-fatal: payload was accepted, body read failed
-            warn!(
-                "OTLP payload {} accepted ({}ms) but failed to read response body: {}",
-                payload_num,
-                duration.as_millis(),
-                e
-            );
-            return;
-        }
-    };
-
-    if body_bytes.is_empty() {
+    // Matches how the other senders in this module report success (one line). The body
+    // is read only when DEBUG is on: a 2xx carries nothing we act on, so reading it
+    // unconditionally would allocate on every successful send to feed a log line that
+    // is filtered out at the default `info` level. `chars().take()` keeps the preview on
+    // a char boundary, so a multi-byte UTF-8 body cannot panic here.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let body = response.text().await.unwrap_or_default();
+        let preview: String = body.trim().chars().take(256).collect();
         debug!(
-            "OTLP payload {} sent successfully in {}ms (empty response body)",
-            payload_num,
-            duration.as_millis()
-        );
-    } else {
-        let body_repr = if let Ok(text) = std::str::from_utf8(&body_bytes) {
-            // Safe char-boundary truncation — avoids panic on multi-byte UTF-8
-            let trimmed = text.trim();
-            let preview: String = trimmed.chars().take(256).collect();
-            let suffix = if trimmed.chars().count() > 256 { " ..." } else { "" };
-            format!("text: {preview}{suffix}")
-        } else {
-            let preview_len = body_bytes.len().min(64);
-            let hex: String = body_bytes[..preview_len]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let suffix = if body_bytes.len() > preview_len { " ..." } else { "" };
-            format!("binary ({} bytes): {hex}{suffix}", body_bytes.len())
-        };
-
-        debug!(
-            "OTLP payload {} sent successfully in {}ms, response {}",
+            "OTLP payload {} sent successfully in {}ms (response: {})",
             payload_num,
             duration.as_millis(),
-            body_repr
+            if preview.is_empty() { "empty" } else { preview.as_str() }
         );
     }
+    Ok(())
 }
 
 /// Forward base64-encoded OTLP `ExportMetricsServiceRequest` protobuf payloads to the OTLP
@@ -888,4 +865,6 @@ pub async fn send_otlp_payload(
     while set.join_next().await.is_some() {}
 
     info!("Finished sending {} OTLP payload(s)", payloads.len());
+
+
 }
