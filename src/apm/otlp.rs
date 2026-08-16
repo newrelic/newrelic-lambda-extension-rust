@@ -1,9 +1,15 @@
-//! Minimal OTLP protobuf types for entity.guid injection.
+//! Minimal OTLP protobuf types for `entity.guid` injection.
 //!
-//! `resource_metrics[].resource.attributes` and `scope_metrics[].scope.name` /
-//! `scope_metrics[].metrics[].name` are decoded for injection and debug logging.
-//! All data-point payloads (gauge, sum, histogram, etc.) remain as unknown fields
-//! and are re-encoded byte-for-bit unchanged.
+//! Prost 0.13 has **no unknown-field preservation**: `derive(Message)` skips any tag a
+//! struct does not declare, so undeclared fields are lost on re-encode. Anything that
+//! must survive is therefore either declared, or held as raw bytes — a length-delimited
+//! `bytes` field is wire-identical to an embedded message, so prost hands back the
+//! sub-message's exact bytes and writes them out unchanged.
+//!
+//! That is why [`ScopeMetrics::metrics_raw`] is `Vec<Vec<u8>>`: every data point (gauge,
+//! sum, histogram, exponential histogram, summary) round-trips bit-for-bit without this
+//! module needing to model it. Only `Resource::attributes` is decoded, because the
+//! injection has to read and edit it.
 
 use prost::Message;
 use tracing::debug;
@@ -71,12 +77,20 @@ pub struct KeyValue {
 }
 
 /// Mirrors `opentelemetry.proto.common.v1.AnyValue`.
-/// Only the `string_value` oneof variant (tag 1) is decoded. Non-string values
+///
+/// Only the `string_value` oneof variant (tag 1) is declared. Non-string values
 /// (bool=2, int64=3, double=4, array=5, kvlist=6, bytes=7) are NOT preserved: prost
-/// has no unknown-field preservation, so an attribute with a non-string value
-/// silently decodes to `value: None` and is dropped on re-encode. Known limitation,
-/// not yet fixed — only affects `Resource.attributes` metadata, not metric data
-/// points (gauge/sum/histogram), which are unaffected via `metrics_raw` below.
+/// 0.13 has no unknown-field preservation, so their bytes are skipped on decode.
+///
+/// Note the precise failure mode — the `AnyValue` message still *decodes* (its frame
+/// is present), leaving `value: Some(AnyValue { value: None })`, which would re-encode
+/// as `12 00`: a `KeyValue` carrying a valueless value. That is arguably malformed
+/// OTLP, so `inject_entity_guid` drops such attributes instead (see its `retain`).
+///
+/// Consequence: a resource attribute with a non-string value is **lost**. Metric data
+/// points (gauge/sum/histogram/summary) are unaffected — they round-trip bit-for-bit
+/// via `ScopeMetrics::metrics_raw`. Holding attributes as raw bytes the same way would
+/// close this gap; deferred as it needs a hand-written reader for the injection logic.
 #[derive(Clone, PartialEq, Message)]
 pub struct AnyValue {
     #[prost(oneof = "AnyValueKind", tags = "1")]
@@ -97,59 +111,26 @@ impl AnyValue {
     }
 }
 
-/// Extract the metric name (field 1, string) from a raw serialised `Metric` protobuf message.
-/// Used only for debug logging — the raw bytes are never decoded into a typed struct.
+/// Just the `name` field of `opentelemetry.proto.metrics.v1.Metric`, for reading a
+/// metric name out of the raw bytes held in [`ScopeMetrics::metrics_raw`].
 ///
-/// `len` and `end` come straight off the wire and are bounds-checked against `raw.len()`
-/// before use: a truncated or malformed payload must never panic here, since this runs
-/// inside a `debug!` log line in a process that must not crash the Lambda extension.
+/// Decode-only: undeclared fields are skipped, which is exactly what we want here
+/// because this value is never re-encoded — the original bytes are what get sent.
+#[derive(Clone, PartialEq, Message)]
+struct MetricName {
+    #[prost(string, tag = "1")]
+    name: String,
+}
+
+/// Metric name for debug logging. Malformed or truncated input yields a placeholder
+/// rather than panicking, since this runs inside a `debug!` in a process that must
+/// not crash the Lambda function.
 fn metric_name_from_raw(raw: &[u8]) -> String {
-    let mut pos = 0;
-    while pos < raw.len() {
-        // read tag varint
-        let mut tag_wire: u64 = 0;
-        let mut shift = 0u32;
-        loop {
-            if pos >= raw.len() { return "<truncated>".to_string(); }
-            let b = raw[pos]; pos += 1;
-            tag_wire |= u64::from(b & 0x7F) << shift;
-            shift += 7;
-            if b & 0x80 == 0 { break; }
-        }
-        let Ok(field) = u32::try_from(tag_wire >> 3) else { break };
-        let wire = (tag_wire & 0x7) as u32;
-        match wire {
-            2 => {
-                // read length-delimited
-                let mut len: u64 = 0;
-                let mut shift = 0u32;
-                loop {
-                    if pos >= raw.len() { return "<truncated>".to_string(); }
-                    let b = raw[pos]; pos += 1;
-                    len |= u64::from(b & 0x7F) << shift;
-                    shift += 7;
-                    if b & 0x80 == 0 { break; }
-                }
-                let Some(end) = len.try_into().ok().and_then(|len: usize| pos.checked_add(len)) else {
-                    return "<truncated>".to_string();
-                };
-                if end > raw.len() {
-                    return "<truncated>".to_string();
-                }
-                if field == 1 {
-                    return std::str::from_utf8(&raw[pos..end])
-                        .unwrap_or("<invalid utf8>")
-                        .to_string();
-                }
-                pos = end;
-            }
-            0 => { while pos < raw.len() { let b = raw[pos]; pos += 1; if b & 0x80 == 0 { break; } } }
-            1 => { pos += 8; }
-            5 => { pos += 4; }
-            _ => break,
-        }
+    match MetricName::decode(raw) {
+        Ok(m) if !m.name.is_empty() => m.name,
+        Ok(_) => "<unknown>".to_string(),
+        Err(_) => "<truncated>".to_string(),
     }
-    "<unknown>".to_string()
 }
 
 /// Error injecting `entity.guid` into an OTLP metrics payload.
@@ -159,6 +140,12 @@ pub enum InjectEntityGuidError {
     Decode(#[from] prost::DecodeError),
     #[error("failed to re-encode OTLP payload: {0}")]
     Encode(#[from] prost::EncodeError),
+    /// `entity_guid` was empty or whitespace. Connect guarantees the field is
+    /// *present* (`.context("Missing entity_guid…")?`) but not that it is non-empty,
+    /// and injecting an empty value would recreate exactly the empty placeholder the
+    /// logic below strips — yielding metrics no entity can be resolved from.
+    #[error("refusing to inject an empty entity.guid")]
+    EmptyEntityGuid,
 }
 
 /// Decode `bytes` as an `ExportMetricsServiceRequest`, add `entity.guid`
@@ -168,10 +155,27 @@ pub enum InjectEntityGuidError {
 /// All metric data (`scope_metrics`, data points, histograms, etc.) is
 /// preserved bit-for-bit because `ScopeMetrics.metrics_raw` holds raw bytes.
 pub fn inject_entity_guid(bytes: &[u8], entity_guid: &str) -> Result<Vec<u8>, InjectEntityGuidError> {
+    // Guarded here rather than at one call site so every caller is covered: writing an
+    // empty entity.guid back would strip a real placeholder and replace it with an
+    // identical empty one, leaving the metrics unattributable while appearing to succeed.
+    if entity_guid.trim().is_empty() {
+        return Err(InjectEntityGuidError::EmptyEntityGuid);
+    }
+
     let mut req = ExportMetricsServiceRequest::decode(bytes)?;
 
     for rm in &mut req.resource_metrics {
         let resource = rm.resource.get_or_insert_with(Resource::default);
+
+        // Drop attributes whose value did not survive decode. `AnyValue` here declares
+        // only `string_value`, so a bool/int/double/array/kvlist value decodes to a
+        // *present but empty* AnyValue and would re-encode as `12 00` — a KeyValue with
+        // a valueless value, i.e. malformed OTLP. Dropping the attribute is lossy but
+        // well-formed; emitting `12 00` is neither. Note the check is on the inner
+        // oneof, not `value.is_some()`: the AnyValue message itself IS present.
+        resource
+            .attributes
+            .retain(|kv| kv.value.as_ref().is_some_and(|v| v.value.is_some()));
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let service_name = resource.attributes.iter()
@@ -642,4 +646,93 @@ mod tests {
     fn metric_name_from_raw_handles_empty_input() {
         assert_eq!(metric_name_from_raw(&[]), "<unknown>");
     }
+
+    // -----------------------------------------------------------------------
+    // Review finding 3: empty entity_guid must not be injected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn empty_or_whitespace_entity_guid_is_rejected() {
+        // Connect guarantees entity_guid is present, not non-empty. Injecting "" would
+        // strip a placeholder and write back an identical one, so the payload would look
+        // enriched while being unattributable.
+        let payload = make_request(vec![("service.name", "svc")]);
+        for guid in ["", "   ", "\t\n"] {
+            let err = inject_entity_guid(&payload, guid)
+                .expect_err("empty/whitespace guid must be rejected");
+            assert!(
+                matches!(err, InjectEntityGuidError::EmptyEntityGuid),
+                "guid={guid:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_guid_guard_fires_before_any_mutation() {
+        // A payload already carrying a good guid must not be stripped by the rejected call.
+        let payload = make_request(vec![("entity.guid", "REAL-GUID-123")]);
+        assert!(inject_entity_guid(&payload, "").is_err());
+
+        let out = inject_entity_guid(&payload, "OTHER").expect("valid guid");
+        let decoded = ExportMetricsServiceRequest::decode(&out[..]).unwrap();
+        let attrs = &decoded.resource_metrics[0].resource.as_ref().unwrap().attributes;
+        let guid = attrs.iter().find(|kv| kv.key == "entity.guid")
+            .and_then(|kv| kv.value.as_ref())
+            .and_then(|v| match &v.value {
+                Some(AnyValueKind::StringValue(s)) => Some(s.as_str()),
+                _ => None,
+            });
+        assert_eq!(guid, Some("REAL-GUID-123"), "existing non-empty guid must win");
+    }
+
+    // -----------------------------------------------------------------------
+    // Review finding 2 (minimal form): a value that didn't survive decode must be
+    // dropped, not re-encoded as `12 00` (a KeyValue with a valueless value).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn non_string_attribute_is_dropped_not_emitted_as_empty_value() {
+        // Hand-build a bool attribute (AnyValue.bool_value = field 2, varint) — the
+        // mirrored AnyValue declares only string_value, so its inner oneof decodes to
+        // None while the AnyValue frame itself is present.
+        let mut bool_val = enc_varint(2 << 3); // field 2, wire 0
+        bool_val.extend(enc_varint(1));        // true
+        let bool_kv = [enc_str(1, "is_prod"), enc_len(2, &bool_val)].concat();
+        let str_kv = [enc_str(1, "service.name"), enc_len(2, &enc_len(1, b"svc"))].concat();
+
+        let attrs: Vec<u8> = [enc_len(1, &bool_kv), enc_len(1, &str_kv)].concat();
+        let rm = enc_len(1, &attrs);
+        let payload = enc_len(1, &rm);
+
+        // Sanity: decoding leaves the value present-but-empty (the shape that would
+        // otherwise re-encode as the malformed `12 00`).
+        let pre = ExportMetricsServiceRequest::decode(&payload[..]).unwrap();
+        let pre_attrs = &pre.resource_metrics[0].resource.as_ref().unwrap().attributes;
+        let pre_bool = pre_attrs.iter().find(|kv| kv.key == "is_prod").unwrap();
+        assert!(pre_bool.value.is_some(), "AnyValue frame decodes as present");
+        assert!(
+            pre_bool.value.as_ref().unwrap().value.is_none(),
+            "but its inner oneof is None - this is what the retain() guard catches"
+        );
+
+        let out = inject_entity_guid(&payload, "GUID").expect("must inject");
+
+        // `12 00` (field 2, length 0) must not appear anywhere in the output.
+        assert!(
+            !out.windows(2).any(|w| w == [0x12, 0x00]),
+            "malformed empty value re-encoded; out={out:02x?}"
+        );
+
+        let decoded = ExportMetricsServiceRequest::decode(&out[..]).unwrap();
+        let attrs = &decoded.resource_metrics[0].resource.as_ref().unwrap().attributes;
+        assert!(
+            !attrs.iter().any(|kv| kv.key == "is_prod"),
+            "non-string attribute must be dropped, not emitted valueless"
+        );
+        // Well-formed neighbours and the injection are unaffected.
+        assert!(attrs.iter().any(|kv| kv.key == "service.name"));
+        assert!(attrs.iter().any(|kv| kv.key == "entity.guid"));
+    }
+
+
 }

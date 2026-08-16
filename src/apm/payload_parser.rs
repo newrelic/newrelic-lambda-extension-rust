@@ -292,4 +292,70 @@ mod tests {
 
         assert!(!data_map.contains_key("otlp_payload"));
     }
+
+    #[test]
+    fn test_otlp_payload_multi_element_array_keeps_every_entry_in_order() {
+        // The agent may batch several OTLP requests into one array. Every element
+        // must survive parsing (not just the first) and keep its original order,
+        // since send_otlp_payload numbers them 1..N for log correlation.
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["first", "second", "third", "fourth"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map
+            .get("otlp_payload")
+            .expect("otlp_payload key missing");
+        assert_eq!(
+            entries,
+            &vec![
+                Value::String("first".to_string()),
+                Value::String("second".to_string()),
+                Value::String("third".to_string()),
+                Value::String("fourth".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_otlp_payload_non_string_elements_are_skipped_not_fatal() {
+        // get_string_array filters on as_str(), so a malformed element is dropped
+        // rather than poisoning the whole batch. Assert that explicitly so the
+        // lenient behaviour is intentional and not an accident of refactoring.
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["good1", 42, null, {"a":1}, ["nested"], "good2"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map
+            .get("otlp_payload")
+            .expect("otlp_payload key missing");
+        assert_eq!(
+            entries,
+            &vec![
+                Value::String("good1".to_string()),
+                Value::String("good2".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_otlp_payload_empty_array_yields_no_map_entry() {
+        // An empty array must behave like an absent key so app.rs takes its
+        // "no otlp_payload found" branch rather than spawning a no-op send.
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": []}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
+    }
+
+    #[test]
+    fn test_otlp_payload_scalar_string_not_wrapped_is_ignored() {
+        // Defensive: a bare string (not an array) does not match Value::Array,
+        // so it yields nothing. Documents the shape contract with the agent.
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": "bare"}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
+    }
 }
