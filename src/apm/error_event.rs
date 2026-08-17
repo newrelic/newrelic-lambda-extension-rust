@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Error event generation for platform faults and timeouts
 //!
 //! Based on error_event.go from Go implementation

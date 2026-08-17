@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! New Relic Lambda Extension Credentials Module
 //! 
 //! This module provides functionality to fetch the New Relic license key from:
@@ -12,8 +15,81 @@ use aws_sdk_secretsmanager::Client as SecretsManagerClient;
 use aws_sdk_ssm::Client as SsmClient;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use crate::config::Configuration;
+
+pub(crate) const SYSTEM_BUNDLE_PATHS: &[&str] = &[
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+];
+
+pub(crate) const MERGED_BUNDLE_PATH: &str = "/tmp/nr_ca_bundle.pem";
+
+/// If `SSL_CERT_FILE` is set, merge the system CA bundle with its contents and
+/// point `SSL_CERT_FILE` at the merged file so all TLS clients (including the
+/// AWS SDK) trust both AWS root CAs and the custom proxy CA.
+pub(crate) fn merge_ca_bundle_if_needed() {
+    let custom_path = match std::env::var("SSL_CERT_FILE") {
+        Ok(v) if !v.is_empty() => v,
+        _ => return,
+    };
+
+    // Idempotency: already merged on a previous call
+    if custom_path == MERGED_BUNDLE_PATH {
+        return;
+    }
+
+    let system_bundle = SYSTEM_BUNDLE_PATHS.iter().find_map(|p| std::fs::read(p).ok());
+    let system_bundle = match system_bundle {
+        Some(b) => b,
+        None => {
+            warn!("SSL_CERT_FILE is set but no system CA bundle found; unsetting SSL_CERT_FILE so AWS SDK uses default resolver");
+            std::env::remove_var("SSL_CERT_FILE");
+            return;
+        }
+    };
+
+    let custom_certs = match std::fs::read(&custom_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("SSL_CERT_FILE='{}' could not be read: {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", custom_path, e);
+            std::env::remove_var("SSL_CERT_FILE");
+            return;
+        }
+    };
+
+    if !custom_certs.windows(27).any(|w| w == b"-----BEGIN CERTIFICATE-----") {
+        warn!("SSL_CERT_FILE='{}' doesn't look like PEM — skipping merge", custom_path);
+        std::env::remove_var("SSL_CERT_FILE");
+        return;
+    }
+
+    let mut merged = system_bundle;
+    merged.extend_from_slice(b"\n\n");
+    merged.extend_from_slice(&custom_certs);
+
+    let tmp_path = format!("{}.tmp", MERGED_BUNDLE_PATH);
+    match std::fs::write(&tmp_path, &merged) {
+        Ok(()) => match std::fs::rename(&tmp_path, MERGED_BUNDLE_PATH) {
+            Ok(()) => {
+                std::env::set_var("SSL_CERT_FILE", MERGED_BUNDLE_PATH);
+                info!("SSL_CERT_FILE: merged system CA bundle with '{}' into '{}'", custom_path, MERGED_BUNDLE_PATH);
+            }
+            Err(e) => {
+                warn!("Failed to rename temp CA bundle to '{}': {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", MERGED_BUNDLE_PATH, e);
+                let _ = std::fs::remove_file(&tmp_path);
+                std::env::remove_var("SSL_CERT_FILE");
+            }
+        },
+        Err(e) => {
+            warn!("Failed to write merged CA bundle to '{}': {}; unsetting SSL_CERT_FILE so AWS SDK uses system CAs", tmp_path, e);
+            std::env::remove_var("SSL_CERT_FILE");
+        }
+    }
+}
 
 /// License key secret structure for JSON parsing
 #[derive(Debug, Serialize, Deserialize)]
@@ -114,7 +190,9 @@ async fn initialize_aws_clients() -> Result<()> {
     if std::env::var("AWS_LAMBDA_RUNTIME_API").is_err() {
         return Err(anyhow!("Not in AWS Lambda environment, skipping AWS client initialization"));
     }
-    
+
+    merge_ca_bundle_if_needed();
+
     let config_future = tokio::spawn(async {
         aws_config::defaults(BehaviorVersion::latest())
             .retry_config(aws_config::retry::RetryConfig::disabled())

@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Platform metrics conversion for APM mode
 //!
 //! Converts AWS Lambda platform REPORT logs to New Relic APM metrics
@@ -93,14 +96,18 @@ pub fn convert_to_apm_metrics(
     metrics: &LambdaMetrics,
     entity_guid: &str,
     function_name: &str,
+    function_arn: &str,
 ) -> Vec<Value> {
     let timestamp = chrono::Utc::now().timestamp_millis();
-    
+
     let mut common_attrs = serde_json::Map::new();
     common_attrs.insert("aws.requestId".to_string(), json!(metrics.request_id));
     common_attrs.insert("entity.guid".to_string(), json!(entity_guid));
     common_attrs.insert("entity.name".to_string(), json!(function_name));
     common_attrs.insert("entity.type".to_string(), json!("APM"));
+    if !function_arn.is_empty() {
+        common_attrs.insert("aws.lambda.arn".to_string(), json!(function_arn));
+    }
 
     let mut apm_metrics = Vec::new();
 
@@ -222,7 +229,7 @@ mod tests {
             error_type: None,
         };
 
-        let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid-123", "my-function");
+        let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid-123", "my-function", "arn:aws:lambda:us-east-1:123456789012:function:my-function");
 
         assert_eq!(apm_metrics.len(), 5);
 

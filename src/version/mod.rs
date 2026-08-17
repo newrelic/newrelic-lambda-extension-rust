@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Version detection module for agent, extension, and layer versions
 
 mod aws_layer;
@@ -17,6 +20,13 @@ static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
 
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Single source of truth for the outbound `User-Agent` advertised to the
+/// New Relic APM collector (PreConnect/Connect handshake and telemetry sends).
+/// Always tracks the crate version from Cargo.toml — never hardcode it.
+pub fn user_agent() -> String {
+    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
+}
 
 /// Agent paths for different runtimes (layer installations)
 const LAYER_AGENT_PATH_NODE: &[&str] = &["/opt/nodejs/node_modules/newrelic"];
@@ -657,5 +667,14 @@ mod tests {
 
         let tags = version_info.as_tags();
         assert!(tags.len() >= 2);
+    }
+
+    #[test]
+    fn user_agent_tracks_cargo_version() {
+        let ua = user_agent();
+        // Must carry the real crate version, never the old hardcoded placeholder.
+        assert_eq!(ua, format!("NewRelic-Rust-Lambda-Extension/{}", env!("CARGO_PKG_VERSION")));
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+        assert_ne!(ua, "NewRelic-Rust-Lambda-Extension/0.1.0");
     }
 }

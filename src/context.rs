@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The context module holds shared state for the duration of an invocation.
 
 /// Holds state for a specific invocation

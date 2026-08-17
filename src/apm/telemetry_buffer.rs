@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Buffer for failed telemetry in APM mode
 //!
 //! Stores individual telemetry types that fail to send to the APM collector
@@ -8,6 +11,16 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, warn};
+
+/// Sentinel telemetry type for *synthesized* error events (timeout/fault errors).
+/// These use the `send_error_events` wire format (`[run_id, {meta}, [events]]`),
+/// which differs from agent-originated `error_event_data` that flows through
+/// `send_apm_telemetry`. Routed specially in the retry loop.
+pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
+
+/// Hard cap on buffered telemetry items to bound memory during a sustained
+/// collector failure on a high-traffic function. When full, the oldest is evicted.
+const MAX_BUFFERED_ITEMS: usize = 500;
 
 /// Failed telemetry data that needs to be retried
 #[derive(Debug, Clone)]
@@ -44,6 +57,11 @@ pub fn buffer_failed_telemetry(
     };
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+        // Bound memory: evict oldest if at capacity (prefer keeping fresher telemetry).
+        if buffer.len() >= MAX_BUFFERED_ITEMS {
+            buffer.remove(0);
+            warn!("Telemetry buffer full ({}) - evicted oldest item", MAX_BUFFERED_ITEMS);
+        }
         buffer.push(failed_telemetry);
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
@@ -56,10 +74,19 @@ pub fn buffer_failed_telemetry(
     }
 }
 
-/// Retry all buffered telemetry
+/// Retry all buffered telemetry.
+///
+/// `current_run_id`/`current_collector_host`, when supplied, OVERRIDE the values
+/// captured when the item was buffered. This is essential after a reconnect: the
+/// buffered `run_id` is stale (the collector expired it / issued a restart), so
+/// retrying with it would fail forever. Passing the live session's identifiers
+/// lets buffered items succeed against the fresh connection. When `None` (e.g.
+/// not connected), the stored values are used as a best-effort fallback.
 pub async fn retry_buffered_telemetry(
     client: &reqwest::Client,
     license_key: &str,
+    current_run_id: Option<&str>,
+    current_collector_host: Option<&str>,
 ) {
     let failed_telemetry = {
         if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
@@ -84,8 +111,6 @@ pub async fn retry_buffered_telemetry(
     let mut retry_failed_count = 0;
 
     for mut item in failed_telemetry {
-        item.retry_count += 1;
-
         // Check age - drop if older than 1 hour (Lambda container lifecycle is short)
         let age = Utc::now().signed_duration_since(item.failed_at);
         if age.num_minutes() > 60 {
@@ -100,16 +125,19 @@ pub async fn retry_buffered_telemetry(
 
         debug!(
             "Retrying {} for request {} (attempt {})",
-            item.telemetry_type, item.request_id, item.retry_count
+            item.telemetry_type, item.request_id, item.retry_count + 1
         );
 
-        // Retry sending
-        let result = if item.telemetry_type == "error_event_data" {
+        let run_id = current_run_id.unwrap_or(item.run_id.as_str());
+        let collector_host = current_collector_host.unwrap_or(item.collector_host.as_str());
+
+        // Synthesized error events use a different wire format and send function.
+        let result = if item.telemetry_type == SYNTHESIZED_ERROR_EVENTS {
             super::collector::send_error_events(
                 client,
                 license_key,
-                &item.collector_host,
-                &item.run_id,
+                collector_host,
+                run_id,
                 &item.data,
             )
             .await
@@ -118,21 +146,22 @@ pub async fn retry_buffered_telemetry(
                 "metric_data" => super::collector::CMD_METRICS,
                 "span_event_data" => super::collector::CMD_SPAN_EVENTS,
                 "error_data" => super::collector::CMD_ERROR_DATA,
+                "error_event_data" => super::collector::CMD_ERROR_EVENTS,
                 "analytic_event_data" => super::collector::CMD_ANALYTIC_EVENTS,
                 "custom_event_data" => super::collector::CMD_CUSTOM_EVENTS,
                 "log_event_data" => super::collector::CMD_LOG_EVENTS,
                 "transaction_sample_data" => super::collector::CMD_TRANSACTION_SAMPLES,
+                "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
                 _ => {
                     warn!("Unknown telemetry type: {}", item.telemetry_type);
                     continue;
                 }
             };
-
             super::collector::send_apm_telemetry(
                 client,
                 license_key,
-                &item.collector_host,
-                &item.run_id,
+                collector_host,
+                run_id,
                 command,
                 &item.data,
             )
@@ -154,16 +183,32 @@ pub async fn retry_buffered_telemetry(
                     item.telemetry_type, item.request_id, e
                 );
 
-                // Put back in buffer for next retry (unless too many attempts)
-                if item.retry_count < 10 {
+                // 409/401: session expired — not a data error. Don't consume a retry slot;
+                // the item will succeed once the session is re-established.
+                let is_restart = e
+                    .downcast_ref::<super::collector::CollectorError>()
+                    .map(|ce| matches!(ce, super::collector::CollectorError::RestartException))
+                    .unwrap_or(false);
+
+                if is_restart {
                     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+                        if buffer.len() >= MAX_BUFFERED_ITEMS {
+                            buffer.remove(0);
+                        }
                         buffer.push(item);
                     }
                 } else {
-                    error!(
-                        "Dropping {} after {} retry attempts for request {}",
-                        item.telemetry_type, item.retry_count, item.request_id
-                    );
+                    item.retry_count += 1;
+                    if item.retry_count < 10 {
+                        if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+                            buffer.push(item);
+                        }
+                    } else {
+                        error!(
+                            "Dropping {} after {} retry attempts for request {}",
+                            item.telemetry_type, item.retry_count, item.request_id
+                        );
+                    }
                 }
             }
         }
@@ -183,4 +228,193 @@ pub fn get_buffer_count() -> usize {
         .lock()
         .map(|buffer| buffer.len())
         .unwrap_or(0)
+}
+
+/// Distinct request_ids that still have un-sent buffered telemetry. Used by the
+/// shutdown summary to report how many invocations' data was dropped.
+pub fn buffered_request_ids() -> Vec<String> {
+    let mut ids: Vec<String> = FAILED_TELEMETRY_BUFFER
+        .lock()
+        .map(|buffer| buffer.iter().map(|item| item.request_id.clone()).collect())
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+#[cfg(test)]
+mod telemetry_buffer_tests {
+    use super::*;
+    use crate::apm::collector::CollectorError;
+    use serde_json::json;
+    use serial_test::serial;
+
+    fn clear() {
+        if let Ok(mut b) = FAILED_TELEMETRY_BUFFER.lock() {
+            b.clear();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn buffers_and_counts() {
+        clear();
+        buffer_failed_telemetry(
+            "metric_data".into(),
+            vec![json!(null), json!({"m": 1})],
+            "req".into(),
+            "run".into(),
+            "host".into(),
+        );
+        assert_eq!(get_buffer_count(), 1);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn buffered_request_ids_are_distinct_and_sorted() {
+        clear();
+        // Two items for req-b, one for req-a → distinct {req-a, req-b}.
+        for (id, ty) in [("req-b", "metric_data"), ("req-a", "span_event_data"), ("req-b", "log_event_data")] {
+            buffer_failed_telemetry(ty.into(), vec![json!({})], id.into(), "run".into(), "host".into());
+        }
+        assert_eq!(buffered_request_ids(), vec!["req-a".to_string(), "req-b".to_string()]);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn caps_buffer_size_by_evicting_oldest() {
+        clear();
+        for _ in 0..(MAX_BUFFERED_ITEMS + 25) {
+            buffer_failed_telemetry(
+                "metric_data".into(),
+                vec![json!(null)],
+                "req".into(),
+                "run".into(),
+                "host".into(),
+            );
+        }
+        assert_eq!(get_buffer_count(), MAX_BUFFERED_ITEMS, "must never exceed cap");
+        clear();
+    }
+
+    #[test]
+    fn synthesized_error_sentinel_is_distinct() {
+        // Must not collide with agent-originated error_event_data, which routes
+        // through send_apm_telemetry with a different wire format.
+        assert_ne!(SYNTHESIZED_ERROR_EVENTS, "error_event_data");
+    }
+
+    fn make_item() -> FailedTelemetry {
+        FailedTelemetry {
+            telemetry_type: "metric_data".into(),
+            data: vec![],
+            request_id: "req-1".into(),
+            run_id: "run-1".into(),
+            collector_host: "host".into(),
+            failed_at: chrono::Utc::now(),
+            retry_count: 0,
+        }
+    }
+
+    // Mirrors the retry-slot decision in retry_buffered_telemetry's Err branch.
+    fn apply_retry_decision(mut item: FailedTelemetry, err: &anyhow::Error) -> Option<FailedTelemetry> {
+        let is_restart = err
+            .downcast_ref::<CollectorError>()
+            .map(|ce| matches!(ce, CollectorError::RestartException))
+            .unwrap_or(false);
+        if is_restart {
+            Some(item)
+        } else {
+            item.retry_count += 1;
+            if item.retry_count < 10 { Some(item) } else { None }
+        }
+    }
+
+    #[test]
+    fn restart_exception_never_hits_retry_cap() {
+        let err = anyhow::Error::new(CollectorError::RestartException);
+        let mut item = make_item();
+        for _ in 0..15 {
+            item = apply_retry_decision(item, &err)
+                .expect("RestartException must never drop the item");
+        }
+        assert_eq!(item.retry_count, 0, "retry_count must stay 0 — no slot consumed on 409/401");
+    }
+
+    #[test]
+    fn generic_error_drops_after_ten_retries() {
+        let err = anyhow::anyhow!("connection refused");
+        let mut item = make_item();
+        for attempt in 1..=9 {
+            item = apply_retry_decision(item, &err)
+                .unwrap_or_else(|| panic!("item must survive attempt {}", attempt));
+            assert_eq!(item.retry_count, attempt);
+        }
+        assert!(
+            apply_retry_decision(item, &err).is_none(),
+            "item must be dropped after 10 attempts"
+        );
+    }
+
+    #[test]
+    fn restart_exception_is_detected_by_downcast() {
+        let e = anyhow::Error::new(CollectorError::RestartException)
+            .context("Collector returned 409 for metric_data");
+        let is_restart = e
+            .downcast_ref::<CollectorError>()
+            .map(|ce| matches!(ce, CollectorError::RestartException))
+            .unwrap_or(false);
+        assert!(is_restart);
+    }
+
+    #[test]
+    fn non_collector_error_is_not_detected_as_restart() {
+        let e = anyhow::anyhow!("connection refused");
+        let is_restart = e
+            .downcast_ref::<CollectorError>()
+            .map(|ce| matches!(ce, CollectorError::RestartException))
+            .unwrap_or(false);
+        assert!(!is_restart);
+    }
+
+    #[test]
+    #[serial]
+    fn restart_rebuffer_respects_cap() {
+        clear();
+        // Fill buffer to exactly the cap via the normal path.
+        for i in 0..MAX_BUFFERED_ITEMS {
+            buffer_failed_telemetry(
+                "metric_data".into(),
+                vec![json!({"seq": i})],
+                format!("req-{}", i),
+                "run".into(),
+                "host".into(),
+            );
+        }
+        assert_eq!(get_buffer_count(), MAX_BUFFERED_ITEMS);
+
+        // Simulate apply_retry_decision with RestartException — mirrors the
+        // is_restart re-buffer branch in retry_buffered_telemetry.
+        let err = anyhow::Error::new(CollectorError::RestartException);
+        let item = make_item();
+        let result = apply_retry_decision(item, &err);
+        assert!(result.is_some(), "RestartException must not drop the item");
+
+        // Manually push through the production re-buffer path to verify the cap.
+        if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+            if buffer.len() >= MAX_BUFFERED_ITEMS {
+                buffer.remove(0);
+            }
+            buffer.push(result.unwrap());
+        }
+
+        assert_eq!(
+            get_buffer_count(),
+            MAX_BUFFERED_ITEMS,
+            "buffer must not exceed cap after re-buffering a RestartException item"
+        );
+        clear();
+    }
 }

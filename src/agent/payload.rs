@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent payload formatting and sending utilities
 //!
 //! This module handles:
@@ -75,10 +78,9 @@ pub async fn send_agent_payload_to_newrelic(
     config: &Arc<ExtensionConfig>,
     version_info: Option<&Arc<version::VersionInfo>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Use robust ARN parsing with validation and fallback
+    // ARN fallback is handled by extract_function_name_from_arn → config.aws.function_name
     let function_name = extract_function_name_from_arn(invoked_function_arn, &config.aws.function_name);
-    
-    // Defensive logging for debugging
+
     debug!(
         "Agent payload context: request_id='{}', invoked_function_arn='{}', extracted_function_name='{}'",
         request_id,

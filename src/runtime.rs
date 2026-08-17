@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! AWS Lambda Extensions API integration
 //! Handles extension registration, telemetry subscription, and event polling
 
@@ -57,6 +60,11 @@ pub enum LambdaRuntimeEvent {
         request_id: String,
         #[serde(rename(deserialize = "invokedFunctionArn"))]
         invoked_function_arn: String,
+        /// Epoch milliseconds at which the function will time out. Used by the event
+        /// loop as the upper bound when waiting for platform.runtimeDone so the wait
+        /// can never outlive the function's own timeout.
+        #[serde(rename(deserialize = "deadlineMs"), default)]
+        deadline_ms: i64,
     },
     #[serde(rename(deserialize = "SHUTDOWN"))]
     Shutdown {

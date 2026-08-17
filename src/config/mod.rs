@@ -1,3 +1,8 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};
 use tracing_subscriber::{
@@ -5,6 +10,13 @@ use tracing_subscriber::{
     registry::LookupSpan,
     EnvFilter,
 };
+
+/// Default per-invocation cap on logs parked while waiting for the trace.id.
+const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
+/// Lower/upper clamp for `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` to avoid 0 (drop
+/// everything) and pathological values that could exhaust sandbox memory.
+const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
+const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
@@ -27,11 +39,24 @@ pub struct NewRelicConfig {
     #[allow(dead_code)]
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
+    /// Max number of logs parked per invocation while waiting for the agent
+    /// payload (the `trace.id` source) to arrive. Only used when
+    /// `collect_trace_id` is true. Configurable via
+    /// `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` (default 2000). On overflow, logs are
+    /// sent without `trace.id` (we cannot stamp a trace we don't yet have).
+    pub trace_id_log_buffer_max: usize,
     pub add_version_detail_tags: bool,
     pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
+    pub apm_blocking_handshake: bool,
+    pub apm_handshake_timeout_secs: u64,
+    /// Telemetry types the customer has opted to drop (APM mode only) via
+    /// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Excluded types are neither sent nor
+    /// buffered. See `crate::apm::collector::KNOWN_TELEMETRY_TYPES`.
+    pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
+    pub proxy_url: Option<String>,
 }
 
 /// AWS Lambda specific configuration
@@ -55,6 +80,17 @@ pub struct ExtensionSettings {
     /// Default: true (logs enabled)
     /// If false, suppresses all [NR_EXT] prefixed logs from appearing in CloudWatch
     pub extension_logs_enabled: bool,
+    /// NEW_RELIC_RUNTIME_DONE_GRACE_MS — grace period (ms) added AFTER
+    /// `platform.runtimeDone` before the end-of-invocation flush, only when
+    /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
+    /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
+    pub runtime_done_grace_ms: u64,
+    /// NEW_RELIC_EXTENSION_PIPELINE_FLUSH — when true, the extension calls
+    /// GET /next immediately after runtimeDone and flushes telemetry in the
+    /// background during the freeze/thaw gap. Reduces billed duration but
+    /// may lose data on final shutdown if flush doesn't complete in time.
+    /// Default: false (safe mode — flush completes before GET /next).
+    pub pipeline_flush: bool,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -97,11 +133,16 @@ impl Default for NewRelicConfig {
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
             harvest_interval: Duration::from_secs(2),
             collect_trace_id: false,
+            trace_id_log_buffer_max: DEFAULT_TRACE_ID_LOG_BUFFER_MAX,
             add_version_detail_tags: false,
             layer_version: None,
             apm_lambda_mode: false,
+            apm_blocking_handshake: false,
+            apm_handshake_timeout_secs: 5,
+            apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            proxy_url: None,
         }
     }
 }
@@ -182,8 +223,40 @@ impl Default for ExtensionSettings {
             send_platform_logs: false,
             log_level: "info".to_string(),
             extension_logs_enabled: true,
+            runtime_done_grace_ms: 25,
+            pipeline_flush: false,
         }
     }
+}
+
+/// Parse `NEW_RELIC_APM_DISABLE_TELEMETRY` into a set of telemetry types to drop.
+///
+/// Comma-separated, case-insensitive, whitespace-trimmed. Only the canonical
+/// types in [`crate::apm::collector::KNOWN_TELEMETRY_TYPES`] are accepted;
+/// unknown tokens are warned about and ignored (fail-soft).
+pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if crate::apm::collector::KNOWN_TELEMETRY_TYPES.contains(&t.as_str()) {
+            set.insert(t);
+        } else {
+            warn!(
+                "NEW_RELIC_APM_DISABLE_TELEMETRY: ignoring unknown telemetry type '{}' (valid: {})",
+                t,
+                crate::apm::collector::KNOWN_TELEMETRY_TYPES.join(", ")
+            );
+        }
+    }
+    if !set.is_empty() {
+        let mut types: Vec<&str> = set.iter().map(String::as_str).collect();
+        types.sort_unstable();
+        debug!("APM telemetry disabled for types: {}", types.join(", "));
+    }
+    set
 }
 
 impl ExtensionConfig {
@@ -199,10 +272,37 @@ impl ExtensionConfig {
         }
     }
 
+    /// Parse "NEW_RELIC_EXTENSION_SEND_LOGS" environment variable
+    /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
+    fn parse_send_logs(value: &str) -> (bool, bool, bool) {
+        let normalized = value.to_lowercase();
+        let parts: Vec<&str> = normalized.split(',').map(|s| s.trim()).collect();
+        
+        // NEW: Check for empty string
+        if normalized.is_empty() {
+            eprintln!("NEW_RELIC_EXTENSION_SEND_LOGS is empty. No logs will be sent");
+            return (false, false, false);
+        }
+        // Check for "all" first
+        if parts.contains(&"all") {
+           if parts.len() > 1 {
+                eprintln!("[NR_EXT] INFO: 'all' specified in SEND_LOGS;defaulting to 'all'");
+            }
+            return (true, true, true);
+        }
+        
+        let send_function = parts.contains(&"function");
+        let send_extension = parts.contains(&"extension");
+        let send_platform = parts.contains(&"platform");
+        
+        (send_function, send_extension, send_platform)
+    }
+
     pub fn from_env() -> Self {
         let send_function_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS").unwrap_or_default();
         let send_extension_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS").unwrap_or_default();
         let send_platform_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS").unwrap_or_default();
+        let send_logs_str = env::var("NEW_RELIC_EXTENSION_SEND_LOGS").unwrap_or_default();
 
         let mut config = Self::default();
 
@@ -223,6 +323,16 @@ impl ExtensionConfig {
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
+        // Per-invocation parking cap for trace.id buffering. Only meaningful when
+        // collect_trace_id is on; clamped to a sane range so a typo can't drop all
+        // logs (0) or exhaust memory.
+        config.new_relic.trace_id_log_buffer_max = env::var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(DEFAULT_TRACE_ID_LOG_BUFFER_MAX, |n| {
+                n.clamp(MIN_TRACE_ID_LOG_BUFFER_MAX, MAX_TRACE_ID_LOG_BUFFER_MAX)
+            });
+
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
@@ -231,21 +341,72 @@ impl ExtensionConfig {
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
+        let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
+        config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);
+
+        config.new_relic.apm_handshake_timeout_secs = env::var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
+
+        // Comma-separated telemetry types the customer wants dropped (APM mode).
+        config.new_relic.apm_disabled_telemetry =
+            parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
+
+        config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
+            .ok()
+            .filter(|s| !s.is_empty());
+
+        if let Some(ref url) = config.new_relic.proxy_url {
+            // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
+            // Mask credentials: http://user:pass@host -> http://***:***@host
+            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
+                format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
+            } else {
+                url.clone()
+            };
+            eprintln!("[NR_EXT] INFO Proxy enabled: {masked}");
+        }
+
         if let Ok(runtime_api) = env::var("AWS_LAMBDA_RUNTIME_API") {
             config.aws.runtime_api = runtime_api;
         }
 
         // Note: function_name is set from extension registration response, not from env var
 
-        config.extension.send_function_logs = parse_bool(&send_function_logs_str);
-        config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
-        config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
+        // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
+        if !send_logs_str.is_empty() {
+            let (function, extension, platform) = Self::parse_send_logs(&send_logs_str);
+            config.extension.send_function_logs = function;
+            config.extension.send_extension_logs = extension;
+            config.extension.send_platform_logs = platform;
+        } else {
+            // Fall back to individual environment variables for backward compatibility
+            config.extension.send_function_logs = parse_bool(&send_function_logs_str);
+            config.extension.send_extension_logs = parse_bool(&send_extension_logs_str);
+            config.extension.send_platform_logs = parse_bool(&send_platform_logs_str);
+        }
 
         let raw_log_level = env::var("NEW_RELIC_EXTENSION_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         config.extension.log_level = Self::validate_log_level(&raw_log_level);
 
         let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
+
+        // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
+        // Default 25 ms — matches the Telemetry API buffer flush window.
+        config.extension.runtime_done_grace_ms = env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(25)
+            .min(2000);
+
+        // NEW_RELIC_EXTENSION_PIPELINE_FLUSH: opt-in to pipeline GET /next pattern.
+        // When enabled, the extension calls GET /next immediately after runtimeDone
+        // and flushes telemetry in the background, reducing billed duration.
+        let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
+        config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
 
         config
     }
@@ -325,6 +486,15 @@ pub fn parse_nr_tags() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Cached NR_TAGS parsed once at cold start. Use `get_nr_tags()` to access.
+static NR_TAGS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Returns cached NR_TAGS, parsing from environment only on first call (cold start).
+/// Subsequent warm-start invocations reuse the cached result with zero allocation.
+pub fn get_nr_tags() -> &'static [(String, String)] {
+    NR_TAGS_CACHE.get_or_init(parse_nr_tags)
+}
+
 /// Global configuration instance
 static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
 static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
@@ -381,158 +551,4 @@ pub fn init_config() -> &'static ExtensionConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_nr_tags_with_default_delimiter() {
-        // Save and clear environment
-        let original_tags = env::var("NR_TAGS").ok();
-        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
-        
-        env::set_var("NR_TAGS", "env:prod;team:backend;region:us-east-1");
-        env::remove_var("NR_ENV_DELIMITER");
-        
-        let tags = parse_nr_tags();
-        
-        assert_eq!(tags.len(), 3);
-        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
-        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
-        assert!(tags.contains(&("region".to_string(), "us-east-1".to_string())));
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-        if let Some(val) = original_delimiter {
-            env::set_var("NR_ENV_DELIMITER", val);
-        } else {
-            env::remove_var("NR_ENV_DELIMITER");
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_with_custom_delimiter() {
-        let original_tags = env::var("NR_TAGS").ok();
-        let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
-        
-        env::set_var("NR_TAGS", "env:prod|team:backend");
-        env::set_var("NR_ENV_DELIMITER", "|");
-        
-        let tags = parse_nr_tags();
-        
-        assert_eq!(tags.len(), 2);
-        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
-        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-        if let Some(val) = original_delimiter {
-            env::set_var("NR_ENV_DELIMITER", val);
-        } else {
-            env::remove_var("NR_ENV_DELIMITER");
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_with_whitespace() {
-        let original_tags = env::var("NR_TAGS").ok();
-        
-        env::set_var("NR_TAGS", " env : prod ; team : backend ");
-        
-        let tags = parse_nr_tags();
-        
-        assert_eq!(tags.len(), 2);
-        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
-        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_invalid_format() {
-        let original_tags = env::var("NR_TAGS").ok();
-        
-        // Test invalid formats - should be skipped
-        env::set_var("NR_TAGS", "invalid;env:prod;also-invalid;team:backend");
-        
-        let tags = parse_nr_tags();
-        
-        assert_eq!(tags.len(), 2);
-        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
-        assert!(tags.contains(&("team".to_string(), "backend".to_string())));
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_empty_values() {
-        let original_tags = env::var("NR_TAGS").ok();
-        
-        // Test empty keys/values - should be skipped
-        env::set_var("NR_TAGS", ":value;key:;env:prod");
-        
-        let tags = parse_nr_tags();
-        
-        assert_eq!(tags.len(), 1);
-        assert!(tags.contains(&("env".to_string(), "prod".to_string())));
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_not_set() {
-        let original_tags = env::var("NR_TAGS").ok();
-        
-        env::remove_var("NR_TAGS");
-        
-        let tags = parse_nr_tags();
-        
-        assert!(tags.is_empty());
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        }
-    }
-
-    #[test]
-    fn test_parse_nr_tags_empty_string() {
-        let original_tags = env::var("NR_TAGS").ok();
-        
-        env::set_var("NR_TAGS", "");
-        
-        let tags = parse_nr_tags();
-        
-        assert!(tags.is_empty());
-        
-        // Restore environment
-        if let Some(val) = original_tags {
-            env::set_var("NR_TAGS", val);
-        } else {
-            env::remove_var("NR_TAGS");
-        }
-    }
-}
-
+mod mod_test;

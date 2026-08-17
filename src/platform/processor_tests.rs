@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 mod tests {
     use crate::platform::processor::normalize_platform_runtime_version;

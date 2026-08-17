@@ -1,0 +1,134 @@
+name: Prepare Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump type"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  prepare:
+    name: Bump version and open release PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      # ── Compute new version ─────────────────────────────────────────────────
+
+      - name: Compute new version
+        id: version
+        run: |
+          CURRENT=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+          MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT" | cut -d. -f3)
+
+          case "${{ github.event.inputs.bump }}" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "new=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "branch=release/v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Bumping $CURRENT → $NEW_VERSION (${{ github.event.inputs.bump }})"
+
+      # ── Update files ────────────────────────────────────────────────────────
+
+      - name: Update version in Cargo.toml
+        run: |
+          sed -i "0,/^version = \"${{ steps.version.outputs.current }}\"/s//version = \"${{ steps.version.outputs.new }}\"/" Cargo.toml
+
+      - name: Update Cargo.lock
+        run: cargo update --workspace
+
+      # ── Regenerate third-party attribution ───────────────────────────────────
+
+      - name: Install cargo-about
+        run: cargo install --locked cargo-about --features cli
+
+      - name: Regenerate THIRD_PARTY_NOTICES.md
+        # Pins every direct + transitive dependency to its Cargo.lock version.
+        # Fails if a dependency carries a license not allowlisted in about.toml.
+        run: bash scripts/generate-third-party-notices.sh
+
+      # ── Generate changelog ──────────────────────────────────────────────────
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1)
+          echo "Generating changelog since ${PREV_TAG}"
+
+          FEATURES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- feat(\(.+\))?:" | sed -E 's/^- feat(\([^)]*\))?: /- /' || true)
+          FIXES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- fix(\(.+\))?:" | sed -E 's/^- fix(\([^)]*\))?: /- /' || true)
+          CHORES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- (chore|build|ci|docs|perf|refactor)(\(.+\))?:" | sed -E 's/^- [a-z]+(\([^)]*\))?: /- /' || true)
+
+          CHANGELOG=""
+          [ -n "$FEATURES" ] && CHANGELOG="${CHANGELOG}### Features\n${FEATURES}\n\n"
+          [ -n "$FIXES" ]    && CHANGELOG="${CHANGELOG}### Bug Fixes\n${FIXES}\n\n"
+          [ -n "$CHORES" ]   && CHANGELOG="${CHANGELOG}### Other Changes\n${CHORES}\n\n"
+          [ -z "$CHANGELOG" ] && CHANGELOG="No significant changes.\n"
+
+          printf "${CHANGELOG}" > /tmp/changelog.md
+          echo "--- Changelog ---"
+          cat /tmp/changelog.md
+
+      # ── Create branch and PR ────────────────────────────────────────────────
+
+      - name: Commit and push release branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${{ steps.version.outputs.branch }}"
+          git add Cargo.toml Cargo.lock THIRD_PARTY_NOTICES.md
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new }}"
+          git push origin "${{ steps.version.outputs.branch }}"
+
+      - name: Open pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.version.outputs.branch }}" \
+            --title "chore: release ${{ steps.version.outputs.tag }}" \
+            --body "$(cat <<EOF
+          ## Release ${{ steps.version.outputs.tag }}
+
+          **Bump type:** ${{ github.event.inputs.bump }}
+          **Version:** ${{ steps.version.outputs.current }} → ${{ steps.version.outputs.new }}
+
+          ---
+
+          $(cat /tmp/changelog.md)
+
+          ---
+
+          Merging this PR will automatically trigger the release workflow which will:
+          - Build x86_64 and arm64 binaries
+          - Create tag \`${{ steps.version.outputs.tag }}\`
+          - Publish GitHub Release with both zip artifacts
+          EOF
+          )"

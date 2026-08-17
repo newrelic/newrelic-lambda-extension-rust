@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Lambda function tagging functionality
 //!
 //! This module handles tagging the Lambda function with New Relic version information.

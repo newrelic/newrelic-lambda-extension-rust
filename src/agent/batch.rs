@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Agent payload batching logic
 //!
 //! This module handles batching of agent payloads for efficient sending to New Relic.
@@ -12,7 +15,7 @@
 use std::sync::{Arc, Mutex};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::ExtensionConfig,
@@ -243,7 +246,7 @@ pub async fn send_batched_payloads_with_reports_only(
             clear_batch_with_reports(&batch_items);
         }
         Err(e) => {
-            error!(
+            warn!(
                 "Failed to send batched payloads with reports after all retries: {} - Keeping {} payloads in buffer for next attempt",
                 e,
                 batch_items.len()
@@ -254,13 +257,14 @@ pub async fn send_batched_payloads_with_reports_only(
 }
 
 /// Send all pending payloads on shutdown with 1MB chunking
-/// Collects from: AGENT_BATCH_BUFFER, REQUEST_AGENT_BUFFERS, and matches with PENDING_REPORTS
+/// Collects from: AGENT_BATCH_BUFFER, REQUEST_DATA (agent buffers + pending reports)
 /// Splits into 1MB chunks while keeping each payload + report together
 pub async fn send_all_pending_payloads_on_shutdown(
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
+    log_processor: Option<&Arc<crate::logs::processor::LogProcessor>>,
 ) {
-    use crate::request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS};
+    use crate::request::{REQUEST_DATA, get_request_context, remove_pending_report};
 
     debug!("Shutdown: Collecting all pending telemetry payloads");
 
@@ -271,14 +275,14 @@ pub async fn send_all_pending_payloads_on_shutdown(
     debug!("Shutdown: Found {} payloads in batch buffer", batched_items.len());
     all_payloads.extend(batched_items);
 
-    // 2. Collect from REQUEST_AGENT_BUFFERS (late/unbatched payloads)
-    let all_buffer_requests: Vec<String> = REQUEST_AGENT_BUFFERS
+    // 2. Collect from REQUEST_DATA (late/unbatched payloads)
+    let all_buffer_requests: Vec<String> = REQUEST_DATA
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
 
     for request_id in all_buffer_requests {
-        if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(&request_id) {
+        if let Some(buffer) = crate::request::get_agent_buffer(&request_id) {
             let payloads = if let Ok(mut buf) = buffer.lock() {
                 std::mem::take(&mut *buf)
             } else {
@@ -289,19 +293,18 @@ pub async fn send_all_pending_payloads_on_shutdown(
                 debug!("Shutdown: Found {} unbatched payload(s) for request: {}", payloads.len(), request_id);
 
                 // Get report line if available
-                let report_line = PENDING_REPORTS.remove(&request_id).map(|(_, report)| report);
+                let report_line = remove_pending_report(&request_id);
 
-                // Get context
-                let arn = REQUEST_CONTEXTS
-                    .get(&request_id)
-                    .map(|ctx_entry| {
+                // Get context — cascade: per-request context → global registration ARN
+                let arn = get_request_context(&request_id)
+                    .and_then(|ctx_entry| {
                         ctx_entry
                             .lock()
                             .ok()
                             .map(|ctx| ctx.invoked_function_arn.clone())
-                            .unwrap_or_else(|| "unknown".to_string())
+                            .filter(|arn| !arn.is_empty())
                     })
-                    .unwrap_or_else(|| "unknown".to_string());
+                    .unwrap_or_else(crate::get_global_fallback_arn);
 
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {
@@ -322,6 +325,24 @@ pub async fn send_all_pending_payloads_on_shutdown(
     }
 
     debug!("Shutdown: Total {} payload(s) to send", all_payloads.len());
+
+    // Last chance to stamp trace.id: a request whose payload never paired before
+    // shutdown still has logs held in pending_logs. Extract its trace here so those
+    // logs are stamped + flushed (by flush_pending_logs_unstamped after this) rather
+    // than shipped untagged. Read-only on the payload; no effect on the send below.
+    if let Some(lp) = log_processor {
+        if config.new_relic.collect_trace_id {
+            for item in &all_payloads {
+                if let Ok(Some(trace_id)) =
+                    crate::trace::extract_trace_id_from_payload(&item.agent_payload_bytes)
+                {
+                    let _ = lp
+                        .on_trace_id_extracted(&item.request_id, &trace_id)
+                        .await;
+                }
+            }
+        }
+    }
 
     // 3. Split into 1MB chunks while keeping each payload + report together
     const MAX_CHUNK_SIZE: usize = 1_000_000; // 1MB
@@ -388,7 +409,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
 }
 
 /// Split payloads into chunks of max_size, keeping each payload + report together
-fn split_into_chunks(
+pub(crate) fn split_into_chunks(
     payloads: Vec<BatchedAgentPayload>,
     max_size: usize,
     config: &Arc<ExtensionConfig>,
@@ -427,7 +448,7 @@ fn split_into_chunks(
 }
 
 /// Estimate the size of a single batched payload item
-fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
+pub(crate) fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
     let mut size = 0;
 
     // Agent payload size
@@ -448,7 +469,7 @@ fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
 }
 
 /// Estimate the base overhead of the JSON structure
-fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
+pub(crate) fn estimate_base_overhead(config: &Arc<ExtensionConfig>) -> usize {
     // Rough estimate: context object + entry wrapper + logEvents array
     let function_name_len = config.aws.function_name.len();
     let base = 500 + (function_name_len * 3); // Function name appears in multiple places

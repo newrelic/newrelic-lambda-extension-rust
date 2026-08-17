@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+# Only runs when the prepare-release PR is merged (identified by commit message)
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    if: "startsWith(github.event.head_commit.message, 'chore: bump version to')"
+
+    permissions:
+      contents: write
+
+    env:
+      CARGO_TERM_COLOR: always
+      BIN_NAME: newrelic-lambda-extension
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-zigbuild for cross-compilation
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild
+
+      # ── Extract version ─────────────────────────────────────────────────────
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | awk -F'"' '{print $2}')
+          echo "new=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION}"
+
+      # ── Generate changelog ──────────────────────────────────────────────────
+
+      - name: Generate changelog
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1)
+          echo "Generating changelog since ${PREV_TAG}"
+
+          FEATURES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- feat(\(.+\))?:" | sed -E 's/^- feat(\([^)]*\))?: /- /' || true)
+          FIXES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- fix(\(.+\))?:" | sed -E 's/^- fix(\([^)]*\))?: /- /' || true)
+          CHORES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" | grep -E "^- (chore|build|ci|docs|perf|refactor)(\(.+\))?:" | sed -E 's/^- [a-z]+(\([^)]*\))?: /- /' || true)
+
+          CHANGELOG=""
+          [ -n "$FEATURES" ] && CHANGELOG="${CHANGELOG}### Features\n${FEATURES}\n\n"
+          [ -n "$FIXES" ]    && CHANGELOG="${CHANGELOG}### Bug Fixes\n${FIXES}\n\n"
+          [ -n "$CHORES" ]   && CHANGELOG="${CHANGELOG}### Other Changes\n${CHORES}\n\n"
+          [ -z "$CHANGELOG" ] && CHANGELOG="No significant changes.\n"
+
+          printf "${CHANGELOG}" > /tmp/changelog.md
+          echo "--- Changelog ---"
+          cat /tmp/changelog.md
+
+      # ── Build ───────────────────────────────────────────────────────────────
+
+      - name: Build release artifacts
+        run: |
+          chmod +x scripts/prepareRelease.sh
+          bash scripts/prepareRelease.sh
+
+      - name: Verify artifacts
+        run: |
+          ls -lh release/*.zip
+          test -f "release/${BIN_NAME}.x86_64.zip" || (echo "Missing x86_64 zip" && exit 1)
+          test -f "release/${BIN_NAME}.arm64.zip"  || (echo "Missing arm64 zip"  && exit 1)
+
+      # ── Tag and release ─────────────────────────────────────────────────────
+
+      - name: Create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            "release/${BIN_NAME}.x86_64.zip" \
+            "release/${BIN_NAME}.arm64.zip" \
+            --title "Release ${{ steps.version.outputs.tag }}" \
+            --notes-file /tmp/changelog.md \
+            --latest

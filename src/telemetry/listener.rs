@@ -1,8 +1,14 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{REQUEST_AGENT_BUFFERS, REQUEST_CONTEXTS, PENDING_REPORTS, RUNTIME_DONE_CHANNELS},
+    request::{
+        get_agent_buffer, get_request_context, get_runtime_done_notify, set_pending_report,
+        TELEMETRY_CURRENT_REQUEST_ID,
+    },
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -32,7 +38,6 @@ pub struct TelemetryRecord {
 pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
-    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     is_apm_mode: bool,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
@@ -45,9 +50,8 @@ pub async fn setup_telemetry_listener(
                 Ok((stream, _)) => {
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
-                    let runtime_done_tx_clone = runtime_done_tx.clone();
                     let is_apm_mode_clone = is_apm_mode;
-                    
+
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
                         let service = service_fn(move |req| {
@@ -55,7 +59,6 @@ pub async fn setup_telemetry_listener(
                                 req,
                                 log_processor.clone(),
                                 platform_processor.clone(),
-                                runtime_done_tx_clone.clone(),
                                 is_apm_mode_clone,
                             )
                         });
@@ -84,7 +87,6 @@ async fn handle_telemetry_request(
     req: Request<Incoming>,
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
-    runtime_done_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     is_apm_mode: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
@@ -101,16 +103,28 @@ async fn handle_telemetry_request(
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
-
-            
             let mut function_completed = false;
-            let mut runtime_done_request_id: Option<String> = None;
             let mut function_count = 0;
             let mut extension_count = 0;
             let mut platform_count = 0;
 
             for record in records {
                 match record.record_type.as_str() {
+                    "platform.start" => {
+                        // Update TELEMETRY_CURRENT_REQUEST_ID - this is the SOURCE OF TRUTH
+                        // for stamping function/extension logs with the correct request_id.
+                        // platform.start always arrives BEFORE function logs for that request,
+                        // so this ensures late logs from request_A don't get stamped with request_B.
+                        if let Some(request_id_value) = record.record.get("requestId") {
+                            if let Some(request_id_str) = request_id_value.as_str() {
+                                if let Ok(mut telemetry_req) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
+                                    *telemetry_req = Some(request_id_str.to_string());
+                                }
+                                debug!("platform.start: Updated telemetry request_id to: {}", request_id_str);
+                            }
+                        }
+                        platform_processor.process_record(record);
+                    }
                     "function" => {
                         function_count += 1;
                         log_processor.process_record(record).await;
@@ -122,8 +136,17 @@ async fn handle_telemetry_request(
                     "platform.runtimeDone" => {
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
-                                runtime_done_request_id = Some(request_id_str.to_string());
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
+                                // Wake the event loop's end-of-invocation flush waiter.
+                                // On fast functions (< ~50 ms), runtimeDone can arrive before
+                                // the event loop has created per-request state — get_runtime_done_notify
+                                // returns None in that case. Record it in PREFIRED_RUNTIME_DONE so
+                                // create_request_processing_state() fires the notify immediately.
+                                if let Some(notify) = get_runtime_done_notify(request_id_str) {
+                                    notify.notify_one();
+                                } else {
+                                    crate::request::record_prefired_runtime_done(request_id_str);
+                                }
                             }
                         }
                         platform_processor.process_record(record);
@@ -133,12 +156,13 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
-                                    
+
                                     if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
+                                        let current_arn = crate::get_global_fallback_arn();
                                         let send_failed = if let Some(ref app) = *apm_app_read {
-                                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                                            if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn).await {
                                                 warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id_str, e);
                                                 true
                                             } else {
@@ -151,67 +175,71 @@ async fn handle_telemetry_request(
                                         };
 
                                         if send_failed {
-                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
+                                            set_pending_report(request_id_str, report_line);
                                             debug!("APM mode: Stored failed platform.report for request: {} (will retry later)", request_id_str);
                                         }
                                         // In APM mode, platform.report and agent payloads are INDEPENDENT
                                         // Agent payloads go directly to APM collector when run_id is available
                                     } else {
                                         // STANDARD MODE: Match platform.report with agent payloads for batching
+                                        // platform.report may arrive in same or next invocation (after freeze/thaw)
                                         if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
-                                            debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                            debug!("Serverless mode: Matched platform.report with batched agent for request: {}", request_id_str);
                                         }
-                                        else if let Some(buffer) = REQUEST_AGENT_BUFFERS.get(request_id_str) {
-                                            let has_agent = buffer.lock().ok().map(|b| !b.is_empty()).unwrap_or(false);
-                                            if has_agent {
-                                                debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
-                                                
-                                                let arn = REQUEST_CONTEXTS.get(request_id_str)
-                                                    .map(|ctx_ref| {
-                                                        ctx_ref.lock()
-                                                            .ok()
-                                                            .map(|ctx| ctx.invoked_function_arn.clone())
-                                                            .unwrap_or_else(|| {
-                                                                // Fallback to global context ARN (set from registration)
-                                                                if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                                    global_ctx.invoked_function_arn.clone()
-                                                                } else {
-                                                                    String::new()
-                                                                }
-                                                            })
-                                                    })
-                                                    .unwrap_or_else(|| {
-                                                        // Fallback to global context ARN (set from registration)
-                                                        if let Ok(global_ctx) = crate::CURRENT_INVOCATION_CONTEXT.read() {
-                                                            global_ctx.invoked_function_arn.clone()
-                                                        } else {
-                                                            String::new()
-                                                        }
-                                                    });
-                                                
-                                                if let Ok(buffer_guard) = buffer.lock() {
-                                                    for payload_bytes in buffer_guard.iter() {
-                                                        add_to_batch(
-                                                            request_id_str.to_string(),
-                                                            payload_bytes.clone(),
-                                                            Some(report_line.clone()),
-                                                            arn.clone(),
-                                                        );
-                                                    }
-                                                }
-                                                
-                                                drop(buffer);
-                                                REQUEST_AGENT_BUFFERS.remove(request_id_str);
-                                                debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                        else if let Some(buffer) = get_agent_buffer(request_id_str) {
+                                            let arn = get_request_context(request_id_str)
+                                                .and_then(|ctx_ref| {
+                                                    ctx_ref.lock()
+                                                        .ok()
+                                                        .map(|ctx| ctx.invoked_function_arn.clone())
+                                                        .filter(|arn| !arn.is_empty())
+                                                })
+                                                .unwrap_or_else(crate::get_global_fallback_arn);
+                                            // Take ownership of the payloads and drop the
+                                            // buffer lock BEFORE any await (trace extraction is
+                                            // async; holding a std Mutex across await is unsound).
+                                            let payloads: Vec<Vec<u8>> = match buffer.lock() {
+                                                Ok(mut g) => std::mem::take(&mut *g),
+                                                Err(_) => Vec::new(),
+                                            };
+                                            let batched = if payloads.is_empty() {
+                                                false
                                             } else {
-                                                PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
-                                                debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                                debug!("Serverless mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                                for payload_bytes in payloads {
+                                                    // Extract this payload's trace.id and stamp + flush the
+                                                    // request's held logs before batching (serverless: the
+                                                    // listener is the common pairing path).
+                                                    if log_processor.is_trace_collection_enabled() {
+                                                        if let Ok(Some(trace_id)) =
+                                                            crate::trace::extract_trace_id_from_payload(&payload_bytes)
+                                                        {
+                                                            let _ = log_processor
+                                                                .on_trace_id_extracted(request_id_str, &trace_id)
+                                                                .await;
+                                                        }
+                                                    }
+                                                    add_to_batch(
+                                                        request_id_str.to_string(),
+                                                        payload_bytes,
+                                                        Some(report_line.clone()),
+                                                        arn.clone(),
+                                                    );
+                                                }
+                                                true
+                                            };
+
+                                            if batched {
+                                                debug!("Serverless mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                            } else {
+                                                set_pending_report(request_id_str, report_line);
+                                                debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                             }
                                         }
                                         else {
-                                            PENDING_REPORTS.insert(request_id_str.to_string(), report_line);
-                                            debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                            set_pending_report(request_id_str, report_line);
+                                            debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
                                 }
@@ -239,25 +267,6 @@ async fn handle_telemetry_request(
                
             } else {
                 debug!("No telemetry records processed in this batch");
-            }
-            
-            if let Some(request_id) = runtime_done_request_id {
-                if let Some(tx) = RUNTIME_DONE_CHANNELS.get(&request_id) {
-                    if let Err(e) = tx.send(()) {
-                        warn!("Failed to send runtime.done signal for request {}: {}", request_id, e);
-                    } else {
-                        debug!("Successfully sent runtime.done signal for request: {}", request_id);
-                    }
-                } else {
-                    // Only warn in standard mode - APM mode doesn't use runtime.done channels
-                    if !is_apm_mode {
-                        debug!("No runtime.done channel found for request: {} (channel may have been cleaned up)", request_id);
-                    }
-                }
-
-                if let Some(ref tx) = runtime_done_tx {
-                    let _ = tx.send(());
-                }
             }
             
             if function_completed {

@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! APM collector client for sending telemetry
 //!
 //! Based on collector.go CollectorRequest() and SendAPMTelemetry()
@@ -18,12 +21,13 @@ pub const CMD_ANALYTIC_EVENTS: &str = "analytic_event_data";
 pub const CMD_CUSTOM_EVENTS: &str = "custom_event_data";
 pub const CMD_TRANSACTION_SAMPLES: &str = "transaction_sample_data";
 pub const CMD_LOG_EVENTS: &str = "log_event_data";
+pub const CMD_SLOW_SQLS: &str = "sql_trace_data";
 
 const PROTOCOL_VERSION: u8 = 17;
-const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn get_user_agent() -> String {
-    format!("NewRelic-Rust-Lambda-Extension/{EXTENSION_VERSION}")
+    // Single source of truth (tracks Cargo.toml); shared with the handshake path.
+    crate::version::user_agent()
 }
 
 /// APM collector error types
@@ -45,6 +49,117 @@ impl std::fmt::Display for CollectorError {
 }
 
 impl std::error::Error for CollectorError {}
+
+/// Set when the collector returns 401/409 (restart) or 410 (disconnect): the
+/// current `run_id` is no longer valid. The event loop consumes this once per
+/// invoke to invalidate the cached `ApmApp` and force a fresh handshake.
+static RECONNECT_NEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Flag that a reconnect is required (collector restart/disconnect observed).
+pub fn signal_reconnect_needed() {
+    RECONNECT_NEEDED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Consume the reconnect-needed flag, returning whether it was set.
+pub fn take_reconnect_needed() -> bool {
+    RECONNECT_NEEDED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// All telemetry types the customer may disable via `NEW_RELIC_APM_DISABLE_TELEMETRY`.
+/// The first nine are agent-payload types; `platform_metrics` is the `apm.lambda.*`
+/// pseudo-type derived from REPORT lines and sent to the Metric API.
+pub const KNOWN_TELEMETRY_TYPES: &[&str] = &[
+    "metric_data",
+    "custom_event_data",
+    "log_event_data",
+    "analytic_event_data",
+    "error_event_data",
+    "error_data",
+    "span_event_data",
+    "sql_trace_data",
+    "transaction_sample_data",
+    "platform_metrics",
+];
+
+/// Process-wide set of telemetry types to drop, populated once at startup from
+/// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Lets code paths without `ExtensionConfig`
+/// in scope (e.g. the telemetry listener) honor the customer's exclusions.
+static DISABLED_TELEMETRY: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashSet<String>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+/// Record which telemetry types are disabled (called once at startup).
+pub fn set_disabled_telemetry(types: std::collections::HashSet<String>) {
+    if let Ok(mut guard) = DISABLED_TELEMETRY.write() {
+        *guard = types;
+    }
+}
+
+/// Whether the given telemetry type has been disabled by the customer.
+pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
+    DISABLED_TELEMETRY
+        .read()
+        .map(|g| g.contains(telemetry_type))
+        .unwrap_or(false)
+}
+
+/// HTTP status codes worth retrying — transient server/throttle conditions.
+/// 401/409 (restart) and 410 (disconnect) are handled separately and are NOT here.
+pub fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Parse a `Retry-After: <seconds>` header into a Duration. The delta-seconds
+/// form is the only one New Relic emits; HTTP-date form is ignored.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+}
+
+/// Outcome classification for a Metric API send failure.
+#[derive(Debug)]
+pub enum MetricApiError {
+    /// Transient failure (5xx/429/408) — safe to retry.
+    Retryable {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Permanent failure (4xx other than 429/408) — retrying will not help.
+    Permanent { status: u16 },
+    /// Transport/network/timeout error — safe to retry.
+    Network(anyhow::Error),
+}
+
+impl MetricApiError {
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            MetricApiError::Retryable { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, MetricApiError::Permanent { .. })
+    }
+}
+
+impl std::fmt::Display for MetricApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetricApiError::Retryable { status, .. } => {
+                write!(f, "Metric API transient error (status {status})")
+            }
+            MetricApiError::Permanent { status } => {
+                write!(f, "Metric API permanent error (status {status})")
+            }
+            MetricApiError::Network(e) => write!(f, "Metric API network error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for MetricApiError {}
 
 /// Send error event telemetry to APM collector
 /// Error events have a special structure: [run_id, {events_seen, reservoir_size}, [events]]
@@ -97,7 +212,10 @@ pub async fn send_error_events(
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await?;
+        .await
+        // Strip the request URL (carries `license_key`) from any error before it
+        // propagates to a log site.
+        .map_err(|e| e.without_url())?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -114,12 +232,19 @@ pub async fn send_error_events(
         
         if status_code == 410 {
             error!("APM collector disconnected (410) - agent should stop sending telemetry");
+            signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", CMD_ERROR_EVENTS)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
+            signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, CMD_ERROR_EVENTS)));
+                .context(format!("Collector returned 409 for {}", CMD_ERROR_EVENTS)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", CMD_ERROR_EVENTS)));
         }
         
         warn!(
@@ -142,7 +267,13 @@ pub async fn send_apm_telemetry(
 ) -> Result<()> {
     let mut processed_data = data.to_vec();
     if !processed_data.is_empty() {
-        processed_data[0] = serde_json::json!(run_id);
+        if processed_data[0].is_null() || processed_data[0].as_str() == Some("") {
+            // null = Python/Node/.NET/Ruby placeholder; "" = Go placeholder — both replaced with actual run_id
+            processed_data[0] = serde_json::json!(run_id);
+        } else {
+            // sql_trace_data: no placeholder at index 0 — prepend run_id
+            processed_data.insert(0, serde_json::json!(run_id));
+        }
     }
 
     let url = format!(
@@ -186,7 +317,10 @@ pub async fn send_apm_telemetry(
         .body(compressed)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await?;
+        .await
+        // Strip the request URL (carries `license_key`) from any error before it
+        // propagates to a log site.
+        .map_err(|e| e.without_url())?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -204,12 +338,19 @@ pub async fn send_apm_telemetry(
         
         if status_code == 410 {
             error!("APM collector disconnected (410) - agent should stop sending telemetry");
+            signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::Disconnect)
                 .context(format!("Collector returned 410 for {}", command)));
-        } else if status_code == 401 || status_code == 409 {
-            warn!("APM collector restart exception ({}) - reconnection needed", status_code);
+        } else if status_code == 409 {
+            info!("APM collector restart exception (409) - reconnection needed");
+            signal_reconnect_needed();
             return Err(anyhow::Error::new(CollectorError::RestartException)
-                .context(format!("Collector returned {} for {}", status_code, command)));
+                .context(format!("Collector returned 409 for {}", command)));
+        } else if status_code == 401 {
+            warn!("APM collector restart exception (401) - reconnection needed");
+            signal_reconnect_needed();
+            return Err(anyhow::Error::new(CollectorError::RestartException)
+                .context(format!("Collector returned 401 for {}", command)));
         }
         
         warn!(
@@ -221,13 +362,17 @@ pub async fn send_apm_telemetry(
     }
 }
 
-/// Send platform metrics to Metric API
+/// Send platform metrics to Metric API.
+///
+/// Returns a typed [`MetricApiError`] so the caller can distinguish transient
+/// failures (buffer + retry) from permanent ones (drop). The caller retains
+/// ownership of `metrics` so it can re-buffer them on a retryable failure.
 pub async fn send_platform_metrics(
     client: &Client,
     license_key: &str,
     metric_endpoint: &str,
-    metrics: Vec<Value>,
-) -> Result<()> {
+    metrics: &[Value],
+) -> std::result::Result<(), MetricApiError> {
     if metrics.is_empty() {
         debug!("No platform metrics to send");
         return Ok(());
@@ -237,8 +382,11 @@ pub async fn send_platform_metrics(
         "metrics": metrics
     }]);
 
-    let payload_json = serde_json::to_string(&payload)?;
-    
+    let payload_json = match serde_json::to_string(&payload) {
+        Ok(s) => s,
+        Err(e) => return Err(MetricApiError::Network(anyhow::Error::new(e))),
+    };
+
     debug!("Platform metrics payload JSON: {}", payload_json);
 
     debug!(
@@ -249,14 +397,24 @@ pub async fn send_platform_metrics(
     );
 
     let start_time = std::time::Instant::now();
-    let response = client
+    let response = match client
         .post(metric_endpoint)
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
         .body(payload_json)
         .timeout(std::time::Duration::from_secs(20))
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // license key travels in the `Api-Key` header here (not the URL), but
+            // strip the URL anyway for defense-in-depth before logging.
+            let e = e.without_url();
+            warn!("Platform metrics network error: {} - will retry", e);
+            return Err(MetricApiError::Network(anyhow::Error::new(e)));
+        }
+    };
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -267,13 +425,122 @@ pub async fn send_platform_metrics(
         debug!("Send platform_metrics duration: {}ms", duration.as_millis());
         info!("Successfully sent {} platform metrics", metrics.len());
         Ok(())
+    } else if is_retryable_status(status_code) {
+        let retry_after = parse_retry_after(response.headers());
+        let body = response.text().await.unwrap_or_default();
+        warn!(
+            "Platform metrics transient failure (status {}, retry_after {:?}) - will retry: {}",
+            status_code, retry_after, body
+        );
+        Err(MetricApiError::Retryable {
+            status: status_code,
+            retry_after,
+        })
     } else {
         let body = response.text().await.unwrap_or_default();
-        debug!("Status Code for platform_metrics telemetry: {}", status_code);
         warn!(
-            "Failed to send platform metrics: {} - {}",
+            "Platform metrics permanent failure (status {}) - dropping: {}",
             status_code, body
         );
-        Err(anyhow::anyhow!("Metric API returned status {}", status_code))
+        Err(MetricApiError::Permanent {
+            status: status_code,
+        })
+    }
+}
+#[cfg(test)]
+mod collector_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn retryable_statuses_are_transient_only() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(code), "{code} should be retryable");
+        }
+        // Permanent / success / restart / disconnect must NOT be classified retryable.
+        for code in [200, 202, 400, 401, 403, 404, 409, 410, 413] {
+            assert!(!is_retryable_status(code), "{code} must not be retryable");
+        }
+    }
+
+    #[test]
+    fn metric_api_error_classification() {
+        let retr = MetricApiError::Retryable {
+            status: 503,
+            retry_after: Some(std::time::Duration::from_secs(7)),
+        };
+        assert!(!retr.is_permanent());
+        assert_eq!(retr.retry_after(), Some(std::time::Duration::from_secs(7)));
+
+        let perm = MetricApiError::Permanent { status: 400 };
+        assert!(perm.is_permanent());
+        assert_eq!(perm.retry_after(), None);
+
+        let net = MetricApiError::Network(anyhow::anyhow!("boom"));
+        assert!(!net.is_permanent());
+        assert_eq!(net.retry_after(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn reconnect_flag_is_one_shot() {
+        // Drain any pre-existing state.
+        let _ = take_reconnect_needed();
+        assert!(!take_reconnect_needed(), "should start clear");
+        signal_reconnect_needed();
+        assert!(take_reconnect_needed(), "first take observes the signal");
+        assert!(!take_reconnect_needed(), "second take is cleared");
+    }
+
+    #[test]
+    #[serial]
+    fn disabled_telemetry_roundtrips() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("platform_metrics".to_string());
+        set.insert("sql_trace_data".to_string());
+        set_disabled_telemetry(set);
+        assert!(is_telemetry_disabled("platform_metrics"));
+        assert!(is_telemetry_disabled("sql_trace_data"));
+        assert!(!is_telemetry_disabled("metric_data"));
+        // Reset so other serial tests see a clean state.
+        set_disabled_telemetry(std::collections::HashSet::new());
+        assert!(!is_telemetry_disabled("platform_metrics"));
+    }
+
+    #[test]
+    fn known_telemetry_types_complete() {
+        // The 9 agent-payload types + platform_metrics.
+        assert_eq!(KNOWN_TELEMETRY_TYPES.len(), 10);
+        assert!(KNOWN_TELEMETRY_TYPES.contains(&"platform_metrics"));
+        assert!(KNOWN_TELEMETRY_TYPES.contains(&"sql_trace_data"));
+    }
+
+    fn restart_log_level(status_code: u16) -> &'static str {
+        if status_code == 409 { "INFO" } else { "WARN" }
+    }
+
+    #[test]
+    fn log_level_409_is_info_401_is_warn() {
+        assert_eq!(restart_log_level(409), "INFO", "409 (routine session refresh) must log at INFO");
+        assert_eq!(restart_log_level(401), "WARN", "401 (auth failure) must log at WARN");
+    }
+
+    #[test]
+    fn disconnect_is_not_restart_exception() {
+        // 410 returns CollectorError::Disconnect, not RestartException. This is
+        // intentional: telemetry_buffer::retry_buffered_telemetry only skips
+        // retry_count for RestartException (409/401). A 410 is a hard disconnect
+        // and must consume a retry slot like any other non-session error.
+        let restart = anyhow::Error::new(CollectorError::RestartException);
+        let disconnect = anyhow::Error::new(CollectorError::Disconnect);
+
+        let is_restart = |e: &anyhow::Error| {
+            e.downcast_ref::<CollectorError>()
+                .map(|ce| matches!(ce, CollectorError::RestartException))
+                .unwrap_or(false)
+        };
+
+        assert!(is_restart(&restart), "RestartException (409/401) must be detected");
+        assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
     }
 }
