@@ -1,6 +1,6 @@
 [![Community Plus header](https://github.com/newrelic/opensource-website/raw/main/src/images/categories/Community_Plus.png)](https://opensource.newrelic.com/oss-category/#community-plus)
 
-# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml)
+# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml) [![CI](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust)
 
 A high-performance Rust implementation of the AWS Lambda extension to collect, enhance, and transport telemetry data from your AWS Lambda functions to New Relic without requiring an external transport such as CloudWatch Logs or Kinesis.
 
