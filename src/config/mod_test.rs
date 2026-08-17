@@ -64,6 +64,8 @@ where
         "NEW_RELIC_EXTENSION_LOG_LEVEL",
         "NEW_RELIC_EXTENSION_LOGS_ENABLED",
         "NEW_RELIC_LAMBDA_EXTENSION_PROXY",
+        "NEW_RELIC_DATA_COLLECTION_TIMEOUT",
+        "NEW_RELIC_HTTP_TIMEOUT",
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
@@ -222,6 +224,8 @@ fn test_new_relic_config_default() {
     assert_eq!(config.apm_host, "collector.newrelic.com");
     assert_eq!(config.metric_endpoint, "https://metric-api.newrelic.com/metric/v1");
     assert_eq!(config.proxy_url, None);
+    assert_eq!(config.data_collection_timeout, None);
+    assert_eq!(config.http_timeout, None);
 }
 
 #[test]
@@ -1167,6 +1171,8 @@ fn test_new_relic_config_all_fields() {
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
+        data_collection_timeout: Some(Duration::from_secs(20)),
+        http_timeout: Some(Duration::from_secs(1)),
     };
     
     assert!(!config.extension_enabled);
@@ -1556,5 +1562,106 @@ fn test_apm_blocking_handshake_truthy_variants() {
             );
         });
     }
+}
+
+// ============================================================================
+// NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
+// ============================================================================
+
+#[test]
+fn test_parse_duration_valid_units() {
+    assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+    assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+    assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+    assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+    assert_eq!(parse_duration("1.5s"), Some(Duration::from_millis(1500)));
+}
+
+#[test]
+fn test_parse_duration_bare_number_rejected() {
+    // Bare numbers with no unit are rejected, matching Go's time.ParseDuration.
+    assert_eq!(parse_duration("15"), None);
+    assert_eq!(parse_duration("20"), None);
+}
+
+#[test]
+fn test_parse_duration_invalid_unit_rejected() {
+    assert_eq!(parse_duration("10x"), None);
+    assert_eq!(parse_duration("10 days"), None);
+}
+
+#[test]
+fn test_parse_duration_negative_rejected() {
+    assert_eq!(parse_duration("-5s"), None);
+}
+
+#[test]
+fn test_parse_duration_empty_rejected() {
+    assert_eq!(parse_duration(""), None);
+}
+
+#[test]
+fn test_parse_duration_trims_whitespace() {
+    assert_eq!(parse_duration("  20s  "), Some(Duration::from_secs(20)));
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_unset_stays_none() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_valid_value() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "20s");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, Some(Duration::from_secs(20)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_invalid_value_falls_back_to_default() {
+    with_full_clean_env(|| {
+        // Bare number, no unit -> falls back to the 10s default, matching the Go extension.
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "15");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, Some(Duration::from_secs(10)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_unset_stays_none() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_valid_value() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "1s");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, Some(Duration::from_secs(1)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
+    with_full_clean_env(|| {
+        // Bare number, no unit -> falls back to the 2400ms default.
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, Some(Duration::from_millis(2400)));
+    });
 }
 

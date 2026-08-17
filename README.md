@@ -230,6 +230,8 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
 | `NEW_RELIC_LAMBDA_EXTENSION_PROXY` | | URL | HTTP proxy for the extension's outbound traffic to New Relic. Only affects the extension — does not interfere with your Lambda function's own traffic. Supports `http://`, `https://`, and `socks5://` schemes. Credentials are supported via `http://user:pass@proxy:port` format and are masked in all log output. Localhost traffic (Lambda Extensions API) is never proxied. When not set, the extension respects standard `HTTPS_PROXY`/`HTTP_PROXY` environment variables as a fallback. |
+| `NEW_RELIC_DATA_COLLECTION_TIMEOUT` | _(unset)_ | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in total retry budget for sending telemetry and logs. When unset, the extension keeps its original fixed 3-attempt retry behavior unchanged. When set, retries continue with a growing backoff (200ms, doubling every 3 attempts, capped at 3s) until this much wall-clock time has elapsed, with a 20-attempt safety cap. Invalid values (e.g. a bare number with no unit) fall back to a 10s budget. |
+| `NEW_RELIC_HTTP_TIMEOUT` | `2400ms` | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in per-request timeout for telemetry and log sends to New Relic, overriding the default 2.4s. Invalid values fall back to the 2400ms default. |
 
 **When to use `NEW_RELIC_LAMBDA_EXTENSION_PROXY`:**
 
