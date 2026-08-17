@@ -96,18 +96,13 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
-    /// Fired by `route_payload_to_request_buffer()` whenever an agent payload is pushed
-    /// into this request's `agent_buffer`. Awaited (bounded, only when
-    /// `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled) by `event_loop::wait_for_late_payload`
-    /// to catch a payload that arrives after the request's own processing already found
-    /// the buffer empty.
-    pub agent_payload_notify: Arc<Notify>,
-    /// Fired by `set_pending_report()` whenever a `platform.report` line is stored for
-    /// this request. Awaited (bounded, only when `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is
-    /// enabled) by `event_loop::wait_for_late_report` to catch a report that arrives
-    /// after the agent payload already did — the serverless-mode mirror of
-    /// `agent_payload_notify`.
-    pub report_notify: Arc<Notify>,
+    /// Immediate-send task handles spawned for this request under
+    /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — one per agent payload chunk, sent
+    /// independently the instant it's received by
+    /// `route_payload_to_request_buffer()`. Drained and awaited by
+    /// `event_loop::process_request_concurrently` before the invocation ends, so a send
+    /// can't be frozen mid-flight by the sandbox.
+    pub pending_send_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Cached ARN for this request. Avoids locking `context` just to read the ARN
     /// on hot paths like cleanup_old_request_buffers and drain_late_paired_payloads.
     pub invoked_function_arn: String,
@@ -135,14 +130,10 @@ pub fn get_pending_report(request_id: &str) -> Option<String> {
     REQUEST_DATA.get(request_id).and_then(|entry| entry.pending_report.clone())
 }
 
-/// Set the pending platform.report for a request. Fires `report_notify` so a
-/// bounded `event_loop::wait_for_late_report` waiter (only armed when
-/// `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` is enabled) picks it up immediately instead of
-/// only on the next invocation's drain or at SHUTDOWN.
+/// Set the pending platform.report for a request.
 pub fn set_pending_report(request_id: &str, report: String) {
     if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
         entry.pending_report = Some(report);
-        entry.report_notify.notify_one();
     }
 }
 
@@ -158,37 +149,25 @@ pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
     REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
 }
 
-/// Get the agent-payload notify for a request (used by
-/// `event_loop::wait_for_late_payload` to wait, and by `route_payload_to_request_buffer`
-/// to signal). Returns None if the request is not registered — unlike
-/// `runtime_done_notify`, no pre-fire map is needed here: an agent payload can only be
-/// routed to a `request_id` after `create_request_processing_state()` has already run
-/// synchronously for it (the language agent doesn't start until the runtime hands off
-/// control), so the Notify always exists before any payload can race it.
-pub fn get_agent_payload_notify(request_id: &str) -> Option<Arc<Notify>> {
-    REQUEST_DATA.get(request_id).map(|entry| entry.agent_payload_notify.clone())
-}
-
-/// Get the report notify for a request (used by `event_loop::wait_for_late_report` to
-/// wait, and by `set_pending_report` to signal). Same no-pre-fire-map reasoning as
-/// `get_agent_payload_notify`: a `platform.report` can only be stored for a `request_id`
-/// after `create_request_processing_state()` has already run for it.
-pub fn get_report_notify(request_id: &str) -> Option<Arc<Notify>> {
-    REQUEST_DATA.get(request_id).map(|entry| entry.report_notify.clone())
-}
-
-/// Atomically take the agent buffer's contents if non-empty. Returns `None` if the
-/// request is unregistered or its buffer is currently empty — used by
-/// `event_loop::wait_for_late_payload` to avoid a TOCTOU gap between checking emptiness
-/// and draining.
-pub fn take_agent_buffer_if_nonempty(request_id: &str) -> Option<Vec<Vec<u8>>> {
-    let entry = REQUEST_DATA.get(request_id)?;
-    let mut buf = entry.agent_buffer.lock().ok()?;
-    if buf.is_empty() {
-        None
-    } else {
-        Some(std::mem::take(&mut *buf))
+/// Push an immediate-send task handle for a request under
+/// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` (see `pending_send_handles`). A no-op if the
+/// request is unregistered.
+pub fn push_pending_send_handle(request_id: &str, handle: tokio::task::JoinHandle<()>) {
+    if let Some(entry) = REQUEST_DATA.get(request_id) {
+        if let Ok(mut handles) = entry.pending_send_handles.lock() {
+            handles.push(handle);
+        }
     }
+}
+
+/// Drain and return every pending immediate-send handle for a request. Called by
+/// `event_loop::process_request_concurrently` before the invocation ends so it can
+/// await them (bounded by the invocation's remaining deadline).
+pub fn take_pending_send_handles(request_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
+    REQUEST_DATA
+        .get(request_id)
+        .and_then(|entry| entry.pending_send_handles.lock().ok().map(|mut h| std::mem::take(&mut *h)))
+        .unwrap_or_default()
 }
 
 /// Record that platform.runtimeDone fired before the request state existed.
@@ -314,8 +293,7 @@ pub fn create_request_processing_state(
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
-        agent_payload_notify: Arc::new(Notify::new()),
-        report_notify: Arc::new(Notify::new()),
+        pending_send_handles: Arc::new(Mutex::new(Vec::new())),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
 
@@ -464,6 +442,25 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
         .and_then(|guard| guard.clone());
 
     if let Some(request_id) = current_request_id {
+        // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH (serverless mode only — gated on
+        // !apm_lambda_mode because this function is the *shared* storage step for
+        // agent payloads in both modes: process_apm_request's Flow-1/Flow-2 reads from
+        // this same agent_buffer, so diverting payloads away from it here would
+        // silently break APM-mode delivery): send immediately instead of buffering to
+        // pair with platform.report.
+        if let Some((newrelic_client, config, log_processor)) = crate::event_loop::SERVERLESS_SEND_CONTEXT.get() {
+            if config.new_relic.synchronous_flush && !config.new_relic.apm_lambda_mode {
+                spawn_immediate_agent_payload_send(
+                    &request_id,
+                    payload_bytes,
+                    newrelic_client.clone(),
+                    config.clone(),
+                    log_processor.clone(),
+                );
+                return;
+            }
+        }
+
         // Route to active request buffer
         if let Some(entry) = REQUEST_DATA.get(&request_id) {
             match entry.agent_buffer.lock() {
@@ -473,10 +470,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored agent payload in request buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-                    // Wake any bounded wait_for_late_payload() waiter for this request
-                    // (only armed when NEW_RELIC_BLOCKING_AGENT_PAYLOAD is enabled). A
-                    // no-op permit if nobody is waiting.
-                    entry.agent_payload_notify.notify_one();
                 }
                 Err(e) => {
                     error!(
@@ -504,11 +497,6 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
                     );
-                    // Same defense-in-depth wake as the active branch above. Note: this
-                    // fallback picks an arbitrary REQUEST_DATA entry (.iter().next()) when
-                    // multiple stale buffers exist — a pre-existing ambiguity this notify
-                    // doesn't resolve, only wakes whichever waiter (if any) is attached.
-                    entry.agent_payload_notify.notify_one();
                 }
             }
         } else {
@@ -525,6 +513,63 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
             }
         }
     }
+}
+
+/// Send an agent payload to New Relic immediately, decoupled from any pairing with
+/// `platform.report`, as its own background task — used when
+/// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled (serverless mode only, per the
+/// caller's gate). Trace-id extraction still runs, exactly as it would for a buffered
+/// payload, before the send. On failure, buffers into `AGENT_BATCH_BUFFER` (unpaired)
+/// rather than dropping the payload, so it's still picked up by the existing
+/// periodic-cleanup / `SHUTDOWN` drain.
+fn spawn_immediate_agent_payload_send(
+    request_id: &str,
+    payload_bytes: Vec<u8>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+    log_processor: Arc<crate::logs::processor::LogProcessor>,
+) {
+    let arn = get_request_context(request_id)
+        .and_then(|ctx_ref| {
+            ctx_ref
+                .lock()
+                .ok()
+                .map(|ctx| ctx.invoked_function_arn.clone())
+                .filter(|arn| !arn.is_empty())
+        })
+        .unwrap_or_else(crate::get_global_fallback_arn);
+
+    let handle_request_id = request_id.to_string();
+    let handle = tokio::spawn(async move {
+        crate::event_loop::extract_and_coordinate_trace_id(
+            &payload_bytes,
+            &handle_request_id,
+            &config,
+            &log_processor,
+        )
+        .await;
+
+        let version_info = crate::version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
+
+        if let Err(e) = send_agent_payload_to_newrelic(
+            &payload_bytes,
+            &handle_request_id,
+            &arn,
+            &newrelic_client,
+            &config,
+            Some(&version_info),
+        )
+        .await
+        {
+            warn!(
+                "Serverless mode: immediate send failed for request {} — buffering for retry: {}",
+                handle_request_id, e
+            );
+            crate::agent::batch::add_to_batch(handle_request_id, payload_bytes, None, arn);
+        }
+    });
+
+    push_pending_send_handle(request_id, handle);
 }
 
 #[cfg(test)]

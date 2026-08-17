@@ -56,9 +56,7 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
-        "NEW_RELIC_BLOCKING_AGENT_PAYLOAD",
-        "NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS",
-        "NEW_RELIC_REPORT_LINE_TIMEOUT_MS",
+        "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
@@ -1170,19 +1168,15 @@ fn test_new_relic_config_all_fields() {
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
-        blocking_agent_payload: false,
-        agent_payload_timeout_ms: 200,
-        report_line_timeout_ms: 200,
+        synchronous_flush: false,
     };
-    
+
     assert!(!config.extension_enabled);
     assert_eq!(config.license_key, Some("key".to_string()));
     assert_eq!(config.harvest_interval, Duration::from_secs(5));
     assert!(config.collect_trace_id);
     assert!(config.apm_lambda_mode);
-    assert!(!config.blocking_agent_payload);
-    assert_eq!(config.agent_payload_timeout_ms, 200);
-    assert_eq!(config.report_line_timeout_ms, 200);
+    assert!(!config.synchronous_flush);
 }
 
 #[test]
@@ -1567,46 +1561,46 @@ fn test_apm_blocking_handshake_truthy_variants() {
     }
 }
 
-// ── serverless-mode blocking_agent_payload / timeouts (NR-600648 follow-up) ──
+// ── serverless-mode synchronous_flush (NR-600648 follow-up) ──
 
 #[test]
 #[serial]
-fn test_blocking_agent_payload_default_false() {
+fn test_synchronous_flush_default_false() {
     with_full_clean_env(|| {
         let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.blocking_agent_payload);
+        assert!(!config.new_relic.synchronous_flush);
     });
 }
 
 #[test]
 #[serial]
-fn test_blocking_agent_payload_enabled_from_env() {
+fn test_synchronous_flush_enabled_from_env() {
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_BLOCKING_AGENT_PAYLOAD", "true");
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
         let config = ExtensionConfig::from_env();
-        assert!(config.new_relic.blocking_agent_payload);
+        assert!(config.new_relic.synchronous_flush);
     });
 }
 
 #[test]
 #[serial]
-fn test_blocking_agent_payload_explicit_false() {
+fn test_synchronous_flush_explicit_false() {
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_BLOCKING_AGENT_PAYLOAD", "false");
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "false");
         let config = ExtensionConfig::from_env();
-        assert!(!config.new_relic.blocking_agent_payload);
+        assert!(!config.new_relic.synchronous_flush);
     });
 }
 
 #[test]
 #[serial]
-fn test_blocking_agent_payload_truthy_variants() {
+fn test_synchronous_flush_truthy_variants() {
     for value in &["1", "yes", "on", "TRUE", "Yes"] {
         with_full_clean_env(|| {
-            env::set_var("NEW_RELIC_BLOCKING_AGENT_PAYLOAD", value);
+            env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", value);
             let config = ExtensionConfig::from_env();
             assert!(
-                config.new_relic.blocking_agent_payload,
+                config.new_relic.synchronous_flush,
                 "Expected true for value '{}'", value
             );
         });
@@ -1615,114 +1609,14 @@ fn test_blocking_agent_payload_truthy_variants() {
 
 #[test]
 #[serial]
-fn test_agent_payload_timeout_ms_default() {
-    with_full_clean_env(|| {
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 200);
-    });
-}
-
-#[test]
-#[serial]
-fn test_agent_payload_timeout_ms_from_env() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS", "500");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 500);
-    });
-}
-
-#[test]
-#[serial]
-fn test_agent_payload_timeout_ms_clamped_to_max() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS", "5000");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 2000);
-    });
-}
-
-#[test]
-#[serial]
-fn test_agent_payload_timeout_ms_zero_allowed() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS", "0");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 0);
-    });
-}
-
-#[test]
-#[serial]
-fn test_agent_payload_timeout_ms_invalid_string_falls_back_to_default() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS", "not_a_number");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 200);
-    });
-}
-
-#[test]
-#[serial]
-fn test_report_line_timeout_ms_default() {
-    with_full_clean_env(|| {
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.report_line_timeout_ms, 200);
-    });
-}
-
-#[test]
-#[serial]
-fn test_report_line_timeout_ms_from_env() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_REPORT_LINE_TIMEOUT_MS", "750");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.report_line_timeout_ms, 750);
-    });
-}
-
-#[test]
-#[serial]
-fn test_report_line_timeout_ms_clamped_to_max() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_REPORT_LINE_TIMEOUT_MS", "9999");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.report_line_timeout_ms, 2000);
-    });
-}
-
-#[test]
-#[serial]
-fn test_report_line_timeout_ms_invalid_string_falls_back_to_default() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_REPORT_LINE_TIMEOUT_MS", "garbage");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.report_line_timeout_ms, 200);
-    });
-}
-
-#[test]
-#[serial]
-fn test_agent_payload_timeout_and_report_line_timeout_are_independent() {
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_AGENT_PAYLOAD_TIMEOUT_MS", "100");
-        env::set_var("NEW_RELIC_REPORT_LINE_TIMEOUT_MS", "1900");
-        let config = ExtensionConfig::from_env();
-        assert_eq!(config.new_relic.agent_payload_timeout_ms, 100);
-        assert_eq!(config.new_relic.report_line_timeout_ms, 1900);
-    });
-}
-
-#[test]
-#[serial]
-fn test_blocking_agent_payload_and_pipeline_flush_both_enabled_is_representable() {
+fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
     // Both flags can legally be set simultaneously — precedence is enforced at the
     // event-loop level (execute_standard_mode_event_loop), not by rejecting the config.
     with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_BLOCKING_AGENT_PAYLOAD", "true");
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
         env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
         let config = ExtensionConfig::from_env();
-        assert!(config.new_relic.blocking_agent_payload);
+        assert!(config.new_relic.synchronous_flush);
         assert!(config.extension.pipeline_flush);
         env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
     });

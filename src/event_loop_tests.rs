@@ -511,22 +511,20 @@ fn test_bounded_wait_budget_ms_u64_max_configured_falls_back_to_deadline_budget(
 // ── APM guard) ──────────────────────────────────────────────────────────────
 
 #[test]
-fn test_pipeline_flush_defers_when_blocking_agent_payload_disabled() {
+fn test_pipeline_flush_defers_when_synchronous_flush_disabled() {
     assert!(should_defer_via_pipeline_flush(true, false));
 }
 
 #[test]
-fn test_pipeline_flush_does_not_defer_when_blocking_agent_payload_enabled() {
+fn test_pipeline_flush_does_not_defer_when_synchronous_flush_enabled() {
     assert!(!should_defer_via_pipeline_flush(true, true));
 }
 
 #[test]
-fn test_no_defer_when_pipeline_flush_disabled_regardless_of_blocking_agent_payload() {
+fn test_no_defer_when_pipeline_flush_disabled_regardless_of_synchronous_flush() {
     assert!(!should_defer_via_pipeline_flush(false, false));
     assert!(!should_defer_via_pipeline_flush(false, true));
 }
-
-// ── wait_for_late_payload / wait_for_late_report (serverless-mode bounded waits) ──
 
 fn make_noop_log_processor_serverless(config: Arc<config::ExtensionConfig>) -> Arc<LogProcessor> {
     Arc::new(LogProcessor::new(
@@ -537,197 +535,9 @@ fn make_noop_log_processor_serverless(config: Arc<config::ExtensionConfig>) -> A
     ))
 }
 
-/// Register a bare `RequestData` for `request_id` (mirrors `request::mod_tests`'s
-/// construction style) and return its agent buffer + both notifies, so the test can
-/// simulate a late payload or a late report arriving via the same notify calls
-/// `route_payload_to_request_buffer` / `set_pending_report` use in production.
-type BareRequestDataServerless = (Arc<Mutex<Vec<Vec<u8>>>>, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
-
-fn insert_bare_request_data_serverless(request_id: &str) -> BareRequestDataServerless {
-    let agent_buffer = Arc::new(Mutex::new(Vec::new()));
-    let agent_payload_notify = Arc::new(tokio::sync::Notify::new());
-    let report_notify = Arc::new(tokio::sync::Notify::new());
-    request::REQUEST_DATA.insert(
-        request_id.to_string(),
-        request::RequestData {
-            context: Arc::new(Mutex::new(crate::context::InvocationContext::default())),
-            agent_buffer: agent_buffer.clone(),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: agent_payload_notify.clone(),
-            report_notify: report_notify.clone(),
-            invoked_function_arn: String::new(),
-        },
-    );
-    (agent_buffer, agent_payload_notify, report_notify)
-}
-
-#[tokio::test]
-async fn test_wait_for_late_payload_returns_immediately_when_no_request_data() {
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload("no-such-request", deadline_ms_from_now(10_000), 200).await;
-    assert!(result.is_empty());
-    assert!(t0.elapsed().as_millis() < 100, "should return immediately, took {}ms", t0.elapsed().as_millis());
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_payload_catches_payload_arriving_after_snapshot() {
-    let request_id = "serverless-late-payload-catch-test";
-    let (agent_buffer, notify, _report_notify) = insert_bare_request_data_serverless(request_id);
-
-    let buffer_clone = agent_buffer.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        if let Ok(mut buf) = buffer_clone.lock() {
-            buf.push(vec![7, 7, 7]);
-        }
-        notify.notify_one();
-    });
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload(request_id, deadline_ms_from_now(5_000), 2000).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert_eq!(result, vec![vec![7, 7, 7]]);
-    assert!(elapsed >= 50, "should have waited for the payload (got {elapsed}ms)");
-    assert!(elapsed < 2000, "should not wait beyond the configured budget (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_payload_times_out_when_nothing_arrives() {
-    let request_id = "serverless-late-payload-timeout-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload(request_id, deadline_ms_from_now(5_000), 150).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_empty());
-    assert!(elapsed >= 100, "should have waited near the configured timeout (got {elapsed}ms)");
-    assert!(elapsed < 600, "should not hang well beyond the configured timeout (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_payload_bounded_by_deadline_not_config_timeout() {
-    let request_id = "serverless-late-payload-deadline-bound-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload(request_id, deadline_ms_from_now(600), 2000).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_empty());
-    assert!(elapsed < 1000, "must be bounded by the deadline budget, not the full configured timeout (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_payload_skips_when_deadline_already_expired() {
-    let request_id = "serverless-late-payload-expired-deadline-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload(request_id, deadline_ms_from_now(-1_000), 2000).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_empty());
-    assert!(elapsed < 100, "should return immediately on an expired deadline, took {elapsed}ms");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_payload_returns_zero_when_timeout_configured_zero() {
-    let request_id = "serverless-late-payload-zero-timeout-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_payload(request_id, deadline_ms_from_now(5_000), 0).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_empty());
-    assert!(elapsed < 100, "a configured timeout of 0 must not wait at all, took {elapsed}ms");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-async fn test_wait_for_late_report_returns_immediately_when_no_request_data() {
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_report("no-such-request", deadline_ms_from_now(10_000), 200).await;
-    assert!(result.is_none());
-    assert!(t0.elapsed().as_millis() < 100, "should return immediately, took {}ms", t0.elapsed().as_millis());
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_report_catches_report_arriving_after_snapshot() {
-    let request_id = "serverless-late-report-catch-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let rid = request_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        request::set_pending_report(&rid, "REPORT line".to_string());
-    });
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_report(request_id, deadline_ms_from_now(5_000), 2000).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert_eq!(result, Some("REPORT line".to_string()));
-    assert!(elapsed >= 50, "should have waited for the report (got {elapsed}ms)");
-    assert!(elapsed < 2000, "should not wait beyond the configured budget (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_report_times_out_when_nothing_arrives() {
-    let request_id = "serverless-late-report-timeout-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_report(request_id, deadline_ms_from_now(5_000), 150).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_none());
-    assert!(elapsed >= 100, "should have waited near the configured timeout (got {elapsed}ms)");
-    assert!(elapsed < 600, "should not hang well beyond the configured timeout (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-#[tokio::test]
-#[serial]
-async fn test_wait_for_late_report_bounded_by_deadline_not_config_timeout() {
-    let request_id = "serverless-late-report-deadline-bound-test";
-    insert_bare_request_data_serverless(request_id);
-
-    let t0 = std::time::Instant::now();
-    let result = wait_for_late_report(request_id, deadline_ms_from_now(600), 2000).await;
-    let elapsed = t0.elapsed().as_millis();
-
-    assert!(result.is_none());
-    assert!(elapsed < 1000, "must be bounded by the deadline budget, not the full configured timeout (got {elapsed}ms)");
-
-    request::REQUEST_DATA.remove(request_id);
-}
-
-// ── process_request_concurrently — direct integration tests for both wait ──
-// ── directions and the unconditional report-restore fix ────────────────────
+// ── process_request_concurrently — direct integration tests for the immediate-send ──
+// ── fix (both process_request_concurrently's own arms and the unconditional ────────
+// ── report-restore fix) ─────────────────────────────────────────────────────────────
 
 fn make_serverless_processor_factory(
     config: Arc<config::ExtensionConfig>,
@@ -750,38 +560,20 @@ fn register_request_for_serverless(
     REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 }
 
-fn make_config_for_serverless(
-    blocking_agent_payload: bool,
-    agent_payload_timeout_ms: u64,
-    report_line_timeout_ms: u64,
-) -> Arc<config::ExtensionConfig> {
+fn make_config_for_serverless(synchronous_flush: bool) -> Arc<config::ExtensionConfig> {
     let mut cfg = config::ExtensionConfig::default();
-    cfg.new_relic.blocking_agent_payload = blocking_agent_payload;
-    cfg.new_relic.agent_payload_timeout_ms = agent_payload_timeout_ms;
-    cfg.new_relic.report_line_timeout_ms = report_line_timeout_ms;
+    cfg.new_relic.synchronous_flush = synchronous_flush;
     Arc::new(cfg)
 }
 
-// Direction 1, flag on: report already arrived, payload lands within the wait window.
+// Flag on, no report pending, no payload buffered: nothing to do — proves the
+// no-payload arm's baseline (no report to lose, nothing to send).
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_catches_late_payload_when_blocking_enabled() {
-    let request_id = "prc-direction1-catch-test";
-    let config = make_config_for_serverless(true, 300, 200);
+async fn process_request_concurrently_no_payload_no_report_is_a_no_op_sync_flush_on() {
+    let request_id = "prc-no-payload-no-report-sync-flush-on-test";
+    let config = make_config_for_serverless(true);
     register_request_for_serverless(request_id, config.clone());
-    request::set_pending_report(request_id, "REPORT for direction1".to_string());
-
-    let buffer = get_agent_buffer(request_id).expect("buffer must exist after registration");
-    let buffer_clone = buffer.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        if let Ok(mut buf) = buffer_clone.lock() {
-            buf.push(vec![1, 2, 3]);
-        }
-        if let Some(notify) = request::get_agent_payload_notify(request_id) {
-            notify.notify_one();
-        }
-    });
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
     let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
@@ -796,20 +588,22 @@ async fn process_request_concurrently_catches_late_payload_when_blocking_enabled
     )
     .await;
 
-    let batched = crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id);
-    assert!(batched.is_some(), "late payload must have been batched, not left unbatched");
-    assert_eq!(batched.unwrap().report_line, Some("REPORT for direction1".to_string()));
-    crate::agent::batch::AGENT_BATCH_BUFFER.remove(request_id);
+    assert!(get_pending_report(request_id).is_none());
+    assert!(crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none());
+
     REQUEST_DATA.remove(request_id);
 }
 
-// Direction 1, flag on, payload never arrives: the report must be RESTORED to
-// pending_report (not lost) so the next invocation / SHUTDOWN can still find it.
+// Flag on, report pending, no payload: the report must be RESTORED to pending_report
+// (not lost) — there is no wait for a late payload anymore (removed: it's effectively
+// unreachable in production, since a fresh request's own platform.report can never be
+// "already arrived" by the time this function's synchronous snapshot runs), so this
+// arm is reached immediately, every time, when there's no payload yet.
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_restores_report_when_payload_never_arrives_blocking_on() {
-    let request_id = "prc-direction1-timeout-restore-test";
-    let config = make_config_for_serverless(true, 100, 200);
+async fn process_request_concurrently_restores_report_when_no_payload_sync_flush_on() {
+    let request_id = "prc-report-restore-sync-flush-on-test";
+    let config = make_config_for_serverless(true);
     register_request_for_serverless(request_id, config.clone());
     request::set_pending_report(request_id, "REPORT never paired".to_string());
 
@@ -829,11 +623,11 @@ async fn process_request_concurrently_restores_report_when_payload_never_arrives
     assert_eq!(
         get_pending_report(request_id),
         Some("REPORT never paired".to_string()),
-        "report must be restored, not lost, when the payload wait times out"
+        "report must be restored, not lost, when there's no payload to send it with"
     );
     assert!(
         crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
-        "nothing should have been batched since the payload never arrived"
+        "nothing should have been batched since there was never a payload"
     );
 
     REQUEST_DATA.remove(request_id);
@@ -841,12 +635,12 @@ async fn process_request_concurrently_restores_report_when_payload_never_arrives
 
 // The regression proof: even with the flag OFF (default), a report that arrives with
 // no payload yet must be restored, not silently dropped — this is the unconditional
-// correctness fix, independent of NEW_RELIC_BLOCKING_AGENT_PAYLOAD.
+// correctness fix, independent of NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH.
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_restores_report_when_no_payload_blocking_off() {
+async fn process_request_concurrently_restores_report_when_no_payload_sync_flush_off() {
     let request_id = "prc-report-restore-flag-off-test";
-    let config = make_config_for_serverless(false, 200, 200); // flag OFF (default)
+    let config = make_config_for_serverless(false); // flag OFF (default)
     register_request_for_serverless(request_id, config.clone());
     request::set_pending_report(request_id, "REPORT with flag off".to_string());
 
@@ -872,24 +666,64 @@ async fn process_request_concurrently_restores_report_when_no_payload_blocking_o
     REQUEST_DATA.remove(request_id);
 }
 
-// Direction 2, flag on: payload already arrived, report lands within the wait window.
+// Payload present (the orphaned-buffer-drained-into-an-active-request edge case) and a
+// report happens to also be pending, flag on: the payload must be sent immediately,
+// decoupled from the report — not paired/batched. The report is restored via
+// set_pending_report (not attached to the send) since agent-payload delivery and
+// platform.report handling are independent features under this flag.
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_catches_late_report_when_blocking_enabled() {
-    let request_id = "prc-direction2-catch-test";
-    let config = make_config_for_serverless(true, 200, 300);
+async fn process_request_concurrently_sends_payload_immediately_and_decouples_report_when_sync_flush_on() {
+    let request_id = "prc-payload-sends-immediately-with-report-test";
+    let config = make_config_for_serverless(true);
     register_request_for_serverless(request_id, config.clone());
+    request::set_pending_report(request_id, "REPORT decoupled".to_string());
 
     let buffer = get_agent_buffer(request_id).expect("buffer must exist after registration");
     if let Ok(mut buf) = buffer.lock() {
         buf.push(vec![4, 5, 6]);
     }
 
-    let rid = request_id.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        request::set_pending_report(&rid, "REPORT for direction2".to_string());
-    });
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(5_000),
+    )
+    .await;
+
+    assert!(
+        crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
+        "the payload must be sent immediately, not batched"
+    );
+    assert_eq!(
+        get_pending_report(request_id),
+        Some("REPORT decoupled".to_string()),
+        "the report must be restored (not attached to the send) — the two are decoupled under this flag"
+    );
+
+    crate::agent::batch::AGENT_BATCH_BUFFER.remove(request_id);
+    REQUEST_DATA.remove(request_id);
+}
+
+// Same edge case, but with no report pending at all — the far more common shape of
+// the orphaned-buffer case in practice. The payload must still send immediately.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_sends_payload_immediately_without_report_when_sync_flush_on() {
+    let request_id = "prc-payload-sends-immediately-no-report-test";
+    let config = make_config_for_serverless(true);
+    register_request_for_serverless(request_id, config.clone());
+
+    let buffer = get_agent_buffer(request_id).expect("buffer must exist after registration");
+    if let Ok(mut buf) = buffer.lock() {
+        buf.push(vec![1, 2, 3]);
+    }
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
     let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
@@ -904,25 +738,29 @@ async fn process_request_concurrently_catches_late_report_when_blocking_enabled(
     )
     .await;
 
-    let batched = crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id);
-    assert!(batched.is_some(), "payload must have been batched once the late report arrived");
-    assert_eq!(batched.unwrap().report_line, Some("REPORT for direction2".to_string()));
+    assert!(
+        crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
+        "the payload must be sent immediately, not batched"
+    );
+    assert!(get_pending_report(request_id).is_none());
+
     crate::agent::batch::AGENT_BATCH_BUFFER.remove(request_id);
     REQUEST_DATA.remove(request_id);
 }
 
-// Direction 2, flag on, report never arrives: must send the payload UNPAIRED right
-// away (report_line: None) instead of leaving it buffered for the next invocation.
+// Regression proof: with the flag off (default), payload+report ready together must
+// still just batch (not send immediately) — unchanged from today's behavior.
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_sends_unpaired_when_report_never_arrives_blocking_on() {
-    let request_id = "prc-direction2-timeout-unpaired-test";
-    let config = make_config_for_serverless(true, 200, 100);
+async fn process_request_concurrently_batches_when_both_ready_sync_flush_off() {
+    let request_id = "prc-both-ready-flag-off-test";
+    let config = make_config_for_serverless(false); // flag OFF (default)
     register_request_for_serverless(request_id, config.clone());
+    request::set_pending_report(request_id, "REPORT both-ready-flag-off".to_string());
 
     let buffer = get_agent_buffer(request_id).expect("buffer must exist after registration");
     if let Ok(mut buf) = buffer.lock() {
-        buf.push(vec![9, 9, 9]);
+        buf.push(vec![7, 8, 9]);
     }
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -939,11 +777,10 @@ async fn process_request_concurrently_sends_unpaired_when_report_never_arrives_b
     .await;
 
     let batched = crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id);
-    assert!(batched.is_some(), "payload must be sent unpaired rather than left buffered");
+    assert!(batched.is_some(), "flag off: must still batch immediately-ready payload+report");
     assert_eq!(
-        batched.unwrap().report_line,
-        None,
-        "must be sent WITHOUT a report line — that's the 'unpaired' send this ticket asked for"
+        batched.expect("checked is_some above").report_line,
+        Some("REPORT both-ready-flag-off".to_string())
     );
     crate::agent::batch::AGENT_BATCH_BUFFER.remove(request_id);
     REQUEST_DATA.remove(request_id);
@@ -953,9 +790,9 @@ async fn process_request_concurrently_sends_unpaired_when_report_never_arrives_b
 // behave exactly as before — re-buffered for the next invocation, nothing batched.
 #[tokio::test]
 #[serial]
-async fn process_request_concurrently_rebuffers_payload_when_no_report_blocking_off() {
+async fn process_request_concurrently_rebuffers_payload_when_no_report_sync_flush_off() {
     let request_id = "prc-payload-only-flag-off-test";
-    let config = make_config_for_serverless(false, 200, 200); // flag OFF (default)
+    let config = make_config_for_serverless(false); // flag OFF (default)
     register_request_for_serverless(request_id, config.clone());
 
     let buffer = get_agent_buffer(request_id).expect("buffer must exist after registration");
@@ -987,6 +824,47 @@ async fn process_request_concurrently_rebuffers_payload_when_no_report_blocking_
     // The payload must have been put back into the buffer for the next invocation.
     let remaining = get_agent_buffer(request_id).and_then(|b| b.lock().ok().map(|g| g.len()));
     assert_eq!(remaining, Some(1), "payload must be re-buffered, not dropped, when the flag is off");
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// process_request_concurrently must await any pending_send_handles registered for its
+// request (e.g. by route_payload_to_request_buffer's immediate-send path) before
+// returning, bounded by the invocation's remaining deadline — proven here via a side
+// effect (an AtomicBool flipped inside the spawned task) that must be observably true
+// by the time process_request_concurrently's own await completes.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_awaits_pending_send_handles_before_returning() {
+    let request_id = "prc-awaits-pending-send-handles-test";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let completed_clone = completed.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    request::push_pending_send_handle(request_id, handle);
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(5_000),
+    )
+    .await;
+
+    assert!(
+        completed.load(std::sync::atomic::Ordering::SeqCst),
+        "process_request_concurrently must await outstanding pending_send_handles before returning"
+    );
 
     REQUEST_DATA.remove(request_id);
 }

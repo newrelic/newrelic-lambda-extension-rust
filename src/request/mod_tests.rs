@@ -195,8 +195,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -229,8 +228,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -284,8 +282,7 @@ mod tests {
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -308,8 +305,7 @@ mod tests {
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -452,8 +448,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -483,8 +478,7 @@ mod tests {
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         // Advance counter to invocation 10
@@ -513,8 +507,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         for _ in 0..10 {
@@ -553,8 +546,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: "arn:test".to_string(),
         });
         for _ in 0..10 {
@@ -603,8 +595,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
@@ -614,8 +605,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -671,8 +661,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -822,8 +811,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
@@ -832,8 +820,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -873,8 +860,7 @@ mod tests {
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
@@ -883,8 +869,7 @@ mod tests {
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -901,213 +886,136 @@ mod tests {
     }
 
     // ========================================================================
-    // agent_payload_notify / report_notify tests (serverless-mode blocking-agent-payload)
+    // pending_send_handles / spawn_immediate_agent_payload_send tests
+    // (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH)
+    //
+    // route_payload_to_request_buffer's own synchronous_flush branch reads
+    // event_loop::SERVERLESS_SEND_CONTEXT, a process-wide OnceLock that's only ever
+    // populated by main.rs (never set during `cargo test`) and cannot be safely
+    // flipped per-test without leaking state into every other test in the same binary
+    // run. spawn_immediate_agent_payload_send takes its client/config/log_processor as
+    // plain parameters instead, so it's tested directly here; the end-to-end wiring is
+    // covered by live AWS verification (see the PR description).
     // ========================================================================
 
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_agent_payload_notify_fires_on_active_route() {
-        clear_request_state();
+    fn make_noop_log_processor(config: Arc<crate::config::ExtensionConfig>) -> Arc<crate::logs::processor::LogProcessor> {
+        Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::new(crate::newrelic::client::NewRelicClient::new_noop()),
+            config,
+            Arc::new(Mutex::new(InvocationContext::default())),
+            None,
+        ))
+    }
 
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer.clone(),
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_no_license_key_completes_without_buffering() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "req-immediate-send-noop";
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: notify.clone(),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
         });
 
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-1".to_string());
+        let config = Arc::new(crate::config::ExtensionConfig::default()); // no license key
+        let log_processor = make_noop_log_processor(config.clone());
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![1, 2, 3],
+            newrelic_client,
+            config,
+            log_processor,
+        );
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for handle in handles {
+            handle.await.expect("send task must not panic");
         }
 
-        let waiter = tokio::spawn(async move {
-            notify.notified().await;
-        });
-
-        route_payload_to_request_buffer(vec![1, 2, 3]).await;
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
-            .await
-            .expect("notify should fire within timeout")
-            .expect("waiter task should not panic");
+        assert!(
+            crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
+            "a successful (short-circuited) send must not fall back to buffering"
+        );
 
         clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     #[serial]
-    async fn test_agent_payload_notify_fires_on_fallback_route() {
+    async fn test_spawn_immediate_agent_payload_send_buffers_on_network_failure() {
         clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
 
-        // No active request, but a buffer exists — exercises the fallback branch.
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let notify = Arc::new(tokio::sync::Notify::new());
-        REQUEST_DATA.insert("some-req".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer.clone(),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: notify.clone(),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
-        });
-
-        let waiter = tokio::spawn(async move {
-            notify.notified().await;
-        });
-
-        route_payload_to_request_buffer(vec![9, 9, 9]).await;
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
-            .await
-            .expect("notify should fire within timeout on the fallback route")
-            .expect("waiter task should not panic");
-
-        clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_agent_payload_notify_returns_none_for_unknown_request() {
-        clear_request_state();
-        assert!(get_agent_payload_notify("does-not-exist").is_none());
-        clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_agent_payload_notify_returns_some_for_known_request() {
-        clear_request_state();
-
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
+        let request_id = "req-immediate-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:test-fn".to_string();
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn.clone(),
         });
 
-        assert!(get_agent_payload_notify("req-1").is_some());
+        let mut cfg = crate::config::ExtensionConfig::default();
+        // A license key is required so send_agent_payload doesn't take its no-key
+        // short-circuit — we need it to actually attempt (and fail) a send.
+        cfg.new_relic.license_key = Some("fake-license-key".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let log_processor = make_noop_log_processor(config.clone());
+        // new_noop()'s 100ms *overall* request timeout bounds the whole send attempt
+        // (connect included) regardless of how the sandbox's network stack handles an
+        // unroutable loopback port — a real NewRelicClient's 10s connect_timeout can
+        // hang far longer than that if the environment silently drops the SYN instead
+        // of refusing it.
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![9, 9, 9],
+            newrelic_client,
+            config,
+            log_processor,
+        );
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1);
+        for handle in handles {
+            handle.await.expect("send task must not panic");
+        }
+
+        {
+            // Scope the DashMap Ref so the shard lock is released before .clear() below.
+            let buffered = crate::agent::batch::AGENT_BATCH_BUFFER
+                .get(request_id)
+                .expect("failed send must buffer the payload for retry, not drop it");
+            assert_eq!(buffered.report_line, None, "must be buffered unpaired");
+            assert_eq!(buffered.invoked_function_arn, arn);
+        }
 
         clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_take_agent_buffer_if_nonempty_drains_and_empties() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(vec![vec![1u8, 2, 3], vec![4, 5]]));
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer.clone(),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
-        });
-
-        let taken = take_agent_buffer_if_nonempty("req-1");
-        assert_eq!(taken, Some(vec![vec![1, 2, 3], vec![4, 5]]));
-        assert!(take_agent_buffer_if_nonempty("req-1").is_none());
-        assert!(buffer.lock().unwrap().is_empty());
-
-        clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_take_agent_buffer_if_nonempty_returns_none_when_empty_or_missing() {
-        clear_request_state();
-
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
-        });
-
-        assert!(take_agent_buffer_if_nonempty("req-1").is_none());
-        assert!(take_agent_buffer_if_nonempty("does-not-exist").is_none());
-
-        clear_request_state();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_report_notify_fires_on_set_pending_report() {
-        clear_request_state();
-
-        let notify = Arc::new(tokio::sync::Notify::new());
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: notify.clone(),
-                invoked_function_arn: String::new(),
-        });
-
-        let waiter = tokio::spawn(async move {
-            notify.notified().await;
-        });
-
-        set_pending_report("req-1", "REPORT line".to_string());
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), waiter)
-            .await
-            .expect("report_notify must fire within timeout when set_pending_report is called")
-            .expect("waiter task should not panic");
-
-        clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_report_notify_returns_none_for_unknown_request() {
-        clear_request_state();
-        assert!(get_report_notify("does-not-exist").is_none());
-        clear_request_state();
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_report_notify_returns_some_for_known_request() {
-        clear_request_state();
-
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            pending_report: None,
-            creation_invocation: 0,
-            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
-            agent_payload_notify: Arc::new(tokio::sync::Notify::new()),
-            report_notify: Arc::new(tokio::sync::Notify::new()),
-                invoked_function_arn: String::new(),
-        });
-
-        assert!(get_report_notify("req-1").is_some());
-
-        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
     }
 
 
