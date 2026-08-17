@@ -473,21 +473,46 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
         .ok()
         .and_then(|guard| guard.clone());
 
+    // Read once; used below both for the immediate-send decision and for trace
+    // extraction. None only in the brief startup window before main.rs populates it.
+    let send_context = crate::event_loop::SERVERLESS_SEND_CONTEXT.get();
+
     if let Some(request_id) = current_request_id {
+        // Extract trace.id the instant we have the payload bytes in hand — regardless
+        // of mode, and regardless of whether it's about to be sent immediately or
+        // buffered below. Held function/extension logs waiting for a trace.id
+        // shouldn't sit around any longer than necessary just because pairing with
+        // platform.report (or, under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH, nothing at
+        // all) hasn't happened yet. Safe to call unconditionally: on_trace_id_extracted
+        // drains pending_logs once, so the later extraction call sites
+        // (process_request_concurrently, telemetry::listener's platform.report
+        // handler, process_apm_request's Flow 1) become harmless no-ops for this
+        // payload if it already ran here.
+        if let Some((_, config, log_processor)) = send_context {
+            if config.new_relic.collect_trace_id {
+                crate::event_loop::extract_and_coordinate_trace_id(
+                    &payload_bytes,
+                    &request_id,
+                    config,
+                    log_processor,
+                )
+                .await;
+            }
+        }
+
         // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH (serverless mode only — gated on
         // !apm_lambda_mode because this function is the *shared* storage step for
         // agent payloads in both modes: process_apm_request's Flow-1/Flow-2 reads from
         // this same agent_buffer, so diverting payloads away from it here would
         // silently break APM-mode delivery): send immediately instead of buffering to
         // pair with platform.report.
-        if let Some((newrelic_client, config, log_processor)) = crate::event_loop::SERVERLESS_SEND_CONTEXT.get() {
+        if let Some((newrelic_client, config, _)) = send_context {
             if config.new_relic.synchronous_flush && !config.new_relic.apm_lambda_mode {
                 spawn_immediate_agent_payload_send(
                     &request_id,
                     payload_bytes,
                     newrelic_client.clone(),
                     config.clone(),
-                    log_processor.clone(),
                 );
                 return;
             }
@@ -522,6 +547,19 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                 "No active request - routing late agent payload to buffer: {}",
                 request_id
             );
+            // Same early trace extraction as the active-request branch above — we
+            // have a concrete request_id to correlate against here too.
+            if let Some((_, config, log_processor)) = send_context {
+                if config.new_relic.collect_trace_id {
+                    crate::event_loop::extract_and_coordinate_trace_id(
+                        &payload_bytes,
+                        &request_id,
+                        config,
+                        log_processor,
+                    )
+                    .await;
+                }
+            }
             if let Some(entry) = REQUEST_DATA.get(&request_id) {
                 if let Ok(mut buffer) = entry.agent_buffer.lock() {
                     buffer.push(payload_bytes);
@@ -550,16 +588,15 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
 /// Send an agent payload to New Relic immediately, decoupled from any pairing with
 /// `platform.report`, as its own background task — used when
 /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled (serverless mode only, per the
-/// caller's gate). Trace-id extraction still runs, exactly as it would for a buffered
-/// payload, before the send. On failure, buffers into `AGENT_BATCH_BUFFER` (unpaired)
-/// rather than dropping the payload, so it's still picked up by the existing
-/// periodic-cleanup / `SHUTDOWN` drain.
+/// caller's gate). Trace-id extraction already ran in the caller
+/// (`route_payload_to_request_buffer`) before this was spawned. On failure, buffers
+/// into `AGENT_BATCH_BUFFER` (unpaired) rather than dropping the payload, so it's
+/// still picked up by the existing periodic-cleanup / `SHUTDOWN` drain.
 fn spawn_immediate_agent_payload_send(
     request_id: &str,
     payload_bytes: Vec<u8>,
     newrelic_client: Arc<NewRelicClient>,
     config: Arc<ExtensionConfig>,
-    log_processor: Arc<crate::logs::processor::LogProcessor>,
 ) {
     let arn = get_request_context(request_id)
         .and_then(|ctx_ref| {
@@ -573,14 +610,8 @@ fn spawn_immediate_agent_payload_send(
 
     let handle_request_id = request_id.to_string();
     let handle = tokio::spawn(async move {
-        crate::event_loop::extract_and_coordinate_trace_id(
-            &payload_bytes,
-            &handle_request_id,
-            &config,
-            &log_processor,
-        )
-        .await;
-
+        // Trace-id extraction already ran in route_payload_to_request_buffer, before
+        // this task was spawned — no need to repeat it here.
         let version_info = crate::version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
 
         if let Err(e) = send_agent_payload_to_newrelic(

@@ -889,23 +889,19 @@ mod tests {
     // pending_send_handles / spawn_immediate_agent_payload_send tests
     // (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH)
     //
-    // route_payload_to_request_buffer's own synchronous_flush branch reads
-    // event_loop::SERVERLESS_SEND_CONTEXT, a process-wide OnceLock that's only ever
-    // populated by main.rs (never set during `cargo test`) and cannot be safely
-    // flipped per-test without leaking state into every other test in the same binary
-    // run. spawn_immediate_agent_payload_send takes its client/config/log_processor as
-    // plain parameters instead, so it's tested directly here; the end-to-end wiring is
-    // covered by live AWS verification (see the PR description).
+    // route_payload_to_request_buffer reads event_loop::SERVERLESS_SEND_CONTEXT, a
+    // process-wide OnceLock that's only ever populated by main.rs (never set during
+    // `cargo test`) and can only be set ONCE for the whole test binary run — so at
+    // most one test in this file may call `.set()` on it, and that test must use
+    // synchronous_flush=false so every other (unrelated, order-independent) test
+    // still exercising the default buffering path isn't silently diverted into the
+    // immediate-send branch. spawn_immediate_agent_payload_send itself takes its
+    // client/config as plain parameters instead of reading the global, so most of its
+    // behavior is tested directly, without touching SERVERLESS_SEND_CONTEXT at all.
+    // The one exception is `test_route_payload_to_request_buffer_extracts_trace_id_...`
+    // below, which needs the real global-reading code path to prove trace-id
+    // extraction fires from route_payload_to_request_buffer itself.
     // ========================================================================
-
-    fn make_noop_log_processor(config: Arc<crate::config::ExtensionConfig>) -> Arc<crate::logs::processor::LogProcessor> {
-        Arc::new(crate::logs::processor::LogProcessor::new(
-            Arc::new(crate::newrelic::client::NewRelicClient::new_noop()),
-            config,
-            Arc::new(Mutex::new(InvocationContext::default())),
-            None,
-        ))
-    }
 
     #[tokio::test]
     #[serial]
@@ -929,7 +925,6 @@ mod tests {
         });
 
         let config = Arc::new(crate::config::ExtensionConfig::default()); // no license key
-        let log_processor = make_noop_log_processor(config.clone());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
 
         spawn_immediate_agent_payload_send(
@@ -937,7 +932,6 @@ mod tests {
             vec![1, 2, 3],
             newrelic_client,
             config,
-            log_processor,
         );
 
         let handles = take_pending_send_handles(request_id);
@@ -983,7 +977,6 @@ mod tests {
         cfg.new_relic.license_key = Some("fake-license-key".to_string());
         cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
         let config = Arc::new(cfg);
-        let log_processor = make_noop_log_processor(config.clone());
         // new_noop()'s 100ms *overall* request timeout bounds the whole send attempt
         // (connect included) regardless of how the sandbox's network stack handles an
         // unroutable loopback port — a real NewRelicClient's 10s connect_timeout can
@@ -996,7 +989,6 @@ mod tests {
             vec![9, 9, 9],
             newrelic_client,
             config,
-            log_processor,
         );
 
         let handles = take_pending_send_handles(request_id);
@@ -1080,7 +1072,104 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // route_payload_to_request_buffer must extract trace.id the instant the payload
+    // arrives, on the DEFAULT (buffered, synchronous_flush=off) path — not just under
+    // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH. Before this, extraction on the default
+    // path only happened much later (telemetry::listener's platform.report handler,
+    // or rarely in process_request_concurrently's own early snapshot), leaving
+    // held function/extension logs parked longer than necessary.
+    //
+    // This is the ONE test in this file allowed to call SERVERLESS_SEND_CONTEXT.set()
+    // (a process-wide OnceLock — see the module-level comment above). It uses
+    // synchronous_flush=false so it cannot divert any other test's payload into the
+    // immediate-send branch, regardless of test execution order.
+    // ========================================================================
 
+    /// Build a payload in the exact wrapped/base64/gzip format
+    /// `trace::extract_trace_id_from_payload` expects (mirrors
+    /// `trace::mod_tests::create_test_payload_with_trace_id`).
+    fn build_trace_bearing_payload(trace_id: &str) -> Vec<u8> {
+        use base64::engine::general_purpose;
+        use base64::Engine as _;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
 
+        let test_data = format!(
+            r#"{{"analytic_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]], "span_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]]}}"#
+        );
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(test_data.as_bytes()).unwrap();
+        let compressed = gz.finish().unwrap();
+        let b64 = general_purpose::STANDARD.encode(&compressed);
+        let payload_array = format!(r#"[2,"NR_LAMBDA_MONITORING","","{b64}"]"#);
+        general_purpose::STANDARD.encode(payload_array.as_bytes()).into_bytes()
+    }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_route_payload_to_request_buffer_extracts_trace_id_on_default_path() {
+        clear_request_state();
+
+        let request_id = "req-trace-on-arrival";
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.collect_trace_id = true;
+        cfg.new_relic.synchronous_flush = false; // must not divert other tests
+        let config = Arc::new(cfg);
+
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            newrelic_client.clone(),
+            config.clone(),
+            Arc::new(Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        // A function log held for this request, waiting on a trace.id — the thing
+        // route_payload_to_request_buffer's new early extraction should unblock.
+        log_processor.test_hold_log(request_id, "held-before-payload-arrives");
+        assert_eq!(log_processor.test_pending_logs_len_for(request_id), 1);
+        assert_eq!(log_processor.test_log_batch_len(), 0);
+
+        // Only ever set once for the whole test binary — see the module comment above.
+        let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((newrelic_client, config, log_processor.clone()));
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some(request_id.to_string());
+        }
+
+        let payload = build_trace_bearing_payload("trace-on-arrival-123");
+        route_payload_to_request_buffer(payload.clone()).await;
+
+        // Trace extraction ran synchronously inside route_payload_to_request_buffer,
+        // before/without any platform.report — the held log must already be routed.
+        assert_eq!(
+            log_processor.test_pending_logs_len_for(request_id),
+            0,
+            "the held log must have been drained by the immediate extraction"
+        );
+        assert_eq!(
+            log_processor.test_log_batch_len(),
+            1,
+            "the held log must have been stamped and routed to the outbound batch"
+        );
+
+        // And the default (synchronous_flush=false) buffering behavior is unaffected:
+        // the payload itself still lands in agent_buffer, not sent immediately.
+        let buffered = get_agent_buffer(request_id).and_then(|b| b.lock().ok().map(|g| g.len()));
+        assert_eq!(buffered, Some(1), "payload must still be buffered normally");
+
+        clear_request_state();
+    }
 }
