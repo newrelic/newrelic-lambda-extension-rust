@@ -1018,7 +1018,67 @@ mod tests {
         crate::agent::batch::AGENT_BATCH_BUFFER.clear();
     }
 
+    // drain_and_await_all_pending_send_handles must catch a pending send regardless of
+    // which request_id it's under — the SHUTDOWN-time gap this closes is a payload
+    // whose own invocation's process_request_concurrently already returned (so nothing
+    // else will ever call take_pending_send_handles for that specific request_id again).
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_awaits_across_multiple_requests() {
+        clear_request_state();
 
+        for request_id in ["req-shutdown-sweep-a", "req-shutdown-sweep-b"] {
+            REQUEST_DATA.insert(request_id.to_string(), RequestData {
+                context: Arc::new(Mutex::new(InvocationContext::default())),
+                agent_buffer: Arc::new(Mutex::new(Vec::new())),
+                pending_report: None,
+                creation_invocation: 0,
+                runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+                pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
+            });
+        }
+
+        let completed_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        for (request_id, flag) in [
+            ("req-shutdown-sweep-a", completed_a.clone()),
+            ("req-shutdown-sweep-b", completed_b.clone()),
+        ] {
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            push_pending_send_handle(request_id, handle);
+        }
+
+        drain_and_await_all_pending_send_handles().await;
+
+        assert!(
+            completed_a.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-a must be awaited"
+        );
+        assert!(
+            completed_b.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-b must be awaited"
+        );
+
+        // Nothing left to drain a second time.
+        assert!(take_pending_send_handles("req-shutdown-sweep-a").is_empty());
+        assert!(take_pending_send_handles("req-shutdown-sweep-b").is_empty());
+
+        clear_request_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_is_a_noop_when_nothing_pending() {
+        clear_request_state();
+        // Must return promptly and without panicking when REQUEST_DATA is empty.
+        drain_and_await_all_pending_send_handles().await;
+        clear_request_state();
+    }
 
 
 

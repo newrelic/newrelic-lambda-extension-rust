@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     context::InvocationContext,
@@ -168,6 +168,40 @@ pub fn take_pending_send_handles(request_id: &str) -> Vec<tokio::task::JoinHandl
         .get(request_id)
         .and_then(|entry| entry.pending_send_handles.lock().ok().map(|mut h| std::mem::take(&mut *h)))
         .unwrap_or_default()
+}
+
+/// Drain and await **every** pending immediate-send handle across **all** requests —
+/// not just one. `take_pending_send_handles` alone only covers the common case (a
+/// payload sent during its own invocation, awaited by that invocation's
+/// `process_request_concurrently`); it misses a payload that arrives *after* its
+/// owning invocation's `process_request_concurrently` has already returned (e.g. an
+/// agent flushing telemetry just after the handler returns, racing the final flush).
+/// That send is still spawned and its handle still lands in `pending_send_handles`,
+/// but nothing would otherwise come back to await it — call this at `SHUTDOWN`,
+/// wrapped in the same bounded timeout as the rest of the shutdown sequence, so a
+/// send in flight when the sandbox is torn down is waited for rather than silently
+/// abandoned.
+pub async fn drain_and_await_all_pending_send_handles() {
+    let request_ids: Vec<String> = REQUEST_DATA.iter().map(|entry| entry.key().clone()).collect();
+
+    let mut handles = Vec::new();
+    for request_id in request_ids {
+        handles.extend(take_pending_send_handles(&request_id));
+    }
+
+    if handles.is_empty() {
+        return;
+    }
+
+    debug!(
+        "Shutdown: awaiting {} outstanding immediate-send task(s)",
+        handles.len()
+    );
+    for handle in handles {
+        if let Err(e) = handle.await {
+            error!("Immediate agent-payload send task panicked during shutdown: {}", e);
+        }
+    }
 }
 
 /// Record that platform.runtimeDone fired before the request state existed.
@@ -434,8 +468,6 @@ pub async fn cleanup_old_request_buffers(
 /// Agent payloads come from named pipe without request_id, so we route to the active request
 /// This is the same logic as 2.4.1 which worked correctly
 pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
-    use tracing::{debug, error, info, warn};
-
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
         .lock()
         .ok()

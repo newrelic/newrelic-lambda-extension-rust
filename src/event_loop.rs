@@ -1173,6 +1173,15 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 tokio::task::yield_now().await;
                 tokio::task::yield_now().await;
 
+                // Under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH, a payload that arrived after
+                // its own invocation's process_request_concurrently already returned (racing
+                // the final flush) has its immediate-send task's handle sitting unawaited in
+                // some request's pending_send_handles — nothing else will ever come back for
+                // it. Sweep every request now, inside this same SHUTDOWN_TIMEOUT_MS-bounded
+                // timeout, so an in-flight send is waited for rather than silently abandoned
+                // when the sandbox is torn down.
+                request::drain_and_await_all_pending_send_handles().await;
+
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
                 send_all_pending_payloads_on_shutdown(
