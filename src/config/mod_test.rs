@@ -57,6 +57,7 @@ where
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
+        "NEW_RELIC_OTLP_METRIC_ENABLED",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -1111,6 +1112,48 @@ fn test_extract_account_id_from_arn_empty_string() {
 }
 
 #[test]
+fn test_extract_account_id_from_arn_rejects_truncated_arn_with_enough_colons() {
+    // Only 5 parts and no "function" segment — must not be mistaken for a valid ARN
+    // just because parts.len() >= 5 and parts[0]/parts[2] happen to match.
+    let arn = "arn:evil:lambda:us-east-1:999999999999";
+    let account_id = AwsConfig::extract_account_id_from_arn(arn);
+    assert_eq!(account_id, None);
+}
+
+#[test]
+fn test_extract_account_id_from_arn_rejects_non_aws_partition() {
+    let arn = "arn:evil:lambda:us-east-1:123456789012:function:my-function";
+    let account_id = AwsConfig::extract_account_id_from_arn(arn);
+    assert_eq!(account_id, None);
+}
+
+#[test]
+fn test_extract_account_id_from_arn_accepts_govcloud_and_china_partitions() {
+    let gov = AwsConfig::extract_account_id_from_arn(
+        "arn:aws-us-gov:lambda:us-gov-west-1:123456789012:function:my-function",
+    );
+    assert_eq!(gov, Some("123456789012".to_string()));
+
+    let cn = AwsConfig::extract_account_id_from_arn(
+        "arn:aws-cn:lambda:cn-north-1:123456789012:function:my-function",
+    );
+    assert_eq!(cn, Some("123456789012".to_string()));
+}
+
+#[test]
+fn test_extract_account_id_from_arn_rejects_empty_region_or_account() {
+    let empty_region = AwsConfig::extract_account_id_from_arn(
+        "arn:aws:lambda::123456789012:function:my-function",
+    );
+    assert_eq!(empty_region, None);
+
+    let empty_account = AwsConfig::extract_account_id_from_arn(
+        "arn:aws:lambda:us-east-1::function:my-function",
+    );
+    assert_eq!(empty_account, None);
+}
+
+#[test]
 #[serial]
 fn test_from_env_with_empty_string_values() {
     with_full_clean_env(|| {
@@ -1166,6 +1209,8 @@ fn test_new_relic_config_all_fields() {
         apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
+        otlp_metric_endpoint: "http://otlp".to_string(),
+        otlp_metric_enabled: true,
         proxy_url: Some("http://proxy:8080".to_string()),
     };
     
@@ -1556,5 +1601,59 @@ fn test_apm_blocking_handshake_truthy_variants() {
             );
         });
     }
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_true_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.otlp_metric_enabled,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_garbage_string_falls_back_to_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "not_a_bool");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
 }
 

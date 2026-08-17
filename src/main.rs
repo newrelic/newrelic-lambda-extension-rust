@@ -347,16 +347,26 @@ async fn perform_one_time_initialization(
     // Detect EU endpoints from license key prefix
     let license_key_prefix = license_key.get(0..2);
 
+    // OTLP metrics ingest at `/v1/metrics` on the APM collector host, so otlp_metric_endpoint
+    // follows apm_host rather than being configured separately. NEW_RELIC_OTLP_METRIC_ENDPOINT
+    // (applied below) still overrides this for anyone who needs a different host.
     if let Ok(host) = env::var("NEW_RELIC_HOST") {
+        updated_config.new_relic.otlp_metric_endpoint = format!("https://{host}/v1/metrics");
         updated_config.new_relic.apm_host = host;
     } else if let Some("eu") = license_key_prefix {
-        updated_config.new_relic.apm_host = "collector.eu01.nr-data.net".to_string();
+        updated_config.new_relic.apm_host = "collector.eu.newrelic.com".to_string();
+        updated_config.new_relic.otlp_metric_endpoint =
+            "https://collector.eu.newrelic.com/v1/metrics".to_string();
     }
 
     if let Ok(endpoint) = env::var("NEW_RELIC_METRIC_ENDPOINT") {
         updated_config.new_relic.metric_endpoint = endpoint;
     } else if let Some("eu") = license_key_prefix {
         updated_config.new_relic.metric_endpoint = "https://metric-api.eu.newrelic.com/metric/v1".to_string();
+    }
+
+    if let Ok(endpoint) = env::var("NEW_RELIC_OTLP_METRIC_ENDPOINT") {
+        updated_config.new_relic.otlp_metric_endpoint = endpoint;
     }
 
     if let Ok(endpoint) = env::var("NEW_RELIC_TELEMETRY_ENDPOINT") {
@@ -471,6 +481,18 @@ async fn perform_one_time_initialization(
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
 
+    // Mirror the *effective* OTLP capability (env var AND APM mode), not just the env var,
+    // so is_otlp_metric_enabled() answers "will OTLP actually be sent?" rather than "did the
+    // customer ask for it?". Warn on the mismatch — otherwise a customer who sets the flag
+    // in serverless mode gets no metrics and no explanation.
+    if config.new_relic.otlp_metric_enabled && !config.new_relic.apm_lambda_mode {
+        warn!(
+            "NEW_RELIC_OTLP_METRIC_ENABLED=true but APM mode is disabled - OTLP metric \
+             forwarding requires NEW_RELIC_APM_LAMBDA_MODE=true and will not run"
+        );
+    }
+    apm::collector::set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
             // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
@@ -488,6 +510,7 @@ async fn perform_one_time_initialization(
 
             let apm_host = config.new_relic.apm_host.clone();
             let metric_endpoint = config.new_relic.metric_endpoint.clone();
+            let otlp_metric_endpoint = config.new_relic.otlp_metric_endpoint.clone();
             let function_name = std::env::var("NEW_RELIC_APP_NAME")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -525,6 +548,7 @@ async fn perform_one_time_initialization(
                     license_key,
                     apm_host,
                     metric_endpoint,
+                    otlp_metric_endpoint,
                     apm_client_clone,
                     function_name,
                     lambda_function_name,

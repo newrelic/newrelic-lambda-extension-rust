@@ -26,6 +26,8 @@ pub struct LambdaData {
     pub span_event_data: Vec<Value>,
     pub sql_trace_data: Vec<Value>,
     pub transaction_sample_data: Vec<Value>,
+    /// Base64-encoded OTLP ExportMetricsServiceRequest protobuf entries
+    pub otlp_payload: Vec<String>,
 }
 
 /// Protocol v1 wrapper with metadata and data fields
@@ -145,6 +147,13 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     if !data.transaction_sample_data.is_empty() {
         map.insert("transaction_sample_data".to_string(), data.transaction_sample_data);
     }
+    if !data.otlp_payload.is_empty() {
+        // Store as Vec<Value::String> so it fits the shared map type
+        map.insert(
+            "otlp_payload".to_string(),
+            data.otlp_payload.into_iter().map(Value::String).collect(),
+        );
+    }
 
     map
 }
@@ -160,13 +169,23 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
         
         fn get_field(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<Value> {
             let value = map.get(snake_case).or_else(|| map.get(camel_case));
-            
             match value {
                 Some(Value::Array(arr)) => arr.clone(),
                 _ => Vec::new(),
             }
         }
-        
+
+        fn get_string_array(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<String> {
+            let value = map.get(snake_case).or_else(|| map.get(camel_case));
+            match value {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
         Ok(LambdaData {
             metric_data: get_field(&raw_map, "metric_data", "metricData"),
             custom_event_data: get_field(&raw_map, "custom_event_data", "customEventData"),
@@ -177,6 +196,7 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             span_event_data: get_field(&raw_map, "span_event_data", "spanEventData"),
             sql_trace_data: get_field(&raw_map, "sql_trace_data", "sqlTraceData"),
             transaction_sample_data: get_field(&raw_map, "transaction_sample_data", "transactionSampleData"),
+            otlp_payload: get_string_array(&raw_map, "otlp_payload", "otlpPayload"),
         })
     }
 }
@@ -224,5 +244,118 @@ mod tests {
         assert_eq!(version, 1);
         assert!(data_map.contains_key("metric_data"));
         assert!(data_map.contains_key("span_event_data"));
+    }
+
+    fn create_test_payload_with_json(json_body: &str) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json_body.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{encoded}"]"#).into_bytes()
+    }
+
+    #[test]
+    fn test_otlp_payload_snake_case_key() {
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": ["abc123"]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing");
+        assert_eq!(entries, &vec![Value::String("abc123".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_camel_case_key_fallback() {
+        // .NET-style JSON serializers commonly default to camelCase — must not
+        // silently drop otlp_payload if the agent emits "otlpPayload" instead.
+        let payload = create_test_payload_with_json(r#"{"otlpPayload": ["def456"]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing (camelCase fallback failed)");
+        assert_eq!(entries, &vec![Value::String("def456".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_snake_case_takes_precedence_over_camel_case() {
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["snake"], "otlpPayload": ["camel"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map.get("otlp_payload").unwrap();
+        assert_eq!(entries, &vec![Value::String("snake".to_string())]);
+    }
+
+    #[test]
+    fn test_otlp_payload_absent_key_yields_no_map_entry() {
+        let payload = create_test_payload_with_json(r#"{"metric_data": [[1, 2, 3]]}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
+    }
+
+    #[test]
+    fn test_otlp_payload_multi_element_array_keeps_every_entry_in_order() {
+        // The agent may batch several OTLP requests into one array. Every element
+        // must survive parsing (not just the first) and keep its original order,
+        // since send_otlp_payload numbers them 1..N for log correlation.
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["first", "second", "third", "fourth"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map
+            .get("otlp_payload")
+            .expect("otlp_payload key missing");
+        assert_eq!(
+            entries,
+            &vec![
+                Value::String("first".to_string()),
+                Value::String("second".to_string()),
+                Value::String("third".to_string()),
+                Value::String("fourth".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_otlp_payload_non_string_elements_are_skipped_not_fatal() {
+        // get_string_array filters on as_str(), so a malformed element is dropped
+        // rather than poisoning the whole batch. Assert that explicitly so the
+        // lenient behaviour is intentional and not an accident of refactoring.
+        let payload = create_test_payload_with_json(
+            r#"{"otlp_payload": ["good1", 42, null, {"a":1}, ["nested"], "good2"]}"#,
+        );
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        let entries = data_map
+            .get("otlp_payload")
+            .expect("otlp_payload key missing");
+        assert_eq!(
+            entries,
+            &vec![
+                Value::String("good1".to_string()),
+                Value::String("good2".to_string()),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_otlp_payload_empty_array_yields_no_map_entry() {
+        // An empty array must behave like an absent key so app.rs takes its
+        // "no otlp_payload found" branch rather than spawning a no-op send.
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": []}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
+    }
+
+    #[test]
+    fn test_otlp_payload_scalar_string_not_wrapped_is_ignored() {
+        // Defensive: a bare string (not an array) does not match Value::Array,
+        // so it yields nothing. Documents the shape contract with the agent.
+        let payload = create_test_payload_with_json(r#"{"otlp_payload": "bare"}"#);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+        assert!(!data_map.contains_key("otlp_payload"));
     }
 }

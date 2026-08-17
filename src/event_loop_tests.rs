@@ -266,6 +266,7 @@ fn make_test_apm_app() -> crate::apm::ApmApp {
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-license-key".to_string(),
         metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
+        otlp_metric_endpoint: "http://127.0.0.1:1/v1/metrics".to_string(),
         client: reqwest::Client::new(),
     }
 }

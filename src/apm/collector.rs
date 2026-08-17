@@ -6,6 +6,7 @@
 //! Based on collector.go CollectorRequest() and SendAPMTelemetry()
 
 use anyhow::Result;
+use base64::{Engine as _, engine::general_purpose};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use reqwest::Client;
@@ -103,6 +104,25 @@ pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Process-wide OTLP feature gate, populated once at startup (default false). True only
+/// when `NEW_RELIC_OTLP_METRIC_ENABLED` **and** `NEW_RELIC_APM_LAMBDA_MODE` are both set —
+/// the forwarding code lives in `ApmApp::process_agent_payload`, which does not exist in
+/// serverless mode, so the env var alone is not sufficient. Lets code paths without
+/// `ExtensionConfig` in scope check whether OTLP forwarding will actually happen.
+static OTLP_METRIC_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether OTLP metrics forwarding is enabled (called once at startup).
+/// Callers pass the effective value (env var AND APM mode), not the raw env var.
+pub fn set_otlp_metric_enabled(enabled: bool) {
+    OTLP_METRIC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether OTLP metric forwarding is active: `NEW_RELIC_OTLP_METRIC_ENABLED` is set AND
+/// APM mode is on. False in serverless mode even if the env var is set.
+pub fn is_otlp_metric_enabled() -> bool {
+    OTLP_METRIC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// HTTP status codes worth retrying — transient server/throttle conditions.
 /// 401/409 (restart) and 410 (disconnect) are handled separately and are NOT here.
 pub fn is_retryable_status(status: u16) -> bool {
@@ -160,6 +180,53 @@ impl std::fmt::Display for MetricApiError {
 }
 
 impl std::error::Error for MetricApiError {}
+
+/// Outcome classification for an OTLP payload send failure. Mirrors `MetricApiError`
+/// (same license-key-only auth model, no `run_id`/collector reconnect semantics).
+#[derive(Debug)]
+pub enum OtlpError {
+    /// Transient failure (5xx/429/408) — safe to retry.
+    Retryable {
+        status: u16,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// Permanent failure (4xx other than 429/408) — retrying will not help.
+    Permanent { status: u16 },
+    /// Transport/network/timeout error — safe to retry.
+    Network(anyhow::Error),
+    /// Malformed payload (bad base64, invalid protobuf) — retrying the same bytes
+    /// will never succeed.
+    MalformedPayload(anyhow::Error),
+}
+
+impl OtlpError {
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            OtlpError::Retryable { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, OtlpError::Permanent { .. } | OtlpError::MalformedPayload(_))
+    }
+}
+
+impl std::fmt::Display for OtlpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OtlpError::Retryable { status, .. } => {
+                write!(f, "OTLP transient error (status {status})")
+            }
+            OtlpError::Permanent { status } => {
+                write!(f, "OTLP permanent error (status {status})")
+            }
+            OtlpError::Network(e) => write!(f, "OTLP network error: {e}"),
+            OtlpError::MalformedPayload(e) => write!(f, "OTLP malformed payload: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for OtlpError {}
 
 /// Send error event telemetry to APM collector
 /// Error events have a special structure: [run_id, {events_seen, reservoir_size}, [events]]
@@ -508,6 +575,58 @@ mod collector_tests {
     }
 
     #[test]
+    #[serial]
+    fn otlp_metric_enabled_defaults_to_false_and_roundtrips() {
+        // Process-wide static: don't assume a fresh false here (another test may have
+        // run first), but do confirm the flag actually flips both ways.
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
+        set_otlp_metric_enabled(true);
+        assert!(is_otlp_metric_enabled());
+        // Reset so other serial tests see a clean state.
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
+    }
+
+    /// Pins the full truth table for the effective OTLP gate, exercising the REAL
+    /// production function (`ExtensionConfig::otlp_metric_forwarding_active`) that main.rs
+    /// feeds into `set_otlp_metric_enabled` — not a re-implementation of the `&&`. Guards
+    /// against regressing to mirroring the env var alone, which would leave the flag "on"
+    /// in serverless mode where the OTLP send path does not exist.
+    #[test]
+    #[serial]
+    fn otlp_metric_enabled_requires_both_env_var_and_apm_mode() {
+        for (env_var, apm_mode, expected) in [
+            (true, true, true),    // both on -> OTLP sends
+            (true, false, false),  // flag set but serverless -> no send path exists
+            (false, true, false),  // APM mode but flag off -> opted out
+            (false, false, false), // neither
+        ] {
+            let mut config = crate::config::ExtensionConfig::default();
+            config.new_relic.otlp_metric_enabled = env_var;
+            config.new_relic.apm_lambda_mode = apm_mode;
+
+            assert_eq!(
+                config.otlp_metric_forwarding_active(),
+                expected,
+                "otlp_metric_forwarding_active: env_var={env_var}, apm_mode={apm_mode}"
+            );
+
+            // And confirm it round-trips through the process-wide gate main.rs sets.
+            set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
+            assert_eq!(
+                is_otlp_metric_enabled(),
+                expected,
+                "is_otlp_metric_enabled: env_var={env_var}, apm_mode={apm_mode}"
+            );
+        }
+
+        // Reset so other serial tests see a clean state.
+        set_otlp_metric_enabled(false);
+        assert!(!is_otlp_metric_enabled());
+    }
+
+    #[test]
     fn known_telemetry_types_complete() {
         // The 9 agent-payload types + platform_metrics.
         assert_eq!(KNOWN_TELEMETRY_TYPES.len(), 10);
@@ -543,4 +662,209 @@ mod collector_tests {
         assert!(is_restart(&restart), "RestartException (409/401) must be detected");
         assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
     }
+
+
+}
+
+/// Decode, enrich with `entity.guid`, gzip, and POST a single base64-encoded OTLP payload.
+/// `payload_num` is a 1-based index used only for human-readable logging.
+///
+/// Uses the same 20 s HTTP timeout as `send_error_events` / `send_apm_telemetry` /
+/// `send_platform_metrics`, on both the first attempt and buffered retries.
+///
+/// Note on the shutdown path: `retry_buffered_otlp_payloads` also runs from the SHUTDOWN
+/// handler, whose whole budget is `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`
+/// (1300 ms) shared with the telemetry- and metric-API drains that run first. A 20 s
+/// timeout exceeds that window, so a stalled endpoint means the shutdown drain is
+/// best-effort — the enclosing `tokio::time::timeout` cuts it off and anything undelivered
+/// stays buffered (bounded by `MAX_RETRY_ATTEMPTS` / `MAX_AGE_MINUTES`). That limitation is
+/// shared by all three buffers, not specific to OTLP; shortening only this one would make
+/// OTLP inconsistent with its siblings without fixing the budget.
+pub(super) async fn send_single_otlp_payload(
+    client: &Client,
+    otlp_metric_endpoint: &str,
+    license_key: &str,
+    encoded_payload: &str,
+    entity_guid: &str,
+    payload_num: usize,
+) -> std::result::Result<(), OtlpError> {
+    let raw = general_purpose::STANDARD
+        .decode(encoded_payload)
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to base64-decode OTLP payload {payload_num}: {e}"
+        )))?;
+
+    let enriched: Vec<u8> = super::otlp::inject_entity_guid(&raw, entity_guid)
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to inject entity.guid into OTLP payload {payload_num}: {e}"
+        )))?;
+
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let b64 = general_purpose::STANDARD.encode(&enriched);
+        let preview_len = b64.len().min(256);
+        let suffix = if b64.len() > preview_len { "..." } else { "" };
+        debug!(
+            "OTLP payload {} enriched ({} bytes) base64={}{}",
+            payload_num,
+            enriched.len(),
+            &b64[..preview_len],
+            suffix
+        );
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&enriched)
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to gzip OTLP payload {payload_num}: {e}"
+        )))?;
+    let compressed = encoder.finish()
+        .map_err(|e| OtlpError::MalformedPayload(anyhow::anyhow!(
+            "Failed to finish gzip OTLP payload {payload_num}: {e}"
+        )))?;
+
+    debug!(
+        "OTLP payload {} compressed: {} bytes -> {} bytes",
+        payload_num,
+        enriched.len(),
+        compressed.len()
+    );
+
+    let start_time = std::time::Instant::now();
+    let response = client
+        .post(otlp_metric_endpoint)
+        .header("Content-Type", "application/x-protobuf")
+        .header("Content-Encoding", "gzip")
+        .header("api-key", license_key)
+        .body(compressed)
+        .timeout(std::time::Duration::from_secs(20))
+        .send()
+        .await
+        .map_err(|e| {
+            let e = e.without_url();
+            warn!("OTLP request {} network error: {} - will retry", payload_num, e);
+            OtlpError::Network(anyhow::Error::new(e))
+        })?;
+
+    let duration = start_time.elapsed();
+    let status = response.status();
+    let status_code = status.as_u16();
+
+    if !status.is_success() {
+        let retry_after = parse_retry_after(response.headers());
+        let body = match response.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to read error response body for payload {}: {}", payload_num, e);
+                String::from("<unreadable>")
+            }
+        };
+
+        if is_retryable_status(status_code) {
+            warn!(
+                "OTLP payload {} transient failure (status {}, retry_after {:?}) in {}ms - will retry: {}",
+                payload_num, status_code, retry_after, duration.as_millis(), body
+            );
+            return Err(OtlpError::Retryable { status: status_code, retry_after });
+        }
+
+        warn!(
+            "OTLP payload {} permanent failure (status {}) in {}ms - dropping: {}",
+            payload_num, status_code, duration.as_millis(), body
+        );
+        return Err(OtlpError::Permanent { status: status_code });
+    }
+
+    // Matches how the other senders in this module report success (one line). The body
+    // is read only when DEBUG is on: a 2xx carries nothing we act on, so reading it
+    // unconditionally would allocate on every successful send to feed a log line that
+    // is filtered out at the default `info` level. `chars().take()` keeps the preview on
+    // a char boundary, so a multi-byte UTF-8 body cannot panic here.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let body = response.text().await.unwrap_or_default();
+        let preview: String = body.trim().chars().take(256).collect();
+        debug!(
+            "OTLP payload {} sent successfully in {}ms (response: {})",
+            payload_num,
+            duration.as_millis(),
+            if preview.is_empty() { "empty" } else { preview.as_str() }
+        );
+    }
+    Ok(())
+}
+
+/// Forward base64-encoded OTLP `ExportMetricsServiceRequest` protobuf payloads to the OTLP
+/// endpoint.  Before sending, `entity.guid` is injected into every `ResourceMetrics.resource`
+/// so New Relic can correlate the metrics with the Lambda entity.  All metric data
+/// (`scope_metrics`, data points, histograms) is preserved bit-for-bit.
+///
+/// Payloads are sent concurrently and independently: one payload's failure (a transient
+/// 5xx, a timeout) does not abort or delay the others, matching the fan-out pattern used
+/// elsewhere in this codebase (see `event_loop.rs`'s late-agent-payload `JoinSet` usage).
+/// Transient/network failures are buffered via [`super::otlp_buffer`] for retry on a later
+/// invoke or at shutdown, mirroring [`super::metric_api_buffer`]'s handling of platform
+/// metrics. Permanent failures (malformed payload, non-retryable 4xx) are dropped at the
+/// send site. This function itself never returns an error, since a partial-batch failure
+/// is not a reason to fail the whole send.
+pub async fn send_otlp_payload(
+    client: &Client,
+    otlp_metric_endpoint: &str,
+    license_key: &str,
+    payloads: &[String],
+    entity_guid: &str,
+    request_id: &str,
+) {
+    if payloads.is_empty() {
+        return;
+    }
+
+    info!(
+        "Sending {} OTLP payload(s) to {} (entity.guid={})",
+        payloads.len(),
+        otlp_metric_endpoint,
+        entity_guid,
+    );
+
+    let mut set = tokio::task::JoinSet::new();
+    for (i, encoded) in payloads.iter().enumerate() {
+        let payload_num = i + 1; // 1-based for human-readable logs
+        let client = client.clone();
+        let otlp_metric_endpoint = otlp_metric_endpoint.to_string();
+        let license_key = license_key.to_string();
+        let encoded = encoded.clone();
+        let entity_guid = entity_guid.to_string();
+        let request_id = request_id.to_string();
+
+        set.spawn(async move {
+            match send_single_otlp_payload(
+                &client,
+                &otlp_metric_endpoint,
+                &license_key,
+                &encoded,
+                &entity_guid,
+                payload_num,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.is_permanent() => {
+                    error!("OTLP payload {} dropped (permanent): {}", payload_num, e);
+                }
+                Err(e) => {
+                    let retry_after = e.retry_after();
+                    super::otlp_buffer::buffer_failed_otlp_payload(
+                        encoded,
+                        entity_guid,
+                        otlp_metric_endpoint,
+                        request_id,
+                        retry_after,
+                    );
+                }
+            }
+        });
+    }
+    while set.join_next().await.is_some() {}
+
+    info!("Finished sending {} OTLP payload(s)", payloads.len());
+
+
 }

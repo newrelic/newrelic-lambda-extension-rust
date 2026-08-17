@@ -37,6 +37,8 @@ dashmap = "6.1"
 bytes = "1.11"
 regex = "1.10"  # For parsing platform REPORT logs in APM mode
 rand = "0.9.3"  # For TraceID/SpanID generation in APM mode
+prost = "0.13"  # Protobuf decode/encode for OTLP payload enrichment
+thiserror = "2.0"  # Error enum derive for OTLP injection errors
 
 # AWS dependencies - ALWAYS INCLUDED as default (as you requested)
 aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
