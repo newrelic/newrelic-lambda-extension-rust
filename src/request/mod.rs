@@ -460,6 +460,22 @@ pub async fn cleanup_old_request_buffers(
             }
         }
 
+        // This is the only production call site that removes a REQUEST_DATA entry
+        // outright (cleanup_request_processing_state -> skip_buffer_cleanup=false) —
+        // drain and await any outstanding NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send
+        // for this request first. Otherwise a send still in flight when this stale
+        // entry is evicted would keep running detached, but nothing (not this
+        // function, not the SHUTDOWN sweep — which can only await handles still
+        // reachable from a live REQUEST_DATA entry) would ever come back to await it.
+        for handle in take_pending_send_handles(request_id) {
+            if let Err(e) = handle.await {
+                error!(
+                    "Immediate agent-payload send task panicked during periodic cleanup for {}: {}",
+                    request_id, e
+                );
+            }
+        }
+
         cleanup_request_processing_state(request_id);
     }
 }

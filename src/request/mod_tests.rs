@@ -495,6 +495,55 @@ mod tests {
         clear_request_state();
     }
 
+    // cleanup_old_request_buffers is the only production path that removes a
+    // REQUEST_DATA entry outright — a NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send still
+    // outstanding for a request that's about to be evicted as stale must be drained
+    // and awaited first, or nothing (not this function, not the SHUTDOWN sweep, which
+    // can only see handles still reachable from a live REQUEST_DATA entry) would ever
+    // come back to await it.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_awaits_pending_send_before_evicting() {
+        clear_request_state();
+
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "old-req-with-pending-send".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            trace_id: None,
+        }));
+        REQUEST_DATA.insert("old-req-with-pending-send".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        push_pending_send_handle("old-req-with-pending-send", handle);
+
+        let (client, config) = make_test_client_and_config();
+        cleanup_old_request_buffers(client, config).await;
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "the pending send must be awaited before its request's REQUEST_DATA entry is evicted"
+        );
+        assert!(REQUEST_DATA.get("old-req-with-pending-send").is_none());
+
+        clear_request_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_cleanup_old_request_buffers_empty_buffer() {
