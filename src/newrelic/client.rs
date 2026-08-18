@@ -44,6 +44,48 @@ fn get_backoff_delay(retry_attempt: usize) -> std::time::Duration {
     }
 }
 
+/// Backoff schedule used only when `NEW_RELIC_DATA_COLLECTION_TIMEOUT` is set:
+/// 200ms for attempts 1-3, doubling every 3 attempts, capped at 3s. Matches the
+/// New Relic Go extension's schedule.
+fn get_growing_backoff_delay(retry_attempt: usize) -> std::time::Duration {
+    let stage = retry_attempt.saturating_sub(1) / 3;
+    let ms = 200u64.saturating_mul(1u64 << stage.min(4));
+    std::time::Duration::from_millis(ms.min(3000))
+}
+
+/// Pull a short, human-readable message out of an error response body.
+/// HTML error pages (e.g. "503 Service Unavailable" from an upstream proxy) are
+/// reduced to their `<title>` text instead of dumping the full page into logs.
+fn summarize_response_body(body: &str) -> String {
+    let trimmed = body.trim();
+    if let (Some(start), Some(end)) = (trimmed.find("<title>"), trimmed.find("</title>")) {
+        let start = start + "<title>".len();
+        if start < end {
+            return trimmed[start..end].trim().to_string();
+        }
+    }
+    trimmed.chars().take(200).collect()
+}
+
+/// Whether another retry attempt is allowed.
+/// `budget` is `config.new_relic.data_collection_timeout`:
+/// - `None` (env var unset): preserves the existing fixed-count behavior — same
+///   `max_retries` the caller already uses today.
+/// - `Some(b)`: the env var is present, so retries continue until `b` has elapsed
+///   since the first attempt, capped at 20 attempts as a safety net (matches the
+///   Go extension) — `max_retries` is not used in this branch.
+fn retry_allowed(
+    retries: usize,
+    elapsed: std::time::Duration,
+    budget: Option<std::time::Duration>,
+    max_retries: usize,
+) -> bool {
+    match budget {
+        Some(b) => retries < 20 && elapsed < b,
+        None => retries < max_retries,
+    }
+}
+
 /// Mask credentials in a proxy URL for safe logging.
 /// `http://user:pass@proxy:8080` -> `http://***:***@proxy:8080`
 pub fn mask_proxy_url(url: &str) -> String {
@@ -145,7 +187,7 @@ impl NewRelicClient {
 
         let mut builder = Client::builder()
             .default_headers(headers)
-            .timeout(std::time::Duration::from_millis(2400))
+            .timeout(config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400)))
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
@@ -232,7 +274,13 @@ impl NewRelicClient {
         // Build final payload: [{"common": <cached>, "logs": <batch>}]
         let body = format!(r#"[{{"common":{{"attributes":{}}},"logs":{}}}]"#, common_json, logs_json);
 
-        self.send_payload_raw(&config.new_relic.log_endpoint, body, Some(log_count)).await
+        self.send_payload_raw(
+            &config.new_relic.log_endpoint,
+            body,
+            Some(log_count),
+            config.new_relic.data_collection_timeout,
+        )
+        .await
     }
 
     /// Build or retrieve the pre-serialized common attributes JSON for a given ARN.
@@ -287,9 +335,10 @@ impl NewRelicClient {
         let start_time = std::time::Instant::now();
         let uncompressed_size = payload_json.len();
         debug!("Sending agent payload to NR: {} bytes", uncompressed_size);
-        
+
         let mut retries = 0;
         const MAX_RETRIES: usize = 3;
+        let budget = config.new_relic.data_collection_timeout;
 
         loop {
             
@@ -312,20 +361,24 @@ impl NewRelicClient {
                     } else {
                         let response_text = response.text().await.unwrap_or_else(|_| "Failed to read response".to_string());
                         if retries == 0 {
-                            warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, response_text);
+                            warn!("[agentsend] Failed to send agent payload. Status: {}, Response: {}", status, summarize_response_body(&response_text));
                         }
-                        
+
                         if status.is_client_error() {
                             warn!("[agentsend] Client error (4xx), not retrying");
                             return Ok(());
                         }
-                        
-                        if retries < MAX_RETRIES {
+
+                        if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                             retries += 1;
-                            let delay = get_backoff_delay(retries);
+                            let delay = match budget {
+                                Some(_) => get_growing_backoff_delay(retries),
+                                None => get_backoff_delay(retries),
+                            };
+                            debug!("[agentsend] retry attempt {}, data_collection_timeout: {:?}, next delay: {:?}", retries, budget, delay);
                             tokio::time::sleep(delay).await;
                         } else {
-                            warn!("[agentsend] Max retries exceeded");
+                            warn!("[agentsend] Exhausted {} retries over {:?} - unable to send data to endpoint", retries, start_time.elapsed());
                             return Ok(());
                         }
                     }
@@ -336,18 +389,23 @@ impl NewRelicClient {
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("[agentsend] Connection issue (will retry): {}", e);
                         } else if e.is_timeout() {
-                            warn!("[agentsend] Request timeout after 2.4s (will retry): {}", e);
+                            let effective_timeout = config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400));
+                            warn!("[agentsend] Request timeout after {:?} (will retry): {}", effective_timeout, e);
                         } else {
                             warn!("[agentsend] Network error: {}", e);
                         }
                     }
 
-                    if retries < MAX_RETRIES {
+                    if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                         retries += 1;
-                        let delay = get_backoff_delay(retries);
+                        let delay = match budget {
+                            Some(_) => get_growing_backoff_delay(retries),
+                            None => get_backoff_delay(retries),
+                        };
+                        debug!("[agentsend] retry attempt {}, data_collection_timeout: {:?}, next delay: {:?}", retries, budget, delay);
                         tokio::time::sleep(delay).await;
                     } else {
-                        warn!("[agentsend] Max network retries exceeded");
+                        warn!("[agentsend] Exhausted {} retries over {:?} - unable to send data to endpoint: {}", retries, start_time.elapsed(), e);
                         return Err(e);
                     }
                 }
@@ -357,7 +415,13 @@ impl NewRelicClient {
 
     /// Sends a pre-built JSON body string to an endpoint (compress + retry).
     /// Used by send_logs to avoid double-serialization when common block is pre-cached.
-    async fn send_payload_raw(&self, endpoint: &str, body: String, log_count: Option<usize>) -> Result<(), SendError> {
+    async fn send_payload_raw(
+        &self,
+        endpoint: &str,
+        body: String,
+        log_count: Option<usize>,
+        budget: Option<std::time::Duration>,
+    ) -> Result<(), SendError> {
         let start_time = std::time::Instant::now();
         let uncompressed_size = body.len();
 
@@ -424,9 +488,14 @@ impl NewRelicClient {
                         if status.is_client_error() {
                             return Err(SendError::ClientRejected { status: status.as_u16() });
                         }
-                        if retries < MAX_RETRIES {
+                        if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                             retries += 1;
-                            tokio::time::sleep(get_backoff_delay(retries)).await;
+                            let delay = match budget {
+                                Some(_) => get_growing_backoff_delay(retries),
+                                None => get_backoff_delay(retries),
+                            };
+                            debug!("retry attempt {}, data_collection_timeout: {:?}, next delay: {:?}", retries, budget, delay);
+                            tokio::time::sleep(delay).await;
                             continue;
                         } else {
                             return Err(SendError::ServerExhausted { status: status.as_u16() });
@@ -437,9 +506,14 @@ impl NewRelicClient {
                     if retries == 0 {
                         warn!("Network error sending payload: {}", e);
                     }
-                    if retries < MAX_RETRIES {
+                    if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                         retries += 1;
-                        tokio::time::sleep(get_backoff_delay(retries)).await;
+                        let delay = match budget {
+                            Some(_) => get_growing_backoff_delay(retries),
+                            None => get_backoff_delay(retries),
+                        };
+                        debug!("retry attempt {}, data_collection_timeout: {:?}, next delay: {:?}", retries, budget, delay);
+                        tokio::time::sleep(delay).await;
                         continue;
                     } else {
                         return Err(SendError::Network(e));
@@ -578,5 +652,75 @@ mod tests {
         let debug = format!("{:?}", err);
         assert!(debug.contains("ServerExhausted"), "got: {}", debug);
         assert!(debug.contains("500"), "got: {}", debug);
+    }
+
+    // ========================================================================
+    // NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
+    // ========================================================================
+
+    #[test]
+    fn test_get_growing_backoff_delay_schedule() {
+        // 200ms for attempts 1-3, doubling every 3 attempts, capped at 3s.
+        for attempt in 1..=3 {
+            assert_eq!(get_growing_backoff_delay(attempt), std::time::Duration::from_millis(200));
+        }
+        for attempt in 4..=6 {
+            assert_eq!(get_growing_backoff_delay(attempt), std::time::Duration::from_millis(400));
+        }
+        for attempt in 7..=9 {
+            assert_eq!(get_growing_backoff_delay(attempt), std::time::Duration::from_millis(800));
+        }
+        for attempt in 10..=12 {
+            assert_eq!(get_growing_backoff_delay(attempt), std::time::Duration::from_millis(1600));
+        }
+        // Stage caps at 4 (3000ms) from attempt 13 onward, including well past 20.
+        for attempt in [13, 14, 15, 20, 100] {
+            assert_eq!(get_growing_backoff_delay(attempt), std::time::Duration::from_millis(3000));
+        }
+    }
+
+    #[test]
+    fn test_retry_allowed_none_budget_uses_fixed_count() {
+        // Unset env var: unchanged fixed-retry-count behavior, budget/elapsed ignored.
+        assert!(retry_allowed(0, std::time::Duration::from_secs(999), None, 3));
+        assert!(retry_allowed(2, std::time::Duration::from_secs(999), None, 3));
+        assert!(!retry_allowed(3, std::time::Duration::ZERO, None, 3));
+    }
+
+    #[test]
+    fn test_retry_allowed_some_budget_uses_elapsed_time() {
+        let budget = Some(std::time::Duration::from_secs(10));
+        // Under budget, few retries so far -> allowed regardless of max_retries.
+        assert!(retry_allowed(5, std::time::Duration::from_secs(5), budget, 3));
+        // Budget elapsed -> not allowed even with few retries.
+        assert!(!retry_allowed(1, std::time::Duration::from_secs(10), budget, 3));
+        assert!(!retry_allowed(1, std::time::Duration::from_secs(11), budget, 3));
+    }
+
+    #[test]
+    fn test_retry_allowed_some_budget_caps_at_20_attempts() {
+        // 20-attempt safety net fires even when the time budget hasn't elapsed.
+        let budget = Some(std::time::Duration::from_secs(999));
+        assert!(retry_allowed(19, std::time::Duration::from_secs(1), budget, 3));
+        assert!(!retry_allowed(20, std::time::Duration::from_secs(1), budget, 3));
+        assert!(!retry_allowed(25, std::time::Duration::from_secs(1), budget, 3));
+    }
+
+    #[test]
+    fn test_summarize_response_body_extracts_title() {
+        let body = "<html><head><title>503 Service Unavailable</title></head><body>...</body></html>";
+        assert_eq!(summarize_response_body(body), "503 Service Unavailable");
+    }
+
+    #[test]
+    fn test_summarize_response_body_no_title_truncates() {
+        let body = "a".repeat(500);
+        let summary = summarize_response_body(&body);
+        assert_eq!(summary.chars().count(), 200);
+    }
+
+    #[test]
+    fn test_summarize_response_body_short_plain_text_unchanged() {
+        assert_eq!(summarize_response_body("  plain error  "), "plain error");
     }
 }

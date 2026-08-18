@@ -27,6 +27,7 @@ use tracing::{debug, error, warn};
 pub struct ApmApp {
     pub run_id: String,
     pub entity_guid: String,
+    pub app_name: String,
     pub collector_host: String,
     pub license_key: String,
     pub metric_endpoint: String,
@@ -223,6 +224,7 @@ impl ApmApp {
         Ok(ApmApp {
             run_id,
             entity_guid,
+            app_name: function_name.to_string(),
             collector_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
@@ -509,6 +511,11 @@ impl ApmApp {
     /// Get entity GUID for log correlation
     pub fn get_entity_guid(&self) -> &str {
         &self.entity_guid
+    }
+
+    /// Get the app name sent to Connect, for `entity.name` log correlation
+    pub fn get_app_name(&self) -> &str {
+        &self.app_name
     }
 }
 
@@ -810,6 +817,7 @@ mod tests {
         let app = ApmApp {
             run_id: "test_run_id".to_string(),
             entity_guid: "test_guid".to_string(),
+            app_name: "test_app".to_string(),
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test_key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
@@ -819,5 +827,6 @@ mod tests {
         assert_eq!(app.run_id, "test_run_id");
         assert_eq!(app.entity_guid, "test_guid");
         assert_eq!(app.get_entity_guid(), "test_guid");
+        assert_eq!(app.get_app_name(), "test_app");
     }
 }

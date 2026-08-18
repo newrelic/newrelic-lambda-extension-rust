@@ -262,6 +262,7 @@ fn make_test_apm_app() -> crate::apm::ApmApp {
     crate::apm::ApmApp {
         run_id: "test-run-id".to_string(),
         entity_guid: "test-entity-guid".to_string(),
+        app_name: "test-app-name".to_string(),
         // port 1 → connection refused immediately, no 20s wait
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-license-key".to_string(),

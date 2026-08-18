@@ -1378,6 +1378,7 @@ mod tests {
         let mock_app = ApmApp {
             run_id: "run-1".to_string(),
             entity_guid: entity_guid.to_string(),
+            app_name: "test-app-name".to_string(),
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test-key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
@@ -1465,6 +1466,94 @@ mod tests {
         let batch = p.log_batch.lock().unwrap();
         assert!(!batch[0].attributes.contains_key("entity.guid"),
             "entity.guid must not appear when apm_app is None");
+    }
+
+    // ========================================================================
+    // PHASE 7: entity.name stamping coverage
+    // entity.name rides alongside entity.guid on every path above (APM mode only).
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_stamps_entity_name() {
+        let p = create_apm_processor("test-entity-guid");
+        hold_log(&p, "req-abc", "apm-log-1");
+        hold_log(&p, "req-abc", "apm-log-2");
+
+        p.on_trace_id_extracted("req-abc", "trace-abc").await.unwrap();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2);
+        for log in batch.iter() {
+            let name = log.attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+            assert_eq!(name, "test-app-name",
+                "entity.name must be stamped on log '{}'", log.message);
+        }
+    }
+
+    #[test]
+    fn test_flush_pending_logs_unstamped_stamps_entity_name() {
+        let p = create_apm_processor("flush-entity-guid");
+        hold_log(&p, "req-orphan", "orphan-log-1");
+
+        p.flush_pending_logs_unstamped();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let name = batch[0].attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(name, "test-app-name",
+            "entity.name must be stamped on flushed orphan log");
+    }
+
+    #[test]
+    fn test_process_buffered_logs_stamps_entity_name() {
+        let p = create_apm_processor("direct-path-guid");
+
+        if let Some(ref m) = p.request_trace_ids {
+            m.lock().unwrap().insert("req-001", "trace-xyz");
+        }
+
+        {
+            let mut buf = p.request_id_buffer.lock().unwrap();
+            buf.push(make_log_msg("direct-log"));
+        }
+
+        p.process_buffered_logs_with_request_id("req-001");
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let name = batch[0].attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(name, "test-app-name", "entity.name must be stamped on direct-path log");
+    }
+
+    #[tokio::test]
+    async fn test_entity_name_not_panic_when_apm_app_none() {
+        // When apm_app is None (e.g. serverless mode), entity.name must simply be
+        // absent from the output — same as entity.guid.
+        let p = create_trace_processor(); // no apm_app
+        hold_log(&p, "req-t2", "no-apm-log");
+
+        p.on_trace_id_extracted("req-t2", "t2").await.unwrap();
+        let batch = p.log_batch.lock().unwrap();
+        assert!(!batch[0].attributes.contains_key("entity.name"),
+            "entity.name must not appear when apm_app is None");
+    }
+
+    #[test]
+    fn test_apply_current_invocation_metadata_stamps_entity_guid_and_name() {
+        let p = create_apm_processor("apply-metadata-guid");
+
+        let out = p.apply_current_invocation_metadata(make_log_msg("hello"));
+
+        assert_eq!(
+            out.attributes.get("entity.guid").and_then(|v| v.as_str()),
+            Some("apply-metadata-guid"),
+            "entity.guid must be stamped by apply_current_invocation_metadata"
+        );
+        assert_eq!(
+            out.attributes.get("entity.name").and_then(|v| v.as_str()),
+            Some("test-app-name"),
+            "entity.name must be stamped by apply_current_invocation_metadata"
+        );
     }
 
     // Cold-start INIT (pre-invoke) logs: held until the request's trace arrives, then

@@ -18,6 +18,13 @@ const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
 const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
 const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 
+/// Fallback used when `NEW_RELIC_DATA_COLLECTION_TIMEOUT` is set but not a valid
+/// duration string. Matches the Go extension's default.
+const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -80,6 +87,14 @@ pub struct NewRelicConfig {
     /// Default `false` — no behavior change unless explicitly enabled. Distinct from
     /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
     pub synchronous_flush: bool,
+    /// Total wall-clock budget for retrying a send, set via
+    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
+    /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
+    /// switches to retrying until `d` has elapsed instead of a fixed count.
+    pub data_collection_timeout: Option<Duration>,
+    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in, same as
+    /// data_collection_timeout.
+    pub http_timeout: Option<Duration>,
 }
 
 /// AWS Lambda specific configuration
@@ -167,6 +182,8 @@ impl Default for NewRelicConfig {
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
             synchronous_flush: false,
+            data_collection_timeout: None,
+            http_timeout: None,
         }
     }
 }
@@ -283,6 +300,26 @@ pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
     set
 }
 
+/// Parse a Go-style duration string (`"200ms"`, `"30s"`, `"1m"`, `"2h"`).
+/// Bare numbers with no unit are rejected, matching Go's `time.ParseDuration`.
+pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let unit_start = raw.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (num_part, unit) = raw.split_at(unit_start);
+    let value: f64 = num_part.parse().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    let millis = match unit {
+        "ms" => value,
+        "s" => value * 1_000.0,
+        "m" => value * 60_000.0,
+        "h" => value * 3_600_000.0,
+        _ => return None,
+    };
+    Some(Duration::from_millis(millis as u64))
+}
+
 impl ExtensionConfig {
     /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
@@ -381,6 +418,34 @@ impl ExtensionConfig {
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
             .filter(|s| !s.is_empty());
+
+        // Opt-in: only set (and thus only change retry behavior) when the customer
+        // explicitly provides this env var. Unset means data_collection_timeout stays
+        // None and existing fixed-retry-count behavior is untouched.
+        config.new_relic.data_collection_timeout = env::var("NEW_RELIC_DATA_COLLECTION_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_DATA_COLLECTION_TIMEOUT value '{}', defaulting to 10s",
+                        raw
+                    );
+                    DEFAULT_DATA_COLLECTION_TIMEOUT
+                })
+            });
+
+        // Opt-in, same pattern as data_collection_timeout.
+        config.new_relic.http_timeout = env::var("NEW_RELIC_HTTP_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_HTTP_TIMEOUT value '{}', defaulting to 2400ms",
+                        raw
+                    );
+                    DEFAULT_HTTP_TIMEOUT
+                })
+            });
 
         if let Some(ref url) = config.new_relic.proxy_url {
             // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
