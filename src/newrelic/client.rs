@@ -24,10 +24,10 @@ impl std::fmt::Display for SendError {
             Self::Network(e) => write!(f, "network error: {}", e),
             Self::ServerExhausted { status } => {
                 write!(f, "server error {} after max retries", status)
-            }
+            },
             Self::ClientRejected { status } => {
                 write!(f, "client error {} (not retryable)", status)
-            }
+            },
         }
     }
 }
