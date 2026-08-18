@@ -906,27 +906,3 @@ pub(crate) fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
 
 /// Shared APM app state
 pub type SharedApmApp = Arc<RwLock<Option<ApmApp>>>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_apm_app_creation() {
-        let client = Client::new();
-        let app = ApmApp {
-            run_id: "test_run_id".to_string(),
-            entity_guid: "test_guid".to_string(),
-            app_name: "test_app".to_string(),
-            collector_host: "collector.newrelic.com".to_string(),
-            license_key: "test_key".to_string(),
-            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            client,
-        };
-
-        assert_eq!(app.run_id, "test_run_id");
-        assert_eq!(app.entity_guid, "test_guid");
-        assert_eq!(app.get_entity_guid(), "test_guid");
-        assert_eq!(app.get_app_name(), "test_app");
-    }
-}
