@@ -14,14 +14,16 @@ where
     // Save original values
     let original_tags = env::var("NR_TAGS").ok();
     let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
-    
+    let original_labels = env::var("NEW_RELIC_LABELS").ok();
+
     // Clean environment
     env::remove_var("NR_TAGS");
     env::remove_var("NR_ENV_DELIMITER");
-    
+    env::remove_var("NEW_RELIC_LABELS");
+
     // Run test
     test();
-    
+
     // Restore environment
     if let Some(val) = original_tags {
         env::set_var("NR_TAGS", val);
@@ -32,6 +34,11 @@ where
         env::set_var("NR_ENV_DELIMITER", val);
     } else {
         env::remove_var("NR_ENV_DELIMITER");
+    }
+    if let Some(val) = original_labels {
+        env::set_var("NEW_RELIC_LABELS", val);
+    } else {
+        env::remove_var("NEW_RELIC_LABELS");
     }
 }
 
@@ -44,6 +51,7 @@ where
     let env_vars = vec![
         "NR_TAGS",
         "NR_ENV_DELIMITER",
+        "NEW_RELIC_LABELS",
         "NEW_RELIC_LAMBDA_EXTENSION_ENABLED",
         "NEW_RELIC_LICENSE_KEY",
         "NEW_RELIC_LICENSE_KEY_SECRET",
@@ -182,10 +190,246 @@ fn test_parse_nr_tags_not_set() {
 fn test_parse_nr_tags_empty_string() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "");
-        
+
         let tags = parse_nr_tags();
-        
+
         assert!(tags.is_empty());
+    });
+}
+
+// ============================================================================
+// NEW_RELIC_LABELS (agent-specs/Labels.md) - independent of NR_TAGS above
+// ============================================================================
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_basic() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_whitespace() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", " env : prod ; team : backend ");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_not_set() {
+    with_clean_env(|| {
+        let labels = parse_new_relic_labels();
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_empty_string() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_only_delimiters() {
+    with_clean_env(|| {
+        // Nothing but separators - no labels configured, not a malformed-string error.
+        env::set_var("NEW_RELIC_LABELS", ";;;");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_strips_leading_and_trailing_semicolons() {
+    with_clean_env(|| {
+        // Spec: leading/trailing stray `;` are stripped, not treated as malformed.
+        env::set_var("NEW_RELIC_LABELS", ";;env:prod;;");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels, vec![("env".to_string(), "prod".to_string())]);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_middle_empty_pair_is_malformed() {
+    with_clean_env(|| {
+        // Spec: an empty pair between two valid ones IS malformed (unlike leading/trailing).
+        env::set_var("NEW_RELIC_LABELS", "env:prod;;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty(), "a malformed string must hard-fail to an empty list");
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_missing_colon_hard_fails_whole_list() {
+    with_clean_env(|| {
+        // Unlike NR_TAGS (which skips just the bad pair), NEW_RELIC_LABELS must discard
+        // the entire list on any malformed pair - never a partial list.
+        env::set_var("NEW_RELIC_LABELS", "invalid;env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_multiple_colons_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "valid:value;invalid:has:colons;another:good");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_empty_type_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", ":value;env:prod");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_empty_value_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "key:;env:prod");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_duplicate_type_last_wins() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "env:prod;env:staging");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels, vec![("env".to_string(), "staging".to_string())]);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_truncates_long_value() {
+    with_clean_env(|| {
+        let long_value = "v".repeat(300);
+        env::set_var("NEW_RELIC_LABELS", format!("env:{long_value}"));
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].0, "env");
+        assert_eq!(labels[0].1.chars().count(), 255);
+        assert_eq!(labels[0].1, "v".repeat(255));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_truncates_long_type() {
+    with_clean_env(|| {
+        let long_type = "t".repeat(300);
+        env::set_var("NEW_RELIC_LABELS", format!("{long_type}:prod"));
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].0.chars().count(), 255);
+        assert_eq!(labels[0].0, "t".repeat(255));
+        assert_eq!(labels[0].1, "prod");
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_caps_at_64_entries() {
+    with_clean_env(|| {
+        let raw = (0..70)
+            .map(|i| format!("k{i}:v{i}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        env::set_var("NEW_RELIC_LABELS", raw);
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 64);
+        assert!(labels.contains(&("k0".to_string(), "v0".to_string())));
+        assert!(labels.contains(&("k63".to_string(), "v63".to_string())));
+        assert!(!labels.contains(&("k64".to_string(), "v64".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_ignores_nr_env_delimiter() {
+    with_clean_env(|| {
+        // NEW_RELIC_LABELS uses fixed `:`/`;` delimiters per spec - NR_ENV_DELIMITER
+        // (which only affects NR_TAGS) must have no effect on it.
+        env::set_var("NR_ENV_DELIMITER", "|");
+        env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_independent_of_nr_tags() {
+    with_clean_env(|| {
+        // Malformed NEW_RELIC_LABELS must not affect NR_TAGS, and vice versa - the two
+        // env vars are parsed by entirely separate functions with no shared state.
+        env::set_var("NR_TAGS", "env:prod");
+        env::set_var("NEW_RELIC_LABELS", "invalid");
+
+        assert_eq!(parse_nr_tags(), vec![("env".to_string(), "prod".to_string())]);
+        assert!(parse_new_relic_labels().is_empty());
     });
 }
 

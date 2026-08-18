@@ -19,7 +19,7 @@ use super::payload_parser::parse_agent_payload;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use tracing::{debug, error, warn};
 
@@ -243,6 +243,8 @@ impl ApmApp {
             protocol_version,
             telemetry_map.len()
         );
+
+        apply_custom_tag_injection(&mut telemetry_map);
 
         // Normalize transaction names for Ruby v2 payloads only
         // Ruby agent sends transaction names without proper "OtherTransaction/Ruby/" prefix
@@ -519,6 +521,104 @@ impl ApmApp {
     }
 }
 
+/// Applies `inject_custom_tag_attributes` to `analytic_event_data` (Transaction events)
+/// and `span_event_data` (Span events), if present. Split out of `process_agent_payload`
+/// to keep that function under the line-count lint, not because it's reused elsewhere.
+fn apply_custom_tag_injection(telemetry_map: &mut std::collections::HashMap<String, Vec<Value>>) {
+    let tags = get_custom_tag_attributes();
+    if let Some(data) = telemetry_map.get_mut("analytic_event_data") {
+        inject_custom_tag_attributes(data, "Transaction", tags);
+    }
+    if let Some(data) = telemetry_map.get_mut("span_event_data") {
+        inject_custom_tag_attributes(data, "Span", tags);
+    }
+}
+
+/// `NEW_RELIC_LABELS` attribute set for Transaction/Span injection (NR-600651), built
+/// once and reused for every invocation - "only check once", not re-parsed or rebuilt
+/// per payload.
+///
+/// `NR_TAGS` is deliberately excluded here - it stays exactly as it's always been
+/// (connect payload Entity Tags + log-forwarding attributes only, both unchanged). This
+/// is a hard constraint carried over from earlier in this feature's development, not an
+/// oversight: `NR_TAGS`'s behavior must never gain scope beyond what it already does.
+///
+/// Keys are `tags.`-prefixed (e.g. `tags.team`), not raw (`team`) - a deliberate choice
+/// for uniformity with the log-forwarding attributes (`client.rs::get_or_build_common_json`),
+/// which are `tags.`-prefixed too. Entity Tags (`connection.rs::get_labels`) stay
+/// unprefixed regardless, since that's a structured `label_type`/`label_value` field in
+/// the connect payload, not a flat attribute map a prefix could apply to.
+static CUSTOM_TAG_ATTRIBUTES: OnceLock<serde_json::Map<String, Value>> = OnceLock::new();
+
+fn get_custom_tag_attributes() -> &'static serde_json::Map<String, Value> {
+    CUSTOM_TAG_ATTRIBUTES.get_or_init(|| {
+        let mut map = serde_json::Map::new();
+        for (k, v) in crate::config::get_new_relic_labels() {
+            map.insert(format!("tags.{k}"), Value::String(v.clone()));
+        }
+        map
+    })
+}
+
+/// Inject `tags` (already `tags.`-prefixed by the caller, see `get_custom_tag_attributes`)
+/// as custom attributes into every event of the given intrinsic `type` ("Transaction" or
+/// "Span") in an `analytic_event_data`/`span_event_data` payload. This function itself is
+/// prefix-agnostic - it inserts whatever keys `tags` contains verbatim - so its tests can
+/// exercise plain keys without needing to know about the prefixing convention.
+/// Structure: `data[2]` is the events array; each event is `[intrinsics, user_attrs,
+/// agent_attrs]` (the standard NR agent event triple). `user_attrs` is the same slot a
+/// customer's own `newrelic.addCustomAttributes()` call would populate, which is why an
+/// attribute the agent already set there is never overwritten (agent wins on collision).
+/// Takes `tags` as a parameter (rather than reading the cache directly) so it stays
+/// testable without needing the process-wide `OnceLock` cache - see `get_nr_tags`/
+/// `get_new_relic_labels` for why that cache can't be exercised more than once per
+/// test binary.
+pub(crate) fn inject_custom_tag_attributes(
+    data: &mut [Value],
+    event_type: &str,
+    tags: &serde_json::Map<String, Value>,
+) {
+    if tags.is_empty() {
+        return; // zero overhead when neither env var is set
+    }
+    if data.len() < 3 {
+        return;
+    }
+    let Some(events_array) = data[2].as_array_mut() else {
+        return;
+    };
+
+    for event_tuple in events_array.iter_mut() {
+        let Some(fields) = event_tuple.as_array_mut() else {
+            continue;
+        };
+        if fields.len() < 2 {
+            continue;
+        }
+
+        let is_match = fields[0]
+            .as_object()
+            .and_then(|o| o.get("type"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| t == event_type);
+        if !is_match {
+            continue;
+        }
+
+        if let Some(user_attrs) = fields[1].as_object_mut() {
+            for (k, v) in tags {
+                user_attrs.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        } else {
+            let mut user_attrs = serde_json::Map::new();
+            for (k, v) in tags {
+                user_attrs.insert(k.clone(), v.clone());
+            }
+            fields[1] = Value::Object(user_attrs);
+        }
+    }
+}
+
 /// Check if transaction name needs normalization (doesn't contain '/')
 fn needs_normalization(name: &str) -> bool {
     !name.contains('/')
@@ -632,7 +732,7 @@ fn normalize_span_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in metric_data
 /// Structure: [run_id, timestamp_start, timestamp_end, [[[{name: "..."}, [values]]], ...]]
-fn normalize_metric_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_metric_data(data: &mut Vec<Value>) {
     // Check we have the expected structure: data[3] should be the metrics array
     if data.len() < 4 {
         return;
@@ -691,7 +791,7 @@ fn normalize_metric_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in error_event_data
 /// Structure: [run_id, {metadata}, [[[error_obj, {}, {}]], ...]]
-fn normalize_error_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_error_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -738,7 +838,7 @@ fn normalize_error_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in custom_event_data
 /// Structure: [run_id, {metadata}, [[[event_obj, {}, {}]], ...]]
-fn normalize_custom_event_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_custom_event_data(data: &mut Vec<Value>) {
     if data.len() < 3 {
         return;
     }
@@ -774,7 +874,7 @@ fn normalize_custom_event_data(data: &mut Vec<Value>) {
 
 /// Normalize transaction names in transaction_sample_data
 /// Structure: [run_id, [[transaction_id, timestamp, name, duration, encoded_data], ...]]
-fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
+pub(crate) fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
     if data.len() < 2 {
         return;
     }
@@ -806,27 +906,3 @@ fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
 
 /// Shared APM app state
 pub type SharedApmApp = Arc<RwLock<Option<ApmApp>>>;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_apm_app_creation() {
-        let client = Client::new();
-        let app = ApmApp {
-            run_id: "test_run_id".to_string(),
-            entity_guid: "test_guid".to_string(),
-            app_name: "test_app".to_string(),
-            collector_host: "collector.newrelic.com".to_string(),
-            license_key: "test_key".to_string(),
-            metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            client,
-        };
-
-        assert_eq!(app.run_id, "test_run_id");
-        assert_eq!(app.entity_guid, "test_guid");
-        assert_eq!(app.get_entity_guid(), "test_guid");
-        assert_eq!(app.get_app_name(), "test_app");
-    }
-}
