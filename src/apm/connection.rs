@@ -124,7 +124,7 @@ pub fn reset_connect_stats() {
 /// Uses the collector's actual error message (not a hardcoded phrase); falls
 /// back to just the code when the body is empty. Body is trimmed/truncated so a
 /// verbose response can't bloat the log line.
-fn http_failure_reason(code: u16, body: &str) -> String {
+pub(crate) fn http_failure_reason(code: u16, body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
         format!("HTTP {code}")
@@ -135,7 +135,7 @@ fn http_failure_reason(code: u16, body: &str) -> String {
 }
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
-fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data)?;
     encoder.finish().map_err(|e| anyhow!("Compression failed: {}", e))
@@ -425,77 +425,20 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
         });
     }
 
+    // NEW_RELIC_LABELS (agent-specs/Labels.md) - additive, alongside NR_TAGS above.
+    // Sent unprefixed here, matching the connect payload's `label_type`/`label_value`
+    // shape - confirmed against the official Python agent (agent_protocol.py's
+    // _connect_payload sends settings["labels"] verbatim, built by config.py's
+    // _process_labels_setting as {"label_type": key, "label_value": value}, no
+    // prefix). The `tags.` prefix only applies to the log-forwarding path (client.rs),
+    // matching data_collector.py's `f"tags.{label['label_type']}"` construction there.
+    for (key, value) in crate::config::get_new_relic_labels() {
+        labels.push(Label {
+            label_type: key.clone(),
+            label_value: value.clone(),
+        });
+    }
+
     labels
 }
 
-#[cfg(test)]
-mod connection_tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    fn permanent_auth_error_detected_through_context_chain() {
-        // Mirrors how try_connect wraps the error: `.context("PreConnect failed")`.
-        let err = anyhow::Error::new(PermanentAuthError { status: 401 })
-            .context("PreConnect failed");
-        assert_eq!(is_permanent_auth_error(&err), Some(401));
-    }
-
-    #[test]
-    fn transient_error_is_not_permanent() {
-        let err = anyhow!("Connect failed with HTTP 503 - service unavailable");
-        assert_eq!(is_permanent_auth_error(&err), None);
-    }
-
-    #[test]
-    fn permanent_auth_error_display_has_no_secret() {
-        let msg = PermanentAuthError { status: 403 }.to_string();
-        assert!(msg.contains("403"));
-        assert!(!msg.contains("license_key"));
-    }
-
-    #[test]
-    #[serial]
-    fn handshake_fatal_latch_roundtrips() {
-        reset_handshake_fatal_for_test();
-        assert!(!is_handshake_fatal());
-        signal_handshake_fatal();
-        assert!(is_handshake_fatal());
-        reset_handshake_fatal_for_test();
-        assert!(!is_handshake_fatal());
-    }
-
-    #[test]
-    #[serial]
-    fn connect_stats_accumulate_and_reset() {
-        reset_connect_stats();
-        record_connect_cycle();
-        record_connect_attempt();
-        record_connect_attempt();
-        record_failure_reason("HTTP 503");
-        assert_eq!(connect_cycles(), 1);
-        assert_eq!(connect_attempts_total(), 2);
-        assert_eq!(last_failure_reason().as_deref(), Some("HTTP 503"));
-        // A successful connect resets the disconnected-streak diagnostics.
-        reset_connect_stats();
-        assert_eq!(connect_cycles(), 0);
-        assert_eq!(connect_attempts_total(), 0);
-        assert_eq!(last_failure_reason(), None);
-    }
-
-    #[test]
-    fn http_failure_reason_uses_api_body_and_truncates() {
-        // Empty body → just the code.
-        assert_eq!(http_failure_reason(503, "   "), "HTTP 503");
-        // Real collector message is surfaced (trimmed), not a hardcoded phrase.
-        assert_eq!(
-            http_failure_reason(401, "  Invalid license key.  "),
-            "HTTP 401: Invalid license key."
-        );
-        // A verbose body is truncated so it can't bloat the log line.
-        let long = "x".repeat(500);
-        let r = http_failure_reason(500, &long);
-        assert!(r.starts_with("HTTP 500: "));
-        assert!(r.len() <= "HTTP 500: ".len() + 300);
-    }
-}

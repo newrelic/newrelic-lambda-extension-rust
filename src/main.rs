@@ -21,6 +21,8 @@ mod runtime;
 mod request;
 mod event_loop;
 mod error_synthesis;
+#[cfg(test)]
+mod error_synthesis_tests;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
