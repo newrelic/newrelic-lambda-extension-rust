@@ -14,10 +14,10 @@ For any licenses that require the disclosure of source code, the source code can
 
 ## Licenses in use
 
-- Apache License 2.0 (`Apache-2.0`) — 156 crate references
+- Apache License 2.0 (`Apache-2.0`) — 146 crate references
 - MIT License (`MIT`) — 45 crate references
 - Unicode License v3 (`Unicode-3.0`) — 19 crate references
-- ISC License (`ISC`) — 6 crate references
+- ISC License (`ISC`) — 4 crate references
 - BSD 3-Clause "New" or "Revised" License (`BSD-3-Clause`) — 2 crate references
 
 ## Dependencies
@@ -27,7 +27,7 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **num-conv 0.2.0** — `MIT OR Apache-2.0` — <https://github.com/jhpratt/num-conv>
 - **powerfmt 0.2.0** — `MIT OR Apache-2.0` — <https://github.com/jhpratt/powerfmt>
 - **deranged 0.5.5** — `MIT OR Apache-2.0` — <https://github.com/jhpratt/deranged>
-- **cmov 0.5.3** — `Apache-2.0 OR MIT` — <https://github.com/RustCrypto/utils>
+- **cmov 0.5.4** — `Apache-2.0 OR MIT` — <https://github.com/RustCrypto/utils>
 - **ctutils 0.4.2** — `Apache-2.0 OR MIT` — <https://github.com/RustCrypto/utils>
 - **iri-string 0.7.10** — `MIT OR Apache-2.0` — <https://github.com/lo48576/iri-string>
 - **utf8_iter 1.0.4** — `Apache-2.0 OR MIT` — <https://github.com/hsivonen/utf8_iter>
@@ -36,26 +36,28 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **zerocopy 0.8.37** — `BSD-2-Clause OR Apache-2.0 OR MIT` — <https://github.com/google/zerocopy>
 - **rustls-platform-verifier 0.6.2** — `MIT OR Apache-2.0` — <https://github.com/rustls/rustls-platform-verifier>
 - **ipnet 2.11.0** — `MIT OR Apache-2.0` — <https://github.com/krisprice/ipnet>
+- **deadpool-runtime 0.1.4** — `MIT OR Apache-2.0` — <https://github.com/bikeshedder/deadpool>
+- **deadpool 0.12.3** — `MIT OR Apache-2.0` — <https://github.com/bikeshedder/deadpool>
 - **crc32fast 1.5.0** — `MIT OR Apache-2.0` — <https://github.com/srijs/rust-crc32fast>
 - **hex 0.4.3** — `MIT OR Apache-2.0` — <https://github.com/KokaKiwi/rust-hex>
 - **scc 2.4.0** — `Apache-2.0` — <https://github.com/wvwwvwwv/scalable-concurrent-containers/>
 - **aws-sdk-lambda 1.123.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
 - **aws-sdk-secretsmanager 1.105.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
 - **aws-sdk-ssm 1.110.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
-- **aws-sdk-sso 1.99.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
-- **aws-sdk-ssooidc 1.101.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
 - **aws-sdk-sts 1.104.0** — `Apache-2.0` — <https://github.com/awslabs/aws-sdk-rust>
 - **futures-channel 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **futures-core 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **futures-executor 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
+- **futures-io 0.3.34** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
+- **futures-macro 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **futures-sink 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **futures-task 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **futures-util 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
+- **futures 0.3.31** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/futures-rs>
 - **typenum 1.20.0** — `MIT OR Apache-2.0` — <https://github.com/paholg/typenum>
 - **reqwest 0.13.1** — `MIT OR Apache-2.0` — <https://github.com/seanmonstar/reqwest>
 - **http 0.2.12** — `MIT OR Apache-2.0` — <https://github.com/hyperium/http>
 - **http 1.4.0** — `MIT OR Apache-2.0` — <https://github.com/hyperium/http>
-- **tokio-rustls 0.24.1** — `MIT OR Apache-2.0` — <https://github.com/rustls/tokio-rustls>
 - **tokio-rustls 0.26.4** — `MIT OR Apache-2.0` — <https://github.com/rustls/tokio-rustls>
 - **pin-utils 0.1.0** — `MIT OR Apache-2.0` — <https://github.com/rust-lang-nursery/pin-utils>
 - **ppv-lite86 0.2.21** — `MIT OR Apache-2.0` — <https://github.com/cryptocorrosion/cryptocorrosion>
@@ -73,7 +75,6 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **displaydoc 0.2.5** — `MIT OR Apache-2.0` — <https://github.com/yaahc/displaydoc>
 - **either 1.15.0** — `MIT OR Apache-2.0` — <https://github.com/rayon-rs/either>
 - **equivalent 1.0.2** — `Apache-2.0 OR MIT` — <https://github.com/indexmap-rs/equivalent>
-- **errno 0.3.14** — `MIT OR Apache-2.0` — <https://github.com/lambda-fairy/rust-errno>
 - **fastrand 2.3.0** — `Apache-2.0 OR MIT` — <https://github.com/smol-rs/fastrand>
 - **find-msvc-tools 0.1.9** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/cc-rs>
 - **flate2 1.1.8** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/flate2-rs>
@@ -82,7 +83,6 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **hashbrown 0.14.5** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/hashbrown>
 - **hashbrown 0.16.1** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/hashbrown>
 - **httparse 1.10.1** — `MIT OR Apache-2.0` — <https://github.com/seanmonstar/httparse>
-- **hyper-rustls 0.24.2** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/hyper-rustls>
 - **hyper-rustls 0.27.7** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/hyper-rustls>
 - **idna 1.1.0** — `MIT OR Apache-2.0` — <https://github.com/servo/rust-url/>
 - **idna_adapter 1.2.1** — `Apache-2.0 OR MIT` — <https://github.com/hsivonen/idna_adapter>
@@ -93,6 +93,7 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **log 0.4.29** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/log>
 - **num-integer 0.1.46** — `MIT OR Apache-2.0` — <https://github.com/rust-num/num-integer>
 - **num-traits 0.2.19** — `MIT OR Apache-2.0` — <https://github.com/rust-num/num-traits>
+- **num_cpus 1.17.0** — `MIT OR Apache-2.0` — <https://github.com/seanmonstar/num_cpus>
 - **once_cell 1.21.3** — `MIT OR Apache-2.0` — <https://github.com/matklad/once_cell>
 - **openssl-probe 0.2.1** — `MIT OR Apache-2.0` — <https://github.com/rustls/openssl-probe>
 - **parking_lot 0.12.5** — `MIT OR Apache-2.0` — <https://github.com/Amanieu/parking_lot>
@@ -102,38 +103,27 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **regex-lite 0.1.8** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/regex>
 - **regex-syntax 0.8.8** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/regex>
 - **regex 1.12.2** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/regex>
-- **ring 0.17.14** — `Apache-2.0 AND ISC` — <https://github.com/briansmith/ring>
 - **rustc_version 0.4.1** — `MIT OR Apache-2.0` — <https://github.com/djc/rustc-version-rs>
 - **rustls-native-certs 0.8.3** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/rustls-native-certs>
-- **rustls 0.21.12** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/rustls>
 - **rustls 0.23.36** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/rustls>
 - **scopeguard 1.2.0** — `MIT OR Apache-2.0` — <https://github.com/bluss/scopeguard>
-- **sct 0.7.1** — `Apache-2.0 OR ISC OR MIT` — <https://github.com/rustls/sct.rs>
-- **signal-hook-registry 1.4.8** — `MIT OR Apache-2.0` — <https://github.com/vorner/signal-hook>
 - **smallvec 1.15.1** — `MIT OR Apache-2.0` — <https://github.com/servo/rust-smallvec>
-- **socket2 0.5.10** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/socket2>
 - **socket2 0.6.2** — `MIT OR Apache-2.0` — <https://github.com/rust-lang/socket2>
 - **stable_deref_trait 1.2.1** — `MIT OR Apache-2.0` — <https://github.com/storyyeller/stable_deref_trait>
 - **thread_local 1.1.9** — `MIT OR Apache-2.0` — <https://github.com/Amanieu/thread_local-rs>
 - **url 2.5.8** — `MIT OR Apache-2.0` — <https://github.com/servo/rust-url>
 - **uuid 1.20.0** — `Apache-2.0 OR MIT` — <https://github.com/uuid-rs/uuid>
-- **version_check 0.9.5** — `MIT OR Apache-2.0` — <https://github.com/SergioBenitez/version_check>
+- **wiremock 0.6.5** — `MIT OR Apache-2.0` — <https://github.com/LukeMathWalker/wiremock-rs>
 - **xmlparser 0.13.6** — `MIT OR Apache-2.0` — <https://github.com/RazrFalcon/xmlparser>
-- **block-buffer 0.10.4** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/utils>
 - **block-buffer 0.12.0** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/utils>
 - **const-oid 0.10.2** — `Apache-2.0 OR MIT` — <https://github.com/RustCrypto/formats>
-- **cpufeatures 0.2.17** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/utils>
 - **cpufeatures 0.3.0** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/utils>
-- **crypto-common 0.1.7** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/traits>
 - **crypto-common 0.2.2** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/traits>
-- **digest 0.10.7** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/traits>
 - **digest 0.11.3** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/traits>
 - **hmac 0.13.0** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/MACs>
 - **hybrid-array 0.4.12** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/hybrid-array>
-- **sha1 0.10.6** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/hashes>
 - **sha2 0.11.0** — `MIT OR Apache-2.0` — <https://github.com/RustCrypto/hashes>
 - **rand_core 0.9.5** — `MIT OR Apache-2.0` — <https://github.com/rust-random/rand>
-- **getrandom 0.2.17** — `MIT OR Apache-2.0` — <https://github.com/rust-random/getrandom>
 - **getrandom 0.3.4** — `MIT OR Apache-2.0` — <https://github.com/rust-random/getrandom>
 - **adler2 2.0.1** — `0BSD OR MIT OR Apache-2.0` — <https://github.com/oyvindln/adler2>
 - **httpdate 1.0.3** — `MIT OR Apache-2.0` — <https://github.com/pyfisch/httpdate>
@@ -183,15 +173,12 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **subtle 2.6.1** — `BSD-3-Clause` — <https://github.com/dalek-cryptography/subtle>
 - **aws-lc-sys 0.39.1** — `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)` — <https://github.com/aws/aws-lc-rs>
 - **untrusted 0.9.0** — `ISC` — <https://github.com/briansmith/untrusted>
-- **rustls-webpki 0.101.7** — `ISC` — <https://github.com/rustls/webpki>
-- **ring 0.17.14** — `Apache-2.0 AND ISC` — <https://github.com/briansmith/ring>
 - **rustls-webpki 0.103.13** — `ISC` — <https://github.com/rustls/webpki>
 - **aws-lc-rs 1.16.2** — `ISC AND (Apache-2.0 OR ISC)` — <https://github.com/aws/aws-lc-rs>
 - **aws-lc-sys 0.39.1** — `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)` — <https://github.com/aws/aws-lc-rs>
+- **cfg_aliases 0.2.1** — `MIT` — <https://github.com/katharostech/cfg_aliases>
 - **mio 1.1.1** — `MIT` — <https://github.com/tokio-rs/mio>
-- **hyper 0.14.32** — `MIT` — <https://github.com/hyperium/hyper>
 - **hyper 1.8.1** — `MIT` — <https://github.com/hyperium/hyper>
-- **h2 0.3.27** — `MIT` — <https://github.com/hyperium/h2>
 - **h2 0.4.13** — `MIT` — <https://github.com/hyperium/h2>
 - **bytes 1.11.1** — `MIT` — <https://github.com/tokio-rs/bytes>
 - **serial_test 3.3.1** — `MIT` — <https://github.com/palfrey/serial_test/>
@@ -199,6 +186,7 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **want 0.3.1** — `MIT` — <https://github.com/seanmonstar/want>
 - **try-lock 0.2.5** — `MIT` — <https://github.com/seanmonstar/try-lock>
 - **slab 0.4.12** — `MIT` — <https://github.com/tokio-rs/slab>
+- **assert-json-diff 2.0.2** — `MIT` — <https://github.com/davidpdrsn/assert-json-diff.git>
 - **sharded-slab 0.1.7** — `MIT` — <https://github.com/hawkw/sharded-slab>
 - **matchers 0.2.0** — `MIT` — <https://github.com/hawkw/matchers>
 - **http-body 0.4.6** — `MIT` — <https://github.com/hyperium/http-body>
@@ -226,12 +214,12 @@ The following third-party crates are bundled into the extension, each pinned to 
 - **tokio 1.49.0** — `MIT` — <https://github.com/tokio-rs/tokio>
 - **simd-adler32 0.3.8** — `MIT` — <https://github.com/mcountryman/simd-adler32>
 - **zmij 1.0.19** — `MIT` — <https://github.com/dtolnay/zmij>
+- **tracing-core 0.1.36** — `MIT` — <https://github.com/tokio-rs/tracing>
 - **aho-corasick 1.1.4** — `Unlicense OR MIT` — <https://github.com/BurntSushi/aho-corasick>
 - **memchr 2.7.6** — `Unlicense OR MIT` — <https://github.com/BurntSushi/memchr>
 - **nix 0.31.1** — `MIT` — <https://github.com/nix-rust/nix>
 - **aws-lc-sys 0.39.1** — `ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)` — <https://github.com/aws/aws-lc-rs>
 - **nu-ansi-term 0.50.3** — `MIT` — <https://github.com/nushell/nu-ansi-term>
-- **generic-array 0.14.7** — `MIT` — <https://github.com/fizyk20/generic-array.git>
 - **urlencoding 2.1.3** — `MIT` — <https://github.com/kornelski/rust_urlencoding>
 - **unicode-ident 1.0.22** — `(MIT OR Apache-2.0) AND Unicode-3.0` — <https://github.com/dtolnay/unicode-ident>
 - **icu_collections 2.1.1** — `Unicode-3.0` — <https://github.com/unicode-org/icu4x>
