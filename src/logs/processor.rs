@@ -30,6 +30,7 @@ const ATTR_FAAS_EXECUTION: &str = "faas.execution";
 const ATTR_FAAS_ARN: &str = "faas.arn";
 const ATTR_TRACE_ID: &str = "trace.id";
 const ATTR_ENTITY_GUID: &str = "entity.guid";
+const ATTR_ENTITY_NAME: &str = "entity.name";
 const ATTR_LMI_INSTANCE_ID: &str = "aws.lambda.managedInstance.instanceId";
 const ATTR_LMI_INSTANCE_MAX_MEMORY: &str = "aws.lambda.managedInstance.instanceMaxMemory";
 
@@ -799,6 +800,11 @@ impl LogProcessor {
                         log_message.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                             serde_json::Value::String(entity_guid.to_string()));
                     }
+                    let entity_name = app.get_app_name();
+                    if !entity_name.is_empty() {
+                        log_message.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                            serde_json::Value::String(entity_name.to_string()));
+                    }
                 }
             }
         }
@@ -1401,20 +1407,25 @@ impl LogProcessor {
                 }
             }
 
-            // Stamp entity.guid if APM app available
+            // Stamp entity.guid + entity.name if APM app available
             if let Some(ref apm_app_arc) = self.apm_app {
                 if let Ok(apm_guard) = apm_app_arc.try_read() {
                     if let Some(ref app) = *apm_guard {
                         let entity_guid = app.get_entity_guid();
                         if !entity_guid.is_empty() {
-                            log.attributes.insert("entity.guid".to_string(),
+                            log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                 serde_json::Value::String(entity_guid.to_string()));
+                        }
+                        let entity_name = app.get_app_name();
+                        if !entity_name.is_empty() {
+                            log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                serde_json::Value::String(entity_name.to_string()));
                         }
                     }
                 }
             }
         }
-        
+
         // Every log above now carries faas.arn + aws.lambda_request_id + faas.execution
         // (context was validated non-empty before we started) — they are NEVER routed
         // without ARN + request_id, and no placeholders are used.
@@ -1558,20 +1569,25 @@ impl LogProcessor {
                     log.attributes.insert("faas.execution".to_string(),
                         serde_json::Value::String(request_id.clone()));
                     
-                    // Add entity.guid if in APM mode
+                    // Add entity.guid + entity.name if in APM mode
                     if let Some(ref apm_app_arc) = self.apm_app {
                         if let Ok(apm_guard) = apm_app_arc.try_read() {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log.attributes.insert("entity.guid".to_string(),
+                                    log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                     }
                 }
-                
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 
@@ -1598,20 +1614,25 @@ impl LogProcessor {
                     log.attributes.insert("nr.forceFlushed".to_string(),
                         serde_json::Value::Bool(true));
                     
-                    // Add entity.guid if in APM mode
+                    // Add entity.guid + entity.name if in APM mode
                     if let Some(ref apm_app_arc) = self.apm_app {
                         if let Ok(apm_guard) = apm_app_arc.try_read() {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log.attributes.insert("entity.guid".to_string(),
+                                    log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                     }
                 }
-                
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 
@@ -1629,6 +1650,42 @@ impl LogProcessor {
         self.pending_logs.is_some()
     }
 
+    /// Test-only: hold a log under `request_id` in the per-request pending buffer,
+    /// mirroring how `process_record` parks a function/extension log while its
+    /// trace.id is still unknown. Lets tests outside this module (e.g.
+    /// `request::mod_tests`) set up a "log held, waiting for trace.id" fixture without
+    /// reaching into `pending_logs` directly (private to this module).
+    #[cfg(test)]
+    pub(crate) fn test_hold_log(&self, request_id: &str, message: &str) {
+        if let Some(ref pending) = self.pending_logs {
+            if let Ok(mut buf) = pending.lock() {
+                let _ = buf.push(
+                    request_id,
+                    payload::LogMessage {
+                        timestamp: 0,
+                        message: message.to_string(),
+                        attributes: serde_json::Map::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Test-only: number of logs still held (not yet stamped + routed) for `request_id`.
+    #[cfg(test)]
+    pub(crate) fn test_pending_logs_len_for(&self, request_id: &str) -> usize {
+        self.pending_logs
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map_or(0, |p| p.len_for(request_id))
+    }
+
+    /// Test-only: number of logs currently sitting in the outbound batch.
+    #[cfg(test)]
+    pub(crate) fn test_log_batch_len(&self) -> usize {
+        self.log_batch.lock().map_or(0, |b| b.len())
+    }
+
     /// Best-effort current APM `entity.guid`; `None` when unavailable or not APM mode.
     fn current_entity_guid(&self) -> Option<String> {
         self.apm_app.as_ref().and_then(|arc| match arc.try_read() {
@@ -1636,6 +1693,17 @@ impl LogProcessor {
                 .as_ref()
                 .map(|app| app.get_entity_guid().to_string())
                 .filter(|g| !g.is_empty()),
+            Err(_) => None,
+        })
+    }
+
+    /// Best-effort current APM `entity.name`; `None` when unavailable or not APM mode.
+    fn current_entity_name(&self) -> Option<String> {
+        self.apm_app.as_ref().and_then(|arc| match arc.try_read() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|app| app.get_app_name().to_string())
+                .filter(|n| !n.is_empty()),
             Err(_) => None,
         })
     }
@@ -1666,12 +1734,19 @@ impl LogProcessor {
         );
 
         let entity_guid_opt = self.current_entity_guid();
+        let entity_name_opt = self.current_entity_name();
         for log in &mut logs {
             log.attributes.insert(ATTR_TRACE_ID.to_string(), trace_id.into());
             if let Some(ref guid) = entity_guid_opt {
                 log.attributes.insert(
                     ATTR_ENTITY_GUID.to_string(),
                     serde_json::Value::String(guid.clone()),
+                );
+            }
+            if let Some(ref name) = entity_name_opt {
+                log.attributes.insert(
+                    ATTR_ENTITY_NAME.to_string(),
+                    serde_json::Value::String(name.clone()),
                 );
             }
         }
@@ -1702,6 +1777,14 @@ impl LogProcessor {
                 log.attributes.insert(
                     ATTR_ENTITY_GUID.to_string(),
                     serde_json::Value::String(guid.clone()),
+                );
+            }
+        }
+        if let Some(ref name) = self.current_entity_name() {
+            for log in &mut logs {
+                log.attributes.insert(
+                    ATTR_ENTITY_NAME.to_string(),
+                    serde_json::Value::String(name.clone()),
                 );
             }
         }
@@ -1782,20 +1865,25 @@ impl LogProcessor {
                     }
                 }
 
-                // Stamp entity.guid for APM mode (same pattern as pre-invoke and shutdown paths).
+                // Stamp entity.guid + entity.name for APM mode (same pattern as pre-invoke and shutdown paths).
                 if let Some(ref apm_app_arc) = self.apm_app {
                     match apm_app_arc.try_read() {
                         Ok(apm_guard) => {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log_message.attributes.insert("entity.guid".to_string(),
+                                    log_message.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log_message.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                         Err(_) => {
-                            debug!("process_buffered_logs: entity.guid unavailable (apm_app write lock held); log routed without it");
+                            debug!("process_buffered_logs: entity.guid/entity.name unavailable (apm_app write lock held); log routed without them");
                         }
                     }
                 }

@@ -76,6 +76,33 @@ async fn mock_server(codes: Vec<u16>) -> String {
     format!("http://{addr}/metric/v1")
 }
 
+/// Proves the is_some() guard fix: retry_buffered_metric_api takes only
+/// (client, license_key) — no apm_app/run_id. It must succeed even when the
+/// APM session is None (reconnect window), because Metric API auth is
+/// license-key-only. In event_loop.rs this function now runs outside the
+/// apm_app.is_some() guard so platform metrics are not delayed during reconnect.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn retry_proceeds_without_apm_session() {
+    clear();
+    let url = mock_server(vec![202]).await;
+    let client = reqwest::Client::new();
+    buffer_failed_metric_api(
+        vec![json!({"name": "apm.lambda.transaction.duration"})],
+        url,
+        None,
+    );
+    assert_eq!(get_metric_api_buffer_count(), 1);
+    // No apm_app passed — succeeds regardless of APM session state.
+    retry_buffered_metric_api(&client, "lk").await;
+    assert_eq!(
+        get_metric_api_buffer_count(),
+        0,
+        "metric API retry must succeed without a live APM session"
+    );
+    clear();
+}
+
 /// END-TO-END PROOF: a 503 is buffered, then a subsequent drain re-sends and
 /// succeeds (202), leaving the buffer empty. This exercises the real send →
 /// classify → buffer → retry → success path over a live socket.

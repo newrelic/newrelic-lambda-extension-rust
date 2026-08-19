@@ -14,7 +14,7 @@
 #[cfg(test)]
 mod tests {
     use serial_test::serial;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use crate::agent::batch::*;
     use crate::config::ExtensionConfig;
@@ -49,7 +49,8 @@ mod tests {
             // Scope the DashMap Ref so the shard lock is released before clear_batch_state
             let item = AGENT_BATCH_BUFFER.get("req-1").expect("should exist");
             assert_eq!(item.request_id, "req-1");
-            assert_eq!(*item.agent_payload_bytes, b"agent-data-1".to_vec());
+            assert_eq!(item.agent_payload_bytes.len(), 1);
+            assert_eq!(*item.agent_payload_bytes[0], b"agent-data-1".to_vec());
             assert_eq!(item.report_line.as_deref(), Some("REPORT Duration: 100ms"));
             assert_eq!(
                 item.invoked_function_arn,
@@ -78,20 +79,63 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_add_to_batch_replaces_same_request_id() {
+    fn test_add_to_batch_accumulates_multiple_payloads_same_request_id() {
         clear_batch_state();
 
         add_to_batch("req-1".into(), vec![1], None, "arn-1".into());
         add_to_batch("req-1".into(), vec![2], Some("report".into()), "arn-2".into());
 
-        // DashMap replaces on same key
+        // A second payload for the same request_id must be APPENDED, not overwrite the
+        // first — losing an earlier payload silently drops customer telemetry.
         assert_eq!(AGENT_BATCH_BUFFER.len(), 1);
         {
             let item = AGENT_BATCH_BUFFER.get("req-1").expect("exists");
-            assert_eq!(*item.agent_payload_bytes, vec![2]);
+            assert_eq!(item.agent_payload_bytes.len(), 2);
+            assert_eq!(*item.agent_payload_bytes[0], vec![1]);
+            assert_eq!(*item.agent_payload_bytes[1], vec![2]);
             assert_eq!(item.report_line.as_deref(), Some("report"));
+            // ARN is invariant per request_id — the first insert's value is kept.
+            assert_eq!(item.invoked_function_arn, "arn-1");
         }
 
+        clear_batch_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_to_batch_does_not_overwrite_report_with_none() {
+        clear_batch_state();
+
+        add_to_batch("req-1".into(), vec![1], Some("report".into()), "arn".into());
+        // A later call with no report must not erase the one already attached.
+        add_to_batch("req-1".into(), vec![2], None, "arn".into());
+
+        {
+            // Scope the DashMap Ref so the shard lock is released before clear_batch_state
+            let item = AGENT_BATCH_BUFFER.get("req-1").expect("exists");
+            assert_eq!(item.report_line.as_deref(), Some("report"));
+            assert_eq!(item.agent_payload_bytes.len(), 2);
+        }
+
+        clear_batch_state();
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_to_batch_only_counts_distinct_request_ids_in_metadata() {
+        clear_batch_state();
+
+        add_to_batch("req-1".into(), vec![1], None, "arn".into());
+        add_to_batch("req-1".into(), vec![2], None, "arn".into());
+        add_to_batch("req-1".into(), vec![3], None, "arn".into());
+
+        // Same request_id, three payloads accumulated into one entry — agent_count
+        // tracks distinct buffered requests, not total add_to_batch calls.
+        assert_eq!(AGENT_BATCH_BUFFER.len(), 1);
+        let meta = BATCH_META.lock().expect("lock");
+        assert_eq!(meta.agent_count, 1);
+
+        drop(meta);
         clear_batch_state();
     }
 
@@ -269,7 +313,7 @@ mod tests {
     fn make_payload(id: &str, size: usize) -> BatchedAgentPayload {
         BatchedAgentPayload {
             request_id: id.to_string(),
-            agent_payload_bytes: Arc::new(vec![0u8; size]),
+            agent_payload_bytes: vec![Arc::new(vec![0u8; size])],
             report_line: None,
             invoked_function_arn: "arn:test".to_string(),
             timestamp: chrono::Utc::now(),
@@ -344,7 +388,7 @@ mod tests {
     fn test_estimate_item_size_without_report() {
         let item = BatchedAgentPayload {
             request_id: "req".to_string(),
-            agent_payload_bytes: Arc::new(vec![0u8; 1000]),
+            agent_payload_bytes: vec![Arc::new(vec![0u8; 1000])],
             report_line: None,
             invoked_function_arn: "arn".to_string(),
             timestamp: chrono::Utc::now(),
@@ -359,7 +403,7 @@ mod tests {
     fn test_estimate_item_size_with_report() {
         let item = BatchedAgentPayload {
             request_id: "req".to_string(),
-            agent_payload_bytes: Arc::new(vec![0u8; 500]),
+            agent_payload_bytes: vec![Arc::new(vec![0u8; 500])],
             report_line: Some("REPORT Duration: 100ms".to_string()),
             invoked_function_arn: "arn".to_string(),
             timestamp: chrono::Utc::now(),
@@ -540,6 +584,7 @@ mod tests {
             pending_report: Some("REPORT Duration: 50ms".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -589,7 +634,7 @@ mod tests {
             "old-req".to_string(),
             BatchedAgentPayload {
                 request_id: "old-req".to_string(),
-                agent_payload_bytes: Arc::new(vec![1, 2, 3]),
+                agent_payload_bytes: vec![Arc::new(vec![1, 2, 3])],
                 report_line: Some("REPORT old".to_string()),
                 invoked_function_arn: "arn:old".to_string(),
                 timestamp: old_timestamp,
@@ -633,7 +678,7 @@ mod tests {
             "old-1".to_string(),
             BatchedAgentPayload {
                 request_id: "old-1".to_string(),
-                agent_payload_bytes: Arc::new(vec![1]),
+                agent_payload_bytes: vec![Arc::new(vec![1])],
                 report_line: None,
                 invoked_function_arn: "arn".to_string(),
                 timestamp: old_timestamp,
@@ -643,7 +688,7 @@ mod tests {
             "old-2".to_string(),
             BatchedAgentPayload {
                 request_id: "old-2".to_string(),
-                agent_payload_bytes: Arc::new(vec![2]),
+                agent_payload_bytes: vec![Arc::new(vec![2])],
                 report_line: Some("report".to_string()),
                 invoked_function_arn: "arn".to_string(),
                 timestamp: old_timestamp,

@@ -1,6 +1,6 @@
 [package]
 name = "newrelic-lambda-extension"
-version = "2.6.3"
+version = "2.6.4"
 edition = "2021"
 authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
@@ -39,10 +39,10 @@ regex = "1.10"  # For parsing platform REPORT logs in APM mode
 rand = "0.9.3"  # For TraceID/SpanID generation in APM mode
 
 # AWS dependencies - ALWAYS INCLUDED as default (as you requested)
-aws-config = { version = "1.8", features = ["behavior-version-latest"] }
-aws-sdk-secretsmanager = { version = "1.88", features = ["behavior-version-latest"] }
-aws-sdk-ssm = { version = "1.93", features = ["behavior-version-latest"] }
-aws-sdk-lambda = { version = "1.66", features = ["behavior-version-latest"] }
+aws-config = { version = "1.8", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-secretsmanager = { version = "1.88", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-ssm = { version = "1.93", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-lambda = { version = "1.66", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
 [profile.release]
 lto = "fat"          # Maximum link-time optimization

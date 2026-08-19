@@ -383,6 +383,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -654,6 +655,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -717,6 +719,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -858,6 +861,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -1562,6 +1566,7 @@ mod tests {
             let fake_app = crate::apm::ApmApp {
                 run_id: "drain-run-id".to_string(),
                 entity_guid: "drain-entity-guid".to_string(),
+                app_name: "test-app".to_string(),
                 collector_host: "http://unreachable.invalid.test".to_string(),
                 license_key: "fake-license-for-drain-test".to_string(),
                 metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),

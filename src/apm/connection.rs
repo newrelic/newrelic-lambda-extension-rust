@@ -125,7 +125,7 @@ pub fn reset_connect_stats() {
 /// Uses the collector's actual error message (not a hardcoded phrase); falls
 /// back to just the code when the body is empty. Body is trimmed/truncated so a
 /// verbose response can't bloat the log line.
-fn http_failure_reason(code: u16, body: &str) -> String {
+pub(crate) fn http_failure_reason(code: u16, body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
         format!("HTTP {code}")
@@ -136,7 +136,7 @@ fn http_failure_reason(code: u16, body: &str) -> String {
 }
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
-fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data)?;
     encoder.finish().map_err(|e| anyhow!("Compression failed: {}", e))
@@ -444,6 +444,20 @@ fn get_labels(function_arn: &str, runtime: &str, deployment: DeploymentContext) 
     }
 
     for (key, value) in crate::config::get_nr_tags() {
+        labels.push(Label {
+            label_type: key.clone(),
+            label_value: value.clone(),
+        });
+    }
+
+    // NEW_RELIC_LABELS (agent-specs/Labels.md) - additive, alongside NR_TAGS above.
+    // Sent unprefixed here, matching the connect payload's `label_type`/`label_value`
+    // shape - confirmed against the official Python agent (agent_protocol.py's
+    // _connect_payload sends settings["labels"] verbatim, built by config.py's
+    // _process_labels_setting as {"label_type": key, "label_value": value}, no
+    // prefix). The `tags.` prefix only applies to the log-forwarding path (client.rs),
+    // matching data_collector.py's `f"tags.{label['label_type']}"` construction there.
+    for (key, value) in crate::config::get_new_relic_labels() {
         labels.push(Label {
             label_type: key.clone(),
             label_value: value.clone(),

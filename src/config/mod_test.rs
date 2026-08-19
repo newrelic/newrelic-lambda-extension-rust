@@ -14,14 +14,16 @@ where
     // Save original values
     let original_tags = env::var("NR_TAGS").ok();
     let original_delimiter = env::var("NR_ENV_DELIMITER").ok();
-    
+    let original_labels = env::var("NEW_RELIC_LABELS").ok();
+
     // Clean environment
     env::remove_var("NR_TAGS");
     env::remove_var("NR_ENV_DELIMITER");
-    
+    env::remove_var("NEW_RELIC_LABELS");
+
     // Run test
     test();
-    
+
     // Restore environment
     if let Some(val) = original_tags {
         env::set_var("NR_TAGS", val);
@@ -32,6 +34,11 @@ where
         env::set_var("NR_ENV_DELIMITER", val);
     } else {
         env::remove_var("NR_ENV_DELIMITER");
+    }
+    if let Some(val) = original_labels {
+        env::set_var("NEW_RELIC_LABELS", val);
+    } else {
+        env::remove_var("NEW_RELIC_LABELS");
     }
 }
 
@@ -44,6 +51,7 @@ where
     let env_vars = vec![
         "NR_TAGS",
         "NR_ENV_DELIMITER",
+        "NEW_RELIC_LABELS",
         "NEW_RELIC_LAMBDA_EXTENSION_ENABLED",
         "NEW_RELIC_LICENSE_KEY",
         "NEW_RELIC_LICENSE_KEY_SECRET",
@@ -56,6 +64,7 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
+        "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
@@ -64,6 +73,8 @@ where
         "NEW_RELIC_EXTENSION_LOG_LEVEL",
         "NEW_RELIC_EXTENSION_LOGS_ENABLED",
         "NEW_RELIC_LAMBDA_EXTENSION_PROXY",
+        "NEW_RELIC_DATA_COLLECTION_TIMEOUT",
+        "NEW_RELIC_HTTP_TIMEOUT",
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
@@ -180,10 +191,246 @@ fn test_parse_nr_tags_not_set() {
 fn test_parse_nr_tags_empty_string() {
     with_clean_env(|| {
         env::set_var("NR_TAGS", "");
-        
+
         let tags = parse_nr_tags();
-        
+
         assert!(tags.is_empty());
+    });
+}
+
+// ============================================================================
+// NEW_RELIC_LABELS (agent-specs/Labels.md) - independent of NR_TAGS above
+// ============================================================================
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_basic() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_whitespace() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", " env : prod ; team : backend ");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_not_set() {
+    with_clean_env(|| {
+        let labels = parse_new_relic_labels();
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_empty_string() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_only_delimiters() {
+    with_clean_env(|| {
+        // Nothing but separators - no labels configured, not a malformed-string error.
+        env::set_var("NEW_RELIC_LABELS", ";;;");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_strips_leading_and_trailing_semicolons() {
+    with_clean_env(|| {
+        // Spec: leading/trailing stray `;` are stripped, not treated as malformed.
+        env::set_var("NEW_RELIC_LABELS", ";;env:prod;;");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels, vec![("env".to_string(), "prod".to_string())]);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_middle_empty_pair_is_malformed() {
+    with_clean_env(|| {
+        // Spec: an empty pair between two valid ones IS malformed (unlike leading/trailing).
+        env::set_var("NEW_RELIC_LABELS", "env:prod;;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty(), "a malformed string must hard-fail to an empty list");
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_missing_colon_hard_fails_whole_list() {
+    with_clean_env(|| {
+        // Unlike NR_TAGS (which skips just the bad pair), NEW_RELIC_LABELS must discard
+        // the entire list on any malformed pair - never a partial list.
+        env::set_var("NEW_RELIC_LABELS", "invalid;env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_multiple_colons_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "valid:value;invalid:has:colons;another:good");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_empty_type_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", ":value;env:prod");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_malformed_empty_value_hard_fails_whole_list() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "key:;env:prod");
+
+        let labels = parse_new_relic_labels();
+
+        assert!(labels.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_duplicate_type_last_wins() {
+    with_clean_env(|| {
+        env::set_var("NEW_RELIC_LABELS", "env:prod;env:staging");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels, vec![("env".to_string(), "staging".to_string())]);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_truncates_long_value() {
+    with_clean_env(|| {
+        let long_value = "v".repeat(300);
+        env::set_var("NEW_RELIC_LABELS", format!("env:{long_value}"));
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].0, "env");
+        assert_eq!(labels[0].1.chars().count(), 255);
+        assert_eq!(labels[0].1, "v".repeat(255));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_truncates_long_type() {
+    with_clean_env(|| {
+        let long_type = "t".repeat(300);
+        env::set_var("NEW_RELIC_LABELS", format!("{long_type}:prod"));
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].0.chars().count(), 255);
+        assert_eq!(labels[0].0, "t".repeat(255));
+        assert_eq!(labels[0].1, "prod");
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_caps_at_64_entries() {
+    with_clean_env(|| {
+        let raw = (0..70)
+            .map(|i| format!("k{i}:v{i}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        env::set_var("NEW_RELIC_LABELS", raw);
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 64);
+        assert!(labels.contains(&("k0".to_string(), "v0".to_string())));
+        assert!(labels.contains(&("k63".to_string(), "v63".to_string())));
+        assert!(!labels.contains(&("k64".to_string(), "v64".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_ignores_nr_env_delimiter() {
+    with_clean_env(|| {
+        // NEW_RELIC_LABELS uses fixed `:`/`;` delimiters per spec - NR_ENV_DELIMITER
+        // (which only affects NR_TAGS) must have no effect on it.
+        env::set_var("NR_ENV_DELIMITER", "|");
+        env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+
+        let labels = parse_new_relic_labels();
+
+        assert_eq!(labels.len(), 2);
+        assert!(labels.contains(&("env".to_string(), "prod".to_string())));
+        assert!(labels.contains(&("team".to_string(), "backend".to_string())));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_new_relic_labels_independent_of_nr_tags() {
+    with_clean_env(|| {
+        // Malformed NEW_RELIC_LABELS must not affect NR_TAGS, and vice versa - the two
+        // env vars are parsed by entirely separate functions with no shared state.
+        env::set_var("NR_TAGS", "env:prod");
+        env::set_var("NEW_RELIC_LABELS", "invalid");
+
+        assert_eq!(parse_nr_tags(), vec![("env".to_string(), "prod".to_string())]);
+        assert!(parse_new_relic_labels().is_empty());
     });
 }
 
@@ -222,6 +469,8 @@ fn test_new_relic_config_default() {
     assert_eq!(config.apm_host, "collector.newrelic.com");
     assert_eq!(config.metric_endpoint, "https://metric-api.newrelic.com/metric/v1");
     assert_eq!(config.proxy_url, None);
+    assert_eq!(config.data_collection_timeout, None);
+    assert_eq!(config.http_timeout, None);
 }
 
 #[test]
@@ -1167,13 +1416,17 @@ fn test_new_relic_config_all_fields() {
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
+        synchronous_flush: false,
+        data_collection_timeout: Some(Duration::from_secs(20)),
+        http_timeout: Some(Duration::from_secs(1)),
     };
-    
+
     assert!(!config.extension_enabled);
     assert_eq!(config.license_key, Some("key".to_string()));
     assert_eq!(config.harvest_interval, Duration::from_secs(5));
     assert!(config.collect_trace_id);
     assert!(config.apm_lambda_mode);
+    assert!(!config.synchronous_flush);
 }
 
 #[test]
@@ -1557,5 +1810,167 @@ fn test_apm_blocking_handshake_truthy_variants() {
             );
         });
     }
+}
+
+// ── serverless-mode synchronous_flush (NR-600648 follow-up) ──
+
+#[test]
+#[serial]
+fn test_synchronous_flush_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_enabled_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.synchronous_flush,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
+    // Both flags can legally be set simultaneously — precedence is enforced at the
+    // event-loop level (execute_standard_mode_event_loop), not by rejecting the config.
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
+        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.synchronous_flush);
+        assert!(config.extension.pipeline_flush);
+        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
+    });
+}
+
+// ============================================================================
+// NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
+// ============================================================================
+
+#[test]
+fn test_parse_duration_valid_units() {
+    assert_eq!(parse_duration("500ms"), Some(Duration::from_millis(500)));
+    assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+    assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
+    assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+    assert_eq!(parse_duration("1.5s"), Some(Duration::from_millis(1500)));
+}
+
+#[test]
+fn test_parse_duration_bare_number_rejected() {
+    // Bare numbers with no unit are rejected, matching Go's time.ParseDuration.
+    assert_eq!(parse_duration("15"), None);
+    assert_eq!(parse_duration("20"), None);
+}
+
+#[test]
+fn test_parse_duration_invalid_unit_rejected() {
+    assert_eq!(parse_duration("10x"), None);
+    assert_eq!(parse_duration("10 days"), None);
+}
+
+#[test]
+fn test_parse_duration_negative_rejected() {
+    assert_eq!(parse_duration("-5s"), None);
+}
+
+#[test]
+fn test_parse_duration_empty_rejected() {
+    assert_eq!(parse_duration(""), None);
+}
+
+#[test]
+fn test_parse_duration_trims_whitespace() {
+    assert_eq!(parse_duration("  20s  "), Some(Duration::from_secs(20)));
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_unset_stays_none() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_valid_value() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "20s");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, Some(Duration::from_secs(20)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_data_collection_timeout_invalid_value_falls_back_to_default() {
+    with_full_clean_env(|| {
+        // Bare number, no unit -> falls back to the 10s default, matching the Go extension.
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "15");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, Some(Duration::from_secs(10)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_unset_stays_none() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_valid_value() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "1s");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, Some(Duration::from_secs(1)));
+    });
+}
+
+#[test]
+#[serial]
+fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
+    with_full_clean_env(|| {
+        // Bare number, no unit -> falls back to the 2400ms default.
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.http_timeout, Some(Duration::from_millis(2400)));
+    });
 }
 

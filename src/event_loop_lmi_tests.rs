@@ -21,6 +21,7 @@ fn build_fake_apm_app() -> crate::apm::ApmApp {
     crate::apm::ApmApp {
         run_id: "test-run-id".to_string(),
         entity_guid: "test-entity-guid".to_string(),
+        app_name: "test-app".to_string(),
         collector_host: "http://unreachable.invalid.test".to_string(),
         license_key: "fake-license-key-for-unit-test".to_string(),
         metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),

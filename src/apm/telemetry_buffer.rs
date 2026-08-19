@@ -111,8 +111,6 @@ pub async fn retry_buffered_telemetry(
     let mut retry_failed_count = 0;
 
     for mut item in failed_telemetry {
-        item.retry_count += 1;
-
         // Check age - drop if older than 1 hour (Lambda container lifecycle is short)
         let age = Utc::now().signed_duration_since(item.failed_at);
         if age.num_minutes() > 60 {
@@ -127,7 +125,7 @@ pub async fn retry_buffered_telemetry(
 
         debug!(
             "Retrying {} for request {} (attempt {})",
-            item.telemetry_type, item.request_id, item.retry_count
+            item.telemetry_type, item.request_id, item.retry_count + 1
         );
 
         let run_id = current_run_id.unwrap_or(item.run_id.as_str());
@@ -185,16 +183,32 @@ pub async fn retry_buffered_telemetry(
                     item.telemetry_type, item.request_id, e
                 );
 
-                // Put back in buffer for next retry (unless too many attempts)
-                if item.retry_count < 10 {
+                // 409/401: session expired — not a data error. Don't consume a retry slot;
+                // the item will succeed once the session is re-established.
+                let is_restart = e
+                    .downcast_ref::<super::collector::CollectorError>()
+                    .map(|ce| matches!(ce, super::collector::CollectorError::RestartException))
+                    .unwrap_or(false);
+
+                if is_restart {
                     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+                        if buffer.len() >= MAX_BUFFERED_ITEMS {
+                            buffer.remove(0);
+                        }
                         buffer.push(item);
                     }
                 } else {
-                    error!(
-                        "Dropping {} after {} retry attempts for request {}",
-                        item.telemetry_type, item.retry_count, item.request_id
-                    );
+                    item.retry_count += 1;
+                    if item.retry_count < 10 {
+                        if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
+                            buffer.push(item);
+                        }
+                    } else {
+                        error!(
+                            "Dropping {} after {} retry attempts for request {}",
+                            item.telemetry_type, item.retry_count, item.request_id
+                        );
+                    }
                 }
             }
         }

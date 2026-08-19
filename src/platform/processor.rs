@@ -120,7 +120,7 @@ impl PlatformProcessor {
     }
 
    
-    fn create_platform_log_message(&self, record: &TelemetryRecord) -> (String, String) {
+    pub(crate) fn create_platform_log_message(&self, record: &TelemetryRecord) -> (String, String) {
         match record.record_type.as_str() {
             "platform.report" => {
                 if let Some(report_line) = self.convert_platform_report_to_log_line(record) {
@@ -478,7 +478,7 @@ impl PlatformProcessor {
     /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
     /// but the compiler cannot detect it in certain build configurations
     #[allow(dead_code)]
-    fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
+    pub(crate) fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
         if message.starts_with("REPORT RequestId: ") {
             if let Some(start) = message.find("REPORT RequestId: ") {
                 let after_prefix = &message[start + "REPORT RequestId: ".len()..];
@@ -496,7 +496,7 @@ impl PlatformProcessor {
     /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
     /// but the compiler cannot detect it in certain build configurations
     #[allow(dead_code)]
-    fn extract_log_level_from_message(&self, message: &str) -> &'static str {
+    pub(crate) fn extract_log_level_from_message(&self, message: &str) -> &'static str {
         let message_upper = message.to_uppercase();
         
         if message_upper.contains("ERROR") || 

@@ -1,6 +1,6 @@
 [![Community Plus header](https://github.com/newrelic/opensource-website/raw/main/src/images/categories/Community_Plus.png)](https://opensource.newrelic.com/oss-category/#community-plus)
 
-# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml)
+# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml) [![CI](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust)
 
 A high-performance Rust implementation of the AWS Lambda extension to collect, enhance, and transport telemetry data from your AWS Lambda functions to New Relic without requiring an external transport such as CloudWatch Logs or Kinesis.
 
@@ -186,8 +186,9 @@ The New Relic Lambda Extension can send your function's logs to New Relic. If yo
 | `NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS` | `false` | `true`, `false`, `1`, `0` | Send platform logs (START, END, REPORT, etc.) to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
 | `NEW_RELIC_EXTENSION_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` | Set the log level for extension logging. |
 | `NEW_RELIC_EXTENSION_LOGS_ENABLED` | `true` | `true`, `false`, `1`, `0` | Enable or disable [NR_EXT] extension log output in CloudWatch. When false, suppresses all extension logs while keeping functionality intact. |
-| `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Each tag is composed of a colon-delimited key and value. Multiple key-value pairs are semicolon-delimited; for example, `env:prod;team:myTeam`. |
+| `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Format: `env:prod;team:myTeam` (colon-delimited key/value, semicolon-delimited pairs).<br><br>**Notes:**<br>- Only affects log events and APM connect Entity Tags.<br>- Does **not** feed Transaction/Span custom attributes — only `NEW_RELIC_LABELS` does (see below). |
 | `NR_ENV_DELIMITER` | `;` | Any string | Custom delimiter for `NR_TAGS`. Some users in UTF-8 environments might face difficulty with the default semicolon `;` delimiter. |
+| `NEW_RELIC_LABELS` |  | | Specify labels in the standard New Relic cross-agent format. **Optional**. Format: `type1:value1;type2:value2` (fixed `:`/`;` delimiters, not affected by `NR_ENV_DELIMITER`).<br><br>**Where it is used:**<br>- Forwarded log events → `tags.<type>` attributes.<br>- In APM mode (`NEW_RELIC_APM_LAMBDA_MODE=true`), every Transaction and Span event → `tags.<type>` custom attributes (equivalent to calling `newrelic.addCustomAttributes()` in every function). Existing attributes already set by the agent or your code are not overwritten.<br><br>**Validation:**<br>- Duplicate type in `NEW_RELIC_LABELS`: last value wins.<br>- Type/value over 255 chars: truncated, with a warning.<br>- Over 64 entries: list capped, with a warning.<br>- Malformed pair (bad delimiter count, empty type/value): the **entire** list is discarded, with a warning (never partial).<br><br>**With `NR_TAGS`:**<br>- Independent variables: if both are set, both are sent.<br>- `NR_TAGS` does **not** feed Transaction/Span custom attributes; only `NEW_RELIC_LABELS` does.<br>- No cross-variable deduplication.<br>- Entity-level APM connect labels are unprefixed for both variables, so duplicate keys can override each other.<br>- Forwarded logs can also override when keys resolve to the same final attribute name.<br>  Example: `NR_TAGS=tags.team:dev` and `NEW_RELIC_LABELS=team:prod` both become `tags.team` in logs, so `NEW_RELIC_LABELS` wins (`tags.team=prod`). |
 
 ## Extension Environment Variables
 
@@ -219,6 +220,14 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
 
+### Serverless Mode Configuration
+
+Serverless mode (the default, `NEW_RELIC_APM_LAMBDA_MODE=false`) normally pairs each agent payload with its Lambda `platform.report` before sending, batching complete pairs until 3+ have accumulated. For low-invocation-frequency functions, that threshold can otherwise leave a payload sitting unsent until `SHUTDOWN`, several minutes later — this variable closes that gap.
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` | `false` | `true`, `false`, `1`, `0` | When `true`, the agent payload is sent to New Relic the instant it's received — as its own request, independent of `platform.report` — instead of buffering it to pair with the report and waiting for the 3+ batch threshold or `SHUTDOWN`. The extension awaits that send (bounded by the invocation's remaining deadline) before the invocation ends, so delivery completes within the same invoke. `platform.report` handling (used for `billed_duration`/`memory_used` enrichment) is unaffected by this flag and keeps following its existing pairing/threshold/`SHUTDOWN` path — the two are independent by design, since the Telemetry API only emits `platform.report` after every extension has already called `/next`, so there's nothing to gain by waiting for it. Takes precedence over `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` on invocations where the immediate send is exercised. When `false` (default), behavior is unchanged. |
+
 ### Performance Optimization
 
 | Environment variable | Default value | Options | Description |
@@ -230,6 +239,8 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
 | `NEW_RELIC_LAMBDA_EXTENSION_PROXY` | | URL | HTTP proxy for the extension's outbound traffic to New Relic. Only affects the extension — does not interfere with your Lambda function's own traffic. Supports `http://`, `https://`, and `socks5://` schemes. Credentials are supported via `http://user:pass@proxy:port` format and are masked in all log output. Localhost traffic (Lambda Extensions API) is never proxied. When not set, the extension respects standard `HTTPS_PROXY`/`HTTP_PROXY` environment variables as a fallback. |
+| `NEW_RELIC_DATA_COLLECTION_TIMEOUT` | _(unset)_ | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in total retry budget for sending telemetry and logs. When unset, the extension keeps its original fixed 3-attempt retry behavior unchanged. When set, retries continue with a growing backoff (200ms, doubling every 3 attempts, capped at 3s) until this much wall-clock time has elapsed, with a 20-attempt safety cap. Invalid values (e.g. a bare number with no unit) fall back to a 10s budget. |
+| `NEW_RELIC_HTTP_TIMEOUT` | `2400ms` | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in per-request timeout for telemetry and log sends to New Relic, overriding the default 2.4s. Invalid values fall back to the 2400ms default.<br><br>**Cold-start race condition:** Lambda cold starts typically add 200ms–1s+ of latency before the first response arrives. If this timeout is set too close to your function's average response time, it can fire just before a legitimate response completes — causing a failure even though the Lambda succeeded. To avoid this, set `NEW_RELIC_HTTP_TIMEOUT` at least 1–1.5s above the average cold-start duration of your function. Requests that finish faster close immediately; the extra headroom is only used when needed. |
 
 **When to use `NEW_RELIC_LAMBDA_EXTENSION_PROXY`:**
 

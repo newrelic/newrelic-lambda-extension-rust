@@ -22,6 +22,13 @@ const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
 const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
 const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 
+/// Fallback used when `NEW_RELIC_DATA_COLLECTION_TIMEOUT` is set but not a valid
+/// duration string. Matches the Go extension's default.
+const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -66,6 +73,37 @@ pub struct NewRelicConfig {
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
+    /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — master switch for serverless-mode
+    /// (standard/non-APM mode only) immediate delivery of the agent payload. When
+    /// `true`, the agent payload is sent to New Relic the instant it's received on the
+    /// named pipe (`request::route_payload_to_request_buffer`), as its own background
+    /// task — instead of buffering it to pair with `platform.report` and waiting for
+    /// the 3+ batch threshold or `SHUTDOWN`. `process_request_concurrently` awaits any
+    /// outstanding send for its request (bounded by the invocation's remaining
+    /// deadline) before the invocation ends, so delivery completes within the same
+    /// invoke without the sandbox freezing mid-flight.
+    ///
+    /// There is no wait for a late `platform.report`, and report handling is otherwise
+    /// unaffected by this flag: the Telemetry API only emits `platform.report` after
+    /// every extension has already called `/next` for the invocation, so a fresh
+    /// request's own report can never be "already arrived" in practice — waiting for it
+    /// would either time out every time or delay the extension's own `/next` call. The
+    /// report keeps following its existing pairing/threshold/`SHUTDOWN` path
+    /// (`AGENT_BATCH_BUFFER`, `set_pending_report`) exactly as it does when this flag is
+    /// off; since the payload no longer sits in `agent_buffer` waiting to pair, a report
+    /// that arrives later simply finds nothing to pair with, same as today.
+    ///
+    /// Default `false` — no behavior change unless explicitly enabled. Distinct from
+    /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
+    pub synchronous_flush: bool,
+    /// Total wall-clock budget for retrying a send, set via
+    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
+    /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
+    /// switches to retrying until `d` has elapsed instead of a fixed count.
+    pub data_collection_timeout: Option<Duration>,
+    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in, same as
+    /// data_collection_timeout.
+    pub http_timeout: Option<Duration>,
 }
 
 /// AWS Lambda specific configuration
@@ -162,6 +200,9 @@ impl Default for NewRelicConfig {
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
+            synchronous_flush: false,
+            data_collection_timeout: None,
+            http_timeout: None,
         }
     }
 }
@@ -279,6 +320,26 @@ pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
     set
 }
 
+/// Parse a Go-style duration string (`"200ms"`, `"30s"`, `"1m"`, `"2h"`).
+/// Bare numbers with no unit are rejected, matching Go's `time.ParseDuration`.
+pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let unit_start = raw.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (num_part, unit) = raw.split_at(unit_start);
+    let value: f64 = num_part.parse().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    let millis = match unit {
+        "ms" => value,
+        "s" => value * 1_000.0,
+        "m" => value * 60_000.0,
+        "h" => value * 3_600_000.0,
+        _ => return None,
+    };
+    Some(Duration::from_millis(millis as u64))
+}
+
 impl ExtensionConfig {
     /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
@@ -387,6 +448,34 @@ impl ExtensionConfig {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Opt-in: only set (and thus only change retry behavior) when the customer
+        // explicitly provides this env var. Unset means data_collection_timeout stays
+        // None and existing fixed-retry-count behavior is untouched.
+        config.new_relic.data_collection_timeout = env::var("NEW_RELIC_DATA_COLLECTION_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_DATA_COLLECTION_TIMEOUT value '{}', defaulting to 10s",
+                        raw
+                    );
+                    DEFAULT_DATA_COLLECTION_TIMEOUT
+                })
+            });
+
+        // Opt-in, same pattern as data_collection_timeout.
+        config.new_relic.http_timeout = env::var("NEW_RELIC_HTTP_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_HTTP_TIMEOUT value '{}', defaulting to 2400ms",
+                        raw
+                    );
+                    DEFAULT_HTTP_TIMEOUT
+                })
+            });
+
         if let Some(ref url) = config.new_relic.proxy_url {
             // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
             // Mask credentials: http://user:pass@host -> http://***:***@host
@@ -445,6 +534,24 @@ impl ExtensionConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30_000)
             .max(1000);
+
+        let synchronous_flush_str =
+            env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();
+        config.new_relic.synchronous_flush = parse_bool(&synchronous_flush_str);
+
+        // synchronous_flush takes precedence over pipeline_flush on any invocation
+        // where an immediate send is exercised (see event_loop.rs
+        // execute_standard_mode_event_loop) — the delivery guarantee the customer
+        // explicitly opted into must not be silently defeated by the deferred-send
+        // optimization. Surface that trade-off once at startup rather than leaving it silent.
+        if config.extension.pipeline_flush && config.new_relic.synchronous_flush {
+            warn!(
+                "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
+                 deferred-send behavior on invocations where an immediate send is exercised — you \
+                 will not get pipeline_flush's billed-duration savings on those invocations. This is \
+                 intentional: the delivery guarantee takes precedence over the throughput optimization."
+            );
+        }
 
         config
     }
@@ -531,6 +638,119 @@ static NR_TAGS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
 /// Subsequent warm-start invocations reuse the cached result with zero allocation.
 pub fn get_nr_tags() -> &'static [(String, String)] {
     NR_TAGS_CACHE.get_or_init(parse_nr_tags)
+}
+
+/// Maximum length (in Unicode scalar values) allowed for a `NEW_RELIC_LABELS` type or
+/// value, per the cross-agent Labels spec (agent-specs/Labels.md). Longer values are
+/// truncated with a warning, not rejected.
+const MAX_LABEL_LEN: usize = 255;
+/// Maximum number of `NEW_RELIC_LABELS` type/value pairs sent per agent run, per the
+/// cross-agent Labels spec. Applied to `NEW_RELIC_LABELS`'s own output only — independent
+/// of the (uncapped, untouched) `NR_TAGS` output.
+const MAX_LABELS: usize = 64;
+
+/// Parse the `NEW_RELIC_LABELS` environment variable into key-value pairs.
+///
+/// Format: `type1:value1;type2:value2`, per the cross-agent Labels spec
+/// (agent-specs/Labels.md). Deliberately independent of `NR_TAGS`/`parse_nr_tags`, which
+/// this does not touch or share state with:
+/// - The delimiters are fixed (no `NR_ENV_DELIMITER`-style override).
+/// - A duplicate label type keeps only the value from its *last* occurrence.
+/// - A malformed pair (wrong delimiter count, empty type, or empty value — including a
+///   non-leading/trailing empty pair like `foo:bar;;zip:zap`) hard-fails the whole list
+///   to empty, with a warning. Purely leading/trailing separators (`;;foo:bar;;`) are
+///   stripped and not treated as malformed.
+/// - Each type/value longer than 255 chars is truncated, with a warning.
+/// - The list is capped at 64 entries, with a warning.
+///
+/// # Example
+/// ```
+/// std::env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+/// let labels = parse_new_relic_labels();
+/// assert_eq!(labels, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
+/// ```
+pub fn parse_new_relic_labels() -> Vec<(String, String)> {
+    let raw = match env::var("NEW_RELIC_LABELS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Vec::new(),
+    };
+
+    let raw_segments: Vec<&str> = raw.split(';').collect();
+
+    // Strip purely leading/trailing empty segments (stray `;` at either end); a middle
+    // empty segment is a malformed pair per spec, not tolerated the same way.
+    let Some(start) = raw_segments.iter().position(|s| !s.trim().is_empty()) else {
+        // Nothing but separators/whitespace (e.g. ";;;") - no labels configured, not an error.
+        return Vec::new();
+    };
+    let Some(end) = raw_segments.iter().rposition(|s| !s.trim().is_empty()) else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for segment in &raw_segments[start..=end] {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            warn!(
+                "NEW_RELIC_LABELS is malformed (empty label pair between valid entries); discarding all labels"
+            );
+            return Vec::new();
+        }
+
+        let parts: Vec<&str> = segment.split(':').collect();
+        let (label_type, label_value) = match parts.as_slice() {
+            [t, v] if !t.trim().is_empty() && !v.trim().is_empty() => (t.trim(), v.trim()),
+            _ => {
+                warn!(
+                    "NEW_RELIC_LABELS is malformed at \"{segment}\" (expected exactly one non-empty \"type:value\" pair); discarding all labels"
+                );
+                return Vec::new();
+            }
+        };
+
+        let label_type = truncate_label_part(label_type, "label type");
+        let label_value = truncate_label_part(label_value, "label value");
+
+        // Duplicate type: last occurrence wins, updating the value in place.
+        if let Some(existing) = pairs.iter_mut().find(|(t, _)| *t == label_type) {
+            existing.1 = label_value;
+        } else {
+            pairs.push((label_type, label_value));
+        }
+    }
+
+    if pairs.len() > MAX_LABELS {
+        warn!(
+            "NEW_RELIC_LABELS has {} entries, exceeding the {MAX_LABELS}-label limit; truncating",
+            pairs.len()
+        );
+        pairs.truncate(MAX_LABELS);
+    }
+
+    pairs
+}
+
+/// Truncate a `NEW_RELIC_LABELS` type/value to `MAX_LABEL_LEN` chars, warning if truncated.
+fn truncate_label_part(part: &str, kind: &str) -> String {
+    if part.chars().count() > MAX_LABEL_LEN {
+        let truncated: String = part.chars().take(MAX_LABEL_LEN).collect();
+        warn!(
+            "NEW_RELIC_LABELS {kind} \"{part}\" exceeds {MAX_LABEL_LEN} characters; truncating to \"{truncated}\""
+        );
+        truncated
+    } else {
+        part.to_string()
+    }
+}
+
+/// Cached `NEW_RELIC_LABELS` parsed once at cold start. Use `get_new_relic_labels()` to access.
+static NEW_RELIC_LABELS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Returns cached `NEW_RELIC_LABELS`, parsing from environment only on first call (cold
+/// start). Subsequent warm-start invocations reuse the cached result with zero allocation.
+pub fn get_new_relic_labels() -> &'static [(String, String)] {
+    NEW_RELIC_LABELS_CACHE.get_or_init(parse_new_relic_labels)
 }
 
 /// Global configuration instance

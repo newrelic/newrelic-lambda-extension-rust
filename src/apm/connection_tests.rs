@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::deployment::TelemetryMode;
+use anyhow::anyhow;
 use serial_test::serial;
 
 #[test]
@@ -47,6 +48,25 @@ fn labels_on_lmi_have_exactly_one_more_than_normal() {
             "LMI labels are missing a label Normal Lambda sends: {} = {}",
             label.label_type,
             label.label_value
+        );
+    }
+}
+
+#[test]
+fn labels_on_lmi_include_new_relic_labels_alongside_islmi() {
+    // NEW_RELIC_LABELS (main) and isLMI (LMI) must coexist — neither feature
+    // should silently overwrite the other under DeploymentContext::Lmi.
+    let arn = "arn:aws:lambda:us-east-1:123456789012:function:test";
+    let labels = get_labels(arn, "python", DeploymentContext::Lmi);
+
+    assert!(
+        labels.iter().any(|l| l.label_type == "isLMI" && l.label_value == "true"),
+        "expected isLMI:true under LMI, got {labels:?}"
+    );
+    for (key, value) in crate::config::get_new_relic_labels() {
+        assert!(
+            labels.iter().any(|l| &l.label_type == key && &l.label_value == value),
+            "expected NEW_RELIC_LABELS entry {key}={value} to survive under LMI, got {labels:?}"
         );
     }
 }
@@ -115,4 +135,31 @@ fn http_failure_reason_uses_api_body_and_truncates() {
     let r = http_failure_reason(500, &long);
     assert!(r.starts_with("HTTP 500: "));
     assert!(r.len() <= "HTTP 500: ".len() + 300);
+}
+
+#[test]
+fn compress_inline_roundtrips_via_gzip_decoder() {
+    use std::io::Read;
+
+    let original = b"the quick brown fox jumps over the lazy dog ".repeat(50);
+    let compressed = compress_inline(&original).expect("compression should succeed");
+
+    let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).expect("decompression should succeed");
+
+    assert_eq!(decompressed, original);
+}
+
+#[test]
+fn compress_inline_shrinks_repetitive_data() {
+    let original = vec![b'a'; 10_000];
+    let compressed = compress_inline(&original).expect("compression should succeed");
+    assert!(compressed.len() < original.len());
+}
+
+#[test]
+fn compress_inline_handles_empty_input() {
+    let compressed = compress_inline(&[]).expect("compression of empty input should succeed");
+    assert!(!compressed.is_empty(), "gzip stream still has header/footer bytes");
 }
