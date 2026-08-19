@@ -379,6 +379,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -644,6 +645,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -706,6 +708,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -844,6 +847,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 

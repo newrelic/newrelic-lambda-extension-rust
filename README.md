@@ -220,6 +220,14 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
 
+### Serverless Mode Configuration
+
+Serverless mode (the default, `NEW_RELIC_APM_LAMBDA_MODE=false`) normally pairs each agent payload with its Lambda `platform.report` before sending, batching complete pairs until 3+ have accumulated. For low-invocation-frequency functions, that threshold can otherwise leave a payload sitting unsent until `SHUTDOWN`, several minutes later — this variable closes that gap.
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` | `false` | `true`, `false`, `1`, `0` | When `true`, the agent payload is sent to New Relic the instant it's received — as its own request, independent of `platform.report` — instead of buffering it to pair with the report and waiting for the 3+ batch threshold or `SHUTDOWN`. The extension awaits that send (bounded by the invocation's remaining deadline) before the invocation ends, so delivery completes within the same invoke. `platform.report` handling (used for `billed_duration`/`memory_used` enrichment) is unaffected by this flag and keeps following its existing pairing/threshold/`SHUTDOWN` path — the two are independent by design, since the Telemetry API only emits `platform.report` after every extension has already called `/next`, so there's nothing to gain by waiting for it. Takes precedence over `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` on invocations where the immediate send is exercised. When `false` (default), behavior is unchanged. |
+
 ### Performance Optimization
 
 | Environment variable | Default value | Options | Description |

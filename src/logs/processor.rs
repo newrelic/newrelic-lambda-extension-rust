@@ -1526,6 +1526,42 @@ impl LogProcessor {
         self.pending_logs.is_some()
     }
 
+    /// Test-only: hold a log under `request_id` in the per-request pending buffer,
+    /// mirroring how `process_record` parks a function/extension log while its
+    /// trace.id is still unknown. Lets tests outside this module (e.g.
+    /// `request::mod_tests`) set up a "log held, waiting for trace.id" fixture without
+    /// reaching into `pending_logs` directly (private to this module).
+    #[cfg(test)]
+    pub(crate) fn test_hold_log(&self, request_id: &str, message: &str) {
+        if let Some(ref pending) = self.pending_logs {
+            if let Ok(mut buf) = pending.lock() {
+                let _ = buf.push(
+                    request_id,
+                    payload::LogMessage {
+                        timestamp: 0,
+                        message: message.to_string(),
+                        attributes: serde_json::Map::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Test-only: number of logs still held (not yet stamped + routed) for `request_id`.
+    #[cfg(test)]
+    pub(crate) fn test_pending_logs_len_for(&self, request_id: &str) -> usize {
+        self.pending_logs
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map_or(0, |p| p.len_for(request_id))
+    }
+
+    /// Test-only: number of logs currently sitting in the outbound batch.
+    #[cfg(test)]
+    pub(crate) fn test_log_batch_len(&self) -> usize {
+        self.log_batch.lock().map_or(0, |b| b.len())
+    }
+
     /// Best-effort current APM `entity.guid`; `None` when unavailable or not APM mode.
     fn current_entity_guid(&self) -> Option<String> {
         self.apm_app.as_ref().and_then(|arc| match arc.try_read() {

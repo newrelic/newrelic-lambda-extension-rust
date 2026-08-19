@@ -26,6 +26,30 @@ use hyper_util::rt::TokioIo;
 use http_body_util::{BodyExt, Full};
 use tokio::net::TcpListener;
 
+/// After a successful standard-mode `platform.report`/agent-payload pairing, trigger
+/// an immediate batch send when `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled.
+/// Pairing happens here, in this listener's `platform.report` handler, which runs
+/// independently of `process_request_concurrently` — so without this the paired
+/// payload would just sit in `AGENT_BATCH_BUFFER` until the 3+ threshold or `SHUTDOWN`
+/// even with the flag on. (This is a report-side concern only: the flag's primary
+/// effect — sending the agent payload itself immediately on arrival — lives in
+/// `request::route_payload_to_request_buffer` instead.)
+///
+/// Reads `newrelic_client`/`config` from `event_loop::SERVERLESS_SEND_CONTEXT` rather
+/// than threading them through `setup_telemetry_listener`/`handle_telemetry_request`
+/// (which have ~20 test call sites). A no-op (with a one-time debug log) if the context
+/// hasn't been set yet — only possible in the brief startup window before `main.rs`
+/// populates it, well before any `platform.report` can arrive.
+fn maybe_send_immediately_if_blocking_enabled() {
+    let Some((client, config, _log_processor)) = crate::event_loop::SERVERLESS_SEND_CONTEXT.get() else {
+        debug!("SERVERLESS_SEND_CONTEXT not yet set - skipping immediate-send check");
+        return;
+    };
+    if config.new_relic.synchronous_flush {
+        let _ = crate::event_loop::maybe_spawn_batch_send(client.clone(), config.clone());
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TelemetryRecord {
     pub time: DateTime<Utc>,
@@ -186,6 +210,8 @@ async fn handle_telemetry_request(
                                         if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
                                             debug!("Serverless mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                            drop(batch_item);
+                                            maybe_send_immediately_if_blocking_enabled();
                                         }
                                         else if let Some(buffer) = get_agent_buffer(request_id_str) {
                                             let arn = get_request_context(request_id_str)
@@ -232,6 +258,7 @@ async fn handle_telemetry_request(
 
                                             if batched {
                                                 debug!("Serverless mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                                maybe_send_immediately_if_blocking_enabled();
                                             } else {
                                                 set_pending_report(request_id_str, report_line);
                                                 debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);

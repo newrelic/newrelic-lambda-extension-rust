@@ -64,6 +64,7 @@ where
         "NEW_RELIC_APM_LAMBDA_MODE",
         "NEW_RELIC_APM_BLOCKING_HANDSHAKE",
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
+        "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
@@ -1415,15 +1416,17 @@ fn test_new_relic_config_all_fields() {
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
         proxy_url: Some("http://proxy:8080".to_string()),
+        synchronous_flush: false,
         data_collection_timeout: Some(Duration::from_secs(20)),
         http_timeout: Some(Duration::from_secs(1)),
     };
-    
+
     assert!(!config.extension_enabled);
     assert_eq!(config.license_key, Some("key".to_string()));
     assert_eq!(config.harvest_interval, Duration::from_secs(5));
     assert!(config.collect_trace_id);
     assert!(config.apm_lambda_mode);
+    assert!(!config.synchronous_flush);
 }
 
 #[test]
@@ -1806,6 +1809,67 @@ fn test_apm_blocking_handshake_truthy_variants() {
             );
         });
     }
+}
+
+// ── serverless-mode synchronous_flush (NR-600648 follow-up) ──
+
+#[test]
+#[serial]
+fn test_synchronous_flush_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_enabled_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.synchronous_flush);
+    });
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.synchronous_flush,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
+    // Both flags can legally be set simultaneously — precedence is enforced at the
+    // event-loop level (execute_standard_mode_event_loop), not by rejecting the config.
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
+        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.synchronous_flush);
+        assert!(config.extension.pipeline_flush);
+        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
+    });
 }
 
 // ============================================================================

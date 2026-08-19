@@ -615,6 +615,18 @@ async fn perform_one_time_initialization(
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         };
 
+    // Standing (client, config, log processor) handle for code that runs independently
+    // of the event loop — the standard-mode telemetry listener's platform.report
+    // handler, and route_payload_to_request_buffer's immediate agent-payload send
+    // under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH — see event_loop::SERVERLESS_SEND_CONTEXT.
+    // All three are stable from here on (only ARN-related fields on config are ever
+    // overridden after this point).
+    let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((
+        newrelic_client.clone(),
+        config.clone(),
+        temp_log_processor.clone(),
+    ));
+
     runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
         .await?;
 

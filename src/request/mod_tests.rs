@@ -195,6 +195,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -227,6 +228,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -280,6 +282,7 @@ mod tests {
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -302,6 +305,7 @@ mod tests {
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -315,8 +319,15 @@ mod tests {
             // Context and buffer are preserved
             assert!(entry.context.lock().is_ok());
             assert!(entry.agent_buffer.lock().is_ok());
-            // pending_report is always cleared on partial cleanup
-            assert!(entry.pending_report.is_none());
+            // pending_report is preserved too — NOT cleared on partial cleanup. It's
+            // normally already None by this point (remove_pending_report() already took
+            // it at the start of the caller's processing), but process_request_concurrently
+            // can legitimately re-set it (restoring a report whose payload never showed up
+            // within the blocking-agent-payload wait window) so the next invocation or
+            // SHUTDOWN can still find it. Unconditionally clearing it here would silently
+            // undo that restoration — this was a real bug, fixed alongside
+            // NEW_RELIC_BLOCKING_AGENT_PAYLOAD.
+            assert_eq!(entry.pending_report, Some("r".to_string()));
         }
 
         clear_request_state();
@@ -437,6 +448,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -466,6 +478,7 @@ mod tests {
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         // Advance counter to invocation 10
@@ -482,6 +495,55 @@ mod tests {
         clear_request_state();
     }
 
+    // cleanup_old_request_buffers is the only production path that removes a
+    // REQUEST_DATA entry outright — a NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send still
+    // outstanding for a request that's about to be evicted as stale must be drained
+    // and awaited first, or nothing (not this function, not the SHUTDOWN sweep, which
+    // can only see handles still reachable from a live REQUEST_DATA entry) would ever
+    // come back to await it.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_awaits_pending_send_before_evicting() {
+        clear_request_state();
+
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "old-req-with-pending-send".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            trace_id: None,
+        }));
+        REQUEST_DATA.insert("old-req-with-pending-send".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        push_pending_send_handle("old-req-with-pending-send", handle);
+
+        let (client, config) = make_test_client_and_config();
+        cleanup_old_request_buffers(client, config).await;
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "the pending send must be awaited before its request's REQUEST_DATA entry is evicted"
+        );
+        assert!(REQUEST_DATA.get("old-req-with-pending-send").is_none());
+
+        clear_request_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_cleanup_old_request_buffers_empty_buffer() {
@@ -494,6 +556,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         for _ in 0..10 {
@@ -532,6 +595,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: "arn:test".to_string(),
         });
         for _ in 0..10 {
@@ -580,6 +644,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
@@ -589,6 +654,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -644,6 +710,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -793,6 +860,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
@@ -801,6 +869,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -840,6 +909,7 @@ mod tests {
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
@@ -848,6 +918,7 @@ mod tests {
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
 
@@ -863,11 +934,291 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // pending_send_handles / spawn_immediate_agent_payload_send tests
+    // (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH)
+    //
+    // route_payload_to_request_buffer reads event_loop::SERVERLESS_SEND_CONTEXT, a
+    // process-wide OnceLock that's only ever populated by main.rs (never set during
+    // `cargo test`) and can only be set ONCE for the whole test binary run — so at
+    // most one test in this file may call `.set()` on it, and that test must use
+    // synchronous_flush=false so every other (unrelated, order-independent) test
+    // still exercising the default buffering path isn't silently diverted into the
+    // immediate-send branch. spawn_immediate_agent_payload_send itself takes its
+    // client/config as plain parameters instead of reading the global, so most of its
+    // behavior is tested directly, without touching SERVERLESS_SEND_CONTEXT at all.
+    // The one exception is `test_route_payload_to_request_buffer_extracts_trace_id_...`
+    // below, which needs the real global-reading code path to prove trace-id
+    // extraction fires from route_payload_to_request_buffer itself.
+    // ========================================================================
 
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_no_license_key_completes_without_buffering() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
 
+        let request_id = "req-immediate-send-noop";
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        });
 
+        let config = Arc::new(crate::config::ExtensionConfig::default()); // no license key
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
 
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![1, 2, 3],
+            newrelic_client,
+            config,
+        );
 
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for handle in handles {
+            handle.await.expect("send task must not panic");
+        }
 
+        assert!(
+            crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
+            "a successful (short-circuited) send must not fall back to buffering"
+        );
 
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_buffers_on_network_failure() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "req-immediate-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:test-fn".to_string();
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn.clone(),
+        });
+
+        let mut cfg = crate::config::ExtensionConfig::default();
+        // A license key is required so send_agent_payload doesn't take its no-key
+        // short-circuit — we need it to actually attempt (and fail) a send.
+        cfg.new_relic.license_key = Some("fake-license-key".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        // new_noop()'s 100ms *overall* request timeout bounds the whole send attempt
+        // (connect included) regardless of how the sandbox's network stack handles an
+        // unroutable loopback port — a real NewRelicClient's 10s connect_timeout can
+        // hang far longer than that if the environment silently drops the SYN instead
+        // of refusing it.
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![9, 9, 9],
+            newrelic_client,
+            config,
+        );
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1);
+        for handle in handles {
+            handle.await.expect("send task must not panic");
+        }
+
+        {
+            // Scope the DashMap Ref so the shard lock is released before .clear() below.
+            let buffered = crate::agent::batch::AGENT_BATCH_BUFFER
+                .get(request_id)
+                .expect("failed send must buffer the payload for retry, not drop it");
+            assert_eq!(buffered.report_line, None, "must be buffered unpaired");
+            assert_eq!(buffered.invoked_function_arn, arn);
+        }
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
+
+    // drain_and_await_all_pending_send_handles must catch a pending send regardless of
+    // which request_id it's under — the SHUTDOWN-time gap this closes is a payload
+    // whose own invocation's process_request_concurrently already returned (so nothing
+    // else will ever call take_pending_send_handles for that specific request_id again).
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_awaits_across_multiple_requests() {
+        clear_request_state();
+
+        for request_id in ["req-shutdown-sweep-a", "req-shutdown-sweep-b"] {
+            REQUEST_DATA.insert(request_id.to_string(), RequestData {
+                context: Arc::new(Mutex::new(InvocationContext::default())),
+                agent_buffer: Arc::new(Mutex::new(Vec::new())),
+                pending_report: None,
+                creation_invocation: 0,
+                runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+                pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
+            });
+        }
+
+        let completed_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        for (request_id, flag) in [
+            ("req-shutdown-sweep-a", completed_a.clone()),
+            ("req-shutdown-sweep-b", completed_b.clone()),
+        ] {
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            push_pending_send_handle(request_id, handle);
+        }
+
+        drain_and_await_all_pending_send_handles().await;
+
+        assert!(
+            completed_a.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-a must be awaited"
+        );
+        assert!(
+            completed_b.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-b must be awaited"
+        );
+
+        // Nothing left to drain a second time.
+        assert!(take_pending_send_handles("req-shutdown-sweep-a").is_empty());
+        assert!(take_pending_send_handles("req-shutdown-sweep-b").is_empty());
+
+        clear_request_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_is_a_noop_when_nothing_pending() {
+        clear_request_state();
+        // Must return promptly and without panicking when REQUEST_DATA is empty.
+        drain_and_await_all_pending_send_handles().await;
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // route_payload_to_request_buffer must extract trace.id the instant the payload
+    // arrives, on the DEFAULT (buffered, synchronous_flush=off) path — not just under
+    // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH. Before this, extraction on the default
+    // path only happened much later (telemetry::listener's platform.report handler,
+    // or rarely in process_request_concurrently's own early snapshot), leaving
+    // held function/extension logs parked longer than necessary.
+    //
+    // This is the ONE test in this file allowed to call SERVERLESS_SEND_CONTEXT.set()
+    // (a process-wide OnceLock — see the module-level comment above). It uses
+    // synchronous_flush=false so it cannot divert any other test's payload into the
+    // immediate-send branch, regardless of test execution order.
+    // ========================================================================
+
+    /// Build a payload in the exact wrapped/base64/gzip format
+    /// `trace::extract_trace_id_from_payload` expects (mirrors
+    /// `trace::mod_tests::create_test_payload_with_trace_id`).
+    fn build_trace_bearing_payload(trace_id: &str) -> Vec<u8> {
+        use base64::engine::general_purpose;
+        use base64::Engine as _;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let test_data = format!(
+            r#"{{"analytic_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]], "span_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]]}}"#
+        );
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(test_data.as_bytes()).unwrap();
+        let compressed = gz.finish().unwrap();
+        let b64 = general_purpose::STANDARD.encode(&compressed);
+        let payload_array = format!(r#"[2,"NR_LAMBDA_MONITORING","","{b64}"]"#);
+        general_purpose::STANDARD.encode(payload_array.as_bytes()).into_bytes()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_payload_to_request_buffer_extracts_trace_id_on_default_path() {
+        clear_request_state();
+
+        let request_id = "req-trace-on-arrival";
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.collect_trace_id = true;
+        cfg.new_relic.synchronous_flush = false; // must not divert other tests
+        let config = Arc::new(cfg);
+
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            newrelic_client.clone(),
+            config.clone(),
+            Arc::new(Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        // A function log held for this request, waiting on a trace.id — the thing
+        // route_payload_to_request_buffer's new early extraction should unblock.
+        log_processor.test_hold_log(request_id, "held-before-payload-arrives");
+        assert_eq!(log_processor.test_pending_logs_len_for(request_id), 1);
+        assert_eq!(log_processor.test_log_batch_len(), 0);
+
+        // Only ever set once for the whole test binary — see the module comment above.
+        let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((newrelic_client, config, log_processor.clone()));
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some(request_id.to_string());
+        }
+
+        let payload = build_trace_bearing_payload("trace-on-arrival-123");
+        route_payload_to_request_buffer(payload.clone()).await;
+
+        // Trace extraction ran synchronously inside route_payload_to_request_buffer,
+        // before/without any platform.report — the held log must already be routed.
+        assert_eq!(
+            log_processor.test_pending_logs_len_for(request_id),
+            0,
+            "the held log must have been drained by the immediate extraction"
+        );
+        assert_eq!(
+            log_processor.test_log_batch_len(),
+            1,
+            "the held log must have been stamped and routed to the outbound batch"
+        );
+
+        // And the default (synchronous_flush=false) buffering behavior is unaffected:
+        // the payload itself still lands in agent_buffer, not sent immediately.
+        let buffered = get_agent_buffer(request_id).and_then(|b| b.lock().ok().map(|g| g.len()));
+        assert_eq!(buffered, Some(1), "payload must still be buffered normally");
+
+        clear_request_state();
+    }
 }

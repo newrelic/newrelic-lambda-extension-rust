@@ -64,6 +64,29 @@ pub struct NewRelicConfig {
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
+    /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — master switch for serverless-mode
+    /// (standard/non-APM mode only) immediate delivery of the agent payload. When
+    /// `true`, the agent payload is sent to New Relic the instant it's received on the
+    /// named pipe (`request::route_payload_to_request_buffer`), as its own background
+    /// task — instead of buffering it to pair with `platform.report` and waiting for
+    /// the 3+ batch threshold or `SHUTDOWN`. `process_request_concurrently` awaits any
+    /// outstanding send for its request (bounded by the invocation's remaining
+    /// deadline) before the invocation ends, so delivery completes within the same
+    /// invoke without the sandbox freezing mid-flight.
+    ///
+    /// There is no wait for a late `platform.report`, and report handling is otherwise
+    /// unaffected by this flag: the Telemetry API only emits `platform.report` after
+    /// every extension has already called `/next` for the invocation, so a fresh
+    /// request's own report can never be "already arrived" in practice — waiting for it
+    /// would either time out every time or delay the extension's own `/next` call. The
+    /// report keeps following its existing pairing/threshold/`SHUTDOWN` path
+    /// (`AGENT_BATCH_BUFFER`, `set_pending_report`) exactly as it does when this flag is
+    /// off; since the payload no longer sits in `agent_buffer` waiting to pair, a report
+    /// that arrives later simply finds nothing to pair with, same as today.
+    ///
+    /// Default `false` — no behavior change unless explicitly enabled. Distinct from
+    /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
+    pub synchronous_flush: bool,
     /// Total wall-clock budget for retrying a send, set via
     /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
     /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
@@ -158,6 +181,7 @@ impl Default for NewRelicConfig {
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
+            synchronous_flush: false,
             data_collection_timeout: None,
             http_timeout: None,
         }
@@ -472,6 +496,24 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        let synchronous_flush_str =
+            env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();
+        config.new_relic.synchronous_flush = parse_bool(&synchronous_flush_str);
+
+        // synchronous_flush takes precedence over pipeline_flush on any invocation
+        // where an immediate send is exercised (see event_loop.rs
+        // execute_standard_mode_event_loop) — the delivery guarantee the customer
+        // explicitly opted into must not be silently defeated by the deferred-send
+        // optimization. Surface that trade-off once at startup rather than leaving it silent.
+        if config.extension.pipeline_flush && config.new_relic.synchronous_flush {
+            warn!(
+                "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
+                 deferred-send behavior on invocations where an immediate send is exercised — you \
+                 will not get pipeline_flush's billed-duration savings on those invocations. This is \
+                 intentional: the delivery guarantee takes precedence over the throughput optimization."
+            );
+        }
 
         config
     }
