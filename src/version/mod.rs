@@ -10,13 +10,14 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use once_cell::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Global cache for version information (detected once, reused everywhere)
 static VERSION_INFO_CACHE: OnceCell<Arc<VersionInfo>> = OnceCell::new();
 
 /// Global cache for runtime version from platform.initStart event
 static RUNTIME_VERSION_CACHE: OnceCell<String> = OnceCell::new();
+
 
 /// Extension version from Cargo.toml
 const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -39,9 +40,12 @@ const LAYER_AGENT_PATHS_PYTHON: &[&str] = &[
     "/opt/python/lib/python3.9/site-packages/newrelic",
 ];
 const LAYER_AGENT_PATHS_JAVA: &[&str] = &[
+    "/opt/newrelic",  // NR Java agent layer (newrelic.jar + java-agent-version.txt)
     "/opt/java/lib",  // Directory to scan for newrelic JARs
     "/opt/lib",       // Alternative directory to scan
 ];
+/// Fast-path version file installed by the NR Java agent layer at /opt/newrelic/
+const JAVA_AGENT_VERSION_FILE: &str = "/opt/newrelic/java-agent-version.txt";
 const LAYER_AGENT_JAR_NAMES: &[&str] = &[
     "newrelic-java-lambda",  // Prefix for layer JAR (e.g., newrelic-java-lambda-2.2.5.jar)
     "newrelic.jar",          // Generic name
@@ -216,6 +220,16 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         return (Some(version), Some("Ruby".to_string()));
     }
 
+    // Fast path: /opt/newrelic/java-agent-version.txt written by the NR Java agent layer
+    debug!("Checking Java version file: {}", JAVA_AGENT_VERSION_FILE);
+    if let Ok(content) = fs::read_to_string(JAVA_AGENT_VERSION_FILE) {
+        let version = content.trim();
+        if !version.is_empty() {
+            debug!("✓ Detected Java agent version: {} from {}", version, JAVA_AGENT_VERSION_FILE);
+            return (Some(version.to_string()), Some("Java".to_string()));
+        }
+    }
+
     for path in LAYER_AGENT_PATHS_JAVA {
         debug!("Checking Java layer directory: {}", path);
         if let Some((version, jar_path)) = find_java_agent_in_directory(path) {
@@ -240,8 +254,77 @@ fn detect_agent_version() -> (Option<String>, Option<String>) {
         }
     }
 
-    warn!("No agent version detected from any known paths");
+    // Go agent: compiled into the handler binary — no layer files to read.
+    // Scan the Go binary's embedded build info for the NR go-agent module version.
+    // This runs BEFORE the APM connect so the version reaches the Connect payload.
+    if let Some(version) = detect_go_agent_version_from_binary() {
+        debug!("✓ Detected Go agent version from binary build info: {}", version);
+        return (Some(version), Some("Go".to_string()));
+    }
+
+    debug!("No agent version detected from any known paths (expected for Go/custom runtimes)");
     (None, None)
+}
+
+/// Scan the Go handler binary for the NR go-agent module version embedded in build info.
+///
+/// Go encodes module dependency versions in a `go.buildinfo` section as human-readable
+/// tab-separated text, e.g.:
+///   `dep\tgithub.com/newrelic/go-agent/v3\tv3.39.0\th1:...`
+///
+/// We search for the byte pattern and extract the semver string. This is done once at
+/// startup — before the APM Connect — so the version appears in the Connect payload.
+fn detect_go_agent_version_from_binary() -> Option<String> {
+    let task_root = std::env::var("LAMBDA_TASK_ROOT")
+        .unwrap_or_else(|_| "/var/task".to_string());
+
+    // Candidate binary names for Go Lambda handlers
+    let candidates = {
+        let mut v = vec![
+            format!("{}/bootstrap", task_root),
+            format!("{}/handler", task_root),
+        ];
+        // _HANDLER may be "mypackage.Handler" — the binary name is the part before the dot
+        if let Ok(h) = std::env::var("_HANDLER") {
+            let bin = h.split('.').next().unwrap_or(&h);
+            v.push(format!("{}/{}", task_root, bin));
+        }
+        v
+    };
+
+    // Byte pattern: "github.com/newrelic/go-agent/v3\tv"
+    const NR_GO_AGENT_PREFIX: &[u8] = b"github.com/newrelic/go-agent/v3\tv";
+
+    for path in &candidates {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        debug!("Scanning Go binary for NR agent version: {}", path);
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!("Could not read binary {}: {}", path, e);
+                continue;
+            }
+        };
+        if let Some(pos) = bytes.windows(NR_GO_AGENT_PREFIX.len())
+            .position(|w| w == NR_GO_AGENT_PREFIX)
+        {
+            let ver_start = pos + NR_GO_AGENT_PREFIX.len();
+            let ver_end = bytes[ver_start..]
+                .iter()
+                .position(|&b| b == b'\t' || b == b'\n' || b == b'\r' || b == b'\0')
+                .map(|e| ver_start + e)
+                .unwrap_or((ver_start + 20).min(bytes.len()));
+            if let Ok(ver) = std::str::from_utf8(&bytes[ver_start..ver_end]) {
+                let ver = ver.trim();
+                if !ver.is_empty() && ver.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                    return Some(ver.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read Node.js agent version from package.json
@@ -652,29 +735,5 @@ fn detect_runtime_internal() -> String {
 
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_version_info_creation() {
-        let version_info = VersionInfo {
-            agent_version: Some("9.5.0".to_string()),
-            agent_name: Some("python".to_string()),
-            extension_version: "0.1.0".to_string(),
-            layer_version: Some("NewRelicPython313X86:93".to_string()),
-            runtime_version: None,
-        };
-
-        let tags = version_info.as_tags();
-        assert!(tags.len() >= 2);
-    }
-
-    #[test]
-    fn user_agent_tracks_cargo_version() {
-        let ua = user_agent();
-        // Must carry the real crate version, never the old hardcoded placeholder.
-        assert_eq!(ua, format!("NewRelic-Rust-Lambda-Extension/{}", env!("CARGO_PKG_VERSION")));
-        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
-        assert_ne!(ua, "NewRelic-Rust-Lambda-Extension/0.1.0");
-    }
-}
+#[path = "mod_tests.rs"]
+mod tests;

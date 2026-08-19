@@ -18,6 +18,12 @@ mod tests {
 
     use crate::request::*;
     use crate::context::InvocationContext;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+
+    /// Normal-Lambda context for routing tests (mode is irrelevant to routing).
+    const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Serverless };
+    /// LMI context — routes agent payloads by their embedded aws.requestId.
+    const LMI: DeploymentContext = DeploymentContext::Lmi;
 
     /// Helper: clear all global request state between tests
     fn clear_request_state() {
@@ -204,7 +210,7 @@ mod tests {
             *active = Some("req-1".to_string());
         }
 
-        route_payload_to_request_buffer(vec![10, 20, 30]).await;
+        route_payload_to_request_buffer(vec![10, 20, 30], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -232,7 +238,7 @@ mod tests {
                 invoked_function_arn: String::new(),
         });
 
-        route_payload_to_request_buffer(vec![99]).await;
+        route_payload_to_request_buffer(vec![99], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -249,13 +255,140 @@ mod tests {
         clear_request_state();
 
         // No active request, no buffers → orphaned
-        route_payload_to_request_buffer(vec![42]).await;
+        route_payload_to_request_buffer(vec![42], NORMAL).await;
 
         {
             let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
             assert_eq!(orphaned.len(), 1);
             assert_eq!(orphaned[0], vec![42]);
         }
+
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // NR-579361: LMI routes agent payloads by their OWN embedded aws.requestId
+    // (never the racy CURRENT_ACTIVE_REQUEST_ID global). Normal stays unchanged.
+    // ========================================================================
+
+    /// Build a v2 wire agent payload carrying a Transaction event with `aws.requestId`.
+    /// `None` → an id-less, metrics-only harvest (no transaction event).
+    fn lmi_wire_payload(request_id: Option<&str>) -> Vec<u8> {
+        use base64::Engine as _;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let data = match request_id {
+            Some(rid) => serde_json::json!({
+                "analytic_event_data": [null, { "reservoir_size": 10 },
+                    [ [ { "type": "Transaction" }, {}, { "aws.requestId": rid } ] ]]
+            }),
+            None => serde_json::json!({
+                "metric_data": [null, [["Custom/x", [1, 2.0, 2.0, 2.0, 2.0, 4.0]]]]
+            }),
+        };
+        let json_bytes = serde_json::to_vec(&data).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{}"]"#, encoded).into_bytes()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_routes_by_embedded_request_id_ignoring_global() {
+        clear_request_state();
+
+        // Global points at the WRONG request (the racy concurrency case).
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // Payload self-identifies as req-A.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
+
+        // It landed in req-A's slot (auto-created), NOT the global's req-B.
+        let a_len = get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0);
+        assert_eq!(a_len, 1, "payload must be attributed to its own request req-A");
+        assert!(
+            REQUEST_DATA.get("req-B").is_none(),
+            "the CURRENT_ACTIVE_REQUEST_ID global must not be used under LMI"
+        );
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_interleaved_requests_no_cross_contamination() {
+        clear_request_state();
+
+        // Two concurrent invocations' payloads arrive interleaved.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-C")), LMI).await;
+
+        assert_eq!(get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+        assert_eq!(get_agent_buffer("req-C").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_idless_payload_parks_in_orphaned_without_global() {
+        clear_request_state();
+
+        // Even with the global set, an id-less harvest must NOT consult it.
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-Z".to_string());
+        }
+
+        route_payload_to_request_buffer(lmi_wire_payload(None), LMI).await;
+
+        {
+            let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
+            assert_eq!(orphaned.len(), 1, "id-less harvest is parked in the orphaned buffer");
+        }
+        assert!(
+            REQUEST_DATA.get("req-Z").is_none(),
+            "LMI must not route id-less payloads via the global"
+        );
+
+        clear_request_state();
+    }
+
+    /// Normal-Lambda regression: the embedded id is IGNORED; routing uses the active global.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_ignores_embedded_id_uses_active_global() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-B".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // Payload embeds req-A, but NORMAL routes by the active global (req-B).
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
+
+        assert_eq!(buffer.lock().unwrap().len(), 1, "Normal routes to active req-B");
+        assert!(
+            REQUEST_DATA.get("req-A").is_none(),
+            "Normal must not parse or route by the embedded id"
+        );
 
         clear_request_state();
     }
@@ -721,7 +854,7 @@ mod tests {
         }
 
         // Late payload should fall back to any existing buffer
-        route_payload_to_request_buffer(vec![88]).await;
+        route_payload_to_request_buffer(vec![88], NORMAL).await;
 
         // Should be in req-old's buffer (fallback to any existing buffer)
         let stored = get_agent_buffer("req-old")
@@ -935,6 +1068,263 @@ mod tests {
     }
 
     // ========================================================================
+    // record_request_id: per-record correlation source (NR-579360)
+    // ========================================================================
+
+    #[test]
+    fn record_request_id_reads_request_id_field() {
+        let rec = serde_json::json!({ "requestId": "abc-123", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn record_request_id_falls_back_to_aws_request_id() {
+        let rec = serde_json::json!({ "AWSRequestId": "aws-456", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("aws-456"));
+    }
+
+    #[test]
+    fn record_request_id_prefers_request_id_over_aws_request_id() {
+        let rec = serde_json::json!({ "requestId": "primary", "AWSRequestId": "fallback" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn record_request_id_none_for_plaintext_string_record() {
+        // Plain-text log records are a bare JSON string - no requestId to correlate by.
+        let rec = serde_json::Value::String("ERROR something failed".to_string());
+        assert_eq!(record_request_id(&rec), None);
+    }
+
+    #[test]
+    fn record_request_id_none_when_absent_or_empty() {
+        assert_eq!(record_request_id(&serde_json::json!({ "message": "hi" })), None);
+        assert_eq!(record_request_id(&serde_json::json!({ "requestId": "" })), None);
+    }
+
+    // ── Phase 3: concurrent LMI routing — no cross-contamination ─────────────
+
+    /// 20 concurrent `ensure_lmi_request_slot` calls for distinct IDs must each
+    /// create an isolated slot with no cross-contamination.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_concurrent_lmi_slot_creation_no_cross_contamination() {
+        clear_request_state();
+
+        let ids: Vec<String> = (0..20).map(|i| format!("lmi-req-{:03}", i)).collect();
+
+        // Create all slots concurrently
+        let tasks: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let id = id.clone();
+                tokio::spawn(async move {
+                    ensure_lmi_request_slot(&id);
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        // Each slot must exist and be empty (no cross-write)
+        for id in &ids {
+            let buf_len = get_agent_buffer(id)
+                .map(|b| b.lock().unwrap().len())
+                .unwrap_or(0);
+            assert_eq!(
+                buf_len, 0,
+                "slot for {} must exist and start empty (no payload cross-contamination)",
+                id
+            );
+        }
+        // No orphaned payloads must have leaked
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 0, "no payloads must reach the orphan buffer during slot creation");
+
+        clear_request_state();
+    }
+
+    /// `ensure_lmi_request_slot` is idempotent: calling it multiple times for the
+    /// same id must not reset, duplicate, or corrupt existing buffer contents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_concurrent_ensure_lmi_slot_idempotent() {
+        clear_request_state();
+
+        let id = "lmi-idempotent";
+        ensure_lmi_request_slot(id);
+
+        // Write a sentinel byte directly into the buffer
+        if let Some(buf) = get_agent_buffer(id) {
+            buf.lock().unwrap().push(vec![0xAB]);
+        }
+
+        // Concurrent re-calls must not wipe the existing entry
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let id = id.to_string();
+                tokio::spawn(async move { ensure_lmi_request_slot(&id); })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let buf_len = get_agent_buffer(id)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(buf_len, 1, "idempotent slot creation must preserve existing buffer contents");
+
+        clear_request_state();
+    }
+
+    /// Under LMI, payloads without an extractable embedded request-id must end up in
+    /// the orphan buffer, not attributed to any live slot. This tests the "no id" path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_concurrent_orphan_drain_atomic() {
+        clear_request_state();
+
+        // Pre-create a slot so Normal fallback doesn't interfere
+        ensure_lmi_request_slot("lmi-orphan-target");
+
+        // 10 concurrent payloads without valid embedded ids → all go to orphan buffer
+        let tasks: Vec<_> = (0..10)
+            .map(|i| {
+                tokio::spawn(async move {
+                    // Bytes that don't start with `[` → parse_agent_payload returns empty map
+                    // → extract_request_id_from_payload_bytes returns None → orphan buffer
+                    let payload = format!("no-id-payload-{}", i).into_bytes();
+                    route_payload_to_request_buffer(payload, LMI).await;
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(
+            orphan_count, 10,
+            "all 10 id-less LMI payloads must land in the orphan buffer"
+        );
+
+        clear_request_state();
+    }
+
+    /// Under LMI, two concurrent invocations must not cross-attribute payloads:
+    /// payloads for slot A never appear in slot B's buffer and vice versa.
+    /// We test this via `ensure_lmi_request_slot` + direct buffer writes to
+    /// simulate the post-routing state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_lmi_two_concurrent_invocations_no_cross_attribution() {
+        clear_request_state();
+
+        let id_a = "lmi-invoc-a";
+        let id_b = "lmi-invoc-b";
+        ensure_lmi_request_slot(id_a);
+        ensure_lmi_request_slot(id_b);
+
+        // Write 5 payloads for A and 5 for B concurrently
+        let writes: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let id = if i % 2 == 0 { "lmi-invoc-a" } else { "lmi-invoc-b" };
+                    if let Some(buf) = get_agent_buffer(id) {
+                        buf.lock().unwrap().push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+        for w in writes { w.await.unwrap(); }
+
+        let a_len = get_agent_buffer(id_a)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        let b_len = get_agent_buffer(id_b)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+
+        assert_eq!(a_len, 5, "slot A must have exactly 5 payloads");
+        assert_eq!(b_len, 5, "slot B must have exactly 5 payloads");
+        assert_eq!(a_len + b_len, 10, "total payloads must be 10 (no duplication or loss)");
+
+        clear_request_state();
+    }
+
+    // ── Phase 5: thread-safety / no-deadlock harness ──────────────────────────
+
+    /// No deadlock: 20 concurrent tasks — half writing to ORPHANED_PAYLOADS,
+    /// half reading REQUEST_DATA — must all complete without hanging.
+    /// If a deadlock occurs, the test times out under tokio's default test timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_concurrent_payload_routing() {
+        clear_request_state();
+
+        // Pre-create 5 slots
+        for i in 0..5u8 {
+            ensure_lmi_request_slot(&format!("td-slot-{}", i));
+        }
+
+        // 10 writers: push to orphan buffer; 10 readers: inspect slot buffers
+        let writers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() {
+                        g.push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let _ = get_agent_buffer(&format!("td-slot-{}", i % 5));
+                })
+            })
+            .collect();
+
+        for w in writers { w.await.unwrap(); }
+        for r in readers { r.await.unwrap(); }
+
+        // All 10 orphaned payloads must be present (no loss under concurrent writes)
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 10, "all 10 orphan payloads must be written without loss");
+
+        clear_request_state();
+    }
+
+    /// No deadlock: concurrent writes to the same slot's buffer from multiple tasks.
+    /// Verifies the inner `Arc<Mutex<Vec<Vec<u8>>>>` per-slot locking is sound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_orphaned_buffer_concurrent_writes() {
+        clear_request_state();
+
+        let slot = "td-inner-lock-slot";
+        ensure_lmi_request_slot(slot);
+
+        // 20 concurrent tasks each push one payload to the same slot
+        let tasks: Vec<_> = (0..20u8)
+            .map(|i| {
+                let id = slot.to_string();
+                tokio::spawn(async move {
+                    if let Some(buf) = get_agent_buffer(&id) {
+                        if let Ok(mut g) = buf.lock() {
+                            g.push(vec![i]);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let slot_len = get_agent_buffer(slot)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(slot_len, 20, "all 20 concurrent writes to the same slot must succeed without loss or deadlock");
+
+        clear_request_state();
+    }
+
     // pending_send_handles / spawn_immediate_agent_payload_send tests
     // (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH)
     //
@@ -1199,7 +1589,7 @@ mod tests {
         }
 
         let payload = build_trace_bearing_payload("trace-on-arrival-123");
-        route_payload_to_request_buffer(payload.clone()).await;
+        route_payload_to_request_buffer(payload.clone(), NORMAL).await;
 
         // Trace extraction ran synchronously inside route_payload_to_request_buffer,
         // before/without any platform.report — the held log must already be routed.

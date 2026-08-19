@@ -16,6 +16,7 @@ use super::connection::{
 };
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
+use crate::config::deployment::DeploymentContext;
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde_json::Value;
@@ -32,6 +33,9 @@ pub struct ApmApp {
     pub license_key: String,
     pub metric_endpoint: String,
     pub client: Client,
+    /// Deployment context (detected once at startup). Drives type-driven LMI vs Normal
+    /// behavior in this app — e.g. strict vs lenient `platform.report` parsing.
+    pub deployment: DeploymentContext,
 }
 
 impl ApmApp {
@@ -46,6 +50,7 @@ impl ApmApp {
         account_id: Option<String>,
         region: Option<String>,
         timeout_secs: u64,
+        deployment: DeploymentContext,
     ) -> Result<Self> {
         debug!("Initializing APM app connection");
 
@@ -78,6 +83,7 @@ impl ApmApp {
                 &account_id,
                 &region,
                 timeout_secs,
+                deployment,
             )
             .await
             {
@@ -130,6 +136,7 @@ impl ApmApp {
     }
 
     /// Attempt a single connection
+    #[allow(clippy::too_many_arguments)]
     async fn try_connect(
         license_key: &str,
         apm_host: &str,
@@ -141,6 +148,7 @@ impl ApmApp {
         account_id_opt: &Option<String>,
         region_opt: &Option<String>,
         timeout_secs: u64,
+        deployment: DeploymentContext,
     ) -> Result<ApmApp> {
         // OPTIMIZATION: Runtime and agent version are now cached (detected once per container)
         // No need for spawn_blocking or parallelization - instant access
@@ -173,6 +181,19 @@ impl ApmApp {
 
         debug!("PreConnect returned collector host: {}", collector_host);
 
+        // When the user explicitly set a non-default host (e.g. staging-collector.newrelic.com),
+        // honor that override for connect instead of following the preconnect redirect.
+        // Staging preconnect redirects to prod collector; following it silently breaks staging tests.
+        let connect_host = if apm_host != "collector.newrelic.com" {
+            debug!(
+                "Honoring explicit apm_host ({}) for connect, ignoring preconnect redirect to {}",
+                apm_host, collector_host
+            );
+            apm_host.to_string()
+        } else {
+            collector_host
+        };
+
         // Use provided config data instead of environment variables
         // Environment variables like AWS_LAMBDA_FUNCTION_ARN are not available during INIT
         let region = region_opt
@@ -198,10 +219,12 @@ impl ApmApp {
             function_name, account_id, region
         );
 
+        let lmi_metadata = crate::telemetry::managed_instance::try_read_metadata();
+
         let connect_resp = connect(
             client,
             license_key,
-            &collector_host,
+            &connect_host,
             &function_name,
             &function_arn,
             &account_id,
@@ -210,6 +233,8 @@ impl ApmApp {
             &runtime,
             &agent_version,
             timeout_secs,
+            lmi_metadata,
+            deployment,
         )
         .await
         .context("Connect failed")?;
@@ -225,10 +250,11 @@ impl ApmApp {
             run_id,
             entity_guid,
             app_name: function_name.to_string(),
-            collector_host,
+            collector_host: connect_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
             client: client.clone(),
+            deployment,
         })
     }
 
@@ -284,7 +310,7 @@ impl ApmApp {
 
         let mut send_tasks = Vec::new();
 
-        for (telemetry_type, data) in telemetry_map {
+        for (telemetry_type, mut data) in telemetry_map {
             if data.is_empty() {
                 continue;
             }
@@ -294,6 +320,27 @@ impl ApmApp {
                 debug!("Telemetry type {} disabled - skipping", telemetry_type);
                 continue;
             }
+
+            // metric_data[1] and [2] are the harvest epoch window (start, end).
+            // The Java agent serverless mode writes these in milliseconds; the APM
+            // collector protocol expects seconds. Values above this threshold are
+            // unambiguously milliseconds (the year ~33658 as seconds — no real epoch
+            // will exceed this in seconds for centuries).
+            const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
+            if telemetry_type == "metric_data" && data.len() >= 3 {
+                for i in 1..=2usize {
+                    if let Some(ts) = data[i].as_f64() {
+                        if ts > JAVA_AGENT_MS_EPOCH_THRESHOLD {
+                            data[i] = serde_json::Value::from((ts / 1000.0) as i64);
+                        }
+                    }
+                }
+                debug!(
+                    "metric_data epoch range after normalisation: [{}, {}]",
+                    data[1], data[2]
+                );
+            }
+
 
             debug!(
                 "Sending {} telemetry items as {}",
@@ -372,7 +419,7 @@ impl ApmApp {
             return Ok(());
         }
 
-        let metrics_data = match parse_lambda_report_log(log_line) {
+        let metrics_data = match parse_lambda_report_log(log_line, self.deployment) {
             Some(data) => data,
             None => {
                 debug!("Not a REPORT log or parse failed");
@@ -906,3 +953,7 @@ pub(crate) fn normalize_transaction_sample_data(data: &mut Vec<Value>) {
 
 /// Shared APM app state
 pub type SharedApmApp = Arc<RwLock<Option<ApmApp>>>;
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

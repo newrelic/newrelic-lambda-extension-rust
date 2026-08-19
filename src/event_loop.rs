@@ -11,7 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     runtime,
-    config::{self, ExtensionConfig},
+    config::{self, ExtensionConfig, deployment::DeploymentContext},
     newrelic::client::NewRelicClient,
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
@@ -72,6 +72,10 @@ pub struct ExtensionComponents {
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
     pub apm_client: Client,
     pub reconnect_in_flight: Arc<watch::Sender<bool>>,
+    /// Deployment context (Normal Lambda vs LMI). Drives top-level loop dispatch
+    /// in `execute_main_telemetry_processing_loop` — Normal Lambda routes to the
+    /// existing APM/Serverless loops; LMI routes to `event_loop_lmi`.
+    pub deployment: DeploymentContext,
 }
 
 #[derive(Debug, Clone)]
@@ -152,15 +156,30 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or serverless mode based on config (or runtime override for Java)
+///
+/// Top-level dispatch on `DeploymentContext` first — LMI runs a dedicated
+/// telemetry-driven loop because AWS rejects `INVOKE` registration for LMI.
+/// On Normal Lambda, the existing APM-vs-Serverless decision is preserved
+/// (Java-runtime override is encoded in `apm_mode_enabled`).
+///
+/// The match has no `_` arm: adding a new `DeploymentContext` variant in the
+/// future is a compile error here, forcing an explicit decision (see
+/// `LMI_SUPPORT.md` §3).
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let apm_mode_enabled = components.apm_mode_enabled;
-    if apm_mode_enabled {
-        info!("Starting APM mode event loop (connection may still be in progress)");
-        execute_apm_mode_event_loop(components).await
-    } else {
-        debug!("Starting serverless mode event loop");
-        execute_standard_mode_event_loop(components).await
+    match components.deployment {
+        DeploymentContext::Lmi => {
+            info!("Starting LMI event loop (telemetry-driven, no INVOKE polling)");
+            crate::event_loop_lmi::execute_lmi_mode_event_loop(components).await
+        }
+        DeploymentContext::Normal { .. } => {
+            if components.apm_mode_enabled {
+                info!("Starting APM mode event loop (connection may still be in progress)");
+                execute_apm_mode_event_loop(components).await
+            } else {
+                debug!("Starting serverless mode event loop");
+                execute_standard_mode_event_loop(components).await
+            }
+        }
     }
 }
 
@@ -305,6 +324,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let account_id = components.config.aws.account_id.clone();
                         let region = components.config.aws.region.clone();
                         let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
+                        // Copy out before the move closure (don't borrow `components`).
+                        let deployment = components.config.deployment;
 
                         tokio::spawn(async move {
                             let _guard = ReconnectGuard(reconnect_flag);
@@ -320,6 +341,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 account_id,
                                 region,
                                 timeout_secs,
+                                deployment,
                             )
                             .await
                             {
@@ -586,6 +608,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             components.config.aws.region.clone(),
                             // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
                             components.config.new_relic.apm_handshake_timeout_secs.min(2),
+                            components.config.deployment,
                         )
                         .await;
 
@@ -1647,7 +1670,7 @@ async fn wait_for_runtime_done_with_grace(
 
 /// Sends the appropriate APM error event for a given shutdown reason.
 /// Called from the SHUTDOWN handler whether APM was already connected or just reconnected.
-async fn send_error_for_shutdown_reason(
+pub(crate) async fn send_error_for_shutdown_reason(
     app: &crate::apm::ApmApp,
     reason: runtime::ShutdownReason,
     request_id: &str,
@@ -2061,8 +2084,14 @@ pub async fn process_request_concurrently(
     );
 }
 
-/// Tag Lambda function once on first invocation
-fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
+/// Tag Lambda function once on first invocation (or first LMI cold start).
+///
+/// On Normal Lambda this is called from the INVOKE arm on the first event.
+/// On LMI, INVOKE is never delivered; the LMI heartbeat calls this after
+/// `LMI_COLD_START_SEEN` is set by `platform.initReport`.
+/// The internal `Once` guard ensures tagging fires exactly once regardless of
+/// which path gets here first.
+pub(crate) fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
     static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
     TAGGING_DONE.call_once(|| {
         debug!("Spawning background task to tag Lambda function with version information");
@@ -2223,7 +2252,7 @@ async fn drain_late_paired_payloads_serverless(
 
 /// Process any pending agent payloads from previous invocation (APM mode only)
 /// Excludes the current request ID to avoid processing empty buffer
-async fn process_pending_agent_payloads(
+pub(crate) async fn process_pending_agent_payloads(
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,

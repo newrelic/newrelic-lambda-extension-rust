@@ -268,6 +268,9 @@ fn make_test_apm_app() -> crate::apm::ApmApp {
         license_key: "test-license-key".to_string(),
         metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
         client: reqwest::Client::new(),
+        deployment: crate::config::deployment::DeploymentContext::Normal {
+            mode: crate::config::deployment::TelemetryMode::Apm,
+        },
     }
 }
 

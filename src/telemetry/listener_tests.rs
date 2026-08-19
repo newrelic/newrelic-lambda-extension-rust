@@ -251,6 +251,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener should start");
@@ -270,6 +271,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -310,6 +312,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -342,6 +345,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -389,6 +393,7 @@ mod tests {
             log_processor,
             platform_processor,
             false, // standard mode
+            false,
         )
         .await
         .expect("listener");
@@ -450,6 +455,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -502,6 +508,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -535,6 +542,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -570,6 +578,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -600,6 +609,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -655,6 +665,7 @@ mod tests {
             log_processor,
             platform_processor,
             true, // APM mode
+            false,
         )
         .await
         .expect("listener");
@@ -718,6 +729,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -769,6 +781,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -799,6 +812,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -856,6 +870,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -926,6 +941,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -972,6 +988,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1015,6 +1032,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1053,6 +1071,7 @@ mod tests {
         let addr = setup_telemetry_listener(
             log_processor,
             platform_processor,
+            false,
             false,
         )
         .await
@@ -1106,6 +1125,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1149,6 +1169,7 @@ mod tests {
             log_processor,
             platform_processor,
             false,
+            false,
         )
         .await
         .expect("listener");
@@ -1170,6 +1191,571 @@ mod tests {
         // Should not panic
         assert_eq!(resp.status(), 200);
 
+        clear_telemetry_state();
+    }
+
+    // ========================================================================
+    // platform.initStart → managed-instance metadata capture (LMI)
+    // ========================================================================
+
+    /// Helper: clear the LMI metadata global so each test starts from a clean
+    /// slate. Tests using this MUST be `#[serial]`.
+    async fn clear_managed_instance_metadata() {
+        let mut guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.write().await;
+        *guard = None;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_with_max_memory_populates_both_fields() {
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        // Real LMI 2025-01-29 shape: instanceId AND instanceMaxMemory present.
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "lambda-managed-instances",
+                "instanceId": "2026/05/29/test-fn[$LATEST]abc123",
+                "instanceMaxMemory": 2147483648u64,
+                "runtimeVersion": "python:3.14.v43"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        let meta = guard.as_ref().expect("metadata should be populated");
+        assert_eq!(meta.instance_id, "2026/05/29/test-fn[$LATEST]abc123");
+        assert_eq!(meta.instance_max_memory, Some(2147483648));
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_without_max_memory_populates_only_instance_id() {
+        // instanceId present, instanceMaxMemory absent (AWS may omit it).
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "lambda-managed-instances",
+                "instanceId": "no-host-group-id"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        let meta = guard.as_ref().expect("metadata should be populated");
+        assert_eq!(meta.instance_id, "no-host-group-id");
+        assert!(
+            meta.instance_max_memory.is_none(),
+            "instance_max_memory must be None when AWS omits it"
+        );
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_on_standard_lambda_leaves_metadata_none() {
+        // Standard Lambda case: initStart fires but neither instanceId nor
+        // instanceMaxMemory is in the record. Global must remain None so
+        // attribute composition omits the LMI keys entirely.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "on-demand",
+                "runtimeVersion": "python:3.14.v43"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        assert!(
+            guard.is_none(),
+            "Standard Lambda initStart must not populate the LMI metadata global"
+        );
+        drop(guard);
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_does_not_break_other_records_in_same_batch() {
+        // initStart should not short-circuit subsequent records in the batch.
+        // Send initStart followed by platform.start and assert the request_id
+        // tracking still updates.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([
+            {
+                "time": "2026-05-29T11:00:00Z",
+                "type": "platform.initStart",
+                "record": {
+                    "instanceId": "batch-test-id",
+                    "instanceMaxMemory": 1073741824u64
+                }
+            },
+            {
+                "time": "2026-05-29T11:00:01Z",
+                "type": "platform.start",
+                "record": {"requestId": "after-init-req", "version": "$LATEST"}
+            }
+        ]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        // Both side effects must have fired.
+        let id = TELEMETRY_CURRENT_REQUEST_ID.lock().expect("lock").clone();
+        assert_eq!(id, Some("after-init-req".to_string()));
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        assert_eq!(
+            guard.as_ref().map(|m| m.instance_id.as_str()),
+            Some("batch-test-id")
+        );
+        drop(guard);
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_try_read_metadata_returns_populated_value_for_attribute_sites() {
+        // Regression guard: the three attribute-composition sites (logs,
+        // newrelic client, apm metric converter) all read via try_read_metadata.
+        // Confirm that path returns Some after a successful initStart capture.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "instanceId": "attr-site-id",
+                "instanceMaxMemory": 2147483648u64
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        // Give the async write a moment to land on this single-threaded runtime.
+        tokio::task::yield_now().await;
+
+        let meta = crate::telemetry::managed_instance::try_read_metadata()
+            .expect("attribute sites must observe the metadata");
+        assert_eq!(meta.instance_id, "attr-site-id");
+        assert_eq!(meta.instance_max_memory, Some(2147483648));
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    // ========================================================================
+    // LMI dual-mode invariant tests (per LMI_SUPPORT.md §5)
+    // ========================================================================
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_report_returns_ok_without_apm_app() {
+        // LMI + APM mode: platform.report arrives, APM_APP is None (not yet connected).
+        // drain_lmi_request_on_report is gated on `if let Some(ref app)` so it is
+        // skipped; the report is stored for retry. Must complete with 200 and no panic.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_apm_mode=true, is_lmi=true
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": "lmi-report-no-app-001",
+                "metrics": {"durationMs": 45.0}
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "LMI platform.report must return 200 even without APM_APP");
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_start_creates_request_slot() {
+        // LMI + APM mode: platform.start must create a request slot so the per-report
+        // drain has somewhere to look for buffered agent payloads.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.start",
+            "record": {"requestId": "lmi-slot-req-001", "version": "$LATEST"}
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        // Verify the slot was created so drain_lmi_request_on_report can find the buffer.
+        assert!(
+            crate::request::get_agent_buffer("lmi-slot-req-001").is_some(),
+            "platform.start under LMI must create a request buffer slot"
+        );
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_lambda_platform_report_does_not_drain_on_report() {
+        // Normal Lambda (is_lmi=false, is_apm_mode=true): platform.report must NOT
+        // attempt the LMI drain path. APM_APP=None, so the report is simply stored.
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_apm_mode=true, is_lmi=false — Normal Lambda APM
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-06-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": "normal-apm-report-001",
+                "metrics": {"durationMs": 100.0, "billedDurationMs": 100, "memorySizeMB": 128, "maxMemoryUsedMB": 64}
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "Normal Lambda APM platform.report must return 200");
+
+        clear_telemetry_state();
+    }
+
+    /// LMI + APM: when a buffer slot has payloads and APM_APP is populated,
+    /// platform.report must drain (take) those payloads from the slot.
+    /// The payloads reach `process_agent_payload` which silently no-ops on
+    /// non-`[` bytes, so the slot ends up empty regardless of network.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_platform_report_drains_agent_buffer_when_app_present() {
+        use reqwest::Client as ReqwestClient;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::request::{ensure_lmi_request_slot, get_agent_buffer};
+
+        clear_telemetry_state();
+        crate::request::clear_request_state_for_test();
+
+        let request_id = "lmi-drain-with-app-001";
+
+        // ── 1. Populate APM_APP with a fake app (unreachable host, short timeout) ──
+        {
+            let fake_app = crate::apm::ApmApp {
+                run_id: "drain-run-id".to_string(),
+                entity_guid: "drain-entity-guid".to_string(),
+                app_name: "test-app".to_string(),
+                collector_host: "http://unreachable.invalid.test".to_string(),
+                license_key: "fake-license-for-drain-test".to_string(),
+                metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+                client: ReqwestClient::builder().timeout(Duration::from_millis(50)).build().unwrap_or_default(),
+                deployment: DeploymentContext::Lmi,
+            };
+            let mut guard = crate::APM_APP.write().await;
+            *guard = Some(fake_app);
+        }
+
+        // ── 2. Create LMI slot and pre-load sentinel bytes ──
+        ensure_lmi_request_slot(request_id);
+        if let Some(buf) = get_agent_buffer(request_id) {
+            let mut guard = buf.lock().unwrap();
+            guard.push(b"sentinel-payload-1".to_vec());
+            guard.push(b"sentinel-payload-2".to_vec());
+        }
+        assert_eq!(
+            get_agent_buffer(request_id).map(|b| b.lock().unwrap().len()).unwrap_or(0),
+            2,
+            "pre-condition: 2 payloads in buffer before report"
+        );
+
+        // ── 3. Start LMI listener and POST platform.report ──
+        // Use LMI deployment context so convert_platform_report_to_log_line
+        // accepts a stripped report (only durationMs required under LMI).
+        let mut cfg = ExtensionConfig::default();
+        cfg.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(cfg);
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let context = Arc::new(std::sync::Mutex::new(crate::context::InvocationContext::default()));
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            nr_client.clone(), config.clone(), context.clone(), None,
+        ));
+        let platform_processor = Arc::new(crate::platform::processor::PlatformProcessor::new(
+            nr_client, config, context, log_processor.clone(),
+        ));
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-07-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": request_id,
+                "metrics": {"durationMs": 55.5}
+            }
+        }]);
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200, "LMI platform.report with APM_APP must return 200");
+
+        // ── 4. Buffer must now be drained (taken) ──
+        let remaining = get_agent_buffer(request_id)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(remaining, 0, "drain_lmi_request_on_report must empty the buffer slot");
+
+        // ── 5. Clean up APM_APP ──
+        {
+            let mut guard = crate::APM_APP.write().await;
+            *guard = None;
+        }
+        crate::request::clear_request_state_for_test();
+        clear_telemetry_state();
+    }
+
+    // ========================================================================
+    // platform.initReport — LMI_COLD_START_SEEN tests
+    // ========================================================================
+
+    /// Helper: reset the LMI cold-start flag between tests that touch it.
+    fn reset_lmi_cold_start_seen() {
+        crate::LMI_COLD_START_SEEN.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Under LMI (`is_lmi=true`), receiving `platform.initReport` must set
+    /// `LMI_COLD_START_SEEN` so that the next heartbeat can trigger version tagging.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_set_when_lmi_receives_init_report() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.initReport",
+            "record": {"initializationType": "on-demand", "metrics": {"initDurationMs": 120.0}}
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert_eq!(resp.status(), 200);
+        assert!(
+            crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.initReport must set LMI_COLD_START_SEEN=true on LMI"
+        );
+
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+    }
+
+    /// On Normal Lambda (`is_lmi=false`), `platform.initReport` must NOT set
+    /// `LMI_COLD_START_SEEN` — the flag is LMI-only.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_not_set_when_normal_lambda_receives_init_report() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        // is_lmi = false → Normal Lambda path
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.initReport",
+            "record": {"initializationType": "on-demand", "metrics": {"initDurationMs": 80.0}}
+        }]);
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert!(
+            !crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.initReport must NOT set LMI_COLD_START_SEEN on Normal Lambda"
+        );
+
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+    }
+
+    /// `platform.start` must NOT set `LMI_COLD_START_SEEN` — only `platform.initReport`
+    /// is the cold-start signal under LMI.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn lmi_cold_start_seen_not_set_by_platform_start() {
+        reset_lmi_cold_start_seen();
+        clear_telemetry_state();
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.start",
+            "record": {"requestId": "req-lmi-123", "version": "$LATEST"}
+        }]);
+
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+
+        assert!(
+            !crate::LMI_COLD_START_SEEN.load(std::sync::atomic::Ordering::Relaxed),
+            "platform.start must NOT set LMI_COLD_START_SEEN (only platform.initReport does)"
+        );
+
+        reset_lmi_cold_start_seen();
         clear_telemetry_state();
     }
 }

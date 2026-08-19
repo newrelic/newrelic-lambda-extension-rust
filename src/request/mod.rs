@@ -18,6 +18,7 @@ use crate::{
     context::InvocationContext,
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     newrelic::client::NewRelicClient,
     agent::payload::send_agent_payload_to_newrelic,
 };
@@ -273,6 +274,63 @@ pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
 pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
     Lazy::new(DashMap::new);
 
+/// Extract the per-record request id from a telemetry record body.
+///
+/// JSON `function`/`extension`/`platform.*` records carry `requestId` (schema
+/// >= `2022-12-13`); some runtimes emit `AWSRequestId`. Plain-text log records
+/// are a bare string and carry neither — those return `None` and are shipped
+/// uncorrelated rather than mis-attributed (LMI concurrency, NR-579360).
+pub fn record_request_id(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("requestId")
+        .or_else(|| record.get("AWSRequestId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// LMI: create a minimal RequestData slot driven by platform.start (no INVOKE in LMI).
+/// No-op if a full entry already exists (normal APM mode where INVOKE fires first).
+pub fn ensure_lmi_request_slot(request_id: &str) {
+    if REQUEST_DATA.contains_key(request_id) {
+        return;
+    }
+    let arn = crate::get_global_fallback_arn();
+    let context = Arc::new(Mutex::new(InvocationContext {
+        request_id: request_id.to_string(),
+        invoked_function_arn: arn.clone(),
+        trace_id: None,
+    }));
+    let runtime_done_notify = Arc::new(Notify::new());
+    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
+        runtime_done_notify.notify_one();
+    }
+    let entry = REQUEST_DATA.entry(request_id.to_string()).or_insert_with(|| RequestData {
+        context,
+        agent_buffer: Arc::new(Mutex::new(Vec::new())),
+        pending_report: None,
+        creation_invocation: current_invocation_count(),
+        runtime_done_notify,
+        invoked_function_arn: arn,
+        pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    // Drain payloads that beat platform.start to the pipe (cold-start race).
+    if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+        if !orphaned.is_empty() {
+            let drained: Vec<Vec<u8>> = orphaned.drain(..).collect();
+            info!(
+                "LMI: draining {} orphaned agent payload(s) into slot for request {}",
+                drained.len(),
+                request_id
+            );
+            if let Ok(mut buf) = entry.agent_buffer.lock() {
+                buf.extend(drained);
+            }
+        }
+    }
+}
+
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
@@ -480,10 +538,33 @@ pub async fn cleanup_old_request_buffers(
     }
 }
 
-/// Route agent payload to the currently active request's buffer
-/// Agent payloads come from named pipe without request_id, so we route to the active request
-/// This is the same logic as 2.4.1 which worked correctly
-pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
+/// Route an agent payload (which arrives on the named pipe without a request id) into a
+/// per-request buffer. **Type-driven on `DeploymentContext`** so Normal Lambda and LMI
+/// never share a code path:
+///
+/// - **Normal** — unchanged 2.4.1 behavior (plus NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH's
+///   immediate-send early-return, see `route_payload_to_active_request`): route to the
+///   process-global `CURRENT_ACTIVE_REQUEST_ID` (one invocation at a time, so it's
+///   correct there).
+/// - **LMI** — concurrent invocations share one environment, so the global is racy.
+///   Instead, attribute each payload by the `aws.requestId` the agent **embedded inside
+///   it** (NR-579361). The LMI path never reads `CURRENT_ACTIVE_REQUEST_ID`, and
+///   NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH never applies here — that flag is gated on
+///   `!apm_lambda_mode` and LMI always forces APM mode.
+pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>, deployment: DeploymentContext) {
+    match deployment {
+        DeploymentContext::Normal { .. } => route_payload_to_active_request(payload_bytes).await,
+        DeploymentContext::Lmi => route_payload_by_embedded_request_id(payload_bytes),
+    }
+}
+
+/// Normal Lambda routing (verbatim 2.4.1 logic, now also carrying
+/// NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH's immediate-send early-return): one invocation
+/// runs at a time, so the process-global `CURRENT_ACTIVE_REQUEST_ID` correctly names the
+/// owning request.
+async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
+    use tracing::{debug, error, info, warn};
+
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
         .lock()
         .ok()
@@ -601,6 +682,54 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
     }
 }
 
+/// LMI routing: attribute the payload by the `aws.requestId` the agent embedded in it,
+/// independent of any "current request" global. Concurrent invocations therefore never
+/// cross-attribute. `ensure_lmi_request_slot` creates the slot if the payload beat its
+/// `platform.start` to the pipe (cold-start race). Payloads with no transaction id
+/// (metrics-only / log-only harvest — nothing to mis-attribute) are parked in the
+/// orphaned buffer and drained into the next slot; the global is never consulted.
+fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
+    use tracing::{debug, error, warn};
+
+    match crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes) {
+        Some(request_id) => {
+            ensure_lmi_request_slot(&request_id);
+            if let Some(entry) = REQUEST_DATA.get(&request_id) {
+                match entry.agent_buffer.lock() {
+                    Ok(mut buffer) => {
+                        buffer.push(payload_bytes);
+                        debug!(
+                            "LMI: routed agent payload to its own request {} (buffer size: {})",
+                            request_id,
+                            buffer.len()
+                        );
+                    }
+                    Err(e) => error!(
+                        "LMI: failed to lock buffer for {}: {} - payload lost!",
+                        request_id, e
+                    ),
+                }
+            } else {
+                error!(
+                    "LMI: request slot missing for {} after ensure - payload lost!",
+                    request_id
+                );
+            }
+        }
+        None => {
+            if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+                orphaned.push(payload_bytes);
+                debug!(
+                    "LMI: agent payload without transaction requestId parked in orphaned buffer (size: {})",
+                    orphaned.len()
+                );
+            } else {
+                warn!("LMI: failed to lock orphaned buffer - agent payload lost!");
+            }
+        }
+    }
+}
+
 /// Send an agent payload to New Relic immediately, decoupled from any pairing with
 /// `platform.report`, as its own background task — used when
 /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled (serverless mode only, per the
@@ -649,6 +778,16 @@ fn spawn_immediate_agent_payload_send(
     });
 
     push_pending_send_handle(request_id, handle);
+}
+
+/// Clear all per-request global state. Only compiled in test builds.
+#[cfg(test)]
+pub fn clear_request_state_for_test() {
+    REQUEST_PROCESSORS.clear();
+    REQUEST_DATA.clear();
+    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() { g.clear(); }
+    if let Ok(mut g) = CURRENT_ACTIVE_REQUEST_ID.lock() { *g = None; }
+    if let Ok(mut g) = TELEMETRY_CURRENT_REQUEST_ID.lock() { *g = None; }
 }
 
 #[cfg(test)]

@@ -11,6 +11,10 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
+pub mod deployment;
+
+use deployment::{DeploymentContext, TelemetryMode};
+
 /// Default per-invocation cap on logs parked while waiting for the trace.id.
 const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
 /// Lower/upper clamp for `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` to avoid 0 (drop
@@ -31,6 +35,11 @@ pub struct ExtensionConfig {
     pub new_relic: NewRelicConfig,
     pub aws: AwsConfig,
     pub extension: ExtensionSettings,
+    /// Detected once at startup — single source of truth for the deployment
+    /// environment (Normal Lambda vs LMI). All loop-dispatch and mode-aware
+    /// branching reads this rather than re-parsing env vars. See
+    /// `LMI_SUPPORT.md` §2.
+    pub deployment: DeploymentContext,
 }
 
 /// New Relic specific configuration
@@ -129,6 +138,13 @@ pub struct ExtensionSettings {
     /// may lose data on final shutdown if flush doesn't complete in time.
     /// Default: false (safe mode — flush completes before GET /next).
     pub pipeline_flush: bool,
+    /// NEW_RELIC_LMI_FLUSH_INTERVAL_MS — heartbeat flush cadence (ms) for the
+    /// Lambda Managed Instances (LMI) event loop. LMI runs continuously (no
+    /// freeze between invokes), so buffered telemetry is drained on this
+    /// interval by a background task rather than at `platform.runtimeDone`.
+    /// Default 30_000, floored at 1000. Read ONLY by the LMI loop; ignored on
+    /// standard Lambda.
+    pub lmi_flush_interval_ms: u64,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -155,6 +171,9 @@ impl Default for ExtensionConfig {
             new_relic: NewRelicConfig::default(),
             aws: AwsConfig::default(),
             extension: ExtensionSettings::default(),
+            // Default for tests / non-Lambda contexts. Production code paths
+            // overwrite this in `from_env()` via `deployment::detect()`.
+            deployment: DeploymentContext::Normal { mode: TelemetryMode::Serverless },
         }
     }
 }
@@ -266,6 +285,7 @@ impl Default for ExtensionSettings {
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
             pipeline_flush: false,
+            lmi_flush_interval_ms: 30_000,
         }
     }
 }
@@ -402,6 +422,15 @@ impl ExtensionConfig {
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
+        // Detect deployment context exactly once. On LMI, APM mode is forced
+        // regardless of the user-supplied `NEW_RELIC_APM_LAMBDA_MODE` value —
+        // `deployment::detect()` already logs a warning when the user explicitly
+        // disabled it. See `LMI_SUPPORT.md` §7.
+        config.deployment = deployment::detect();
+        if config.deployment.is_lmi() {
+            config.new_relic.apm_lambda_mode = true;
+        }
+
         let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
         config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);
 
@@ -496,6 +525,15 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        // NEW_RELIC_LMI_FLUSH_INTERVAL_MS: heartbeat flush cadence for the LMI
+        // event loop. Floored at 1000 ms to avoid pathological flush storms.
+        // Default 30_000 ms.
+        config.extension.lmi_flush_interval_ms = env::var("NEW_RELIC_LMI_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000)
+            .max(1000);
 
         let synchronous_flush_str =
             env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();

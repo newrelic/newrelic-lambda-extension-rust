@@ -1456,6 +1456,7 @@ fn test_extension_settings_all_fields() {
         extension_logs_enabled: false,
         runtime_done_grace_ms: 250,
         pipeline_flush: false,
+        lmi_flush_interval_ms: 30_000,
     };
     
     assert!(settings.send_function_logs);

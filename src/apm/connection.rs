@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use crate::config::deployment::DeploymentContext;
 use crate::newrelic::client::redact_url;
 
 /// Permanent APM handshake rejection (HTTP 401/403): the license key is invalid
@@ -194,6 +195,12 @@ pub struct AwsLambdaInfo {
     pub account_id: String,
     #[serde(rename = "aws.functionName")]
     pub function_name: String,
+    /// LMI instance identifier from `platform.initStart`. Absent on Standard Lambda.
+    #[serde(rename = "aws.lambda.managedInstance.instanceId", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_id: Option<String>,
+    /// LMI maximum memory (raw AWS uint64, bytes). Absent on Standard Lambda or when AWS omits it.
+    #[serde(rename = "aws.lambda.managedInstance.instanceMaxMemory", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_max_memory: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,6 +294,7 @@ pub async fn preconnect(
 }
 
 /// Execute Connect to get Run ID and Entity GUID
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     client: &Client,
     license_key: &str,
@@ -299,10 +307,17 @@ pub async fn connect(
     runtime: &str,
     agent_version: &str,
     timeout_secs: u64,
+    lmi_metadata: Option<crate::telemetry::managed_instance::ManagedInstanceMetadata>,
+    deployment: DeploymentContext,
 ) -> Result<ConnectResponse> {
     let url = format!(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
     );
+
+    let (managed_instance_id, managed_instance_max_memory) = match lmi_metadata {
+        Some(meta) => (Some(meta.instance_id), meta.instance_max_memory),
+        None => (None, None),
+    };
 
     let connect_req = vec![ConnectRequest {
         pid: std::process::id(),
@@ -319,10 +334,12 @@ pub async fn connect(
                     region: region.to_string(),
                     account_id: account_id.to_string(),
                     function_name: function_name.to_string(),
+                    managed_instance_id,
+                    managed_instance_max_memory,
                 },
             },
         },
-        labels: get_labels(function_arn, runtime),
+        labels: get_labels(function_arn, runtime, deployment),
     }];
 
     let body = serde_json::to_vec(&connect_req)?;
@@ -387,10 +404,10 @@ pub async fn connect(
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
 /// Get labels for Connect request
-fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
+fn get_labels(function_arn: &str, runtime: &str, deployment: DeploymentContext) -> Vec<Label> {
     let runtime_version = crate::version::get_runtime_version();
     let extension_version = env!("CARGO_PKG_VERSION");
-    
+
     let mut labels = vec![
         Label {
             label_type: "aws.arn".to_string(),
@@ -407,14 +424,22 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     ];
 
     // Only send runtime version if we have actual version info
-    if runtime != "unknown" 
-        && !runtime_version.contains("unknown") 
-        && runtime_version != runtime  
+    if runtime != "unknown"
+        && !runtime_version.contains("unknown")
+        && runtime_version != runtime
         && runtime_version.len() > runtime.len()
     {
         labels.push(Label {
             label_type: "lambda.runtime.version".to_string(),
             label_value: runtime_version,
+        });
+    }
+
+    // Only present on Lambda Managed Instances — absent (not "false") on Normal Lambda.
+    if deployment.is_lmi() {
+        labels.push(Label {
+            label_type: "isLMI".to_string(),
+            label_value: "true".to_string(),
         });
     }
 
@@ -442,3 +467,6 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     labels
 }
 
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod connection_tests;
