@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::deployment::{DeploymentContext, TelemetryMode};
+use serial_test::serial;
 
 const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Apm };
 const LMI: DeploymentContext = DeploymentContext::Lmi;
@@ -43,7 +44,13 @@ fn test_parse_fault_log() {
 ///
 /// Unsets the fallback env var so memory fields remain None, testing the
 /// bare-parse path in isolation (env-var back-fill is tested separately).
+///
+/// #[serial] (default key): mutates the process-wide AWS_LAMBDA_FUNCTION_MEMORY_SIZE
+/// env var, same key as metric_converter_memory_fallback_tests.rs — must not run
+/// concurrently with those or with each other, or a set_var/remove_var race can flip
+/// the memory_size fallback mid-test (NR flake: see PR history).
 #[test]
+#[serial]
 fn test_parse_report_log_lmi_stripped_duration_only() {
     std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
     let log = "REPORT RequestId: abc123\tDuration: 21.33 ms";
@@ -73,7 +80,10 @@ fn test_normal_rejects_stripped_report() {
 
 /// A stripped LMI report converts to exactly one metric (duration) when the
 /// fallback env var is absent.  (Env-var back-fill is tested in metric_converter_tests.rs.)
+///
+/// #[serial] (default key): see test_parse_report_log_lmi_stripped_duration_only above.
 #[test]
+#[serial]
 fn test_lmi_stripped_report_yields_duration_metric_only() {
     std::env::remove_var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE");
     let metrics = parse_lambda_report_log("REPORT RequestId: abc123\tDuration: 21.33 ms", LMI).unwrap();
