@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: And example of a simple instrumented NodeJS Lambda
+
+Parameters:
+  NRAccountId:
+    Type: String
+    Description: Your New Relic account ID; necessary for distributed tracing.
+    AllowedPattern: '[0-9]+'
+Globals:
+  Function:
+    Timeout: 3
+
+Resources:
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: newrelic-example-node/
+      Handler: newrelic-lambda-wrapper.handler
+      Runtime: nodejs22.x
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          NEW_RELIC_ACCOUNT_ID: <Your-New-Relic-Account-ID>
+
+          NEW_RELIC_EXTENSION_LOG_LEVEL: DEBUG
+
+          NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS: true
+
+          NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS: true
+
+          NEW_RELIC_LAMBDA_HANDLER: app.lambdaHandler
+         
+          NEW_RELIC_USE_ESM: true
+          NEW_RELIC_LICENSE_KEY: <Your-New-Relic-License-Key>
+
+      Layers:
+        # This layer includes the New Relic Lambda Extension, a sidecar process that sends telemetry,
+        # as well as the New Relic Agent for Node.js, and a handler wrapper that makes integration easy.
+        - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:451483290750:layer:NewRelicNodeJS22X:102
+      Policies:
+        # This policy allows the lambda to know the value of the New Relic licence key. We need this so
+        # that we can send telemetry back to New Relic
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !ImportValue NewRelicLicenseKeySecret-NewRelic-LicenseKeySecretARN
+    
+
+Outputs:
+  HelloWorldFunction:
+    Description: "Hello World Lambda Function ARN"
+    Value: !GetAtt HelloWorldFunction.Arn
+  HelloWorldFunctionIamRole:
+    Description: "Implicit IAM Role created for Hello World function"
+    Value: !GetAtt HelloWorldFunctionRole.Arn
