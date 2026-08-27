@@ -389,7 +389,14 @@ async fn perform_one_time_initialization(
     // Construct registration fallback ARN once from registration response
     // This ARN is used for all telemetry before the first INVOKE event provides the actual invoked_function_arn
     // Also used as fallback when invoked_function_arn is not available
-    let registration_fallback_arn = if let Some(ref account_id) = registration.account_id {
+    // Prefer the account ID from registration; fall back to the one seeded from
+    // NEW_RELIC_AWS_ACCOUNT_ID (config.aws.account_id) for environments where the
+    // registration response omits it (e.g. the local RIE).
+    let fallback_account_id = registration
+        .account_id
+        .clone()
+        .or_else(|| config.aws.account_id.clone());
+    let registration_fallback_arn = if let Some(ref account_id) = fallback_account_id {
         let arn = format!(
             "arn:aws:lambda:{}:{}:function:{}",
             std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".to_string()),

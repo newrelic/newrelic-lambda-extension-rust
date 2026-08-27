@@ -78,6 +78,7 @@ where
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
+        "NEW_RELIC_AWS_ACCOUNT_ID",
     ];
     
     // Save original values
@@ -527,6 +528,66 @@ fn test_configuration_from_extension_config_no_license_key() {
 // ============================================================================
 // Helper Functions - parse_bool
 // ============================================================================
+
+#[test]
+#[serial]
+fn test_aws_account_id_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_AWS_ACCOUNT_ID", "123456789012");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.aws.account_id, Some("123456789012".to_string()));
+    });
+}
+
+#[test]
+#[serial]
+fn test_aws_account_id_from_env_empty_is_none() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_AWS_ACCOUNT_ID", "");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.aws.account_id, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_aws_account_id_unset_is_none() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.aws.account_id, None);
+    });
+}
+
+#[test]
+#[serial]
+fn test_registration_account_id_overrides_env() {
+    with_full_clean_env(|| {
+        let mut aws_config = AwsConfig::default();
+        aws_config.account_id = Some("111111111111".to_string());
+
+        aws_config.update_from_registration(
+            "fn".to_string(),
+            "1".to_string(),
+            Some("222222222222".to_string()),
+        );
+
+        assert_eq!(aws_config.account_id, Some("222222222222".to_string()));
+    });
+}
+
+#[test]
+#[serial]
+fn test_registration_none_preserves_env_account_id() {
+    with_full_clean_env(|| {
+        // Simulates the local RIE: env seeded a value, registration supplies None.
+        let mut aws_config = AwsConfig::default();
+        aws_config.account_id = Some("111111111111".to_string());
+
+        aws_config.update_from_registration("fn".to_string(), "1".to_string(), None);
+
+        assert_eq!(aws_config.account_id, Some("111111111111".to_string()));
+    });
+}
 
 #[test]
 #[serial]

@@ -112,6 +112,12 @@ pub struct AwsConfig {
     pub runtime_api: String,
     pub function_name: String,
     pub function_version: Option<String>,
+    /// The 12-digit AWS account ID (not the New Relic account ID). Normally
+    /// populated from the Extensions API registration response, and failing
+    /// that from the invoked function ARN on the first INVOKE. Can be seeded
+    /// via `NEW_RELIC_AWS_ACCOUNT_ID` for environments where neither source
+    /// supplies it (e.g. the local RIE); registration/ARN still take
+    /// precedence when they provide a value.
     pub account_id: Option<String>,
     pub region: Option<String>,
 }
@@ -254,7 +260,12 @@ impl AwsConfig {
     pub fn update_from_registration(&mut self, function_name: String, function_version: String, account_id: Option<String>) {
         self.function_name = function_name;
         self.function_version = Some(function_version);
-        self.account_id = account_id;
+        // Registration wins when it provides an account ID, but don't clobber a
+        // value already seeded from NEW_RELIC_AWS_ACCOUNT_ID with a None from a
+        // registration response that omits it (e.g. the local RIE).
+        if let Some(account_id) = account_id.filter(|id| !id.is_empty()) {
+            self.account_id = Some(account_id);
+        }
 
         if self.region.is_none() {
             self.region = env::var("AWS_REGION").ok();
@@ -516,6 +527,16 @@ impl ExtensionConfig {
         }
 
         // Note: function_name is set from extension registration response, not from env var
+
+        // Seed the AWS account ID (12-digit AWS identifier, not the New Relic
+        // account ID) from NEW_RELIC_AWS_ACCOUNT_ID when provided. This is a
+        // fallback for environments where the Extensions API registration and
+        // the invoked function ARN do not supply one (e.g. the local RIE);
+        // update_from_registration and the ARN extraction still override this
+        // when they have a real value.
+        config.aws.account_id = env::var("NEW_RELIC_AWS_ACCOUNT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
         if !send_logs_str.is_empty() {
