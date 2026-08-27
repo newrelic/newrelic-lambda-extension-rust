@@ -133,6 +133,33 @@ mod tests {
     }
 
     #[test]
+    fn create_platform_log_message_formats_init_runtime_done() {
+        let processor = make_processor();
+
+        let (msg, level) = processor.create_platform_log_message(&record(
+            "platform.initRuntimeDone",
+            serde_json::json!({"requestId": "req-init-done", "initializationType": "on-demand", "phase": "init", "status": "success"}),
+        ));
+
+        assert_eq!(msg, "INIT RUNTIME DONE RequestId: req-init-done Type: on-demand Phase: init Status: success");
+        assert_eq!(level, "INFO");
+    }
+
+    #[test]
+    fn create_platform_log_message_formats_init_report_without_metrics() {
+        let processor = make_processor();
+
+        // No "metrics" field at all -> duration_info stays empty (the else branch).
+        let (msg, level) = processor.create_platform_log_message(&record(
+            "platform.initReport",
+            serde_json::json!({"requestId": "req-init-report", "initializationType": "on-demand", "phase": "init"}),
+        ));
+
+        assert_eq!(msg, "INIT REPORT RequestId: req-init-report Type: on-demand Phase: init");
+        assert_eq!(level, "INFO");
+    }
+
+    #[test]
     fn create_platform_log_message_falls_back_to_report_formatting_failed_when_fields_missing() {
         let processor = make_processor();
 
@@ -263,6 +290,19 @@ mod report_log_line_tests {
         assert!(!line.contains("Memory Size"));
     }
 
+    // LMI: billedDurationMs and memorySizeMB, when present, get appended too
+    // (each is its own optional branch, separate from maxMemoryUsedMB below).
+    #[test]
+    fn lmi_report_appends_billed_duration_and_memory_size_when_present() {
+        let p = processor(DeploymentContext::Lmi);
+        let line = p
+            .convert_platform_report_to_log_line(&report_record(
+                serde_json::json!({ "durationMs": 12.5, "billedDurationMs": 13, "memorySizeMB": 256 }),
+            ))
+            .expect("should format");
+        assert_eq!(line, "REPORT RequestId: req-1\tDuration: 12.50 ms\tBilled Duration: 13 ms\tMemory Size: 256 MB");
+    }
+
     // LMI: any optional fields that ARE present get appended.
     #[test]
     fn lmi_report_appends_present_optional_fields() {
@@ -299,5 +339,294 @@ mod report_log_line_tests {
         assert!(p
             .convert_platform_report_to_log_line(&report_record(serde_json::json!({ "durationMs": 140.0 })))
             .is_none());
+    }
+}
+
+/// NR-569587: `platform_log_filter` gates which platform event types actually
+/// reach the outbound log batch, on top of the existing `send_platform_logs` flag.
+#[cfg(test)]
+mod platform_log_filter_tests {
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::logs::processor::LogProcessor;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::platform::processor::PlatformProcessor;
+    use crate::telemetry::listener::TelemetryRecord;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    // Returns the processor plus our own handle to its LogProcessor, so tests can
+    // check `test_log_batch_len()` without reaching into PlatformProcessor's
+    // private field (processor_tests is a sibling module, not a descendant).
+    fn processor_with_filter(send_platform_logs: bool, filter: HashSet<String>) -> (PlatformProcessor, Arc<LogProcessor>) {
+        let mut config = ExtensionConfig::default();
+        config.extension.send_platform_logs = send_platform_logs;
+        config.extension.platform_log_filter = filter;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        let log_processor = Arc::new(LogProcessor::new(
+            Arc::clone(&client), Arc::clone(&config), Arc::clone(&ctx), None,
+        ));
+        let processor = PlatformProcessor::new(client, config, ctx, Arc::clone(&log_processor));
+        (processor, log_processor)
+    }
+
+    fn record(record_type: &str) -> TelemetryRecord {
+        TelemetryRecord {
+            time: chrono::Utc::now(),
+            record_type: record_type.to_string(),
+            record: serde_json::json!({"requestId": "req-filter-test"}),
+        }
+    }
+
+    #[test]
+    fn no_filter_sends_every_type() {
+        let (processor, log_processor) = processor_with_filter(true, HashSet::new());
+        processor.process_record(record("platform.start"));
+        processor.process_record(record("platform.report"));
+        assert_eq!(log_processor.test_log_batch_len(), 2);
+    }
+
+    #[test]
+    fn filter_allows_only_listed_types() {
+        let mut filter = HashSet::new();
+        filter.insert("platform.report".to_string());
+        let (processor, log_processor) = processor_with_filter(true, filter);
+
+        processor.process_record(record("platform.start"));
+        assert_eq!(log_processor.test_log_batch_len(), 0);
+
+        processor.process_record(record("platform.report"));
+        assert_eq!(log_processor.test_log_batch_len(), 1);
+    }
+
+    #[test]
+    fn filter_matches_case_insensitively() {
+        // Filter stores lowercase (parsed from env); incoming record_type keeps AWS's
+        // real casing. The gate lowercases record_type before comparing.
+        let mut filter = HashSet::new();
+        filter.insert("platform.start".to_string());
+        let (processor, log_processor) = processor_with_filter(true, filter);
+
+        processor.process_record(record("platform.start"));
+        assert_eq!(log_processor.test_log_batch_len(), 1);
+    }
+
+    #[test]
+    fn send_platform_logs_false_blocks_everything_regardless_of_filter() {
+        let mut filter = HashSet::new();
+        filter.insert("platform.report".to_string());
+        let (processor, log_processor) = processor_with_filter(false, filter);
+
+        processor.process_record(record("platform.report"));
+        assert_eq!(log_processor.test_log_batch_len(), 0);
+    }
+}
+
+/// `check_and_send_platform_errors` — detects error/failure/timeout status on the
+/// 5 platform event types that can carry errors, and records the last-detected
+/// error (read via `error_synthesis::LAST_DETECTED_ERROR`, a process-wide global —
+/// hence `#[serial]`, matching the convention already used for other global/env
+/// state in this crate's tests).
+#[cfg(test)]
+mod check_and_send_platform_errors_tests {
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::error_synthesis::LAST_DETECTED_ERROR;
+    use crate::logs::processor::LogProcessor;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::platform::processor::PlatformProcessor;
+    use crate::telemetry::listener::TelemetryRecord;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    fn processor() -> PlatformProcessor {
+        let client = Arc::new(NewRelicClient::new_noop());
+        let config = Arc::new(ExtensionConfig::default());
+        let context = Arc::new(Mutex::new(InvocationContext::default()));
+        let log_processor = Arc::new(LogProcessor::new(
+            client.clone(),
+            config.clone(),
+            context.clone(),
+            None,
+        ));
+        PlatformProcessor::new(client, config, context, log_processor)
+    }
+
+    fn record(record_type: &str, fields: serde_json::Value) -> TelemetryRecord {
+        TelemetryRecord {
+            time: chrono::Utc::now(),
+            record_type: record_type.to_string(),
+            record: fields,
+        }
+    }
+
+    fn clear_last_error() {
+        *LAST_DETECTED_ERROR.lock().unwrap() = None;
+    }
+
+    #[test]
+    #[serial]
+    fn non_error_capable_type_is_ignored() {
+        clear_last_error();
+        let p = processor();
+        // platform.start/platform.report are not in the can-have-errors list at all.
+        p.process_record(record("platform.start", serde_json::json!({"requestId": "r1", "status": "error"})));
+        assert!(LAST_DETECTED_ERROR.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn error_capable_type_without_error_status_is_ignored() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record("platform.runtimeDone", serde_json::json!({"requestId": "r2", "status": "success"})));
+        assert!(LAST_DETECTED_ERROR.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn init_report_error_with_error_type_is_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.initReport",
+            serde_json::json!({"requestId": "r3", "status": "error", "phase": "init", "errorType": "Runtime.ExitError"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.request_id, "r3");
+        assert_eq!(last.error_type, "Runtime.ExitError");
+    }
+
+    #[test]
+    #[serial]
+    fn init_runtime_done_failure_without_error_type_is_not_recorded() {
+        clear_last_error();
+        let p = processor();
+        // No errorType field -> error message still built, but LAST_DETECTED_ERROR
+        // is only updated when an errorType is present.
+        p.process_record(record(
+            "platform.initRuntimeDone",
+            serde_json::json!({"requestId": "r4", "status": "failure", "phase": "init"}),
+        ));
+        assert!(LAST_DETECTED_ERROR.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_done_timeout_with_duration_is_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.runtimeDone",
+            serde_json::json!({"requestId": "r5", "status": "timeout", "errorType": "Sandbox.Timedout", "metrics": {"durationMs": 3000.0}}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.error_type, "Sandbox.Timedout");
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_done_timeout_without_duration_is_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.runtimeDone",
+            serde_json::json!({"requestId": "r6", "status": "timeout", "errorType": "Sandbox.Timedout"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.error_type, "Sandbox.Timedout");
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_done_error_with_duration_and_error_type_is_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.runtimeDone",
+            serde_json::json!({"requestId": "r7", "status": "error", "errorType": "Runtime.HandlerError", "metrics": {"durationMs": 42.0}}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.error_type, "Runtime.HandlerError");
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_done_failure_without_error_type_or_duration_is_not_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.runtimeDone",
+            serde_json::json!({"requestId": "r8", "status": "failure"}),
+        ));
+        assert!(LAST_DETECTED_ERROR.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn restore_runtime_done_error_with_error_type_is_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.restoreRuntimeDone",
+            serde_json::json!({"requestId": "r9", "status": "error", "errorType": "Runtime.RestoreError"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.error_type, "Runtime.RestoreError");
+    }
+
+    #[test]
+    #[serial]
+    fn restore_report_failure_without_error_type_is_not_recorded() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.restoreReport",
+            serde_json::json!({"requestId": "r10", "status": "failure"}),
+        ));
+        assert!(LAST_DETECTED_ERROR.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn missing_request_id_falls_back_to_instance_id() {
+        clear_last_error();
+        let p = processor();
+        // No "requestId" field at all; falls back to "instanceId" (init-prefixed, first 8 chars).
+        p.process_record(record(
+            "platform.initReport",
+            serde_json::json!({"instanceId": "abcdefghijklmnop", "status": "error", "phase": "init", "errorType": "Runtime.InitError"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.request_id, "init-abcdefgh");
+    }
+
+    #[test]
+    #[serial]
+    fn empty_request_id_falls_back_to_instance_id() {
+        clear_last_error();
+        let p = processor();
+        // "requestId" present but empty -> same instanceId fallback path as the missing case.
+        p.process_record(record(
+            "platform.initReport",
+            serde_json::json!({"requestId": "", "instanceId": "zzzzzzzzzzzz", "status": "error", "phase": "init", "errorType": "Runtime.InitError"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert_eq!(last.request_id, "init-zzzzzzzz");
+    }
+
+    #[test]
+    #[serial]
+    fn no_request_id_or_instance_id_generates_fallback_id() {
+        clear_last_error();
+        let p = processor();
+        p.process_record(record(
+            "platform.initReport",
+            serde_json::json!({"status": "error", "phase": "init", "errorType": "Runtime.InitError"}),
+        ));
+        let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
+        assert!(last.request_id.starts_with("init-"));
     }
 }
