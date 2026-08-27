@@ -46,17 +46,6 @@ Parameters:
     MaxValue: 1600
     Description: Max concurrent invokes per execution environment
 
-  JavaHandlerMode:
-    Type: String
-    Default: request
-    AllowedValues:
-      - request
-      - stream
-    Description: request uses HandlerWrapper::handleRequest, stream uses HandlerWrapper::handleStreamsRequest
-
-Conditions:
-  IsJavaStreamHandler: !Equals [!Ref JavaHandlerMode, stream]
-
 Resources:
   LmiCapacityProvider:
     Type: AWS::Lambda::CapacityProvider
@@ -77,10 +66,11 @@ Resources:
     Type: AWS::Serverless::Function
     Properties:
       Runtime: java21
-      Handler: !If
-        - IsJavaStreamHandler
-        - com.newrelic.java.HandlerWrapper::handleStreamsRequest
-        - com.newrelic.java.HandlerWrapper::handleRequest
+      # This is your own function handler, not a New Relic wrapper class. LMI runs in
+      # APM mode, where the agent attaches via AWS_LAMBDA_EXEC_WRAPPER below instead of
+      # replacing the Handler with com.newrelic.java.HandlerWrapper (that class is for
+      # standard/non-LMI Lambda only).
+      Handler: com.newrelic.lambda.example.App::handleRequest
       CodeUri: src/
       Architectures: [x86_64]
       Timeout: 30
@@ -93,7 +83,7 @@ Resources:
         Variables:
           NEW_RELIC_ACCOUNT_ID: !Ref NewRelicAccountId
           NEW_RELIC_LICENSE_KEY: !Ref NewRelicLicenseKey
-          NEW_RELIC_LAMBDA_HANDLER: com.newrelic.lambda.example.App::handleRequest
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/newrelic-java-handler
           NEW_RELIC_APM_LAMBDA_MODE: "true"
           NEW_RELIC_EXTENSION_SEND_LOGS: "function,platform"
 
