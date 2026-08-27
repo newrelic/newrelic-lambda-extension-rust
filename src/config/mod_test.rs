@@ -1452,6 +1452,7 @@ fn test_extension_settings_all_fields() {
         send_function_logs: true,
         send_extension_logs: true,
         send_platform_logs: true,
+        platform_log_filter: std::collections::HashSet::new(),
         log_level: "debug".to_string(),
         extension_logs_enabled: false,
         runtime_done_grace_ms: 250,
@@ -1639,10 +1640,85 @@ fn test_parse_send_logs_extra_spaces() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "  function  ,  extension  ");
         let config = ExtensionConfig::from_env();
-        
+
         assert!(config.extension.send_function_logs);
         assert!(config.extension.send_extension_logs);
         assert!(!config.extension.send_platform_logs);
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_specific_platform_event() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "platform.report");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert_eq!(config.extension.platform_log_filter.len(), 1);
+        assert!(config.extension.platform_log_filter.contains("platform.report"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_multiple_specific_platform_events() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "platform.start,platform.report");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert_eq!(config.extension.platform_log_filter.len(), 2);
+        assert!(config.extension.platform_log_filter.contains("platform.start"));
+        assert!(config.extension.platform_log_filter.contains("platform.report"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_bare_platform_overrides_specific() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "platform,platform.report");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert!(config.extension.platform_log_filter.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_specific_platform_event_case_insensitive() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "PLATFORM.START");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert!(config.extension.platform_log_filter.contains("platform.start"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_all_clears_platform_filter() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_LOGS", "all");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert!(config.extension.platform_log_filter.is_empty());
+    });
+}
+
+#[test]
+#[serial]
+fn test_parse_send_logs_no_filter_when_only_individual_flag_set() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS", "true");
+        let config = ExtensionConfig::from_env();
+
+        assert!(config.extension.send_platform_logs);
+        assert!(config.extension.platform_log_filter.is_empty());
     });
 }
 

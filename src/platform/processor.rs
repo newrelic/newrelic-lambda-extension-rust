@@ -106,7 +106,10 @@ impl PlatformProcessor {
             attributes,
         };
         
-        if self.config.extension.send_platform_logs {
+        let platform_type_allowed = self.config.extension.platform_log_filter.is_empty()
+            || self.config.extension.platform_log_filter.contains(&record.record_type.to_lowercase());
+
+        if self.config.extension.send_platform_logs && platform_type_allowed {
             // Stamp AWS attributes (request_id, ARN) before adding to batch.
             // This prevents logs from being requeued with wrong request_id.
             // platform.* records carry `requestId`; pass it so LMI correlates per-record

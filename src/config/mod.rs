@@ -122,6 +122,11 @@ pub struct ExtensionSettings {
     pub send_function_logs: bool,
     pub send_extension_logs: bool,
     pub send_platform_logs: bool,
+    /// Specific `platform.*` event type names to send, e.g. `["platform.start", "platform.report"]`.
+    /// Empty means no filter — every platform event type is sent (today's behavior).
+    /// Populated only when `NEW_RELIC_EXTENSION_SEND_LOGS` lists `platform.<event>` tokens
+    /// without the bare `platform` token; bare `platform` (or `all`) always means "no filter".
+    pub platform_log_filter: HashSet<String>,
     pub log_level: String,
     /// NEW_RELIC_EXTENSION_LOGS_ENABLED - Master switch for [NR_EXT] log output
     /// Default: true (logs enabled)
@@ -281,6 +286,7 @@ impl Default for ExtensionSettings {
             send_function_logs: false,
             send_extension_logs: false,
             send_platform_logs: false,
+            platform_log_filter: HashSet::new(),
             log_level: "info".to_string(),
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
@@ -354,29 +360,47 @@ impl ExtensionConfig {
     }
 
     /// Parse "NEW_RELIC_EXTENSION_SEND_LOGS" environment variable
-    /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
-    fn parse_send_logs(value: &str) -> (bool, bool, bool) {
+    /// Accepts comma-separated values: platform, extension, function, all, or specific
+    /// platform.<event> names (e.g. platform.start, platform.report). Returns
+    /// (send_function_logs, send_extension_logs, send_platform_logs, platform_log_filter).
+    /// platform_log_filter is empty (no filter, send every platform event type) unless
+    /// only platform.<event> tokens were given (no bare "platform"/"all").
+    fn parse_send_logs(value: &str) -> (bool, bool, bool, HashSet<String>) {
         let normalized = value.to_lowercase();
         let parts: Vec<&str> = normalized.split(',').map(|s| s.trim()).collect();
-        
+
         // NEW: Check for empty string
         if normalized.is_empty() {
             eprintln!("NEW_RELIC_EXTENSION_SEND_LOGS is empty. No logs will be sent");
-            return (false, false, false);
+            return (false, false, false, HashSet::new());
         }
         // Check for "all" first
         if parts.contains(&"all") {
            if parts.len() > 1 {
                 eprintln!("[NR_EXT] INFO: 'all' specified in SEND_LOGS;defaulting to 'all'");
             }
-            return (true, true, true);
+            return (true, true, true, HashSet::new());
         }
-        
+
         let send_function = parts.contains(&"function");
         let send_extension = parts.contains(&"extension");
-        let send_platform = parts.contains(&"platform");
-        
-        (send_function, send_extension, send_platform)
+        let bare_platform = parts.contains(&"platform");
+
+        let platform_event_tokens: HashSet<String> = parts.iter()
+            .filter(|p| p.starts_with("platform.") && p.len() > "platform.".len())
+            .map(|p| p.to_string())
+            .collect();
+
+        // Bare "platform" always means "no filter, send everything" — it wins over
+        // any specific platform.<event> tokens listed alongside it.
+        let send_platform = bare_platform || !platform_event_tokens.is_empty();
+        let platform_log_filter = if bare_platform {
+            HashSet::new()
+        } else {
+            platform_event_tokens
+        };
+
+        (send_function, send_extension, send_platform, platform_log_filter)
     }
 
     pub fn from_env() -> Self {
@@ -495,10 +519,11 @@ impl ExtensionConfig {
 
         // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
         if !send_logs_str.is_empty() {
-            let (function, extension, platform) = Self::parse_send_logs(&send_logs_str);
+            let (function, extension, platform, platform_log_filter) = Self::parse_send_logs(&send_logs_str);
             config.extension.send_function_logs = function;
             config.extension.send_extension_logs = extension;
             config.extension.send_platform_logs = platform;
+            config.extension.platform_log_filter = platform_log_filter;
         } else {
             // Fall back to individual environment variables for backward compatibility
             config.extension.send_function_logs = parse_bool(&send_function_logs_str);
