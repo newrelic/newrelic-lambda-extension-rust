@@ -11,6 +11,15 @@ process.env.NEW_RELIC_TRUSTED_ACCOUNT_KEY =
 if (process.env.LAMBDA_TASK_ROOT && typeof process.env.NEW_RELIC_SERVERLESS_MODE_ENABLED !== 'undefined') {
   delete process.env.NEW_RELIC_SERVERLESS_MODE_ENABLED
 }
+
+// LMI runs multiple invocations concurrently within one execution environment
+// The agent's worker_threads instrumentation must be on
+// for its context manager to track concurrent invocations correctly; leaving
+// it off is what causes invocations to hang until the function times out.
+if (process.env.AWS_LAMBDA_INITIALIZATION_TYPE === 'lambda-managed-instances') {
+  process.env.NEW_RELIC_WORKER_THREADS_ENABLED = process.env.NEW_RELIC_WORKER_THREADS_ENABLED || 'true'
+}
+
 function getNestedHandler(object, nestedProperty) {
   return nestedProperty.split('.').reduce((nested, key) => {
     return nested && nested[key]
