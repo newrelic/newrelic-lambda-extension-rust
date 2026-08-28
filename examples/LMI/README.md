@@ -1,9 +1,14 @@
 # LMI Examples
 
-Deployable examples showing how to run a New Relic-instrumented Lambda function on
+Deployable SAM examples showing how to run a New Relic-instrumented Lambda function on
 **Lambda Managed Instances (LMI)** — AWS's Lambda compute type that runs your function
 on EC2 instances you control (instance type, VPC placement, EC2 Savings Plans/Reserved
 Instances), while AWS still manages scaling, patching, and routing for you.
+
+> Using the Serverless Framework instead of SAM? See
+> [`examples/LMI`](https://github.com/newrelic/serverless-newrelic-lambda-layers/tree/main/examples/LMI)
+> in the `serverless-newrelic-lambda-layers` repo for equivalent Serverless Framework
+> examples.
 
 Two things make LMI different from standard Lambda, and both matter for how these
 examples are wired up:
@@ -19,9 +24,7 @@ examples are wired up:
   is recent enough to include the fix (anything published after
   [newrelic/newrelic-lambda-layers#540](https://github.com/newrelic/newrelic-lambda-layers/pull/540)).
 
-Five runtimes are covered — `python`, `nodejs`, `java`, `dotnet`, `go` — each as both a
-SAM template and a Serverless Framework config, so you can pick whichever tooling you
-already use.
+Five runtimes are covered — `python`, `nodejs`, `java`, `dotnet`, `go`.
 
 > **Ruby is not covered here.** AWS rejects Lambda Managed Instances deploys for the
 > Ruby runtime with an explicit runtime-not-supported error — this is an AWS platform
@@ -30,7 +33,7 @@ already use.
 
 ## Before you deploy — prerequisites
 
-You'll need, once, regardless of which runtime/tool you pick:
+You'll need, once, regardless of which runtime you pick:
 
 1. **A VPC with subnets and a security group** the capacity provider's EC2 instances
    will launch into. These need outbound internet access (a NAT gateway, or a public
@@ -38,9 +41,8 @@ You'll need, once, regardless of which runtime/tool you pick:
    collector endpoints. If they can't, the extension will connect to the Telemetry API
    fine (it's local) but nothing ever reaches New Relic.
 
-2. **An IAM role for the capacity provider** (`CapacityProviderOperatorRoleArn` /
-   `CAPACITY_PROVIDER_OPERATOR_ROLE_ARN`) that AWS Lambda assumes to manage the EC2
-   instances on your behalf. Create it once:
+2. **An IAM role for the capacity provider** (`CapacityProviderOperatorRoleArn`) that
+   AWS Lambda assumes to manage the EC2 instances on your behalf. Create it once:
 
    ```bash
    aws iam create-role \
@@ -65,33 +67,21 @@ You'll need, once, regardless of which runtime/tool you pick:
 
 3. **A New Relic account ID and license key** (the ingest license key, not a User key).
 
-4. **The New Relic layer ARN for your runtime and region** (SAM only — see below), at
-   extension version `2.7.0` or later. `2.7.0` is the first extension version with LMI
-   support at all; check the layer's description for the extension version before using
-   it. Look up ARNs at <https://layers.newrelic-external.com>.
+4. **The New Relic layer ARN for your runtime and region**, at extension version `2.7.0`
+   or later. `2.7.0` is the first extension version with LMI support at all; check the
+   layer's description for the extension version before using it. Look up ARNs at
+   <https://layers.newrelic-external.com>.
 
 ## Repository layout
 
 ```
 sam/<runtime>/template.yaml     SAM template + src/ handler code
-serverless/<runtime>/serverless.yml   Serverless Framework config + src/ handler code
 ```
 
-## Two ways to deploy: SAM vs. Serverless
+## Deploying
 
-| | SAM (`sam/`) | Serverless (`serverless/`) |
-|---|---|---|
-| New Relic layer | You pass `NewRelicLayerArn` explicitly | Attached automatically by the `serverless-newrelic-lambda-layers` plugin |
-| Handler wrapping | You set the wrapper handler yourself (see table below) | Plugin rewrites the handler automatically (keep your original handler in `serverless.yml`), unless `manualWrapping: true` |
-| Capacity provider config | CloudFormation parameters | Environment variables (see below) |
-| Best for | Full control, no plugin dependency | Least setup — plugin handles layer + wrapping |
-
-Pick one per runtime; you don't need both.
-
-### Deploying with SAM
-
-Every SAM template takes the same parameter set. Runtime-specific extras are called
-out per-runtime below.
+Every template takes the same parameter set. Runtime-specific extras are called out
+per-runtime below.
 
 | Parameter | Required | Notes |
 |---|---|---|
@@ -129,37 +119,10 @@ Runtime-specific parameters:
   wrapper's dynamic `import()` — not when you point `Handler` at the ESM wrapper
   directly, which is what this template does).
 
-### Deploying with Serverless Framework
-
-Requires the [`serverless-newrelic-lambda-layers`](https://github.com/newrelic/serverless-newrelic-lambda-layers)
-plugin (already listed in each `serverless.yml`) and the framework's own AWS
-credentials setup. Configuration comes from environment variables instead of CLI flags:
-
-| Env var | Required | Notes |
-|---|---|---|
-| `NEW_RELIC_ACCOUNT_ID` | Yes | |
-| `NEW_RELIC_LICENSE_KEY` | Yes | |
-| `CAPACITY_PROVIDER_OPERATOR_ROLE_ARN` | Yes | |
-| `CAPACITY_PROVIDER_SUBNET_IDS` | Yes | Comma-separated |
-| `CAPACITY_PROVIDER_SECURITY_GROUP_IDS` | Yes | Comma-separated |
-| `CAPACITY_PROVIDER_MAX_VCPU_COUNT` | No | Default `48` |
-| `CAPACITY_PROVIDER_PER_ENV_MAX_CONCURRENCY` | No | Default `8` |
-
-```bash
-cd serverless/nodejs
-npm install
-
-export NEW_RELIC_ACCOUNT_ID=<your-account-id>
-export NEW_RELIC_LICENSE_KEY=<your-license-key>
-export CAPACITY_PROVIDER_OPERATOR_ROLE_ARN=<role-arn-from-prereqs>
-export CAPACITY_PROVIDER_SUBNET_IDS=<subnet-1>,<subnet-2>
-export CAPACITY_PROVIDER_SECURITY_GROUP_IDS=<sg-1>
-
-sls deploy --region <region> --capacityProviderName <name>
-```
-
-`--region`/`AWS_REGION` and `--capacityProviderName` are optional (default `dev` stage,
-region from your CLI config, capacity provider name `lmi-example-cp`).
+`MaxVCpuCount` defaults to `48` because AWS enforces an undocumented, account/region-
+dependent minimum beyond the documented floor of `2` — lower values were rejected in
+testing as "below the recommended minimum." `48` is a value verified to work, not a
+documented AWS minimum.
 
 ## Verifying the deployment (read this before you invoke)
 
@@ -197,27 +160,18 @@ A couple of other things you'll observe that are expected, not errors:
 | .NET | Your native handler directly | No wrapper — instrumented via the `CORECLR_*` profiler env vars, already set in the template |
 | Go | Your binary directly (`bootstrap`) | No wrapper — instrumented via the `newrelic/go-agent/v3` SDK in code (see `src/main.go`) |
 
-Serverless configs keep your original handler as-is; the
-`serverless-newrelic-lambda-layers` plugin rewrites it at deploy time unless you set
-`manualWrapping: true` in `custom.newRelic`.
-
 ## Cleanup
 
 Capacity provider EC2 instances are billable for as long as they exist, independent of
 whether you're invoking the function. Tear down when you're done:
 
 ```bash
-# SAM
 cd sam/nodejs
 sam delete --stack-name lmi-nodejs-example
-
-# Serverless
-cd serverless/nodejs
-sls remove
 ```
 
 `sam delete` also cleans up the artifacts SAM uploaded to its managed S3 bucket, not just
 the CloudFormation stack — prefer it over a raw `aws cloudformation delete-stack`.
 
-Deleting the stack/service also deletes the capacity provider, which terminates its
-underlying EC2 instances — there's no separate manual EC2 cleanup step.
+Deleting the stack also deletes the capacity provider, which terminates its underlying
+EC2 instances — there's no separate manual EC2 cleanup step.

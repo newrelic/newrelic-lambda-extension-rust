@@ -7,6 +7,28 @@ A high-performance Rust implementation of the AWS Lambda extension to collect, e
 This lightweight AWS Lambda Extension runs alongside your AWS Lambda functions and automatically handles the collection and transport of telemetry data from
 supported New Relic serverless agents. The extension requires a telemetry payload from a New Relic agent. Conditions that delay or prevent that payload from being written may result in longer-than-expected invocation durations.
 
+## New: Lambda Managed Instances (LMI) Support
+
+Starting with extension version **`2.7.0`**, this extension supports [AWS Lambda Managed
+Instances (LMI)](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances.html)
+— run your Lambda functions on EC2 instances you control (instance type, VPC placement,
+EC2 Savings Plans/Reserved Instances) while AWS still manages scaling, patching, and
+routing for you.
+
+> [!TIP]
+> - **No new layer to learn.** Configure the layer exactly the way you already do for a
+>   standard APM-mode Lambda function — there's no separate LMI-specific layer or ARN.
+> - **LMI always runs in APM mode.** There is no serverless-telemetry-mode option on
+>   LMI; the extension detects LMI automatically and forces APM mode for you.
+> - **Multi-concurrency aware.** LMI can run several invocations at once on the same
+>   execution environment (standard Lambda runs one at a time) — the extension and the
+>   supported agent wrappers already account for this.
+> - Just make sure your layer is version `2.7.0` or later — check the layer description
+>   before deploying.
+
+Ready-to-deploy SAM examples for Python, Node.js, Java, .NET, and Go are in
+[`examples/LMI`](examples/LMI).
+
 ## Installation
 
 To install the extension, simply include the layer with your instrumented
