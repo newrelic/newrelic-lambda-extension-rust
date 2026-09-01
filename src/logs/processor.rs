@@ -1154,12 +1154,17 @@ impl LogProcessor {
         let lower = search_area.to_lowercase();
 
         // Level keywords mapped to their output levels
+        // "finest" and "verbose" must be listed so that .NET/Java agent log lines like
+        // "NewRelic FINEST: [pid..] Error Trace harvest starting." resolve to TRACE before
+        // the word "error" in the message body is matched as an ERROR level.
         const LEVELS: &[(&str, &str)] = &[
             ("fatal", "ERROR"),
             ("critical", "ERROR"),
             ("error", "ERROR"),
             ("warning", "WARN"),
             ("warn", "WARN"),
+            ("finest", "TRACE"),
+            ("verbose", "TRACE"),
             ("debug", "DEBUG"),
             ("trace", "TRACE"),
             ("info", "INFO"),

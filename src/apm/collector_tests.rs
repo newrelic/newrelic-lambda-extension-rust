@@ -95,3 +95,59 @@ fn disconnect_is_not_restart_exception() {
     assert!(is_restart(&restart), "RestartException (409/401) must be detected");
     assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
 }
+
+// ---------------------------------------------------------------------------
+// OTLP metrics forwarding gate
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn otlp_metric_enabled_defaults_to_false_and_roundtrips() {
+    // Process-wide static: don't assume a fresh false here (another test may have
+    // run first), but do confirm the flag actually flips both ways.
+    set_otlp_metric_enabled(false);
+    assert!(!is_otlp_metric_enabled());
+    set_otlp_metric_enabled(true);
+    assert!(is_otlp_metric_enabled());
+    // Reset so other serial tests see a clean state.
+    set_otlp_metric_enabled(false);
+    assert!(!is_otlp_metric_enabled());
+}
+
+/// Pins the full truth table for the effective OTLP gate, exercising the REAL
+/// production function (`ExtensionConfig::otlp_metric_forwarding_active`) that main.rs
+/// feeds into `set_otlp_metric_enabled` — not a re-implementation of the `&&`. Guards
+/// against regressing to mirroring the env var alone, which would leave the flag "on"
+/// in serverless mode where the OTLP send path does not exist.
+#[test]
+#[serial]
+fn otlp_metric_enabled_requires_both_env_var_and_apm_mode() {
+    for (env_var, apm_mode, expected) in [
+        (true, true, true),    // both on -> OTLP sends
+        (true, false, false),  // flag set but serverless -> no send path exists
+        (false, true, false),  // APM mode but flag off -> opted out
+        (false, false, false), // neither
+    ] {
+        let mut config = crate::config::ExtensionConfig::default();
+        config.new_relic.otlp_metric_enabled = env_var;
+        config.new_relic.apm_lambda_mode = apm_mode;
+
+        assert_eq!(
+            config.otlp_metric_forwarding_active(),
+            expected,
+            "otlp_metric_forwarding_active: env_var={env_var}, apm_mode={apm_mode}"
+        );
+
+        // And confirm it round-trips through the process-wide gate main.rs sets.
+        set_otlp_metric_enabled(config.otlp_metric_forwarding_active());
+        assert_eq!(
+            is_otlp_metric_enabled(),
+            expected,
+            "is_otlp_metric_enabled: env_var={env_var}, apm_mode={apm_mode}"
+        );
+    }
+
+    // Reset so other serial tests see a clean state.
+    set_otlp_metric_enabled(false);
+    assert!(!is_otlp_metric_enabled());
+}
