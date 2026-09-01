@@ -43,6 +43,21 @@ All of the New Relic Lambda Layers include the Extension and the latest Agent ve
 New Relic Lambda Layer ARNs for your runtime and region are available [here](https://layers.newrelic-external.com/). The 
 `NewRelicLambdaExtension` layer is suitable for Go runtime Lambda.
 
+### Supported Layers
+
+This extension is bundled into every New Relic language layer below, and paired with the New Relic serverless agent for that runtime. Each layer is published for both `x86_64` and `arm64`; exact per-version ARNs are available [here](https://layers.newrelic-external.com/).
+
+| Runtime | Versions |
+|---------|----------|
+| Python | `python3.8`, `python3.9`, `python3.10`, `python3.11`, `python3.12`, `python3.13`, `python3.14` |
+| Node.js | `nodejs16.x`, `nodejs18.x`, `nodejs20.x`, `nodejs22.x`, `nodejs24.x` |
+| .NET | `dotnet6`, `dotnet8`, `dotnet10` |
+| Java | `java8.al2`, `java11`, `java17`, `java21`, `java25` |
+| Provided | `provided.al2`, `provided.al2023` |
+| Ruby | `ruby3.2`, `ruby3.3`, `ruby3.4` |
+
+For Go and other OS-only runtimes (`provided.al2`, `provided.al2023`), use the `NewRelicLambdaExtension` layer, which ships the extension without a bundled agent.
+
 ## APM Mode
 
 The extension supports an **APM (Application Performance Monitoring) Mode** that enables Lambda functions to report telemetry directly to New Relic's APM platform, providing deep application insights and entity-level correlation with other APM services.
