@@ -975,7 +975,7 @@ mod tests {
         // Force effective_request_id deterministically.
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("req-apply".to_string());
 
-        let out = p.apply_current_invocation_metadata(make_log_msg("hello"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("hello"), None);
 
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
 
@@ -1000,7 +1000,7 @@ mod tests {
         p.invocation_context.lock().unwrap().request_id = "B".to_string();
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("A".to_string());
 
-        let out = p.apply_current_invocation_metadata(make_log_msg("late-A"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("late-A"), None);
 
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
 
@@ -1016,7 +1016,7 @@ mod tests {
     fn test_apply_metadata_no_trace_when_request_absent_from_map() {
         let p = create_trace_processor();
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = Some("unknown-req".to_string());
-        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"), None);
         *crate::request::TELEMETRY_CURRENT_REQUEST_ID.lock().unwrap() = None;
         assert!(
             out.attributes.get("trace.id").is_none(),
@@ -1029,7 +1029,7 @@ mod tests {
         // collect_trace_id=false → no map allocated, never stamps trace.id.
         let p = create_test_processor();
         assert!(p.request_trace_ids.is_none());
-        let out = p.apply_current_invocation_metadata(make_log_msg("x"));
+        let out = p.apply_current_invocation_metadata(make_log_msg("x"), None);
         assert!(out.attributes.get("trace.id").is_none());
     }
 
@@ -1378,11 +1378,13 @@ mod tests {
         let mock_app = ApmApp {
             run_id: "run-1".to_string(),
             entity_guid: entity_guid.to_string(),
+            app_name: "test-app-name".to_string(),
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test-key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
             client: reqwest::Client::new(),
+            deployment: crate::config::deployment::DeploymentContext::Lmi,
         };
         let apm_arc: Arc<tokio::sync::RwLock<Option<ApmApp>>> =
             Arc::new(tokio::sync::RwLock::new(Some(mock_app)));
@@ -1596,6 +1598,94 @@ mod tests {
     }
 
     // ========================================================================
+    // PHASE 7: entity.name stamping coverage
+    // entity.name rides alongside entity.guid on every path above (APM mode only).
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_on_trace_id_extracted_stamps_entity_name() {
+        let p = create_apm_processor("test-entity-guid");
+        hold_log(&p, "req-abc", "apm-log-1");
+        hold_log(&p, "req-abc", "apm-log-2");
+
+        p.on_trace_id_extracted("req-abc", "trace-abc").await.unwrap();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2);
+        for log in batch.iter() {
+            let name = log.attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+            assert_eq!(name, "test-app-name",
+                "entity.name must be stamped on log '{}'", log.message);
+        }
+    }
+
+    #[test]
+    fn test_flush_pending_logs_unstamped_stamps_entity_name() {
+        let p = create_apm_processor("flush-entity-guid");
+        hold_log(&p, "req-orphan", "orphan-log-1");
+
+        p.flush_pending_logs_unstamped();
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let name = batch[0].attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(name, "test-app-name",
+            "entity.name must be stamped on flushed orphan log");
+    }
+
+    #[test]
+    fn test_process_buffered_logs_stamps_entity_name() {
+        let p = create_apm_processor("direct-path-guid");
+
+        if let Some(ref m) = p.request_trace_ids {
+            m.lock().unwrap().insert("req-001", "trace-xyz");
+        }
+
+        {
+            let mut buf = p.request_id_buffer.lock().unwrap();
+            buf.push(make_log_msg("direct-log"));
+        }
+
+        p.process_buffered_logs_with_request_id("req-001");
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let name = batch[0].attributes.get("entity.name").and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(name, "test-app-name", "entity.name must be stamped on direct-path log");
+    }
+
+    #[tokio::test]
+    async fn test_entity_name_not_panic_when_apm_app_none() {
+        // When apm_app is None (e.g. serverless mode), entity.name must simply be
+        // absent from the output — same as entity.guid.
+        let p = create_trace_processor(); // no apm_app
+        hold_log(&p, "req-t2", "no-apm-log");
+
+        p.on_trace_id_extracted("req-t2", "t2").await.unwrap();
+        let batch = p.log_batch.lock().unwrap();
+        assert!(!batch[0].attributes.contains_key("entity.name"),
+            "entity.name must not appear when apm_app is None");
+    }
+
+    #[test]
+    fn test_apply_current_invocation_metadata_stamps_entity_guid_and_name() {
+        let p = create_apm_processor("apply-metadata-guid");
+
+        let out = p.apply_current_invocation_metadata(make_log_msg("hello"), None);
+
+        assert_eq!(
+            out.attributes.get("entity.guid").and_then(|v| v.as_str()),
+            Some("apply-metadata-guid"),
+            "entity.guid must be stamped by apply_current_invocation_metadata"
+        );
+        assert_eq!(
+            out.attributes.get("entity.name").and_then(|v| v.as_str()),
+            Some("test-app-name"),
+            "entity.name must be stamped by apply_current_invocation_metadata"
+        );
+    }
+
+    // ========================================================================
     // PHASE 8: SendError classification + log_type_from_message
     // ========================================================================
 
@@ -1716,5 +1806,220 @@ mod tests {
             p.push_to_failed_buffer(entry);
         }
         assert_eq!(p.failed_logs_buffer.lock().unwrap().len(), 0);
+    }
+}
+
+/// NR-579360: per-record request-id attribution under LMI, and proof that
+/// Normal Lambda stamping is unchanged. These assert *attribution* (which
+/// request a log is stamped with), not liveness.
+#[cfg(test)]
+mod lmi_request_id_attribution_tests {
+    use super::super::LogProcessor;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::newrelic::payload::LogMessage;
+    use crate::request::TELEMETRY_CURRENT_REQUEST_ID;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    fn processor_with(deployment: DeploymentContext, ctx_request_id: &str) -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.deployment = deployment;
+        let config = Arc::new(config);
+        let newrelic_client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: ctx_request_id.to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(newrelic_client, config, ctx, None)
+    }
+
+    fn empty_msg() -> LogMessage {
+        LogMessage { timestamp: 0, message: "m".to_string(), attributes: serde_json::Map::new() }
+    }
+
+    fn stamped_request_id(msg: &LogMessage) -> Option<String> {
+        msg.attributes.get("faas.execution").and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
+
+    fn set_global(id: Option<&str>) {
+        if let Ok(mut g) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
+            *g = id.map(|s| s.to_string());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn lmi_uses_per_record_id_not_the_global() {
+        // Even with the (Normal-era) global pointing at a different request,
+        // LMI must stamp from the per-record id.
+        set_global(Some("global-B"));
+        let p = processor_with(DeploymentContext::Lmi, "");
+        let out = p.apply_current_invocation_metadata(empty_msg(), Some("rec-A"));
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("rec-A"));
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn lmi_without_request_id_ships_uncorrelated() {
+        set_global(Some("global-B"));
+        let p = processor_with(DeploymentContext::Lmi, "");
+        let out = p.apply_current_invocation_metadata(empty_msg(), None);
+        // No request-id attributes — uncorrelated, never mis-stamped from the global.
+        assert_eq!(stamped_request_id(&out), None);
+        assert!(out.attributes.get("aws").is_none());
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn normal_unchanged_prefers_global_and_ignores_per_record() {
+        // Regression guard: Normal Lambda keeps stamping from the global and
+        // IGNORES the new per-record argument.
+        set_global(Some("global-T"));
+        let p = processor_with(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "ctx-X");
+        let out = p.apply_current_invocation_metadata(empty_msg(), Some("rec-IGNORED"));
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("global-T"));
+        set_global(None);
+    }
+
+    #[test]
+    #[serial]
+    fn normal_falls_back_to_context_when_global_empty() {
+        // Regression guard: Normal falls back to the invocation context, unchanged.
+        set_global(None);
+        let p = processor_with(DeploymentContext::Normal { mode: TelemetryMode::Apm }, "ctx-Y");
+        let out = p.apply_current_invocation_metadata(empty_msg(), None);
+        assert_eq!(stamped_request_id(&out).as_deref(), Some("ctx-Y"));
+    }
+}
+
+/// NR-579360: end-to-end log flow through `process_record` under LMI vs Normal.
+/// Proves per-record attribution with zero cross-contamination, uncorrelated
+/// shipping for plaintext, and that the request_id_buffer orphan-hold is
+/// Normal-only — while Normal behavior is unchanged.
+#[cfg(test)]
+mod lmi_process_record_tests {
+    use super::super::LogProcessor;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+    use crate::config::ExtensionConfig;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::telemetry::listener::TelemetryRecord;
+    use std::sync::{Arc, Mutex};
+
+    fn processor(
+        deployment: DeploymentContext,
+        ctx_arn: &str,
+        ctx_request_id: &str,
+    ) -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.deployment = deployment;
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let newrelic_client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: ctx_request_id.to_string(),
+            invoked_function_arn: ctx_arn.to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(newrelic_client, config, ctx, None)
+    }
+
+    /// A `function` telemetry record. `request_id = Some` → JSON body carrying
+    /// `requestId`; `None` → a bare plain-text string record (no requestId).
+    fn function_record(request_id: Option<&str>, msg: &str) -> TelemetryRecord {
+        let record = match request_id {
+            Some(id) => serde_json::json!({
+                "timestamp": 0, "level": "INFO", "requestId": id, "message": msg
+            }),
+            None => serde_json::Value::String(msg.to_string()),
+        };
+        TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record,
+        }
+    }
+
+    fn req_id(msg: &crate::newrelic::payload::LogMessage) -> Option<String> {
+        msg.attributes.get("faas.execution").and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
+
+    // Under LMI the global context is never INVOKE-populated, so logs flow through
+    // pre_invoke_buffer; the per-record id must already be stamped on them there.
+    #[tokio::test]
+    async fn lmi_function_log_buffered_with_its_request_id() {
+        let p = processor(DeploymentContext::Lmi, "", "");
+        p.process_record(function_record(Some("r-1"), "hello")).await;
+
+        let buf = p.pre_invoke_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1, "log should be in pre_invoke_buffer (no ARN under LMI)");
+        assert_eq!(req_id(&buf[0]).as_deref(), Some("r-1"));
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        assert!(p.request_id_buffer.lock().unwrap().is_empty());
+    }
+
+    // ACCEPTANCE: interleaved, out-of-order records each keep their own id — zero
+    // cross-contamination.
+    #[tokio::test]
+    async fn lmi_interleaved_records_keep_own_request_ids() {
+        let p = processor(DeploymentContext::Lmi, "", "");
+        for (id, m) in [("r-A", "a"), ("r-C", "c"), ("r-B", "b")] {
+            p.process_record(function_record(Some(id), m)).await;
+        }
+        let buf = p.pre_invoke_buffer.lock().unwrap();
+        let ids: Vec<Option<String>> = buf.iter().map(req_id).collect();
+        assert_eq!(
+            ids,
+            vec![Some("r-A".into()), Some("r-C".into()), Some("r-B".into())],
+            "each log keeps the requestId from its own record, in arrival order"
+        );
+    }
+
+    // Plain-text logs carry no requestId → shipped uncorrelated, never mis-stamped.
+    #[tokio::test]
+    async fn lmi_plaintext_log_ships_uncorrelated() {
+        let p = processor(DeploymentContext::Lmi, "", "");
+        p.process_record(function_record(None, "plain text line")).await;
+
+        let buf = p.pre_invoke_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1);
+        assert_eq!(req_id(&buf[0]), None, "no requestId attribute");
+        assert!(buf[0].attributes.get("aws").is_none());
+    }
+
+    // LMI gate: with an ARN present but no context request_id, the log must NOT be
+    // parked in request_id_buffer (nothing drains it under LMI) — it stamps from the
+    // per-record id and proceeds to the batch.
+    #[tokio::test]
+    async fn lmi_does_not_park_in_request_id_buffer() {
+        let p = processor(DeploymentContext::Lmi, "arn:aws:lambda:us-east-1:1:function:f", "");
+        p.process_record(function_record(Some("r-Y"), "hello")).await;
+
+        assert!(p.request_id_buffer.lock().unwrap().is_empty(), "LMI must not park");
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(req_id(&batch[0]).as_deref(), Some("r-Y"));
+    }
+
+    // Normal regression: same setup (ARN present, empty context request_id) STILL parks
+    // in request_id_buffer exactly as before this change.
+    #[tokio::test]
+    async fn normal_still_parks_in_request_id_buffer() {
+        let p = processor(
+            DeploymentContext::Normal { mode: TelemetryMode::Serverless },
+            "arn:aws:lambda:us-east-1:1:function:f",
+            "",
+        );
+        p.process_record(function_record(Some("r-X"), "hello")).await;
+
+        assert_eq!(p.request_id_buffer.lock().unwrap().len(), 1, "Normal parks, unchanged");
+        assert!(p.log_batch.lock().unwrap().is_empty());
+        assert!(p.pre_invoke_buffer.lock().unwrap().is_empty());
     }
 }

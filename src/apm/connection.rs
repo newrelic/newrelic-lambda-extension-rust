@@ -16,6 +16,7 @@ use tracing::{debug, info};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+use crate::config::deployment::DeploymentContext;
 use crate::newrelic::client::redact_url;
 
 /// Permanent APM handshake rejection (HTTP 401/403): the license key is invalid
@@ -124,7 +125,7 @@ pub fn reset_connect_stats() {
 /// Uses the collector's actual error message (not a hardcoded phrase); falls
 /// back to just the code when the body is empty. Body is trimmed/truncated so a
 /// verbose response can't bloat the log line.
-fn http_failure_reason(code: u16, body: &str) -> String {
+pub(crate) fn http_failure_reason(code: u16, body: &str) -> String {
     let body = body.trim();
     if body.is_empty() {
         format!("HTTP {code}")
@@ -135,7 +136,7 @@ fn http_failure_reason(code: u16, body: &str) -> String {
 }
 
 /// OPTIMIZATION: Inline compression (no spawn_blocking overhead)
-fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn compress_inline(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(data)?;
     encoder.finish().map_err(|e| anyhow!("Compression failed: {}", e))
@@ -194,6 +195,12 @@ pub struct AwsLambdaInfo {
     pub account_id: String,
     #[serde(rename = "aws.functionName")]
     pub function_name: String,
+    /// LMI instance identifier from `platform.initStart`. Absent on Standard Lambda.
+    #[serde(rename = "aws.lambda.managedInstance.instanceId", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_id: Option<String>,
+    /// LMI maximum memory (raw AWS uint64, bytes). Absent on Standard Lambda or when AWS omits it.
+    #[serde(rename = "aws.lambda.managedInstance.instanceMaxMemory", skip_serializing_if = "Option::is_none")]
+    pub managed_instance_max_memory: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -287,6 +294,7 @@ pub async fn preconnect(
 }
 
 /// Execute Connect to get Run ID and Entity GUID
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     client: &Client,
     license_key: &str,
@@ -299,10 +307,17 @@ pub async fn connect(
     runtime: &str,
     agent_version: &str,
     timeout_secs: u64,
+    lmi_metadata: Option<crate::telemetry::managed_instance::ManagedInstanceMetadata>,
+    deployment: DeploymentContext,
 ) -> Result<ConnectResponse> {
     let url = format!(
         "https://{collector_host}/agent_listener/invoke_raw_method?marshal_format=json&protocol_version=17&method=connect&license_key={license_key}"
     );
+
+    let (managed_instance_id, managed_instance_max_memory) = match lmi_metadata {
+        Some(meta) => (Some(meta.instance_id), meta.instance_max_memory),
+        None => (None, None),
+    };
 
     let connect_req = vec![ConnectRequest {
         pid: std::process::id(),
@@ -319,10 +334,12 @@ pub async fn connect(
                     region: region.to_string(),
                     account_id: account_id.to_string(),
                     function_name: function_name.to_string(),
+                    managed_instance_id,
+                    managed_instance_max_memory,
                 },
             },
         },
-        labels: get_labels(function_arn, runtime),
+        labels: get_labels(function_arn, runtime, deployment),
     }];
 
     let body = serde_json::to_vec(&connect_req)?;
@@ -387,10 +404,10 @@ pub async fn connect(
 // Note: parse_nr_tags() is now defined in config::mod for shared use
 
 /// Get labels for Connect request
-fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
+fn get_labels(function_arn: &str, runtime: &str, deployment: DeploymentContext) -> Vec<Label> {
     let runtime_version = crate::version::get_runtime_version();
     let extension_version = env!("CARGO_PKG_VERSION");
-    
+
     let mut labels = vec![
         Label {
             label_type: "aws.arn".to_string(),
@@ -407,14 +424,22 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
     ];
 
     // Only send runtime version if we have actual version info
-    if runtime != "unknown" 
-        && !runtime_version.contains("unknown") 
-        && runtime_version != runtime  
+    if runtime != "unknown"
+        && !runtime_version.contains("unknown")
+        && runtime_version != runtime
         && runtime_version.len() > runtime.len()
     {
         labels.push(Label {
             label_type: "lambda.runtime.version".to_string(),
             label_value: runtime_version,
+        });
+    }
+
+    // Only present on Lambda Managed Instances — absent (not "false") on Normal Lambda.
+    if deployment.is_lmi() {
+        labels.push(Label {
+            label_type: "isLMI".to_string(),
+            label_value: "true".to_string(),
         });
     }
 
@@ -425,77 +450,23 @@ fn get_labels(function_arn: &str, runtime: &str) -> Vec<Label> {
         });
     }
 
+    // NEW_RELIC_LABELS (agent-specs/Labels.md) - additive, alongside NR_TAGS above.
+    // Sent unprefixed here, matching the connect payload's `label_type`/`label_value`
+    // shape - confirmed against the official Python agent (agent_protocol.py's
+    // _connect_payload sends settings["labels"] verbatim, built by config.py's
+    // _process_labels_setting as {"label_type": key, "label_value": value}, no
+    // prefix). The `tags.` prefix only applies to the log-forwarding path (client.rs),
+    // matching data_collector.py's `f"tags.{label['label_type']}"` construction there.
+    for (key, value) in crate::config::get_new_relic_labels() {
+        labels.push(Label {
+            label_type: key.clone(),
+            label_value: value.clone(),
+        });
+    }
+
     labels
 }
 
 #[cfg(test)]
-mod connection_tests {
-    use super::*;
-    use serial_test::serial;
-
-    #[test]
-    fn permanent_auth_error_detected_through_context_chain() {
-        // Mirrors how try_connect wraps the error: `.context("PreConnect failed")`.
-        let err = anyhow::Error::new(PermanentAuthError { status: 401 })
-            .context("PreConnect failed");
-        assert_eq!(is_permanent_auth_error(&err), Some(401));
-    }
-
-    #[test]
-    fn transient_error_is_not_permanent() {
-        let err = anyhow!("Connect failed with HTTP 503 - service unavailable");
-        assert_eq!(is_permanent_auth_error(&err), None);
-    }
-
-    #[test]
-    fn permanent_auth_error_display_has_no_secret() {
-        let msg = PermanentAuthError { status: 403 }.to_string();
-        assert!(msg.contains("403"));
-        assert!(!msg.contains("license_key"));
-    }
-
-    #[test]
-    #[serial]
-    fn handshake_fatal_latch_roundtrips() {
-        reset_handshake_fatal_for_test();
-        assert!(!is_handshake_fatal());
-        signal_handshake_fatal();
-        assert!(is_handshake_fatal());
-        reset_handshake_fatal_for_test();
-        assert!(!is_handshake_fatal());
-    }
-
-    #[test]
-    #[serial]
-    fn connect_stats_accumulate_and_reset() {
-        reset_connect_stats();
-        record_connect_cycle();
-        record_connect_attempt();
-        record_connect_attempt();
-        record_failure_reason("HTTP 503");
-        assert_eq!(connect_cycles(), 1);
-        assert_eq!(connect_attempts_total(), 2);
-        assert_eq!(last_failure_reason().as_deref(), Some("HTTP 503"));
-        // A successful connect resets the disconnected-streak diagnostics.
-        reset_connect_stats();
-        assert_eq!(connect_cycles(), 0);
-        assert_eq!(connect_attempts_total(), 0);
-        assert_eq!(last_failure_reason(), None);
-    }
-
-    #[test]
-    fn http_failure_reason_uses_api_body_and_truncates() {
-        // Empty body → just the code.
-        assert_eq!(http_failure_reason(503, "   "), "HTTP 503");
-        // Real collector message is surfaced (trimmed), not a hardcoded phrase.
-        assert_eq!(
-            http_failure_reason(401, "  Invalid license key.  "),
-            "HTTP 401: Invalid license key."
-        );
-        // A verbose body is truncated so it can't bloat the log line.
-        let long = "x".repeat(500);
-        let r = http_failure_reason(500, &long);
-        assert!(r.starts_with("HTTP 500: "));
-        assert!(r.len() <= "HTTP 500: ".len() + 300);
-    }
-}
+#[path = "connection_tests.rs"]
+mod connection_tests;

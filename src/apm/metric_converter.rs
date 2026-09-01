@@ -11,11 +11,32 @@ use regex::Regex;
 use serde_json::{json, Value};
 use tracing::{debug, warn};
 
-/// Regex for parsing platform REPORT logs
+use crate::config::deployment::DeploymentContext;
+
+/// Strict REPORT regex — the full line Normal Lambda always emits. This is the
+/// ORIGINAL pattern, used ONLY on the `Normal` path so Standard Lambda parsing is
+/// byte-identical to before.
 static REPORT_REGEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"RequestId: (\S+)\s+Duration: ([\d.]+) ms\s+Billed Duration: (\d+) ms\s+Memory Size: (\d+) MB\s+Max Memory Used: (\d+) MB"
     ).unwrap()
+});
+
+/// LMI-ONLY core REPORT fields: RequestId + Duration. AWS strips Billed Duration /
+/// Memory Size / Max Memory Used from the LMI `platform.report` (only `durationMs`
+/// survives), so on LMI the line is just `REPORT RequestId: X  Duration: N ms`. These
+/// regexes are consulted only on the `Lmi` path; Normal keeps the strict regex above.
+static REPORT_CORE_REGEX_LMI: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"RequestId: (\S+)\s+Duration: ([\d.]+) ms").unwrap()
+});
+static BILLED_DURATION_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"Billed Duration: (\d+) ms").unwrap()
+});
+static MEMORY_SIZE_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"Memory Size: (\d+) MB").unwrap()
+});
+static MAX_MEMORY_USED_REGEX: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"Max Memory Used: (\d+) MB").unwrap()
 });
 
 /// Regex for extracting optional Init Duration
@@ -41,54 +62,184 @@ pub struct LambdaMetrics {
     pub error_type: Option<String>,
 }
 
-/// Parse Lambda REPORT log line
-pub fn parse_lambda_report_log(log_line: &str) -> Option<LambdaMetrics> {
-    if let Some(captures) = REPORT_REGEX.captures(log_line) {
-        let request_id = captures.get(1)?.as_str().to_string();
-        let duration = captures.get(2)?.as_str().parse::<f64>().ok();
-        let billed_duration = captures.get(3)?.as_str().parse::<i64>().ok().map(|v| v as f64);
-        let memory_size = captures.get(4)?.as_str().parse::<i64>().ok();
-        let max_memory_used = captures.get(5)?.as_str().parse::<i64>().ok();
-
-        let init_duration = INIT_DURATION_REGEX.captures(log_line)
-            .and_then(|c| c.get(1))
-            .and_then(|m| m.as_str().parse::<f64>().ok());
-
-        debug!("Parsed REPORT log: request_id={}, duration={:?}", request_id, duration);
-
-        return Some(LambdaMetrics {
-            request_id,
-            duration,
-            billed_duration,
-            memory_size,
-            max_memory_used,
-            init_duration,
-            error: None,
-            error_type: None,
-        });
+/// Parse a Lambda REPORT/fault log line into metrics. **Type-driven on deployment**:
+///
+/// - `Normal` → strict full-format parse (unchanged original behavior).
+/// - `Lmi` → lenient parse: only RequestId + Duration are required; Billed Duration /
+///   Memory Size / Max Memory Used are optional because AWS strips them from the LMI
+///   report. This is why every LMI report previously failed to parse (NR-579361 follow-up).
+pub fn parse_lambda_report_log(log_line: &str, deployment: DeploymentContext) -> Option<LambdaMetrics> {
+    let report = match deployment {
+        DeploymentContext::Normal { .. } => parse_report_normal_strict(log_line),
+        DeploymentContext::Lmi => parse_report_lmi_lenient(log_line),
+    };
+    if report.is_some() {
+        return report;
     }
 
-    if let Some(captures) = FAULT_LOG_REGEX.captures(log_line) {
-        let request_id = captures.get(1)?.as_str().to_string();
-        let error = captures.get(2)?.as_str().to_string();
-        let error_type = captures.get(3).map(|m| m.as_str().to_string());
-
-        debug!("Parsed fault log: request_id={}, error={}", request_id, error);
-
-        return Some(LambdaMetrics {
-            request_id,
-            duration: None,
-            billed_duration: None,
-            memory_size: None,
-            max_memory_used: None,
-            init_duration: None,
-            error: Some(error),
-            error_type,
-        });
+    if let Some(metrics) = parse_fault_log(log_line) {
+        return Some(metrics);
     }
 
-    warn!("Failed to parse Lambda REPORT/fault log: {}", log_line);
+    // Normal expects a full report, so a parse miss is a genuine warning. On LMI, short
+    // or variant report lines are expected — keep it at debug to avoid log spam.
+    match deployment {
+        DeploymentContext::Normal { .. } => {
+            warn!("Failed to parse Lambda REPORT/fault log: {}", log_line)
+        }
+        DeploymentContext::Lmi => {
+            debug!("LMI: REPORT/fault log not parsed (no RequestId+Duration): {}", log_line)
+        }
+    }
     None
+}
+
+/// Normal Lambda — strict full-format extraction (verbatim original logic).
+fn parse_report_normal_strict(log_line: &str) -> Option<LambdaMetrics> {
+    let captures = REPORT_REGEX.captures(log_line)?;
+    let request_id = captures.get(1)?.as_str().to_string();
+    let duration = captures.get(2)?.as_str().parse::<f64>().ok();
+    let billed_duration = captures.get(3)?.as_str().parse::<i64>().ok().map(|v| v as f64);
+    let memory_size = captures.get(4)?.as_str().parse::<i64>().ok();
+    let max_memory_used = captures.get(5)?.as_str().parse::<i64>().ok();
+
+    let init_duration = INIT_DURATION_REGEX.captures(log_line)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<f64>().ok());
+
+    debug!("Parsed REPORT log: request_id={}, duration={:?}", request_id, duration);
+
+    Some(LambdaMetrics {
+        request_id,
+        duration,
+        billed_duration,
+        memory_size,
+        max_memory_used,
+        init_duration,
+        error: None,
+        error_type: None,
+    })
+}
+
+/// LMI — lenient extraction: RequestId + Duration required; Billed/Memory/Max optional
+/// (AWS strips them from the LMI report). LMI-only path; never runs for Normal Lambda.
+///
+/// When the report is stripped (the normal LMI case), memory fields are back-filled:
+/// - `memory_size`    ← `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` env var (always set by runtime)
+/// - `max_memory_used` ← cgroup memory stats (total container usage, cgroupsv2 first)
+///
+/// `billed_duration` is intentionally left as `None`: LMI billing is by vCPU-hour for
+/// the execution-environment lifetime, not per-invocation milliseconds. There is no
+/// meaningful per-request "billed duration" to report.
+fn parse_report_lmi_lenient(log_line: &str) -> Option<LambdaMetrics> {
+    let captures = REPORT_CORE_REGEX_LMI.captures(log_line)?;
+    let request_id = captures.get(1)?.as_str().to_string();
+    let duration = captures.get(2)?.as_str().parse::<f64>().ok();
+
+    // billed_duration: parse from log if present (shouldn't appear on real LMI); stays
+    // None otherwise. See doc comment above — no per-invocation billed duration on LMI.
+    let billed_duration = BILLED_DURATION_REGEX.captures(log_line)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+        .map(|v| v as f64);
+
+    // memory_size: parse from log if present; fall back to the runtime env var.
+    let memory_size = MEMORY_SIZE_REGEX.captures(log_line)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+        .or_else(|| {
+            let mb = read_env_memory_size_mb();
+            if let Some(v) = mb {
+                debug!("LMI: memory_size from AWS_LAMBDA_FUNCTION_MEMORY_SIZE: {} MB", v);
+            }
+            mb
+        });
+
+    // max_memory_used: parse from log if present; fall back to live cgroup stats.
+    let max_memory_used = MAX_MEMORY_USED_REGEX.captures(log_line)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<i64>().ok())
+        .or_else(|| {
+            let mb = read_cgroup_memory_mb();
+            match mb {
+                Some(v) => {
+                    debug!("LMI: max_memory_used from cgroup: {} MB", v);
+                    Some(v)
+                }
+                None => {
+                    debug!("LMI: cgroup memory unavailable (non-Lambda environment?)");
+                    None
+                }
+            }
+        });
+
+    let init_duration = INIT_DURATION_REGEX.captures(log_line)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<f64>().ok());
+
+    debug!(
+        "LMI: parsed REPORT: request_id={}, duration={:?}ms, memory_size={:?}MB, max_memory_used={:?}MB",
+        request_id, duration, memory_size, max_memory_used
+    );
+
+    Some(LambdaMetrics {
+        request_id,
+        duration,
+        billed_duration,
+        memory_size,
+        max_memory_used,
+        init_duration,
+        error: None,
+        error_type: None,
+    })
+}
+
+/// Reads the configured Lambda memory allocation (MB) from the runtime environment.
+/// `AWS_LAMBDA_FUNCTION_MEMORY_SIZE` is always set by the Lambda runtime for every
+/// execution environment including LMI.
+pub(crate) fn read_env_memory_size_mb() -> Option<i64> {
+    std::env::var("AWS_LAMBDA_FUNCTION_MEMORY_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// Reads the current container memory usage (MB) from the Linux cgroup hierarchy.
+///
+/// Tries cgroupsv2 (`/sys/fs/cgroup/memory.current`) first (Amazon Linux 2023 /
+/// newer Lambda runtimes), then falls back to cgroupsv1
+/// (`/sys/fs/cgroup/memory/memory.usage_in_bytes`). The value is the total bytes
+/// used by the Lambda execution environment (function + extension + runtime),
+/// which corresponds to "Max Memory Used" on Normal Lambda REPORT lines.
+///
+/// Returns `None` in non-Lambda environments (local tests, CI) where cgroup files
+/// are absent.
+pub(crate) fn read_cgroup_memory_mb() -> Option<i64> {
+    let bytes_str = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .or_else(|_| std::fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+        .ok()?;
+    let bytes = bytes_str.trim().parse::<i64>().ok()?;
+    Some(bytes / (1024 * 1024))
+}
+
+/// Shared fault-log parse (`Status: error  ErrorType: …`). Same for both deployments.
+fn parse_fault_log(log_line: &str) -> Option<LambdaMetrics> {
+    let captures = FAULT_LOG_REGEX.captures(log_line)?;
+    let request_id = captures.get(1)?.as_str().to_string();
+    let error = captures.get(2)?.as_str().to_string();
+    let error_type = captures.get(3).map(|m| m.as_str().to_string());
+
+    debug!("Parsed fault log: request_id={}, error={}", request_id, error);
+
+    Some(LambdaMetrics {
+        request_id,
+        duration: None,
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: Some(error),
+        error_type,
+    })
 }
 
 /// Convert Lambda metrics to New Relic APM metrics
@@ -107,6 +258,21 @@ pub fn convert_to_apm_metrics(
     common_attrs.insert("entity.type".to_string(), json!("APM"));
     if !function_arn.is_empty() {
         common_attrs.insert("aws.lambda.arn".to_string(), json!(function_arn));
+    }
+
+    // LMI host metadata. None on Standard Lambda; populated once at
+    // cold-start init when the listener processes platform.initStart.
+    if let Some(meta) = crate::telemetry::managed_instance::try_read_metadata() {
+        common_attrs.insert(
+            "aws.lambda.managedInstance.instanceId".to_string(),
+            json!(meta.instance_id),
+        );
+        if let Some(max_memory) = meta.instance_max_memory {
+            common_attrs.insert(
+                "aws.lambda.managedInstance.instanceMaxMemory".to_string(),
+                json!(max_memory),
+            );
+        }
     }
 
     let mut apm_metrics = Vec::new();
@@ -182,61 +348,9 @@ pub fn convert_to_apm_metrics(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "metric_converter_memory_fallback_tests.rs"]
+mod memory_fallback_tests;
 
-    #[test]
-    fn test_parse_report_log_basic() {
-        let log = "REPORT RequestId: abc123\tDuration: 123.45 ms\tBilled Duration: 124 ms\tMemory Size: 512 MB\tMax Memory Used: 256 MB";
-        let metrics = parse_lambda_report_log(log).unwrap();
-
-        assert_eq!(metrics.request_id, "abc123");
-        assert_eq!(metrics.duration, Some(123.45));
-        assert_eq!(metrics.billed_duration, Some(124.0));
-        assert_eq!(metrics.memory_size, Some(512));
-        assert_eq!(metrics.max_memory_used, Some(256));
-        assert_eq!(metrics.init_duration, None);
-    }
-
-    #[test]
-    fn test_parse_report_log_with_init() {
-        let log = "REPORT RequestId: abc123\tDuration: 123.45 ms\tBilled Duration: 124 ms\tMemory Size: 512 MB\tMax Memory Used: 256 MB\tInit Duration: 456.78 ms";
-        let metrics = parse_lambda_report_log(log).unwrap();
-
-        assert_eq!(metrics.init_duration, Some(456.78));
-    }
-
-    #[test]
-    fn test_parse_fault_log() {
-        let log = "RequestId: abc123 Status: error ErrorType: Runtime.ExitError";
-        let metrics = parse_lambda_report_log(log).unwrap();
-
-        assert_eq!(metrics.request_id, "abc123");
-        assert_eq!(metrics.error, Some("error".to_string()));
-        assert_eq!(metrics.error_type, Some("Runtime.ExitError".to_string()));
-    }
-
-    #[test]
-    fn test_convert_to_apm_metrics() {
-        let metrics = LambdaMetrics {
-            request_id: "abc123".to_string(),
-            duration: Some(123.45),
-            billed_duration: Some(124.0),
-            memory_size: Some(512),
-            max_memory_used: Some(256),
-            init_duration: Some(456.78),
-            error: None,
-            error_type: None,
-        };
-
-        let apm_metrics = convert_to_apm_metrics(&metrics, "entity-guid-123", "my-function", "arn:aws:lambda:us-east-1:123456789012:function:my-function");
-
-        assert_eq!(apm_metrics.len(), 5);
-
-        let first_metric = &apm_metrics[0];
-        assert_eq!(first_metric["name"], "apm.lambda.transaction.duration");
-        assert_eq!(first_metric["type"], "gauge");
-        assert_eq!(first_metric["value"], 123.45);
-        assert_eq!(first_metric["attributes"]["entity.guid"], "entity-guid-123");
-    }
-}
+#[cfg(test)]
+#[path = "metric_converter_tests.rs"]
+mod tests;

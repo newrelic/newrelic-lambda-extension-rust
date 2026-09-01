@@ -1,6 +1,6 @@
 [package]
 name = "newrelic-lambda-extension"
-version = "2.6.4"
+version = "2.7.0"
 edition = "2021"
 authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
@@ -76,3 +76,4 @@ opt-level = 1  # Some optimization for better development experience
 [dev-dependencies]
 serial_test = "3.0"
 tokio = { version = "1", features = ["rt-multi-thread"] }
+wiremock = "0.6"

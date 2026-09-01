@@ -51,11 +51,27 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
       
-      - name: Mask sensitive data
+      - name: Configure AWS credentials
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
-          # Ensure AWS credentials are never printed
-          echo "::add-mask::${{ secrets.AWS_ACCESS_KEY_ID }}"
-          echo "::add-mask::${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          # Verify credentials are set
+          if [ -z "$AWS_ACCESS_KEY_ID" ] || [ -z "$AWS_SECRET_ACCESS_KEY" ]; then
+            echo "❌ Error: AWS credentials are not set in GitHub secrets"
+            echo "Please add AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY to repository secrets"
+            exit 1
+          fi
+          
+          # Configure AWS CLI explicitly
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set default.region ${{ env.AWS_REGION }}
+          
+          # Verify credentials work
+          echo "✓ Testing AWS credentials..."
+          aws sts get-caller-identity
+          echo "✓ AWS credentials configured successfully"
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1

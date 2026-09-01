@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     context::InvocationContext,
     platform::processor::PlatformProcessor,
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     newrelic::client::NewRelicClient,
     agent::payload::send_agent_payload_to_newrelic,
 };
@@ -96,6 +97,13 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
+    /// Immediate-send task handles spawned for this request under
+    /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — one per agent payload chunk, sent
+    /// independently the instant it's received by
+    /// `route_payload_to_request_buffer()`. Drained and awaited by
+    /// `event_loop::process_request_concurrently` before the invocation ends, so a send
+    /// can't be frozen mid-flight by the sandbox.
+    pub pending_send_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     /// Cached ARN for this request. Avoids locking `context` just to read the ARN
     /// on hot paths like cleanup_old_request_buffers and drain_late_paired_payloads.
     pub invoked_function_arn: String,
@@ -140,6 +148,61 @@ pub fn remove_pending_report(request_id: &str) -> Option<String> {
 /// callers must then record the pre-fire in PREFIRED_RUNTIME_DONE.
 pub fn get_runtime_done_notify(request_id: &str) -> Option<Arc<Notify>> {
     REQUEST_DATA.get(request_id).map(|entry| entry.runtime_done_notify.clone())
+}
+
+/// Push an immediate-send task handle for a request under
+/// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` (see `pending_send_handles`). A no-op if the
+/// request is unregistered.
+pub fn push_pending_send_handle(request_id: &str, handle: tokio::task::JoinHandle<()>) {
+    if let Some(entry) = REQUEST_DATA.get(request_id) {
+        if let Ok(mut handles) = entry.pending_send_handles.lock() {
+            handles.push(handle);
+        }
+    }
+}
+
+/// Drain and return every pending immediate-send handle for a request. Called by
+/// `event_loop::process_request_concurrently` before the invocation ends so it can
+/// await them (bounded by the invocation's remaining deadline).
+pub fn take_pending_send_handles(request_id: &str) -> Vec<tokio::task::JoinHandle<()>> {
+    REQUEST_DATA
+        .get(request_id)
+        .and_then(|entry| entry.pending_send_handles.lock().ok().map(|mut h| std::mem::take(&mut *h)))
+        .unwrap_or_default()
+}
+
+/// Drain and await **every** pending immediate-send handle across **all** requests —
+/// not just one. `take_pending_send_handles` alone only covers the common case (a
+/// payload sent during its own invocation, awaited by that invocation's
+/// `process_request_concurrently`); it misses a payload that arrives *after* its
+/// owning invocation's `process_request_concurrently` has already returned (e.g. an
+/// agent flushing telemetry just after the handler returns, racing the final flush).
+/// That send is still spawned and its handle still lands in `pending_send_handles`,
+/// but nothing would otherwise come back to await it — call this at `SHUTDOWN`,
+/// wrapped in the same bounded timeout as the rest of the shutdown sequence, so a
+/// send in flight when the sandbox is torn down is waited for rather than silently
+/// abandoned.
+pub async fn drain_and_await_all_pending_send_handles() {
+    let request_ids: Vec<String> = REQUEST_DATA.iter().map(|entry| entry.key().clone()).collect();
+
+    let mut handles = Vec::new();
+    for request_id in request_ids {
+        handles.extend(take_pending_send_handles(&request_id));
+    }
+
+    if handles.is_empty() {
+        return;
+    }
+
+    debug!(
+        "Shutdown: awaiting {} outstanding immediate-send task(s)",
+        handles.len()
+    );
+    for handle in handles {
+        if let Err(e) = handle.await {
+            error!("Immediate agent-payload send task panicked during shutdown: {}", e);
+        }
+    }
 }
 
 /// Record that platform.runtimeDone fired before the request state existed.
@@ -211,6 +274,63 @@ pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
 pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
     Lazy::new(DashMap::new);
 
+/// Extract the per-record request id from a telemetry record body.
+///
+/// JSON `function`/`extension`/`platform.*` records carry `requestId` (schema
+/// >= `2022-12-13`); some runtimes emit `AWSRequestId`. Plain-text log records
+/// are a bare string and carry neither — those return `None` and are shipped
+/// uncorrelated rather than mis-attributed (LMI concurrency, NR-579360).
+pub fn record_request_id(record: &serde_json::Value) -> Option<String> {
+    record
+        .get("requestId")
+        .or_else(|| record.get("AWSRequestId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// LMI: create a minimal RequestData slot driven by platform.start (no INVOKE in LMI).
+/// No-op if a full entry already exists (normal APM mode where INVOKE fires first).
+pub fn ensure_lmi_request_slot(request_id: &str) {
+    if REQUEST_DATA.contains_key(request_id) {
+        return;
+    }
+    let arn = crate::get_global_fallback_arn();
+    let context = Arc::new(Mutex::new(InvocationContext {
+        request_id: request_id.to_string(),
+        invoked_function_arn: arn.clone(),
+        trace_id: None,
+    }));
+    let runtime_done_notify = Arc::new(Notify::new());
+    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
+        runtime_done_notify.notify_one();
+    }
+    let entry = REQUEST_DATA.entry(request_id.to_string()).or_insert_with(|| RequestData {
+        context,
+        agent_buffer: Arc::new(Mutex::new(Vec::new())),
+        pending_report: None,
+        creation_invocation: current_invocation_count(),
+        runtime_done_notify,
+        invoked_function_arn: arn,
+        pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+    });
+
+    // Drain payloads that beat platform.start to the pipe (cold-start race).
+    if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+        if !orphaned.is_empty() {
+            let drained: Vec<Vec<u8>> = orphaned.drain(..).collect();
+            info!(
+                "LMI: draining {} orphaned agent payload(s) into slot for request {}",
+                drained.len(),
+                request_id
+            );
+            if let Ok(mut buf) = entry.agent_buffer.lock() {
+                buf.extend(drained);
+            }
+        }
+    }
+}
+
 pub fn create_request_processing_state(
     request_id: &str,
     invoked_function_arn: &str,
@@ -265,6 +385,7 @@ pub fn create_request_processing_state(
         pending_report: None,
         creation_invocation: current_invocation_count(),
         runtime_done_notify,
+        pending_send_handles: Arc::new(Mutex::new(Vec::new())),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
 
@@ -294,12 +415,14 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         // (create_request_processing_state for a completed request_id is never called again).
         REQUEST_DATA.remove(request_id);
         PREFIRED_RUNTIME_DONE.remove(request_id);
-    } else {
-        // Partial cleanup: keep context/buffer/creation_invocation, clear pending_report
-        if let Some(mut entry) = REQUEST_DATA.get_mut(request_id) {
-            entry.pending_report = None;
-        }
     }
+    // Partial cleanup (skip_buffer_cleanup=true): keep context/buffer/creation_invocation
+    // AND pending_report — do not clear it here. It was already .take()n by
+    // remove_pending_report() at the start of the caller's processing, so it's normally
+    // None by now; but process_request_concurrently's blocking_agent_payload path can
+    // legitimately re-set it mid-function (restoring a report whose payload never showed
+    // up within the wait window) so the next invocation or SHUTDOWN can still find it.
+    // Unconditionally clearing it here would silently undo that restoration.
 }
 
 /// Periodic cleanup of stale request buffers that have survived more than 5 invocations
@@ -395,14 +518,51 @@ pub async fn cleanup_old_request_buffers(
             }
         }
 
+        // This is the only production call site that removes a REQUEST_DATA entry
+        // outright (cleanup_request_processing_state -> skip_buffer_cleanup=false) —
+        // drain and await any outstanding NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send
+        // for this request first. Otherwise a send still in flight when this stale
+        // entry is evicted would keep running detached, but nothing (not this
+        // function, not the SHUTDOWN sweep — which can only await handles still
+        // reachable from a live REQUEST_DATA entry) would ever come back to await it.
+        for handle in take_pending_send_handles(request_id) {
+            if let Err(e) = handle.await {
+                error!(
+                    "Immediate agent-payload send task panicked during periodic cleanup for {}: {}",
+                    request_id, e
+                );
+            }
+        }
+
         cleanup_request_processing_state(request_id);
     }
 }
 
-/// Route agent payload to the currently active request's buffer
-/// Agent payloads come from named pipe without request_id, so we route to the active request
-/// This is the same logic as 2.4.1 which worked correctly
-pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
+/// Route an agent payload (which arrives on the named pipe without a request id) into a
+/// per-request buffer. **Type-driven on `DeploymentContext`** so Normal Lambda and LMI
+/// never share a code path:
+///
+/// - **Normal** — unchanged 2.4.1 behavior (plus NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH's
+///   immediate-send early-return, see `route_payload_to_active_request`): route to the
+///   process-global `CURRENT_ACTIVE_REQUEST_ID` (one invocation at a time, so it's
+///   correct there).
+/// - **LMI** — concurrent invocations share one environment, so the global is racy.
+///   Instead, attribute each payload by the `aws.requestId` the agent **embedded inside
+///   it** (NR-579361). The LMI path never reads `CURRENT_ACTIVE_REQUEST_ID`, and
+///   NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH never applies here — that flag is gated on
+///   `!apm_lambda_mode` and LMI always forces APM mode.
+pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>, deployment: DeploymentContext) {
+    match deployment {
+        DeploymentContext::Normal { .. } => route_payload_to_active_request(payload_bytes).await,
+        DeploymentContext::Lmi => route_payload_by_embedded_request_id(payload_bytes),
+    }
+}
+
+/// Normal Lambda routing (verbatim 2.4.1 logic, now also carrying
+/// NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH's immediate-send early-return): one invocation
+/// runs at a time, so the process-global `CURRENT_ACTIVE_REQUEST_ID` correctly names the
+/// owning request.
+async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
     use tracing::{debug, error, info, warn};
 
     let current_request_id = CURRENT_ACTIVE_REQUEST_ID
@@ -410,7 +570,51 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
         .ok()
         .and_then(|guard| guard.clone());
 
+    // Read once; used below both for the immediate-send decision and for trace
+    // extraction. None only in the brief startup window before main.rs populates it.
+    let send_context = crate::event_loop::SERVERLESS_SEND_CONTEXT.get();
+
     if let Some(request_id) = current_request_id {
+        // Extract trace.id the instant we have the payload bytes in hand — regardless
+        // of mode, and regardless of whether it's about to be sent immediately or
+        // buffered below. Held function/extension logs waiting for a trace.id
+        // shouldn't sit around any longer than necessary just because pairing with
+        // platform.report (or, under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH, nothing at
+        // all) hasn't happened yet. Safe to call unconditionally: on_trace_id_extracted
+        // drains pending_logs once, so the later extraction call sites
+        // (process_request_concurrently, telemetry::listener's platform.report
+        // handler, process_apm_request's Flow 1) become harmless no-ops for this
+        // payload if it already ran here.
+        if let Some((_, config, log_processor)) = send_context {
+            if config.new_relic.collect_trace_id {
+                crate::event_loop::extract_and_coordinate_trace_id(
+                    &payload_bytes,
+                    &request_id,
+                    config,
+                    log_processor,
+                )
+                .await;
+            }
+        }
+
+        // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH (serverless mode only — gated on
+        // !apm_lambda_mode because this function is the *shared* storage step for
+        // agent payloads in both modes: process_apm_request's Flow-1/Flow-2 reads from
+        // this same agent_buffer, so diverting payloads away from it here would
+        // silently break APM-mode delivery): send immediately instead of buffering to
+        // pair with platform.report.
+        if let Some((newrelic_client, config, _)) = send_context {
+            if config.new_relic.synchronous_flush && !config.new_relic.apm_lambda_mode {
+                spawn_immediate_agent_payload_send(
+                    &request_id,
+                    payload_bytes,
+                    newrelic_client.clone(),
+                    config.clone(),
+                );
+                return;
+            }
+        }
+
         // Route to active request buffer
         if let Some(entry) = REQUEST_DATA.get(&request_id) {
             match entry.agent_buffer.lock() {
@@ -440,6 +644,19 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
                 "No active request - routing late agent payload to buffer: {}",
                 request_id
             );
+            // Same early trace extraction as the active-request branch above — we
+            // have a concrete request_id to correlate against here too.
+            if let Some((_, config, log_processor)) = send_context {
+                if config.new_relic.collect_trace_id {
+                    crate::event_loop::extract_and_coordinate_trace_id(
+                        &payload_bytes,
+                        &request_id,
+                        config,
+                        log_processor,
+                    )
+                    .await;
+                }
+            }
             if let Some(entry) = REQUEST_DATA.get(&request_id) {
                 if let Ok(mut buffer) = entry.agent_buffer.lock() {
                     buffer.push(payload_bytes);
@@ -463,6 +680,114 @@ pub async fn route_payload_to_request_buffer(payload_bytes: Vec<u8>) {
             }
         }
     }
+}
+
+/// LMI routing: attribute the payload by the `aws.requestId` the agent embedded in it,
+/// independent of any "current request" global. Concurrent invocations therefore never
+/// cross-attribute. `ensure_lmi_request_slot` creates the slot if the payload beat its
+/// `platform.start` to the pipe (cold-start race). Payloads with no transaction id
+/// (metrics-only / log-only harvest — nothing to mis-attribute) are parked in the
+/// orphaned buffer and drained into the next slot; the global is never consulted.
+fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
+    use tracing::{debug, error, warn};
+
+    match crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes) {
+        Some(request_id) => {
+            ensure_lmi_request_slot(&request_id);
+            if let Some(entry) = REQUEST_DATA.get(&request_id) {
+                match entry.agent_buffer.lock() {
+                    Ok(mut buffer) => {
+                        buffer.push(payload_bytes);
+                        debug!(
+                            "LMI: routed agent payload to its own request {} (buffer size: {})",
+                            request_id,
+                            buffer.len()
+                        );
+                    }
+                    Err(e) => error!(
+                        "LMI: failed to lock buffer for {}: {} - payload lost!",
+                        request_id, e
+                    ),
+                }
+            } else {
+                error!(
+                    "LMI: request slot missing for {} after ensure - payload lost!",
+                    request_id
+                );
+            }
+        }
+        None => {
+            if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
+                orphaned.push(payload_bytes);
+                debug!(
+                    "LMI: agent payload without transaction requestId parked in orphaned buffer (size: {})",
+                    orphaned.len()
+                );
+            } else {
+                warn!("LMI: failed to lock orphaned buffer - agent payload lost!");
+            }
+        }
+    }
+}
+
+/// Send an agent payload to New Relic immediately, decoupled from any pairing with
+/// `platform.report`, as its own background task — used when
+/// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled (serverless mode only, per the
+/// caller's gate). Trace-id extraction already ran in the caller
+/// (`route_payload_to_request_buffer`) before this was spawned. On failure, buffers
+/// into `AGENT_BATCH_BUFFER` (unpaired) rather than dropping the payload, so it's
+/// still picked up by the existing periodic-cleanup / `SHUTDOWN` drain.
+fn spawn_immediate_agent_payload_send(
+    request_id: &str,
+    payload_bytes: Vec<u8>,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) {
+    let arn = get_request_context(request_id)
+        .and_then(|ctx_ref| {
+            ctx_ref
+                .lock()
+                .ok()
+                .map(|ctx| ctx.invoked_function_arn.clone())
+                .filter(|arn| !arn.is_empty())
+        })
+        .unwrap_or_else(crate::get_global_fallback_arn);
+
+    let handle_request_id = request_id.to_string();
+    let handle = tokio::spawn(async move {
+        // Trace-id extraction already ran in route_payload_to_request_buffer, before
+        // this task was spawned — no need to repeat it here.
+        let version_info = crate::version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
+
+        if let Err(e) = send_agent_payload_to_newrelic(
+            &payload_bytes,
+            &handle_request_id,
+            &arn,
+            &newrelic_client,
+            &config,
+            Some(&version_info),
+        )
+        .await
+        {
+            warn!(
+                "Serverless mode: immediate send failed for request {} — buffering for retry: {}",
+                handle_request_id, e
+            );
+            crate::agent::batch::add_to_batch(handle_request_id, payload_bytes, None, arn);
+        }
+    });
+
+    push_pending_send_handle(request_id, handle);
+}
+
+/// Clear all per-request global state. Only compiled in test builds.
+#[cfg(test)]
+pub fn clear_request_state_for_test() {
+    REQUEST_PROCESSORS.clear();
+    REQUEST_DATA.clear();
+    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() { g.clear(); }
+    if let Ok(mut g) = CURRENT_ACTIVE_REQUEST_ID.lock() { *g = None; }
+    if let Ok(mut g) = TELEMETRY_CURRENT_REQUEST_ID.lock() { *g = None; }
 }
 
 #[cfg(test)]

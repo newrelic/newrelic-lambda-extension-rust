@@ -5,6 +5,7 @@
 use tracing::{debug, error, info, trace, warn};
 use crate::{
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     context::InvocationContext,
     newrelic::{client::NewRelicClient, flush::Flush, payload},
     telemetry::listener::TelemetryRecord,
@@ -29,6 +30,9 @@ const ATTR_FAAS_EXECUTION: &str = "faas.execution";
 const ATTR_FAAS_ARN: &str = "faas.arn";
 const ATTR_TRACE_ID: &str = "trace.id";
 const ATTR_ENTITY_GUID: &str = "entity.guid";
+const ATTR_ENTITY_NAME: &str = "entity.name";
+const ATTR_LMI_INSTANCE_ID: &str = "aws.lambda.managedInstance.instanceId";
+const ATTR_LMI_INSTANCE_MAX_MEMORY: &str = "aws.lambda.managedInstance.instanceMaxMemory";
 
 /// Recursively estimate the JSON byte size of a serde_json Value without allocating.
 fn estimate_json_value_size(v: &serde_json::Value) -> usize {
@@ -495,13 +499,18 @@ impl LogProcessor {
     /// No-op when another auto-flush is already in flight (`is_auto_flushing`
     /// mutex). Returns with the batch untouched when no ARN is available.
     fn try_spawn_auto_flush(&self) {
-        /// Auto-flush threshold: 10 logs flushes more batches during function execution,
-        /// leaving a smaller tail for the post-runtime-done flush (billed time).
         const FLUSH_THRESHOLD: usize = 25;
+        const LMI_FLUSH_THRESHOLD_BYTES: usize = 1_000_000;
 
         let logs_to_send = {
             let mut batch = self.log_batch.lock().unwrap();
-            if batch.len() < FLUSH_THRESHOLD {
+            let should_flush = if self.config.deployment.is_lmi() {
+                let batch_bytes: usize = batch.iter().map(estimate_log_size).sum();
+                batch_bytes >= LMI_FLUSH_THRESHOLD_BYTES
+            } else {
+                batch.len() >= FLUSH_THRESHOLD
+            };
+            if !should_flush {
                 return;
             }
             // Atomically claim the flush slot; abort if another flush is already running.
@@ -703,44 +712,68 @@ impl LogProcessor {
     }
 
    
-    pub fn apply_current_invocation_metadata(&self, mut log_message: payload::LogMessage) -> payload::LogMessage {
+    /// Stamp the AWS request-id attributes (`lambda_request_id` + `faas.execution`)
+    /// onto a log. No-op for empty / `"unknown"` ids so an uncorrelated log ships
+    /// without a request id rather than with a placeholder.
+    fn stamp_request_id_attrs(log_message: &mut payload::LogMessage, request_id: &str) {
+        if request_id.is_empty() || request_id == "unknown" {
+            return;
+        }
+        let mut aws_attrs = serde_json::Map::new();
+        aws_attrs.insert(
+            ATTR_LAMBDA_REQUEST_ID.to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        log_message
+            .attributes
+            .insert(ATTR_AWS.to_string(), serde_json::Value::Object(aws_attrs));
+        log_message.attributes.insert(
+            ATTR_FAAS_EXECUTION.to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+    }
+
+    pub fn apply_current_invocation_metadata(
+        &self,
+        mut log_message: payload::LogMessage,
+        per_record_request_id: Option<&str>,
+    ) -> payload::LogMessage {
         if let Some(context) = self.invocation_context.safe_lock() {
-            // REQUEST_ID: Prefer TELEMETRY_CURRENT_REQUEST_ID over invocation context.
+            // REQUEST_ID resolution is deployment-dependent (type-driven; LMI_SUPPORT.md §6).
             //
-            // WHY: The event loop updates invocation context immediately when GET /next returns
-            // with the NEW invoke, but telemetry API delivers function logs asynchronously.
-            // Late logs from request_A can arrive AFTER the context has been updated to request_B.
+            // Normal Lambda: one invocation in flight at a time. The event loop updates the
+            // context on INVOKE, but telemetry logs arrive asynchronously, so a late log from
+            // request_A could otherwise be stamped with request_B. We prefer
+            // TELEMETRY_CURRENT_REQUEST_ID (set on platform.start) and fall back to the
+            // context. THIS BRANCH IS UNCHANGED — `per_record_request_id` is ignored.
             //
-            // platform.start always arrives BEFORE function logs for that request in the telemetry
-            // stream, so TELEMETRY_CURRENT_REQUEST_ID gives us the correct request_id association.
-            // Falls back to invocation context if telemetry tracking hasn't started yet.
-            let effective_request_id = crate::request::TELEMETRY_CURRENT_REQUEST_ID
-                .lock()
-                .ok()
-                .and_then(|guard| guard.clone())
-                .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| context.request_id.clone());
+            // LMI: invocations run concurrently and there is NO INVOKE, so any process-wide
+            // "current request" is wrong. Correlate strictly by the requestId carried on THIS
+            // record; if the record has none (plain-text logs), ship uncorrelated rather than
+            // mis-stamp. See NR-579360.
+            let effective_request_id = match self.config.deployment {
+                DeploymentContext::Lmi => per_record_request_id.unwrap_or("").to_string(),
+                DeploymentContext::Normal { .. } => crate::request::TELEMETRY_CURRENT_REQUEST_ID
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone())
+                    .filter(|id| !id.is_empty())
+                    .unwrap_or_else(|| context.request_id.clone()),
+            };
 
+            Self::stamp_request_id_attrs(&mut log_message, &effective_request_id);
+
+            // Stamp trace.id from the recent request->trace map (populated when the
+            // agent payload for this request was parsed). Covers post-extraction and
+            // late-delivered logs of any type; keyed by request so a straggler from an
+            // earlier request gets ITS trace, not the current invocation's.
             if !effective_request_id.is_empty() && effective_request_id != "unknown" {
-                let mut aws_attrs = serde_json::Map::new();
-                aws_attrs.insert(ATTR_LAMBDA_REQUEST_ID.to_string(),
-                    serde_json::Value::String(effective_request_id.clone()));
-                log_message.attributes.insert(ATTR_AWS.to_string(),
-                    serde_json::Value::Object(aws_attrs));
-
-                // Stamp trace.id from the recent request->trace map (populated when the
-                // agent payload for this request was parsed). Covers post-extraction and
-                // late-delivered logs of any type; keyed by request so a straggler from an
-                // earlier request gets ITS trace, not the current invocation's.
                 if let Some(ref trace_map) = self.request_trace_ids {
                     if let Some(trace_id) = trace_map.lock().unwrap().get(&effective_request_id) {
                         log_message.attributes.insert(ATTR_TRACE_ID.to_string(),
                             serde_json::Value::String(trace_id.to_string()));
                     }
                 }
-
-                log_message.attributes.insert(ATTR_FAAS_EXECUTION.to_string(),
-                    serde_json::Value::String(effective_request_id));
             }
 
             // Always use best available ARN (prefer invoked_function_arn, fallback to global context ARN)
@@ -767,7 +800,25 @@ impl LogProcessor {
                         log_message.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                             serde_json::Value::String(entity_guid.to_string()));
                     }
+                    let entity_name = app.get_app_name();
+                    if !entity_name.is_empty() {
+                        log_message.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                            serde_json::Value::String(entity_name.to_string()));
+                    }
                 }
+            }
+        }
+
+        if let Some(meta) = crate::telemetry::managed_instance::try_read_metadata() {
+            log_message.attributes.insert(
+                ATTR_LMI_INSTANCE_ID.to_string(),
+                serde_json::Value::String(meta.instance_id),
+            );
+            if let Some(max_memory) = meta.instance_max_memory {
+                log_message.attributes.insert(
+                    ATTR_LMI_INSTANCE_MAX_MEMORY.to_string(),
+                    serde_json::Value::Number(max_memory.into()),
+                );
             }
         }
 
@@ -822,7 +873,26 @@ impl LogProcessor {
         };
         let message_str = message_owned.as_str();
 
-        if let Some(log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+        if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+            // Per-record request id (JSON logs >= 2022-12-13 carry `requestId`; some runtimes
+            // use `AWSRequestId`). Plain-text logs carry neither → None → shipped uncorrelated.
+            let per_record_request_id = crate::request::record_request_id(&record.record);
+
+            // LMI: stamp the request id NOW, before any buffering. Under LMI the global
+            // invocation context is never populated (no INVOKE), so logs flow through
+            // pre_invoke_buffer and never reach the apply_current_invocation_metadata call
+            // below — stamping here ensures the correct per-record id ships with the log.
+            // Normal Lambda is untouched (this arm is a no-op; Normal still stamps at the
+            // apply_current_invocation_metadata call site as before).
+            match self.config.deployment {
+                DeploymentContext::Lmi => {
+                    if let Some(ref rid) = per_record_request_id {
+                        Self::stamp_request_id_attrs(&mut log_message, rid);
+                    }
+                }
+                DeploymentContext::Normal { .. } => {}
+            }
+
             // Read context ONCE — avoids 4 separate mutex lock/unlock cycles per record.
             let (has_arn, has_valid_request_id, ctx_request_id, ctx_arn) = {
                 let context = match self.invocation_context.lock() {
@@ -846,12 +916,21 @@ impl LogProcessor {
                 return;
             }
 
+            // request_id_buffer holds a log until the INVOKE-populated context gains a
+            // request_id. Under LMI there is no INVOKE, so this hold would never drain — and
+            // the per-record id was already stamped above. Park only on Normal Lambda; under
+            // LMI fall through so the (already-stamped, possibly-uncorrelated) log ships.
             if !has_valid_request_id {
-                let mut request_buffer = self.request_id_buffer.lock().unwrap();
-                request_buffer.push(log_message);
-                return;
+                match self.config.deployment {
+                    DeploymentContext::Normal { .. } => {
+                        let mut request_buffer = self.request_id_buffer.lock().unwrap();
+                        request_buffer.push(log_message);
+                        return;
+                    }
+                    DeploymentContext::Lmi => {}
+                }
             }
-            
+
             // Check if we're actually in APM mode (both outer and inner Option must be Some)
             let is_apm_mode = self.apm_app.as_ref().and_then(|apm_arc| {
                 apm_arc.try_read().ok().and_then(|guard| {
@@ -874,7 +953,15 @@ impl LogProcessor {
                 let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
                     .replace('\n', "\\n").replace('\r', "\\r");
 
-                let (request_id, function_arn) = (ctx_request_id.clone(), ctx_arn.clone());
+                // Attribute the synthesized error to the owning request. On LMI the context
+                // request_id is empty (no INVOKE), so use the per-record id; Normal is unchanged.
+                let (request_id, function_arn) = match self.config.deployment {
+                    DeploymentContext::Lmi => (
+                        per_record_request_id.clone().unwrap_or_default(),
+                        ctx_arn.clone(),
+                    ),
+                    DeploymentContext::Normal { .. } => (ctx_request_id.clone(), ctx_arn.clone()),
+                };
 
                 // Store error details for potential platform fault correlation
                 let error_type = if message_str.contains("Task timed out") {
@@ -959,7 +1046,7 @@ impl LogProcessor {
                 }
             }
     
-            let log_message = self.apply_current_invocation_metadata(log_message);
+            let log_message = self.apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
 
             // trace.id buffering (only when collect_trace_id is on). Hold each log under
             // its own request_id until that request's trace.id is known, then stamp + send.
@@ -1325,20 +1412,25 @@ impl LogProcessor {
                 }
             }
 
-            // Stamp entity.guid if APM app available
+            // Stamp entity.guid + entity.name if APM app available
             if let Some(ref apm_app_arc) = self.apm_app {
                 if let Ok(apm_guard) = apm_app_arc.try_read() {
                     if let Some(ref app) = *apm_guard {
                         let entity_guid = app.get_entity_guid();
                         if !entity_guid.is_empty() {
-                            log.attributes.insert("entity.guid".to_string(),
+                            log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                 serde_json::Value::String(entity_guid.to_string()));
+                        }
+                        let entity_name = app.get_app_name();
+                        if !entity_name.is_empty() {
+                            log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                serde_json::Value::String(entity_name.to_string()));
                         }
                     }
                 }
             }
         }
-        
+
         // Every log above now carries faas.arn + aws.lambda_request_id + faas.execution
         // (context was validated non-empty before we started) — they are NEVER routed
         // without ARN + request_id, and no placeholders are used.
@@ -1383,6 +1475,49 @@ impl LogProcessor {
                 batch.extend(to_batch);
             }
         }
+    }
+
+    /// In LMI mode there is no INVOKE event, so invocation context (ARN + request_id) is
+    /// never set. This moves logs from pre_invoke_buffer into log_batch using the fallback
+    /// ARN from platform.initStart, leaving request_id empty. Called by the heartbeat so
+    /// these logs are not stuck indefinitely waiting for a context that never arrives.
+    pub fn process_pre_invoke_logs_lmi(&self) {
+        let arn = self.get_best_available_arn();
+        if arn.is_empty() {
+            debug!("LMI: skipping pre-invoke buffer drain — no ARN available yet");
+            return;
+        }
+
+        let pre_invoke_logs = {
+            let mut buf = self.pre_invoke_buffer.lock().unwrap();
+            if buf.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *buf)
+        };
+
+        debug!("LMI: moving {} pre-invoke logs to batch using fallback ARN", pre_invoke_logs.len());
+
+        let entity_guid = self.apm_app.as_ref().and_then(|arc| {
+            arc.try_read().ok().and_then(|guard| {
+                guard.as_ref().map(|app| app.get_entity_guid().to_string())
+            })
+        });
+
+        let mut stamped = pre_invoke_logs;
+        for log in &mut stamped {
+            log.attributes.insert("faas.arn".to_string(), serde_json::Value::String(arn.clone()));
+            if let Some(ref guid) = entity_guid {
+                if !guid.is_empty() {
+                    log.attributes.insert("entity.guid".to_string(), serde_json::Value::String(guid.clone()));
+                }
+            }
+        }
+
+        if let Ok(mut batch) = self.log_batch.lock() {
+            batch.extend(stamped);
+        }
+        self.try_spawn_auto_flush();
     }
 
     /// Send pre-invoke logs on shutdown with last request ID (or force flush with marker in error cases)
@@ -1439,20 +1574,25 @@ impl LogProcessor {
                     log.attributes.insert("faas.execution".to_string(),
                         serde_json::Value::String(request_id.clone()));
                     
-                    // Add entity.guid if in APM mode
+                    // Add entity.guid + entity.name if in APM mode
                     if let Some(ref apm_app_arc) = self.apm_app {
                         if let Ok(apm_guard) = apm_app_arc.try_read() {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log.attributes.insert("entity.guid".to_string(),
+                                    log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                     }
                 }
-                
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 
@@ -1479,20 +1619,25 @@ impl LogProcessor {
                     log.attributes.insert("nr.forceFlushed".to_string(),
                         serde_json::Value::Bool(true));
                     
-                    // Add entity.guid if in APM mode
+                    // Add entity.guid + entity.name if in APM mode
                     if let Some(ref apm_app_arc) = self.apm_app {
                         if let Ok(apm_guard) = apm_app_arc.try_read() {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log.attributes.insert("entity.guid".to_string(),
+                                    log.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                     }
                 }
-                
+
                 let client = Arc::clone(&self.newrelic_client);
                 let config = Arc::clone(&self.config);
                 
@@ -1510,6 +1655,42 @@ impl LogProcessor {
         self.pending_logs.is_some()
     }
 
+    /// Test-only: hold a log under `request_id` in the per-request pending buffer,
+    /// mirroring how `process_record` parks a function/extension log while its
+    /// trace.id is still unknown. Lets tests outside this module (e.g.
+    /// `request::mod_tests`) set up a "log held, waiting for trace.id" fixture without
+    /// reaching into `pending_logs` directly (private to this module).
+    #[cfg(test)]
+    pub(crate) fn test_hold_log(&self, request_id: &str, message: &str) {
+        if let Some(ref pending) = self.pending_logs {
+            if let Ok(mut buf) = pending.lock() {
+                let _ = buf.push(
+                    request_id,
+                    payload::LogMessage {
+                        timestamp: 0,
+                        message: message.to_string(),
+                        attributes: serde_json::Map::new(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Test-only: number of logs still held (not yet stamped + routed) for `request_id`.
+    #[cfg(test)]
+    pub(crate) fn test_pending_logs_len_for(&self, request_id: &str) -> usize {
+        self.pending_logs
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .map_or(0, |p| p.len_for(request_id))
+    }
+
+    /// Test-only: number of logs currently sitting in the outbound batch.
+    #[cfg(test)]
+    pub(crate) fn test_log_batch_len(&self) -> usize {
+        self.log_batch.lock().map_or(0, |b| b.len())
+    }
+
     /// Best-effort current APM `entity.guid`; `None` when unavailable or not APM mode.
     fn current_entity_guid(&self) -> Option<String> {
         self.apm_app.as_ref().and_then(|arc| match arc.try_read() {
@@ -1517,6 +1698,17 @@ impl LogProcessor {
                 .as_ref()
                 .map(|app| app.get_entity_guid().to_string())
                 .filter(|g| !g.is_empty()),
+            Err(_) => None,
+        })
+    }
+
+    /// Best-effort current APM `entity.name`; `None` when unavailable or not APM mode.
+    fn current_entity_name(&self) -> Option<String> {
+        self.apm_app.as_ref().and_then(|arc| match arc.try_read() {
+            Ok(guard) => guard
+                .as_ref()
+                .map(|app| app.get_app_name().to_string())
+                .filter(|n| !n.is_empty()),
             Err(_) => None,
         })
     }
@@ -1547,12 +1739,19 @@ impl LogProcessor {
         );
 
         let entity_guid_opt = self.current_entity_guid();
+        let entity_name_opt = self.current_entity_name();
         for log in &mut logs {
             log.attributes.insert(ATTR_TRACE_ID.to_string(), trace_id.into());
             if let Some(ref guid) = entity_guid_opt {
                 log.attributes.insert(
                     ATTR_ENTITY_GUID.to_string(),
                     serde_json::Value::String(guid.clone()),
+                );
+            }
+            if let Some(ref name) = entity_name_opt {
+                log.attributes.insert(
+                    ATTR_ENTITY_NAME.to_string(),
+                    serde_json::Value::String(name.clone()),
                 );
             }
         }
@@ -1583,6 +1782,14 @@ impl LogProcessor {
                 log.attributes.insert(
                     ATTR_ENTITY_GUID.to_string(),
                     serde_json::Value::String(guid.clone()),
+                );
+            }
+        }
+        if let Some(ref name) = self.current_entity_name() {
+            for log in &mut logs {
+                log.attributes.insert(
+                    ATTR_ENTITY_NAME.to_string(),
+                    serde_json::Value::String(name.clone()),
                 );
             }
         }
@@ -1663,20 +1870,25 @@ impl LogProcessor {
                     }
                 }
 
-                // Stamp entity.guid for APM mode (same pattern as pre-invoke and shutdown paths).
+                // Stamp entity.guid + entity.name for APM mode (same pattern as pre-invoke and shutdown paths).
                 if let Some(ref apm_app_arc) = self.apm_app {
                     match apm_app_arc.try_read() {
                         Ok(apm_guard) => {
                             if let Some(ref app) = *apm_guard {
                                 let entity_guid = app.get_entity_guid();
                                 if !entity_guid.is_empty() {
-                                    log_message.attributes.insert("entity.guid".to_string(),
+                                    log_message.attributes.insert(ATTR_ENTITY_GUID.to_string(),
                                         serde_json::Value::String(entity_guid.to_string()));
+                                }
+                                let entity_name = app.get_app_name();
+                                if !entity_name.is_empty() {
+                                    log_message.attributes.insert(ATTR_ENTITY_NAME.to_string(),
+                                        serde_json::Value::String(entity_name.to_string()));
                                 }
                             }
                         }
                         Err(_) => {
-                            debug!("process_buffered_logs: entity.guid unavailable (apm_app write lock held); log routed without it");
+                            debug!("process_buffered_logs: entity.guid/entity.name unavailable (apm_app write lock held); log routed without them");
                         }
                     }
                 }
@@ -1825,10 +2037,19 @@ impl LogProcessor {
                 }
                 return Ok(());
             }
-            warn!(
-                "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
-                fallback, context.request_id
-            );
+            // In LMI heartbeat flushes there is no active invocation, so request_id is
+            // legitimately empty. Only include it in the message when it carries a value.
+            if context.request_id.is_empty() {
+                warn!(
+                    "Log flush: Using fallback ARN '{}' (heartbeat flush — no active invocation context)",
+                    fallback
+                );
+            } else {
+                warn!(
+                    "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
+                    fallback, context.request_id
+                );
+            }
             fallback
         };
         

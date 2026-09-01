@@ -11,7 +11,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     runtime,
-    config::{self, ExtensionConfig},
+    config::{self, ExtensionConfig, deployment::DeploymentContext},
     newrelic::client::NewRelicClient,
     newrelic::flush::Flush,
     logs::processor::LogProcessor,
@@ -36,6 +36,13 @@ use crate::{
 };
 
 const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
+
+/// Safety margin (ms) reserved before a function's own remaining deadline when
+/// bound-waiting for something within an invocation (an APM handshake, a late agent
+/// payload, or a late `platform.report`) — leaves headroom for the downstream
+/// flush/cleanup work that still has to run before the extension returns to `/next`.
+/// Shared by every bounded-wait helper so they can't drift apart on this value.
+const INVOKE_DEADLINE_SAFETY_MARGIN_MS: u64 = 500;
 
 /// Budget reserved (out of SHUTDOWN_TIMEOUT_MS) to POST the APM "telemetry
 /// dropped" diagnostic directly to New Relic Logs. The main shutdown work runs
@@ -65,6 +72,10 @@ pub struct ExtensionComponents {
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
     pub apm_client: Client,
     pub reconnect_in_flight: Arc<watch::Sender<bool>>,
+    /// Deployment context (Normal Lambda vs LMI). Drives top-level loop dispatch
+    /// in `execute_main_telemetry_processing_loop` — Normal Lambda routes to the
+    /// existing APM/Serverless loops; LMI routes to `event_loop_lmi`.
+    pub deployment: DeploymentContext,
 }
 
 #[derive(Debug, Clone)]
@@ -145,15 +156,30 @@ pub async fn run_infinite_event_loop(
 }
 
 /// Lambda extension pattern: GET /next (block) → process INVOKE → repeat until SHUTDOWN
-/// Routes to APM or serverless mode based on config (or runtime override for Java)
+///
+/// Top-level dispatch on `DeploymentContext` first — LMI runs a dedicated
+/// telemetry-driven loop because AWS rejects `INVOKE` registration for LMI.
+/// On Normal Lambda, the existing APM-vs-Serverless decision is preserved
+/// (Java-runtime override is encoded in `apm_mode_enabled`).
+///
+/// The match has no `_` arm: adding a new `DeploymentContext` variant in the
+/// future is a compile error here, forcing an explicit decision (see
+/// `LMI_SUPPORT.md` §3).
 async fn execute_main_telemetry_processing_loop(components: &mut ExtensionComponents) -> u32 {
-    let apm_mode_enabled = components.apm_mode_enabled;
-    if apm_mode_enabled {
-        info!("Starting APM mode event loop (connection may still be in progress)");
-        execute_apm_mode_event_loop(components).await
-    } else {
-        debug!("Starting serverless mode event loop");
-        execute_standard_mode_event_loop(components).await
+    match components.deployment {
+        DeploymentContext::Lmi => {
+            info!("Starting LMI event loop (telemetry-driven, no INVOKE polling)");
+            crate::event_loop_lmi::execute_lmi_mode_event_loop(components).await
+        }
+        DeploymentContext::Normal { .. } => {
+            if components.apm_mode_enabled {
+                info!("Starting APM mode event loop (connection may still be in progress)");
+                execute_apm_mode_event_loop(components).await
+            } else {
+                debug!("Starting serverless mode event loop");
+                execute_standard_mode_event_loop(components).await
+            }
+        }
     }
 }
 
@@ -305,6 +331,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         let account_id = components.config.aws.account_id.clone();
                         let region = components.config.aws.region.clone();
                         let timeout_secs = components.config.new_relic.apm_handshake_timeout_secs;
+                        // Copy out before the move closure (don't borrow `components`).
+                        let deployment = components.config.deployment;
 
                         tokio::spawn(async move {
                             let _guard = ReconnectGuard(reconnect_flag);
@@ -321,6 +349,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                 account_id,
                                 region,
                                 timeout_secs,
+                                deployment,
                             )
                             .await
                             {
@@ -588,6 +617,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             components.config.aws.region.clone(),
                             // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
                             components.config.new_relic.apm_handshake_timeout_secs.min(2),
+                            components.config.deployment,
                         )
                         .await;
 
@@ -1061,7 +1091,20 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     .await;
                 });
 
-                if components.config.extension.pipeline_flush {
+                // synchronous_flush wins over pipeline_flush: process_request_concurrently
+                // (processing_handle) awaits any immediate-send tasks kicked off for this
+                // request by route_payload_to_request_buffer, plus it may itself send
+                // immediately on a successful pairing (maybe_spawn_batch_send) instead of
+                // waiting for the batch threshold. If pipeline_flush deferred
+                // processing_handle into the background here, those sends could be frozen
+                // mid-flight by the sandbox freeze — silently defeating the delivery
+                // guarantee the customer explicitly opted into.
+                let defer_via_pipeline_flush = should_defer_via_pipeline_flush(
+                    components.config.extension.pipeline_flush,
+                    components.config.new_relic.synchronous_flush,
+                );
+
+                if defer_via_pipeline_flush {
                     pending_flush_handles.push(processing_handle);
                 } else {
                     if let Err(e) = processing_handle.await {
@@ -1170,6 +1213,15 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                 // already in the mpsc channel are routed before the shutdown collect.
                 tokio::task::yield_now().await;
                 tokio::task::yield_now().await;
+
+                // Under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH, a payload that arrived after
+                // its own invocation's process_request_concurrently already returned (racing
+                // the final flush) has its immediate-send task's handle sitting unawaited in
+                // some request's pending_send_handles — nothing else will ever come back for
+                // it. Sweep every request now, inside this same SHUTDOWN_TIMEOUT_MS-bounded
+                // timeout, so an in-flight send is waited for rather than silently abandoned
+                // when the sandbox is torn down.
+                request::drain_and_await_all_pending_send_handles().await;
 
                 // CRITICAL: Send ALL remaining payloads at shutdown (with or without reports)
                 debug!("Standard mode shutdown: Sending ALL remaining payloads (including those without reports)");
@@ -1636,7 +1688,7 @@ async fn wait_for_runtime_done_with_grace(
 
 /// Sends the appropriate APM error event for a given shutdown reason.
 /// Called from the SHUTDOWN handler whether APM was already connected or just reconnected.
-async fn send_error_for_shutdown_reason(
+pub(crate) async fn send_error_for_shutdown_reason(
     app: &crate::apm::ApmApp,
     reason: runtime::ShutdownReason,
     request_id: &str,
@@ -1670,6 +1722,20 @@ async fn send_error_for_shutdown_reason(
 /// After `platform.runtimeDone`, use remaining deadline budget to let an in-flight
 /// APM handshake complete before calling /next. Sandbox stays active while the
 /// extension has not yet called /next — no freeze risk. Bounded by deadline_ms.
+/// Shared budget computation for every bounded wait in this file: how many
+/// milliseconds are left to wait for something within this invocation, capped by
+/// both the caller's configured timeout and the invocation's own remaining deadline
+/// (minus `INVOKE_DEADLINE_SAFETY_MARGIN_MS`). Never returns more than either input.
+fn bounded_wait_budget_ms(deadline_ms: i64, configured_timeout_ms: u64) -> u64 {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let deadline_budget_ms = if deadline_ms > now_ms {
+        ((deadline_ms - now_ms) as u64).saturating_sub(INVOKE_DEADLINE_SAFETY_MARGIN_MS)
+    } else {
+        0
+    };
+    configured_timeout_ms.min(deadline_budget_ms)
+}
+
 async fn wait_for_apm_handshake_within_budget(
     reconnect_sender: &watch::Sender<bool>,
     deadline_ms: i64,
@@ -1677,13 +1743,9 @@ async fn wait_for_apm_handshake_within_budget(
     if !*reconnect_sender.borrow() {
         return;
     }
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    const SAFETY_MARGIN_MS: u64 = 500;
-    let budget_ms = if deadline_ms > now_ms {
-        ((deadline_ms - now_ms) as u64).saturating_sub(SAFETY_MARGIN_MS)
-    } else {
-        0
-    };
+    // Handshake wait has no separate "configured timeout" of its own — it's bounded
+    // purely by the invocation deadline, so pass u64::MAX as the "no cap" timeout input.
+    let budget_ms = bounded_wait_budget_ms(deadline_ms, u64::MAX);
     if budget_ms == 0 {
         debug!("APM handshake in-flight but no deadline budget remaining — skipping wait");
         return;
@@ -1698,6 +1760,114 @@ async fn wait_for_apm_handshake_within_budget(
         rx.wait_for(|in_flight| !in_flight),
     )
     .await;
+}
+
+/// Whether `execute_standard_mode_event_loop` should defer `process_request_concurrently`
+/// into the background `pending_flush_handles` queue (the `pipeline_flush` optimization)
+/// rather than synchronously awaiting it before calling `/next` again.
+///
+/// `synchronous_flush` always wins: deferring would let the sandbox freeze mid-send
+/// (either the immediate per-payload send kicked off by
+/// `request::route_payload_to_request_buffer`, or the batch send in
+/// `maybe_spawn_batch_send`), silently defeating the delivery guarantee the customer
+/// explicitly opted into. Pure function so the precedence rule is unit-testable without
+/// spinning up the event loop.
+fn should_defer_via_pipeline_flush(pipeline_flush: bool, synchronous_flush: bool) -> bool {
+    pipeline_flush && !synchronous_flush
+}
+
+/// Standing (client, config, log processor) handle so code that runs independently of
+/// `process_request_concurrently` — the standard-mode telemetry listener's
+/// `platform.report` handler, and `request::route_payload_to_request_buffer`'s
+/// immediate agent-payload send under `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — can
+/// send without threading these values through their own call chains
+/// (`setup_telemetry_listener`/`handle_telemetry_request` alone have ~20 test call
+/// sites). Set once at startup in `main.rs` right after all three are constructed;
+/// read-only thereafter.
+pub(crate) static SERVERLESS_SEND_CONTEXT: std::sync::OnceLock<(
+    Arc<NewRelicClient>,
+    Arc<ExtensionConfig>,
+    Arc<LogProcessor>,
+)> = std::sync::OnceLock::new();
+
+/// Add every payload in `payloads` to `AGENT_BATCH_BUFFER`, each paired with a clone of
+/// `report_line` (or unpaired, if `None`). Shared by every arm of
+/// `process_request_concurrently`'s send decision so the batching call is made exactly
+/// the same way regardless of which arm supplied the payloads/report.
+fn batch_all_payloads(
+    request_id: &str,
+    payloads: Vec<Vec<u8>>,
+    report_line: Option<&str>,
+    invoked_function_arn: &str,
+) {
+    for payload_bytes in payloads {
+        add_to_batch(
+            request_id.to_string(),
+            payload_bytes,
+            report_line.map(str::to_string),
+            invoked_function_arn.to_string(),
+        );
+    }
+}
+
+/// Send every payload in `payloads` immediately and independently — decoupled from any
+/// `platform.report` — as a single spawned task, for the rare orphaned-buffer edge case
+/// where a payload ends up sitting in `agent_buffer` under
+/// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` (it arrived before this request existed, so
+/// `route_payload_to_request_buffer`'s own immediate-send path — the common case —
+/// never saw it). Mirrors that same immediate-send behavior: on failure, buffers into
+/// `AGENT_BATCH_BUFFER` (unpaired) rather than dropping the payload.
+fn spawn_immediate_agent_payload_sends(
+    request_id: String,
+    payloads: Vec<Vec<u8>>,
+    invoked_function_arn: String,
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let version_info = version::VersionInfo::get_or_detect(config.new_relic.layer_version.clone());
+        for payload_bytes in payloads {
+            if let Err(e) = crate::agent::payload::send_agent_payload_to_newrelic(
+                &payload_bytes,
+                &request_id,
+                &invoked_function_arn,
+                &newrelic_client,
+                &config,
+                Some(&version_info),
+            )
+            .await
+            {
+                warn!(
+                    "Serverless mode: immediate send failed for request {} — buffering for retry: {}",
+                    request_id, e
+                );
+                add_to_batch(request_id.clone(), payload_bytes, None, invoked_function_arn.clone());
+            }
+        }
+    })
+}
+
+/// Spawn the batch-send task. When `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled,
+/// every successful report pairing sends immediately — waiting for the 3+ count
+/// threshold would mean a low-invocation-frequency function's report/billing data
+/// still doesn't ship until `SHUTDOWN`. With the flag off, behavior is unchanged: only
+/// spawn once the threshold is hit.
+///
+/// `pub(crate)` so `telemetry::listener`'s `platform.report` handler — which pairs
+/// independently of `process_request_concurrently` — can reuse the same bypass via
+/// `SERVERLESS_SEND_CONTEXT` instead of duplicating this condition.
+pub(crate) fn maybe_spawn_batch_send(
+    newrelic_client: Arc<NewRelicClient>,
+    config: Arc<ExtensionConfig>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if config.new_relic.synchronous_flush || should_send_batch_by_threshold() {
+        debug!("Sending payloads with report lines now");
+        Some(tokio::spawn(async move {
+            send_batched_payloads_with_reports_only(newrelic_client, config).await;
+        }))
+    } else {
+        None
+    }
 }
 
 pub async fn process_request_concurrently(
@@ -1781,40 +1951,64 @@ pub async fn process_request_concurrently(
         }
     }
 
-    // Smart batching: Only send complete payloads (with report)
+    // Smart batching: only send complete payloads (with report). There is no wait for
+    // a late agent payload or a late platform.report here: the Telemetry API only
+    // emits platform.report after every extension — including this one — has already
+    // called /next for the invocation, so a fresh request's own report can never be
+    // "already arrived" at this point in practice, and waiting for a payload would
+    // gain nothing either way. Under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH the agent
+    // payload is instead sent the instant it's received, by
+    // request::route_payload_to_request_buffer — so agent_payloads here is normally
+    // empty except for the rare orphaned-buffer edge case (payload arrived before this
+    // request existed) handled explicitly below. The common report-arrives-after-
+    // payload case (flag off) is paired opportunistically by telemetry::listener's
+    // platform.report handler, which runs independently of this function; see
+    // SERVERLESS_SEND_CONTEXT.
     let send_agent_task = if agent_payloads.is_empty() {
-        debug!("Serverless mode: No agent payload for request: {}", request_id);
+        // No payload yet. If a report is already here, restore it so it isn't silently
+        // lost — an UNCONDITIONAL correctness fix, independent of any flag: report_line
+        // was already taken out of REQUEST_DATA via remove_pending_report() above, and
+        // without restoring it here it would vanish (never found by
+        // drain_late_paired_payloads_serverless or SHUTDOWN).
+        if let Some(report) = report_line {
+            debug!(
+                "Serverless mode: No agent payload for request: {} - restoring report for next invocation",
+                request_id
+            );
+            request::set_pending_report(&request_id, report);
+        } else {
+            debug!("Serverless mode: No agent payload for request: {}", request_id);
+        }
         None
+    } else if config.new_relic.synchronous_flush {
+        // Payload(s) present — the orphaned-buffer edge case, since
+        // route_payload_to_request_buffer no longer buffers under this flag on the
+        // normal active-request path — and the flag is on: send immediately, decoupled
+        // from any report (agent-payload delivery and platform.report handling are
+        // independent under this flag; trace-id extraction already ran above,
+        // unconditional whenever agent_payloads is non-empty). Restore report_line (if
+        // any) rather than pairing it, so it's never lost and still gets swept up by
+        // the untouched report-side path.
+        if let Some(report) = report_line {
+            request::set_pending_report(&request_id, report);
+        }
+        Some(spawn_immediate_agent_payload_sends(
+            request_id.clone(),
+            agent_payloads,
+            invoked_function_arn.clone(),
+            newrelic_client.clone(),
+            config.clone(),
+        ))
     } else if let Some(ref report) = report_line {
         // Both payload and report available - send now (complete data)
         debug!(
             "Serverless mode: Payload + report both ready for {} - adding to batch",
             request_id
         );
-
-        for payload_bytes in agent_payloads {
-            add_to_batch(
-                request_id.clone(),
-                payload_bytes,
-                Some(report.clone()),
-                invoked_function_arn.clone(),
-            );
-        }
-
-        // Check if batch threshold is met and send if needed (only payloads with report lines)
-        if should_send_batch_by_threshold() {
-            debug!("Batch threshold reached - sending payloads with report lines only");
-            let newrelic_client_clone = newrelic_client.clone();
-            let config_clone = config.clone();
-
-            Some(tokio::spawn(async move {
-                send_batched_payloads_with_reports_only(newrelic_client_clone, config_clone).await;
-            }))
-        } else {
-            None
-        }
+        batch_all_payloads(&request_id, agent_payloads, Some(report.as_str()), &invoked_function_arn);
+        maybe_spawn_batch_send(newrelic_client.clone(), config.clone())
     } else {
-        // Only payload, no report yet - put back in buffer for next invocation
+        // Only payload, no report yet, flag off (default) - put back in buffer for next invocation
         debug!(
             "Serverless mode: Payload ready but NO report yet for {} - keeping in buffer",
             request_id
@@ -1844,7 +2038,38 @@ pub async fn process_request_concurrently(
     let log_flushing = global_log_processor.flush();
     let platform_flushing = state.platform_processor.flush();
 
-    let (log_result, platform_result, agent_result) = tokio::join!(
+    // Immediate-send tasks kicked off for this request by
+    // route_payload_to_request_buffer (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH) run
+    // concurrently with the invocation's own handler code — await them here, bounded
+    // by the remaining deadline, so a send in flight can't be frozen mid-POST when the
+    // sandbox freezes after this function returns.
+    let pending_sends_await = async {
+        let pending_sends = request::take_pending_send_handles(&request_id);
+        if pending_sends.is_empty() {
+            return;
+        }
+        let budget_ms = bounded_wait_budget_ms(deadline_ms, u64::MAX);
+        if budget_ms == 0 {
+            debug!(
+                "Serverless mode: no deadline budget remaining to await pending immediate sends for request: {}",
+                request_id
+            );
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(budget_ms), async {
+            for handle in pending_sends {
+                if let Err(e) = handle.await {
+                    error!(
+                        "Immediate agent-payload send task panicked for request {}: {}",
+                        request_id, e
+                    );
+                }
+            }
+        })
+        .await;
+    };
+
+    let (log_result, platform_result, agent_result, ()) = tokio::join!(
         log_flushing,
         platform_flushing,
         async {
@@ -1853,7 +2078,8 @@ pub async fn process_request_concurrently(
             } else {
                 Ok(())
             }
-        }
+        },
+        pending_sends_await,
     );
 
     if let Err(e) = log_result {
@@ -1876,8 +2102,14 @@ pub async fn process_request_concurrently(
     );
 }
 
-/// Tag Lambda function once on first invocation
-fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
+/// Tag Lambda function once on first invocation (or first LMI cold start).
+///
+/// On Normal Lambda this is called from the INVOKE arm on the first event.
+/// On LMI, INVOKE is never delivered; the LMI heartbeat calls this after
+/// `LMI_COLD_START_SEEN` is set by `platform.initReport`.
+/// The internal `Once` guard ensures tagging fires exactly once regardless of
+/// which path gets here first.
+pub(crate) fn tag_lambda_function_once(invoked_function_arn: String, config: &config::ExtensionConfig) {
     static TAGGING_DONE: std::sync::Once = std::sync::Once::new();
     TAGGING_DONE.call_once(|| {
         debug!("Spawning background task to tag Lambda function with version information");
@@ -1922,7 +2154,7 @@ fn update_global_invocation_context(request_id: &str, invoked_function_arn: &str
 }
 
 /// Extract trace ID from agent payload if enabled in config
-async fn extract_and_coordinate_trace_id(
+pub(crate) async fn extract_and_coordinate_trace_id(
     payload_bytes: &[u8],
     request_id: &str,
     config: &Arc<ExtensionConfig>,
@@ -2038,7 +2270,7 @@ async fn drain_late_paired_payloads_serverless(
 
 /// Process any pending agent payloads from previous invocation (APM mode only)
 /// Excludes the current request ID to avoid processing empty buffer
-async fn process_pending_agent_payloads(
+pub(crate) async fn process_pending_agent_payloads(
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,

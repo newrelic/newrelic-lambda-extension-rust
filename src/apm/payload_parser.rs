@@ -30,14 +30,17 @@ pub struct LambdaData {
     pub otlp_payload: Vec<String>,
 }
 
-/// Protocol v1 wrapper with metadata and data fields
+/// Protocol v1 wrapper with metadata and data fields.
+/// Note: metadata (agent_version, agent_language) is available in the payload
+/// but arrives AFTER APM Connect has already been made — too late to use.
+/// We only deserialize `data`; metadata is intentionally ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LambdaRawData {
     pub data: LambdaData,
 }
 
-/// Parse agent payload and return telemetry data by type
-/// Returns (data_map, protocol_version)
+/// Parse agent payload and return telemetry data by type.
+/// Returns (data_map, protocol_version).
 pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<Value>>, u8)> {
     let payload_str = std::str::from_utf8(payload_bytes)?;
     
@@ -62,7 +65,7 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
 
     let (data_map, version) = match protocol_version {
         "2" => {
-            // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
+            // Protocol v2: no metadata wrapper — data is the root object
             let sanitized_payload = String::from_utf8_lossy(&uncompressed_json)
                 .replace('\n', "\\n")
                 .replace('\r', "\\r");
@@ -158,6 +161,40 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     map
 }
 
+/// Extract the Lambda invocation request id (`aws.requestId`) the agent embedded in the
+/// transaction analytic event of an agent payload.
+///
+/// Under LMI we route agent payloads by this **self-describing** id instead of a
+/// process-global "current request", so concurrent invocations never cross-attribute
+/// (NR-579361). We read **only** `analytic_event_data` (transaction analytic events);
+/// we deliberately never look at `span_event_data`, whose external/AWS-SDK spans carry
+/// their own unrelated `aws.requestId`.
+///
+/// `analytic_event_data = [ harvest_meta_or_null, { reservoir }, [ EVENT, … ] ]` where
+/// `EVENT = [ intrinsics, userAttributes, agentAttributes ]`; `aws.requestId` lives in
+/// `agentAttributes` (the 3rd tuple element). Every level is guarded — returns `None`
+/// on any shape mismatch (Zero-Panic).
+pub fn extract_transaction_request_id(data_map: &HashMap<String, Vec<Value>>) -> Option<String> {
+    let events = data_map.get("analytic_event_data")?.get(2)?.as_array()?;
+    events.iter().find_map(|event| {
+        event
+            .as_array()?
+            .get(2)
+            .and_then(|agent_attributes| agent_attributes.get("aws.requestId"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
+}
+
+/// Parse a raw wire agent payload and extract its embedded transaction `aws.requestId`.
+/// Returns `None` on any parse failure or when no transaction event carries the id
+/// (e.g. metrics-only / log-only harvest). Reuses [`parse_agent_payload`].
+pub fn extract_request_id_from_payload_bytes(payload_bytes: &[u8]) -> Option<String> {
+    let (data_map, _version) = parse_agent_payload(payload_bytes).ok()?;
+    extract_transaction_request_id(&data_map)
+}
+
 /// Implement Deserialize for LambdaData manually to handle flexible field names
 /// Supports both snake_case and camelCase field names for compatibility
 impl<'de> serde::Deserialize<'de> for LambdaData {
@@ -202,160 +239,5 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    use std::io::Write;
-
-    fn create_test_payload(version: &str) -> Vec<u8> {
-        let test_data = if version == "2" {
-            r#"{"metric_data": [[1, 2, 3]], "span_event_data": [[4, 5, 6]]}"#
-        } else {
-            r#"{"data": {"metric_data": [[1, 2, 3]], "span_event_data": [[4, 5, 6]]}}"#
-        };
-
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(test_data.as_bytes()).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let encoded = general_purpose::STANDARD.encode(&compressed);
-
-        let payload = format!(r#"["{}", "NR_LAMBDA_MONITORING", "{}"]"#, version, encoded);
-
-        payload.into_bytes()
-    }
-
-    #[test]
-    fn test_parse_v2_payload() {
-        let payload = create_test_payload("2");
-        let (data_map, version) = parse_agent_payload(&payload).unwrap();
-
-        assert_eq!(version, 2);
-        assert!(data_map.contains_key("metric_data"));
-        assert!(data_map.contains_key("span_event_data"));
-    }
-
-    #[test]
-    fn test_parse_v1_payload() {
-        let payload = create_test_payload("1");
-        let (data_map, version) = parse_agent_payload(&payload).unwrap();
-
-        assert_eq!(version, 1);
-        assert!(data_map.contains_key("metric_data"));
-        assert!(data_map.contains_key("span_event_data"));
-    }
-
-    fn create_test_payload_with_json(json_body: &str) -> Vec<u8> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(json_body.as_bytes()).unwrap();
-        let compressed = encoder.finish().unwrap();
-        let encoded = general_purpose::STANDARD.encode(&compressed);
-        format!(r#"["2", "NR_LAMBDA_MONITORING", "{encoded}"]"#).into_bytes()
-    }
-
-    #[test]
-    fn test_otlp_payload_snake_case_key() {
-        let payload = create_test_payload_with_json(r#"{"otlp_payload": ["abc123"]}"#);
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing");
-        assert_eq!(entries, &vec![Value::String("abc123".to_string())]);
-    }
-
-    #[test]
-    fn test_otlp_payload_camel_case_key_fallback() {
-        // .NET-style JSON serializers commonly default to camelCase — must not
-        // silently drop otlp_payload if the agent emits "otlpPayload" instead.
-        let payload = create_test_payload_with_json(r#"{"otlpPayload": ["def456"]}"#);
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        let entries = data_map.get("otlp_payload").expect("otlp_payload key missing (camelCase fallback failed)");
-        assert_eq!(entries, &vec![Value::String("def456".to_string())]);
-    }
-
-    #[test]
-    fn test_otlp_payload_snake_case_takes_precedence_over_camel_case() {
-        let payload = create_test_payload_with_json(
-            r#"{"otlp_payload": ["snake"], "otlpPayload": ["camel"]}"#,
-        );
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        let entries = data_map.get("otlp_payload").unwrap();
-        assert_eq!(entries, &vec![Value::String("snake".to_string())]);
-    }
-
-    #[test]
-    fn test_otlp_payload_absent_key_yields_no_map_entry() {
-        let payload = create_test_payload_with_json(r#"{"metric_data": [[1, 2, 3]]}"#);
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        assert!(!data_map.contains_key("otlp_payload"));
-    }
-
-    #[test]
-    fn test_otlp_payload_multi_element_array_keeps_every_entry_in_order() {
-        // The agent may batch several OTLP requests into one array. Every element
-        // must survive parsing (not just the first) and keep its original order,
-        // since send_otlp_payload numbers them 1..N for log correlation.
-        let payload = create_test_payload_with_json(
-            r#"{"otlp_payload": ["first", "second", "third", "fourth"]}"#,
-        );
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        let entries = data_map
-            .get("otlp_payload")
-            .expect("otlp_payload key missing");
-        assert_eq!(
-            entries,
-            &vec![
-                Value::String("first".to_string()),
-                Value::String("second".to_string()),
-                Value::String("third".to_string()),
-                Value::String("fourth".to_string()),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_otlp_payload_non_string_elements_are_skipped_not_fatal() {
-        // get_string_array filters on as_str(), so a malformed element is dropped
-        // rather than poisoning the whole batch. Assert that explicitly so the
-        // lenient behaviour is intentional and not an accident of refactoring.
-        let payload = create_test_payload_with_json(
-            r#"{"otlp_payload": ["good1", 42, null, {"a":1}, ["nested"], "good2"]}"#,
-        );
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        let entries = data_map
-            .get("otlp_payload")
-            .expect("otlp_payload key missing");
-        assert_eq!(
-            entries,
-            &vec![
-                Value::String("good1".to_string()),
-                Value::String("good2".to_string()),
-            ],
-        );
-    }
-
-    #[test]
-    fn test_otlp_payload_empty_array_yields_no_map_entry() {
-        // An empty array must behave like an absent key so app.rs takes its
-        // "no otlp_payload found" branch rather than spawning a no-op send.
-        let payload = create_test_payload_with_json(r#"{"otlp_payload": []}"#);
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        assert!(!data_map.contains_key("otlp_payload"));
-    }
-
-    #[test]
-    fn test_otlp_payload_scalar_string_not_wrapped_is_ignored() {
-        // Defensive: a bare string (not an array) does not match Value::Array,
-        // so it yields nothing. Documents the shape contract with the agent.
-        let payload = create_test_payload_with_json(r#"{"otlp_payload": "bare"}"#);
-        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
-
-        assert!(!data_map.contains_key("otlp_payload"));
-    }
-}
+#[path = "payload_parser_tests.rs"]
+mod tests;

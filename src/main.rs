@@ -20,7 +20,10 @@ mod apm;
 mod runtime;
 mod request;
 mod event_loop;
+mod event_loop_lmi;
 mod error_synthesis;
+#[cfg(test)]
+mod error_synthesis_tests;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -80,6 +83,12 @@ pub fn get_global_fallback_arn() -> String {
 
 /// Global flag to track if this is a warm start (for performance optimization)
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+/// Set to true when platform.initReport is received under LMI — the only reliable
+/// cold-start signal available when INVOKE events are not delivered.
+/// Used to trigger version-detail tagging exactly once per execution environment.
+static LMI_COLD_START_SEEN: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
 /// Set once a SHUTDOWN event is being handled. While set, the extension stops
@@ -326,6 +335,7 @@ async fn perform_one_time_initialization(
             apm_mode_enabled: false,
             apm_client: Client::new(),
             reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+            deployment: config.deployment,
         });
     }
 
@@ -406,8 +416,19 @@ async fn perform_one_time_initialization(
         
         Some(arn)
     } else {
-        warn!("Account ID not provided by Lambda runtime (local testing?) - ARN will be populated from first INVOKE event");
-        None
+        // On LMI, INVOKE never fires so the ARN would never be populated from an INVOKE event.
+        // AWS_LAMBDA_FUNCTION_ARN is always set by the Lambda runtime — use it as the fallback ARN.
+        let env_arn = std::env::var("AWS_LAMBDA_FUNCTION_ARN").unwrap_or_default();
+        if !env_arn.is_empty() {
+            info!("Account ID not in registration response; using AWS_LAMBDA_FUNCTION_ARN as fallback ARN: {}", env_arn);
+            if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
+                global_context.invoked_function_arn = env_arn.clone();
+            }
+            Some(env_arn)
+        } else {
+            warn!("Account ID not provided by Lambda runtime and AWS_LAMBDA_FUNCTION_ARN not set (local testing?) - ARN will be populated from first INVOKE event");
+            None
+        }
     };
 
     debug!(
@@ -461,7 +482,7 @@ async fn perform_one_time_initialization(
         extension_id
     );
 
-    start_agent_payload_collector_background_task(agent_telemetry_rx);
+    start_agent_payload_collector_background_task(agent_telemetry_rx, config.deployment);
 
     cleanup_old_failed_payloads();
 
@@ -542,6 +563,9 @@ async fn perform_one_time_initialization(
             let flag_clone = reconnect_in_flight.clone();
             let apm_app_clone = Arc::clone(&apm_app);
             let apm_client_clone = apm_client.clone();
+            // DeploymentContext is Copy — capture it before the move closure so we don't
+            // move/borrow `config` (still used after the spawn).
+            let deployment = config.deployment;
             tokio::spawn(async move {
                 debug!("Background APM connection started...");
                 match apm::ApmApp::new(
@@ -556,6 +580,7 @@ async fn perform_one_time_initialization(
                     account_id,
                     region,
                     handshake_timeout,
+                    deployment,
                 )
                 .await
                 {
@@ -601,6 +626,7 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 config.new_relic.apm_lambda_mode,
+                config.deployment.is_lmi(),
             )
             .await?;
 
@@ -631,14 +657,35 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 config.new_relic.apm_lambda_mode,
+                config.deployment.is_lmi(),
             )
             .await?;
 
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         };
 
-    runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
-        .await?;
+    // Standing (client, config, log processor) handle for code that runs independently
+    // of the event loop — the standard-mode telemetry listener's platform.report
+    // handler, and route_payload_to_request_buffer's immediate agent-payload send
+    // under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH — see event_loop::SERVERLESS_SEND_CONTEXT.
+    // All three are stable from here on (only ARN-related fields on config are ever
+    // overridden after this point).
+    let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((
+        newrelic_client.clone(),
+        config.clone(),
+        temp_log_processor.clone(),
+    ));
+
+    let telemetry_schema = runtime::subscribe_to_telemetry(
+        &client,
+        &extension_id,
+        telemetry_listener_address.port(),
+    )
+    .await?;
+    debug!(
+        "Telemetry API subscription active using schema={}",
+        telemetry_schema.name()
+    );
 
     // Log flushing is event-driven: size-based auto-flush inside LogProcessor, plus
     // end-of-execution flush in the event loop gated on platform.runtimeDone, plus
@@ -656,6 +703,7 @@ async fn perform_one_time_initialization(
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
         apm_client,
         reconnect_in_flight,
+        deployment: config.deployment,
     })
 }
 
@@ -703,6 +751,7 @@ async fn handle_no_license_key(
         apm_mode_enabled: false,
         apm_client: Client::new(),
         reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+        deployment: config.deployment,
     })
 }
 
@@ -758,7 +807,19 @@ async fn initialize_lambda_runtime_client_and_register(
         .pool_max_idle_per_host(10)
         .build()?);
 
-    let (registration, extension_id) = runtime::register_extension(&lambda_runtime_client, EXTENSION_NAME).await?;
+    // Detect deployment context once and dispatch the matching registration
+    // schema. Standard Lambda subscribes to INVOKE+SHUTDOWN; Lambda Managed
+    // Instances subscribes to SHUTDOWN only (AWS rejects INVOKE on LMI).
+    // See LMI_SUPPORT.md §3.
+    let deployment = config::deployment::detect();
+    let schema = runtime::schema_for(deployment);
+
+    let (registration, extension_id) = runtime::register_extension(
+        &lambda_runtime_client,
+        EXTENSION_NAME,
+        schema,
+    )
+    .await?;
     Ok((lambda_runtime_client, extension_id, registration))
 }
 
@@ -784,12 +845,20 @@ async fn initialize_agent_telemetry_ipc_channel(
 }
 
 /// Start agent payload collector as background task with request handling
-fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Receiver<Vec<u8>>) {
-    start_concurrent_agent_payload_collector(agent_telemetry_rx);
+fn start_agent_payload_collector_background_task(
+    agent_telemetry_rx: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
+    start_concurrent_agent_payload_collector(agent_telemetry_rx, deployment);
 }
 
-/// Channel-based agent payload collector with immediate processing and notification
-fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
+/// Channel-based agent payload collector with immediate processing and notification.
+/// `deployment` (Copy) selects the routing strategy: Normal uses the active-request global,
+/// LMI routes each payload by its own embedded `aws.requestId` (NR-579361).
+fn start_concurrent_agent_payload_collector(
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
     tokio::spawn(async move {
         debug!("Agent payload collector started - continuously listening for agent payloads");
         let mut payload_count = 0;
@@ -810,8 +879,9 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 debug!("Agent Payload (complete): {}", sanitized);
             }
 
-            // Route to currently active request using 2.4.1 approach (simple and reliable)
-            request::route_payload_to_request_buffer(payload_bytes).await;
+            // Route per deployment context: Normal → active-request global (2.4.1);
+            // LMI → the payload's own embedded aws.requestId (NR-579361, race-free).
+            request::route_payload_to_request_buffer(payload_bytes, deployment).await;
         }
 
         debug!("Agent payload collector channel closed. No more agent payloads will be received");

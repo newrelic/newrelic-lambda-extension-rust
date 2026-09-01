@@ -62,8 +62,8 @@ function setup_agent {
     fi
 
     if [ -z "${NEW_RELIC_APP_NAME}" ]; then
-      export NEW_RELIC_APP_NAME=lambda-function
-      log_debug "Setting NEW_RELIC_APP_NAME to be lambda-function"
+      export NEW_RELIC_APP_NAME=${AWS_LAMBDA_FUNCTION_NAME:-lambda-function}
+      log_debug "Setting NEW_RELIC_APP_NAME to be ${NEW_RELIC_APP_NAME}"
     fi
 
     if [ -z "${NEW_RELIC_LOG_FILE_PATH}" ]; then

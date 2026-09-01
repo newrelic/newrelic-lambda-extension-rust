@@ -4,9 +4,11 @@
 //! Agent payload batching logic
 //!
 //! This module handles batching of agent payloads for efficient sending to New Relic.
-//! Batching strategies:
-//! - Cold starts: Send immediately with `platform.report`
-//! - Warm starts: Batch multiple payloads until threshold (3+ payloads or 5-minute timeout)
+//! Batching strategy: hold payloads paired with a `platform.report` until 3+ have
+//! accumulated, then send (also flushed at shutdown and periodic 5-minute cleanup).
+//! `NEW_RELIC_BLOCKING_AGENT_PAYLOAD` bypasses the 3+ threshold — see
+//! `event_loop::maybe_spawn_batch_send` — so a low-invocation-frequency function still
+//! gets its telemetry out within the invocation rather than waiting on the threshold.
 //!
 //! Global state:
 //! - `AGENT_BATCH_BUFFER`: Stores batched agent payloads with optional `platform.report`
@@ -23,11 +25,16 @@ use crate::{
     EXTENSION_VERSION,
 };
 
-/// Batched agent payload with optional platform.report line
+/// Batched agent payload with optional platform.report line.
+///
+/// `agent_payload_bytes` holds every payload chunk buffered for this `request_id` — a
+/// single invocation can emit more than one agent payload (e.g. multiple explicit
+/// harvest/flush calls), and each must survive as its own log event rather than the
+/// last one silently overwriting the rest (see `add_to_batch`).
 #[derive(Debug, Clone)]
 pub struct BatchedAgentPayload {
     pub request_id: String,
-    pub agent_payload_bytes: Arc<Vec<u8>>,
+    pub agent_payload_bytes: Vec<Arc<Vec<u8>>>,
     pub report_line: Option<String>,
     pub invoked_function_arn: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -51,7 +58,14 @@ pub static BATCH_META: Lazy<Arc<Mutex<BatchMetadata>>> =
         oldest_timestamp: None,
     })));
 
-/// Add agent payload to batch buffer
+/// Add an agent payload to the batch buffer, keyed by `request_id`.
+///
+/// A second (or third...) call for the same `request_id` (e.g. a single invocation
+/// that flushed more than one agent payload) APPENDS to that entry's
+/// `agent_payload_bytes` instead of replacing it — a plain `DashMap::insert` on the
+/// same key would silently keep only the last payload and drop the rest. `report_line`
+/// is updated only when a new one is actually supplied, so a later payload-only call
+/// can't erase a report an earlier call already attached.
 pub fn add_to_batch(
     request_id: String,
     agent_bytes: Vec<u8>,
@@ -60,23 +74,34 @@ pub fn add_to_batch(
 ) {
     let timestamp = chrono::Utc::now();
 
-    AGENT_BATCH_BUFFER.insert(
-        request_id.clone(),
-        BatchedAgentPayload {
-            request_id,
-            agent_payload_bytes: Arc::new(agent_bytes),
-            report_line,
-            invoked_function_arn: arn,
-            timestamp,
+    let is_new_key = if let Some(mut existing) = AGENT_BATCH_BUFFER.get_mut(&request_id) {
+        existing.agent_payload_bytes.push(Arc::new(agent_bytes));
+        if report_line.is_some() {
+            existing.report_line = report_line;
         }
-    );
+        false
+    } else {
+        AGENT_BATCH_BUFFER.insert(
+            request_id.clone(),
+            BatchedAgentPayload {
+                request_id,
+                agent_payload_bytes: vec![Arc::new(agent_bytes)],
+                report_line,
+                invoked_function_arn: arn,
+                timestamp,
+            },
+        );
+        true
+    };
 
     if let Ok(mut meta) = BATCH_META.lock() {
-        meta.agent_count += 1;
-        if meta.oldest_timestamp.is_none() {
-            meta.oldest_timestamp = Some(timestamp);
+        if is_new_key {
+            meta.agent_count = AGENT_BATCH_BUFFER.len();
+            if meta.oldest_timestamp.is_none() {
+                meta.oldest_timestamp = Some(timestamp);
+            }
         }
-        debug!("Added agent payload to batch (total buffered: {})", meta.agent_count);
+        debug!("Added agent payload to batch (requests buffered: {})", meta.agent_count);
     }
 }
 
@@ -156,6 +181,28 @@ fn clear_batch_with_reports(items: &[BatchedAgentPayload]) {
     }
 }
 
+/// Push one log event per buffered agent-payload chunk in `item`, followed by its
+/// report-line event (if any). A single `request_id` can carry more than one agent
+/// payload (see `add_to_batch`) — this emits an event for each so none are dropped.
+fn push_agent_log_events(log_events: &mut Vec<serde_json::Value>, item: &BatchedAgentPayload) {
+    for payload_bytes in &item.agent_payload_bytes {
+        let agent_str = String::from_utf8_lossy(payload_bytes);
+        log_events.push(serde_json::json!({
+            "id": &item.request_id,
+            "message": &*agent_str,
+            "timestamp": item.timestamp.timestamp_millis(),
+        }));
+    }
+
+    if let Some(ref report) = item.report_line {
+        log_events.push(serde_json::json!({
+            "id": item.request_id,
+            "message": report,
+            "timestamp": item.timestamp.timestamp_millis(),
+        }));
+    }
+}
+
 /// Send only batched agent payloads WITH report lines (when threshold is hit)
 /// Payloads without report lines remain in buffer for timeout/shutdown sending
 /// DATA LOSS PREVENTION: Only removes payloads from buffer AFTER successful send
@@ -187,24 +234,9 @@ pub async fn send_batched_payloads_with_reports_only(
     let mut log_events = Vec::with_capacity(batch_items.len() * 3);
 
     for item in &batch_items {
-        // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
-        let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
-        log_events.push(serde_json::json!({
-            "id": &item.request_id,
-            "message": &*agent_str,
-            "timestamp": item.timestamp.timestamp_millis(),
-        }));
+        push_agent_log_events(&mut log_events, item);
 
-        // All items in this batch have report lines (filtered) - append as second log event
-        if let Some(ref report) = item.report_line {
-            log_events.push(serde_json::json!({
-                "id": item.request_id,
-                "message": report,
-                "timestamp": item.timestamp.timestamp_millis(),
-            }));
-        }
-
-        // Append version line in serverless mode (third log event)
+        // Append version line in serverless mode (extra log event)
         if let Some(ref version_info) = version_info {
             let version_line = version_info.format_version_line(&item.request_id);
             log_events.push(serde_json::json!({
@@ -309,7 +341,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
                 for payload_bytes in payloads {
                     all_payloads.push(BatchedAgentPayload {
                         request_id: request_id.clone(),
-                        agent_payload_bytes: Arc::new(payload_bytes),
+                        agent_payload_bytes: vec![Arc::new(payload_bytes)],
                         report_line: report_line.clone(),
                         invoked_function_arn: arn.clone(),
                         timestamp: chrono::Utc::now(),
@@ -333,12 +365,15 @@ pub async fn send_all_pending_payloads_on_shutdown(
     if let Some(lp) = log_processor {
         if config.new_relic.collect_trace_id {
             for item in &all_payloads {
-                if let Ok(Some(trace_id)) =
-                    crate::trace::extract_trace_id_from_payload(&item.agent_payload_bytes)
-                {
-                    let _ = lp
-                        .on_trace_id_extracted(&item.request_id, &trace_id)
-                        .await;
+                for payload_bytes in &item.agent_payload_bytes {
+                    if let Ok(Some(trace_id)) =
+                        crate::trace::extract_trace_id_from_payload(payload_bytes)
+                    {
+                        let _ = lp
+                            .on_trace_id_extracted(&item.request_id, &trace_id)
+                            .await;
+                        break; // one trace.id per request is enough
+                    }
                 }
             }
         }
@@ -359,21 +394,7 @@ pub async fn send_all_pending_payloads_on_shutdown(
         let mut log_events = Vec::with_capacity(chunk_items.len() * 2);
 
         for item in chunk_items {
-            // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
-            let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
-            log_events.push(serde_json::json!({
-                "id": &item.request_id,
-                "message": &*agent_str,
-                "timestamp": item.timestamp.timestamp_millis(),
-            }));
-
-            if let Some(ref report) = item.report_line {
-                log_events.push(serde_json::json!({
-                    "id": item.request_id,
-                    "message": report,
-                    "timestamp": item.timestamp.timestamp_millis(),
-                }));
-            }
+            push_agent_log_events(&mut log_events, item);
         }
 
         let most_recent = chunk_items.last().expect("chunk should not be empty");
@@ -451,18 +472,17 @@ pub(crate) fn split_into_chunks(
 pub(crate) fn estimate_item_size(item: &BatchedAgentPayload) -> usize {
     let mut size = 0;
 
-    // Agent payload size
-    size += item.agent_payload_bytes.len();
-
-    // Report line size (if present)
-    if let Some(ref report) = item.report_line {
-        size += report.len();
+    // Agent payload bytes + JSON overhead (~150 bytes per event for structure +
+    // metadata) for each buffered chunk — a request_id can carry more than one.
+    for payload_bytes in &item.agent_payload_bytes {
+        size += payload_bytes.len();
+        size += 150;
     }
 
-    // JSON overhead per log event (~150 bytes per event for structure + metadata)
-    size += 150;
-    if item.report_line.is_some() {
-        size += 150; // Second log event for report
+    // Report line size (if present) + its own log event overhead
+    if let Some(ref report) = item.report_line {
+        size += report.len();
+        size += 150;
     }
 
     size
@@ -503,22 +523,7 @@ pub async fn cleanup_old_batch_entries(
     let mut log_events = Vec::with_capacity(old_entries.len() * 2);
 
     for item in &old_entries {
-        // Avoid unnecessary string clones - use Cow to only allocate on invalid UTF-8
-        let agent_str = String::from_utf8_lossy(&item.agent_payload_bytes);
-        log_events.push(serde_json::json!({
-            "id": &item.request_id,
-            "message": &*agent_str,
-            "timestamp": item.timestamp.timestamp_millis(),
-        }));
-
-        // Include report line if available
-        if let Some(ref report) = item.report_line {
-            log_events.push(serde_json::json!({
-                "id": item.request_id,
-                "message": report,
-                "timestamp": item.timestamp.timestamp_millis(),
-            }));
-        }
+        push_agent_log_events(&mut log_events, item);
     }
 
     let most_recent = old_entries.last().expect("old_entries should not be empty");
