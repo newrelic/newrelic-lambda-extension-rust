@@ -6,11 +6,24 @@ authors = ["Lambda Serverless Team"]
 description = "AWS Lambda Extension for New Relic monitoring integration"
 license = "Apache-2.0"
 repository = "https://github.com/newrelic/newrelic-lambda-extension-rust"
-readme = "README.md"
+readme = false
 # This crate ships as an AWS Lambda layer zip, not to crates.io. Marking it
 # unpublished prevents accidental `cargo publish` and excludes our own
 # first-party code from the generated THIRD_PARTY_NOTICES.md.
 publish = false
+exclude = [
+	".github/",                    # Excludes all GitHub Actions workflows
+	"scripts/",                    # Excludes all test and layer scripts
+	"examples/",                   # Excludes the examples folder (if you add one)
+	"src/**/*_test.rs",            # Excludes unit test files ending in _test.rs
+	"src/**/*_tests.rs",           # Excludes unit test files ending in _tests.rs
+	"README.md",                   # Excludes the README.md file
+	"CODE_OF_CONDUCT.md",          # Excludes contributing guidelines
+	"CONTRIBUTING.md",
+	"cla.md",
+	"about.toml",
+	"about.hbs"
+]
 
 [dependencies]
 # Tokio - only load what we actually use (massive startup time improvement)
