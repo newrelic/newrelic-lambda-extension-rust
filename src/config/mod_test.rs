@@ -78,6 +78,11 @@ where
         "AWS_LAMBDA_RUNTIME_API",
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
+        // OTLP metrics forwarding opt-in. Must be cleared here or a preceding test that
+        // sets it leaks into the default-value assertions below (the list is an explicit
+        // allowlist, not a wildcard).
+        "NEW_RELIC_OTLP_METRIC_ENABLED",
+        "NEW_RELIC_OTLP_METRIC_ENDPOINT",
     ];
     
     // Save original values
@@ -1415,6 +1420,8 @@ fn test_new_relic_config_all_fields() {
         apm_disabled_telemetry: std::collections::HashSet::new(),
         apm_host: "apm.host".to_string(),
         metric_endpoint: "http://metrics".to_string(),
+        otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+        otlp_metric_enabled: false,
         proxy_url: Some("http://proxy:8080".to_string()),
         synchronous_flush: false,
         data_collection_timeout: Some(Duration::from_secs(20)),
@@ -2050,3 +2057,59 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
     });
 }
 
+
+// ── OTLP metrics forwarding opt-in (NEW_RELIC_OTLP_METRIC_ENABLED) ──
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_default_false() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_true_from_env() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "true");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_explicit_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "false");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_truthy_variants() {
+    for value in &["1", "yes", "on", "TRUE", "Yes"] {
+        with_full_clean_env(|| {
+            env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", value);
+            let config = ExtensionConfig::from_env();
+            assert!(
+                config.new_relic.otlp_metric_enabled,
+                "Expected true for value '{}'", value
+            );
+        });
+    }
+}
+
+#[test]
+#[serial]
+fn test_otlp_metric_enabled_garbage_string_falls_back_to_false() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_OTLP_METRIC_ENABLED", "not_a_bool");
+        let config = ExtensionConfig::from_env();
+        assert!(!config.new_relic.otlp_metric_enabled);
+    });
+}

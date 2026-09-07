@@ -72,6 +72,16 @@ pub struct NewRelicConfig {
     pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
+    pub otlp_metric_endpoint: String,
+    /// `NEW_RELIC_OTLP_METRIC_ENABLED` — feature-gates OTLP metrics forwarding
+    /// (protobuf `entity.guid` injection + send). Default: false. While
+    /// disabled, any `otlp_payload` entries the agent sends are dropped
+    /// without being decoded or forwarded.
+    ///
+    /// This is the raw env-var value. Forwarding additionally requires
+    /// `apm_lambda_mode`, since the send path lives in `ApmApp`; the effective
+    /// gate is `crate::apm::collector::is_otlp_metric_enabled()`.
+    pub otlp_metric_enabled: bool,
     pub proxy_url: Option<String>,
     /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — master switch for serverless-mode
     /// (standard/non-APM mode only) immediate delivery of the agent payload. When
@@ -204,6 +214,8 @@ impl Default for NewRelicConfig {
             apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+            otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
+            otlp_metric_enabled: false,
             proxy_url: None,
             synchronous_flush: false,
             data_collection_timeout: None,
@@ -270,9 +282,19 @@ impl AwsConfig {
         }
     }
 
+    /// Extracts the account ID from a Lambda function ARN, which has the form
+    /// `arn:<partition>:lambda:<region>:<account-id>:function:<name>`.
+    /// Requires the full 7-part shape and an `aws`-prefixed partition (`aws`,
+    /// `aws-cn`, `aws-us-gov`) to reject malformed or non-Lambda ARNs.
     fn extract_account_id_from_arn(arn: &str) -> Option<String> {
         let parts: Vec<&str> = arn.split(':').collect();
-        if parts.len() >= 5 && parts[0] == "arn" && parts[2] == "lambda" {
+        if parts.len() >= 7
+            && parts[0] == "arn"
+            && parts[1].starts_with("aws")
+            && parts[2] == "lambda"
+            && !parts[3].is_empty()
+            && !parts[4].is_empty()
+        {
             Some(parts[4].to_string())
         } else {
             None
@@ -347,6 +369,17 @@ pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
 }
 
 impl ExtensionConfig {
+    /// Whether OTLP metric forwarding will actually run: the customer opted in via
+    /// `NEW_RELIC_OTLP_METRIC_ENABLED` **and** APM mode is on. APM mode is required
+    /// because the send path lives in `ApmApp::process_agent_payload`, and no `ApmApp`
+    /// is constructed in serverless mode — so the env var alone is not sufficient.
+    ///
+    /// This is the single source of truth mirrored into
+    /// `crate::apm::collector::set_otlp_metric_enabled()` at startup.
+    pub fn otlp_metric_forwarding_active(&self) -> bool {
+        self.new_relic.otlp_metric_enabled && self.new_relic.apm_lambda_mode
+    }
+
     /// Validates the log level and returns a valid level or defaults to "info" with a warning
     fn validate_log_level(raw_level: &str) -> String {
         let normalized = raw_level.to_lowercase();
@@ -467,6 +500,10 @@ impl ExtensionConfig {
         // Comma-separated telemetry types the customer wants dropped (APM mode).
         config.new_relic.apm_disabled_telemetry =
             parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
+
+        // OTLP metrics forwarding is opt-in: default false until customers explicitly enable it.
+        let otlp_metric_enabled_str = env::var("NEW_RELIC_OTLP_METRIC_ENABLED").unwrap_or_default();
+        config.new_relic.otlp_metric_enabled = parse_bool(&otlp_metric_enabled_str);
 
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
@@ -779,58 +816,50 @@ pub fn get_new_relic_labels() -> &'static [(String, String)] {
 }
 
 /// Global configuration instance
-static mut GLOBAL_CONFIG: Option<ExtensionConfig> = None;
-static CONFIG_INIT: std::sync::Once = std::sync::Once::new();
+static GLOBAL_CONFIG: OnceLock<ExtensionConfig> = OnceLock::new();
 
 /// Initialize the global configuration and logging
 pub fn init_config() -> &'static ExtensionConfig {
-    unsafe {
-        CONFIG_INIT.call_once(|| {
-            let config = ExtensionConfig::from_env();
+    GLOBAL_CONFIG.get_or_init(|| {
+        let config = ExtensionConfig::from_env();
 
-            let log_level = if config.extension.log_level.to_lowercase() == "all" {
-                "trace".to_string()
-            } else {
-                config.extension.log_level.clone()
-            };
+        let log_level = if config.extension.log_level.to_lowercase() == "all" {
+            "trace".to_string()
+        } else {
+            config.extension.log_level.clone()
+        };
 
-            let filter_directive = format!(
-                "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
-                log_level,
-                log_level
-            );
+        let filter_directive = format!(
+            "newrelic_lambda_extension={},aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,{}",
+            log_level,
+            log_level
+        );
 
-            // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
-            let env_filter = match EnvFilter::try_new(&filter_directive) {
-                Ok(filter) => filter,
-                Err(e) => {
-                    eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
-                    let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
-                    EnvFilter::try_new(fallback_directive)
-                        .expect("Fallback filter directive should always be valid")
-                }
-            };
+        // Try to create EnvFilter with the configured log level, fallback to "info" if it fails
+        let env_filter = match EnvFilter::try_new(&filter_directive) {
+            Ok(filter) => filter,
+            Err(e) => {
+                eprintln!("[NR_EXT] ERROR: Failed to parse log level filter '{}': {}. Falling back to 'info' level.", filter_directive, e);
+                let fallback_directive = "newrelic_lambda_extension=info,aws_config=info,aws_sdk_lambda=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sigv4=info,hyper=info,h2=info,info";
+                EnvFilter::try_new(fallback_directive)
+                    .expect("Fallback filter directive should always be valid")
+            }
+        };
 
-            let subscriber = fmt::Subscriber::builder()
-                .with_env_filter(env_filter)
-                .event_format(CustomFormatter {
-                    enabled: config.extension.extension_logs_enabled,
-                })
-                .finish();
+        let subscriber = fmt::Subscriber::builder()
+            .with_env_filter(env_filter)
+            .event_format(CustomFormatter {
+                enabled: config.extension.extension_logs_enabled,
+            })
+            .finish();
 
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("setting default subscriber failed");
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("setting default subscriber failed");
 
-            debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
+        debug!("New Relic Lambda Extension v{} started", env!("CARGO_PKG_VERSION"));
 
-            GLOBAL_CONFIG = Some(config);
-        });
-
-        #[allow(static_mut_refs)]
-        {
-            GLOBAL_CONFIG.as_ref().unwrap()
-        }
-    }
+        config
+    })
 }
 
 #[cfg(test)]

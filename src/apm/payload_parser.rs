@@ -26,6 +26,8 @@ pub struct LambdaData {
     pub span_event_data: Vec<Value>,
     pub sql_trace_data: Vec<Value>,
     pub transaction_sample_data: Vec<Value>,
+    /// Base64-encoded OTLP ExportMetricsServiceRequest protobuf entries
+    pub otlp_payload: Vec<String>,
 }
 
 /// Protocol v1 wrapper with metadata and data fields.
@@ -148,6 +150,13 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     if !data.transaction_sample_data.is_empty() {
         map.insert("transaction_sample_data".to_string(), data.transaction_sample_data);
     }
+    if !data.otlp_payload.is_empty() {
+        // Store as Vec<Value::String> so it fits the shared map type
+        map.insert(
+            "otlp_payload".to_string(),
+            data.otlp_payload.into_iter().map(Value::String).collect(),
+        );
+    }
 
     map
 }
@@ -197,13 +206,23 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
         
         fn get_field(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<Value> {
             let value = map.get(snake_case).or_else(|| map.get(camel_case));
-            
             match value {
                 Some(Value::Array(arr)) => arr.clone(),
                 _ => Vec::new(),
             }
         }
-        
+
+        fn get_string_array(map: &HashMap<String, Value>, snake_case: &str, camel_case: &str) -> Vec<String> {
+            let value = map.get(snake_case).or_else(|| map.get(camel_case));
+            match value {
+                Some(Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
         Ok(LambdaData {
             metric_data: get_field(&raw_map, "metric_data", "metricData"),
             custom_event_data: get_field(&raw_map, "custom_event_data", "customEventData"),
@@ -214,6 +233,7 @@ impl<'de> serde::Deserialize<'de> for LambdaData {
             span_event_data: get_field(&raw_map, "span_event_data", "spanEventData"),
             sql_trace_data: get_field(&raw_map, "sql_trace_data", "sqlTraceData"),
             transaction_sample_data: get_field(&raw_map, "transaction_sample_data", "transactionSampleData"),
+            otlp_payload: get_string_array(&raw_map, "otlp_payload", "otlpPayload"),
         })
     }
 }

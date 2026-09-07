@@ -609,12 +609,14 @@ fn read_java_version(jar_path: &str) -> Option<String> {
 
 /// Read .NET agent version
 fn read_dotnet_version(base_path: &str) -> Option<String> {
-    let version_file = format!("{}/VERSION", base_path);
-    if Path::new(&version_file).exists() {
-        if let Ok(content) = fs::read_to_string(&version_file) {
-            let version = content.trim();
-            if !version.is_empty() {
-                return Some(version.to_string());
+    for filename in &["VERSION", "version.txt"] {
+        let version_file = format!("{}/{}", base_path, filename);
+        if Path::new(&version_file).exists() {
+            if let Ok(content) = fs::read_to_string(&version_file) {
+                let version = content.trim();
+                if !version.is_empty() {
+                    return Some(version.to_string());
+                }
             }
         }
     }

@@ -17,6 +17,7 @@ fn test_apm_app_creation() {
         collector_host: "collector.newrelic.com".to_string(),
         license_key: "test_key".to_string(),
         metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+        otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
         client,
         deployment: DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Apm,

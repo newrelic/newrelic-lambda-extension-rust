@@ -1570,6 +1570,7 @@ mod tests {
                 collector_host: "http://unreachable.invalid.test".to_string(),
                 license_key: "fake-license-for-drain-test".to_string(),
                 metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+                otlp_metric_endpoint: "http://otlp.invalid.test/v1/metrics".to_string(),
                 client: ReqwestClient::builder().timeout(Duration::from_millis(50)).build().unwrap_or_default(),
                 deployment: DeploymentContext::Lmi,
             };
