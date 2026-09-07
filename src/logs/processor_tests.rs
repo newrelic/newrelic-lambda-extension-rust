@@ -2021,4 +2021,40 @@ mod lmi_process_record_tests {
         assert!(p.log_batch.lock().unwrap().is_empty());
         assert!(p.pre_invoke_buffer.lock().unwrap().is_empty());
     }
+
+    // NR-609043: a handled exception the function catches, logs at error severity,
+    // and never rethrows/rejects must ship as a plain log entry — never trigger
+    // synthesized-error delivery to the Errors Inbox. Function logs are observability
+    // only; the extension's only legitimate error signal is a real Lambda Shutdown
+    // (timeout/failure) or platform.* fault event, both handled elsewhere and
+    // untouched by this test.
+    #[tokio::test]
+    async fn function_log_at_error_level_is_forwarded_but_not_synthesized_as_error() {
+        *crate::error_synthesis::LAST_DETECTED_ERROR.lock().unwrap() = None;
+
+        let p = processor(
+            DeploymentContext::Normal { mode: TelemetryMode::Serverless },
+            "arn:aws:lambda:us-east-1:1:function:f",
+            "r-handled",
+        );
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "timestamp": 0,
+                "level": "error",
+                "requestId": "r-handled",
+                "message": "Error: Request failed with status code 400\n    at settle (/var/task/index.js:60152:12)"
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1, "handled exception still ships as a normal log entry");
+        assert!(
+            crate::error_synthesis::LAST_DETECTED_ERROR.lock().unwrap().is_none(),
+            "function log content must never synthesize an Errors Inbox entry"
+        );
+    }
 }
