@@ -9,6 +9,7 @@
 
 pub mod listener;
 pub mod managed_instance;
+pub mod normal_log_stream;
 
 #[cfg(test)]
 mod listener_tests;

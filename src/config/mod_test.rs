@@ -1143,7 +1143,7 @@ fn test_from_env_aws_runtime_api() {
     with_full_clean_env(|| {
         env::set_var("AWS_LAMBDA_RUNTIME_API", "192.168.1.100:8080");
         let config = ExtensionConfig::from_env();
-        
+
         assert_eq!(config.aws.runtime_api, "192.168.1.100:8080");
     });
 }
@@ -1438,7 +1438,7 @@ fn test_aws_config_all_fields() {
         account_id: Some("999888777666".to_string()),
         region: Some("ap-south-1".to_string()),
     };
-    
+
     assert_eq!(config.runtime_api, "192.168.1.1:9001");
     assert_eq!(config.function_name, "test-function");
     assert_eq!(config.function_version, Some("v2.0".to_string()));

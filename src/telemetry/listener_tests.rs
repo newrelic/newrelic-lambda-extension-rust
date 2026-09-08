@@ -1213,7 +1213,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
             .await
             .expect("listener");
 
@@ -1257,7 +1257,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
             .await
             .expect("listener");
 
@@ -1338,6 +1338,164 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial]
+    async fn test_init_start_on_standard_lambda_routes_instance_id_to_log_stream_not_managed_instance() {
+        // Live-traffic regression: once subscribed on the 2025-01-29 schema, a
+        // Standard Lambda `platform.initStart` record CAN carry an `instanceId`
+        // field too (observed value: the CloudWatch log-stream name, not an
+        // LMI host id) — contradicting the assumption that this field is
+        // LMI-exclusive. On Standard Lambda this must be captured as the
+        // best-effort `aws.logStream` source (telemetry::normal_log_stream),
+        // NOT mislabeled as `aws.lambda.managedInstance.instanceId` — gated on
+        // `is_lmi` (DeploymentContext), never on field presence alone.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+        {
+            let mut guard =
+                crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+            *guard = None;
+        }
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "on-demand",
+                "instanceId": "2026/09/08/[$LATEST]659ab15eb262490bbfb175940fb0a786",
+                "instanceMaxMemory": 268_435_456u64,
+                "runtimeVersion": "nodejs:22.mainline.v98"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        let guard =
+            crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA.read().await;
+        assert!(
+            guard.is_none(),
+            "Standard Lambda must not populate the LMI managed-instance global"
+        );
+        drop(guard);
+
+        assert_eq!(
+            crate::telemetry::normal_log_stream::try_read(),
+            Some("2026/09/08/[$LATEST]659ab15eb262490bbfb175940fb0a786".to_string()),
+            "Standard Lambda must capture instanceId as the best-effort log stream"
+        );
+
+        let mut guard =
+            crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+        *guard = None;
+        drop(guard);
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_on_lmi_does_not_populate_normal_log_stream() {
+        // The inverse of the test above: LMI's instanceId is a host id, not a
+        // log stream — it must never leak into the Standard-Lambda-only global.
+        clear_telemetry_state();
+        clear_managed_instance_metadata().await;
+        {
+            let mut guard =
+                crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+            *guard = None;
+        }
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "lambda-managed-instances",
+                "instanceId": "lmi-host-abc123",
+                "instanceMaxMemory": 2_147_483_648u64
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        assert_eq!(
+            crate::telemetry::normal_log_stream::try_read(),
+            None,
+            "LMI's instanceId must not be routed into the Standard-Lambda log-stream global"
+        );
+
+        clear_managed_instance_metadata().await;
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_init_start_on_standard_lambda_ignores_empty_string_instance_id() {
+        // Mirrors extract_managed_instance_metadata's empty-string guard on the
+        // LMI side (managed_instance_tests.rs) — the Standard-Lambda branch has
+        // its own `.filter(|s| !s.is_empty())` that needs the same coverage.
+        clear_telemetry_state();
+        {
+            let mut guard =
+                crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+            *guard = None;
+        }
+
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2026-05-29T11:00:00Z",
+            "type": "platform.initStart",
+            "record": {
+                "initializationType": "on-demand",
+                "instanceId": "",
+                "runtimeVersion": "nodejs:22.mainline.v98"
+            }
+        }]);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        assert_eq!(
+            crate::telemetry::normal_log_stream::try_read(),
+            None,
+            "an empty-string instanceId must not populate the log-stream global"
+        );
+
+        clear_telemetry_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
     async fn test_init_start_does_not_break_other_records_in_same_batch() {
         // initStart should not short-circuit subsequent records in the batch.
         // Send initStart followed by platform.start and assert the request_id
@@ -1346,7 +1504,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
             .await
             .expect("listener");
 
@@ -1401,7 +1559,7 @@ mod tests {
         clear_managed_instance_metadata().await;
 
         let (log_processor, platform_processor) = create_test_processors();
-        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false)
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, true)
             .await
             .expect("listener");
 
