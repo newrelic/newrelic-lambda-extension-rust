@@ -204,7 +204,7 @@ impl ApmApp {
         let account_id = account_id_opt
             .clone()
             .unwrap_or_else(|| {
-                warn!("Account ID not available from registration, using placeholder. Transactions may not appear in APM.");
+                warn!("AWS account ID not available from registration, using placeholder. Transactions may not appear in APM. This is expected under the local RIE, which does not supply an AWS account ID; set NEW_RELIC_AWS_ACCOUNT_ID to provide one.");
                 "000000000000".to_string()
             });
 
