@@ -1,6 +1,6 @@
 'use strict';
 const newrelic = require('newrelic');
-const AWS = require('aws-sdk')
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
 
 /**
@@ -28,7 +28,7 @@ exports.sqsHandler = async (event, context) => {
         transaction.insertDistributedTraceHeaders(traceContextObject);
         const traceContextJson = JSON.stringify(traceContextObject);
 
-        const sns = new AWS.SNS({apiVersion: '2010-03-31'});
+        const sns = new SNSClient({apiVersion: '2010-03-31'});
         const params = {
             Message: r.body,
             TopicArn: SNS_TOPIC_ARN,
@@ -39,7 +39,7 @@ exports.sqsHandler = async (event, context) => {
                 }
             }
         };
-        return sns.publish(params).promise();
+        return sns.send(new PublishCommand(params));
     }).map(async sendPromise => {
         const data = await sendPromise;
         console.log("SNS MessageID is " + data.MessageId);
