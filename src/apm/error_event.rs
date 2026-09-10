@@ -9,39 +9,6 @@ use super::id_generator::TraceIDGenerator;
 use serde_json::{json, Value};
 use tracing::debug;
 
-/// Generate error event from platform fault/timeout log
-/// Returns full APM error event structure matching Go implementation
-pub fn generate_error_event_from_fault(
-    log_line: &str,
-    request_id: &str,
-    function_arn: &str,
-) -> Option<Vec<Value>> {
-    let is_timeout = log_line.contains("Task timed out");
-    let is_fault = log_line.contains("error")
-        || log_line.contains("ERROR")
-        || log_line.contains("Error")
-        || log_line.contains("exception")
-        || log_line.contains("Exception");
-
-    if !is_timeout && !is_fault {
-        return None;
-    }
-
-    let error_message = if is_timeout {
-        "Task timed out".to_string()
-    } else {
-        extract_error_message(log_line)
-    };
-
-    let error_class = if is_timeout {
-        "LambdaTimeout"
-    } else {
-        "LambdaError"
-    };
-
-    generate_error_event_internal(error_class, &error_message, request_id, function_arn)
-}
-
 /// Generate error event directly from error class and message
 /// Used for shutdown events (timeout, failure) where we don't parse from log lines
 pub fn generate_error_event(
@@ -125,21 +92,6 @@ fn extract_function_version(arn: &str) -> String {
         parts[7].to_string()
     } else {
         "$LATEST".to_string()
-    }
-}
-
-/// Extract error message from log line
-fn extract_error_message(log_line: &str) -> String {
-    if let Some(pos) = log_line.find("error:") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("ERROR") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("Error:") {
-        log_line[pos..].chars().take(200).collect()
-    } else if let Some(pos) = log_line.find("Exception:") {
-        log_line[pos..].chars().take(200).collect()
-    } else {
-        log_line.chars().take(200).collect()
     }
 }
 

@@ -856,8 +856,8 @@ impl LogProcessor {
             }
         }
         
-        // Compute message string ONCE — used for error detection AND passed to to_log_message
-        // to avoid double-serialization of non-String records.
+        // Compute message string ONCE, passed to to_log_message to avoid
+        // double-serialization of non-String records.
         let message_owned: String = match &record.record {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Object(obj) => {
@@ -871,7 +871,6 @@ impl LogProcessor {
             }
             other => other.to_string(),
         };
-        let message_str = message_owned.as_str();
 
         if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
             // Per-record request id (JSON logs >= 2022-12-13 carry `requestId`; some runtimes
@@ -893,8 +892,8 @@ impl LogProcessor {
                 DeploymentContext::Normal { .. } => {}
             }
 
-            // Read context ONCE — avoids 4 separate mutex lock/unlock cycles per record.
-            let (has_arn, has_valid_request_id, ctx_request_id, ctx_arn) = {
+            // Read context ONCE — avoids repeated mutex lock/unlock cycles per record.
+            let (has_arn, has_valid_request_id) = {
                 let context = match self.invocation_context.lock() {
                     Ok(guard) => guard,
                     Err(_) => {
@@ -905,8 +904,6 @@ impl LogProcessor {
                 (
                     !context.invoked_function_arn.is_empty(),
                     !context.request_id.is_empty() && context.request_id != "unknown",
-                    context.request_id.clone(),
-                    context.invoked_function_arn.clone(),
                 )
             };
 
@@ -931,121 +928,6 @@ impl LogProcessor {
                 }
             }
 
-            // Check if we're actually in APM mode (both outer and inner Option must be Some)
-            let is_apm_mode = self.apm_app.as_ref().and_then(|apm_arc| {
-                apm_arc.try_read().ok().and_then(|guard| {
-                    if guard.is_some() { Some(()) } else { None }
-                })
-            }).is_some();
-
-            // Determine if this log should be treated as an error
-            // Uses extract_log_level which handles both structured JSON levels and
-            // unstructured keyword matching with position-priority and word boundaries
-            let should_treat_as_error = if record.record_type == "function" && !message_str.is_empty() {
-                message_str.contains("Task timed out")
-                    || self.extract_log_level(&record.record, message_str) == "ERROR"
-            } else {
-                false
-            };
-
-            if should_treat_as_error {
-                // Escape newlines to prevent log corruption when captured by Lambda Telemetry API
-                let sanitized_msg: String = message_str.chars().take(100).collect::<String>()
-                    .replace('\n', "\\n").replace('\r', "\\r");
-
-                // Attribute the synthesized error to the owning request. On LMI the context
-                // request_id is empty (no INVOKE), so use the per-record id; Normal is unchanged.
-                let (request_id, function_arn) = match self.config.deployment {
-                    DeploymentContext::Lmi => (
-                        per_record_request_id.clone().unwrap_or_default(),
-                        ctx_arn.clone(),
-                    ),
-                    DeploymentContext::Normal { .. } => (ctx_request_id.clone(), ctx_arn.clone()),
-                };
-
-                // Store error details for potential platform fault correlation
-                let error_type = if message_str.contains("Task timed out") {
-                    "Timeout"
-                } else if message_str.contains("Exception") || message_str.contains("exception") {
-                    "Exception"
-                } else if message_str.contains("Fatal") || message_str.contains("fatal") {
-                    "Fatal"
-                } else {
-                    "Error"
-                };
-
-                if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
-                    *last_error = Some(crate::error_synthesis::LastDetectedError {
-                        request_id: request_id.clone(),
-                        error_type: error_type.to_string(),
-                    });
-                }
-
-                if is_apm_mode {
-                    debug!("APM mode: Error detected in function log: {}", sanitized_msg);
-                    debug!("APM mode: Sending error event for request_id: {}", request_id);
-
-                    if let Some(ref apm_app_arc) = self.apm_app {
-                        let apm_clone = Arc::clone(apm_app_arc);
-                        let msg_clone = message_str.to_string();
-
-                        // Send error asynchronously during the current invoke
-                        let apm_guard = apm_clone.read().await;
-                        if let Some(ref app) = *apm_guard {
-                            if let Err(e) = app.send_error_event_from_fault(&msg_clone, &request_id, &function_arn).await {
-                                debug!("Failed to send error event from function log fault: {}", e);
-                            }
-                        }
-                    }
-                } else {
-                    // Standard (non-APM) mode: Send errors to telemetry endpoint
-                    debug!("Serverless mode: Error detected in function log: {}", sanitized_msg);
-                    debug!("Serverless mode: Sending error for request_id: {}", request_id);
-
-                    // Determine error type - use consistent LambdaError for all function errors
-                    // (except timeout which should match platform timeout)
-                    let error_type = if message_str.contains("Task timed out") {
-                        "LambdaTimeout"  // Match platform timeout error class
-                    } else {
-                        "LambdaError"    // Use single consistent error class
-                    };
-
-                    let client = Arc::clone(&self.newrelic_client);
-                    let config = Arc::clone(&self.config);
-                    let msg_clone = message_str.to_string();
-                    let error_type_clone = error_type.to_string();
-
-                    // Format error message like timeout/platform errors for Error Inbox recognition
-                    // Format: "{ISO_TIMESTAMP} {REQUEST_ID} {ERROR_CLASS} {original_error_message}"
-                    // Keep the original error message with [ERROR] prefix intact
-                    let formatted_error_msg = format!(
-                        "{} {} {} {}",
-                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ"),
-                        request_id,
-                        error_type,  // LambdaError or LambdaTimeout
-                        msg_clone    // Keep original message with [ERROR] prefix
-                    );
-
-                    // Store error details for potential platform fault correlation
-                    if let Ok(mut last_error) = crate::error_synthesis::LAST_DETECTED_ERROR.lock() {
-                        *last_error = Some(crate::error_synthesis::LastDetectedError {
-                            request_id: request_id.clone(),
-                            error_type: error_type_clone.clone(),
-                        });
-                    }
-
-                    // Send error asynchronously during the current invoke
-                    crate::error_synthesis::send_lambda_error(
-                        &formatted_error_msg,  // Send formatted message, not raw log
-                        &request_id,
-                        &function_arn,
-                        &error_type_clone,
-                        &client,
-                        &config,
-                    ).await;
-                }
-            }
-    
             let log_message = self.apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
 
             // trace.id buffering (only when collect_trace_id is on). Hold each log under

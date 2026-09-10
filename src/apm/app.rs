@@ -470,30 +470,6 @@ impl ApmApp {
         }
     }
 
-    pub async fn send_error_event_from_fault(
-        &self,
-        log_line: &str,
-        request_id: &str,
-        function_arn: &str,
-    ) -> Result<()> {
-        use super::error_event::generate_error_event_from_fault;
-        
-        let error_events = match generate_error_event_from_fault(log_line, request_id, function_arn) {
-            Some(events) => events,
-            None => {
-                debug!("Not a fault/timeout log, skipping error event generation");
-                return Ok(());
-            }
-        };
-
-        debug!(
-            "Sending error event for fault/timeout in request: {}",
-            request_id
-        );
-
-        self.send_error_events_buffered(error_events, request_id).await
-    }
-
     /// Send synthesized error events, buffering them for retry on failure so a
     /// transient collector error or stale run_id does not silently drop them.
     async fn send_error_events_buffered(
