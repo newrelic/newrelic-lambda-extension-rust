@@ -512,7 +512,7 @@ async fn drain_on_shutdown_with_timeout(
             {
                 let apm_app_guard = components.apm_app.read().await;
                 if let Some(ref app) = *apm_app_guard {
-                    send_error_for_shutdown_reason(app, reason, &last_request_id, &last_arn).await;
+                    send_error_for_shutdown_reason(app, reason, &last_request_id, &last_arn, &components.config).await;
                 } else {
                     debug!(
                         "LMI shutdown: APM app not connected — skipping shutdown error event for request {}",

@@ -509,17 +509,19 @@ impl ApmApp {
     }
 
     /// Send error event for shutdown events (timeout, failure)
-    /// Used when Lambda shuts down due to timeout or platform fault
+    /// Used when Lambda shuts down due to timeout or platform fault.
+    /// `is_expected` is forwarded to `error.expected` on the generated event.
     pub async fn send_shutdown_error_event(
         &self,
         error_class: &str,
         error_message: &str,
         request_id: &str,
         function_arn: &str,
+        is_expected: bool,
     ) -> Result<()> {
         use super::error_event::generate_error_event;
 
-        let error_events = generate_error_event(error_class, error_message, request_id, function_arn);
+        let error_events = generate_error_event(error_class, error_message, request_id, function_arn, is_expected);
 
         if error_events.is_empty() {
             return Ok(());

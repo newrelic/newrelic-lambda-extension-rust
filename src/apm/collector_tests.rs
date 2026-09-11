@@ -95,3 +95,43 @@ fn disconnect_is_not_restart_exception() {
     assert!(is_restart(&restart), "RestartException (409/401) must be detected");
     assert!(!is_restart(&disconnect), "Disconnect (410) must NOT be treated as restart");
 }
+
+#[test]
+fn collector_error_display_messages() {
+    assert_eq!(CollectorError::Disconnect.to_string(), "Collector disconnected (410)");
+    assert_eq!(CollectorError::RestartException.to_string(), "Collector restart exception (401/409)");
+}
+
+#[test]
+fn metric_api_error_display_messages() {
+    let retr = MetricApiError::Retryable { status: 503, retry_after: None };
+    assert_eq!(retr.to_string(), "Metric API transient error (status 503)");
+
+    let perm = MetricApiError::Permanent { status: 400 };
+    assert_eq!(perm.to_string(), "Metric API permanent error (status 400)");
+
+    let net = MetricApiError::Network(anyhow::anyhow!("connection reset"));
+    assert_eq!(net.to_string(), "Metric API network error: connection reset");
+}
+
+#[test]
+fn parse_retry_after_parses_valid_seconds_header() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+    assert_eq!(parse_retry_after(&headers), Some(std::time::Duration::from_secs(30)));
+}
+
+#[test]
+fn parse_retry_after_ignores_http_date_form() {
+    // New Relic only ever emits delta-seconds; the HTTP-date form must be
+    // ignored (parsed as u64 fails) rather than panicking or guessing.
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::RETRY_AFTER, "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap());
+    assert_eq!(parse_retry_after(&headers), None);
+}
+
+#[test]
+fn parse_retry_after_missing_header_returns_none() {
+    let headers = reqwest::header::HeaderMap::new();
+    assert_eq!(parse_retry_after(&headers), None);
+}

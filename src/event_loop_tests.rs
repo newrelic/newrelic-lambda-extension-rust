@@ -278,12 +278,14 @@ fn make_test_apm_app() -> crate::apm::ApmApp {
 #[tokio::test]
 async fn test_send_error_spindown_no_network_call() {
     let app = make_test_apm_app();
+    let config = crate::config::ExtensionConfig::default();
     let t0 = std::time::Instant::now();
     send_error_for_shutdown_reason(
         &app,
         crate::runtime::ShutdownReason::Spindown,
         "req-123",
         "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
     )
     .await;
     assert!(
@@ -297,12 +299,14 @@ async fn test_send_error_spindown_no_network_call() {
 #[tokio::test]
 async fn test_send_error_timeout_swallows_network_error() {
     let app = make_test_apm_app();
+    let config = crate::config::ExtensionConfig::default();
     // Should complete without panic even though the HTTP call fails
     send_error_for_shutdown_reason(
         &app,
         crate::runtime::ShutdownReason::Timeout,
         "req-456",
         "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
     )
     .await;
 }
@@ -311,11 +315,13 @@ async fn test_send_error_timeout_swallows_network_error() {
 #[tokio::test]
 async fn test_send_error_failure_swallows_network_error() {
     let app = make_test_apm_app();
+    let config = crate::config::ExtensionConfig::default();
     send_error_for_shutdown_reason(
         &app,
         crate::runtime::ShutdownReason::Failure,
         "req-789",
         "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
     )
     .await;
 }
@@ -324,13 +330,39 @@ async fn test_send_error_failure_swallows_network_error() {
 #[tokio::test]
 async fn test_send_error_unknown_swallows_network_error() {
     let app = make_test_apm_app();
+    let config = crate::config::ExtensionConfig::default();
     send_error_for_shutdown_reason(
         &app,
         crate::runtime::ShutdownReason::Unknown,
         "req-000",
         "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
     )
     .await;
+}
+
+// NR-616580: a class listed in NEW_RELIC_EXTENSION_IGNORE_ERRORS must skip the
+// network call entirely (unlike Timeout/Failure/Unknown above, which always attempt
+// one) — verified the same way spindown's no-network-call case is verified.
+#[tokio::test]
+async fn test_send_error_ignored_class_no_network_call() {
+    let app = make_test_apm_app();
+    let mut config = crate::config::ExtensionConfig::default();
+    config.extension.ignore_errors.insert("lambdatimeout".to_string());
+    let t0 = std::time::Instant::now();
+    send_error_for_shutdown_reason(
+        &app,
+        crate::runtime::ShutdownReason::Timeout,
+        "req-999",
+        "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
+    )
+    .await;
+    assert!(
+        t0.elapsed().as_millis() < 100,
+        "Ignored error class should not make any network call (took {}ms)",
+        t0.elapsed().as_millis()
+    );
 }
 
 #[test]

@@ -10,3 +10,5 @@ pub mod payload;
 mod payload_tests;
 #[cfg(test)]
 mod batch_tests;
+#[cfg(test)]
+mod ipc_tests;
