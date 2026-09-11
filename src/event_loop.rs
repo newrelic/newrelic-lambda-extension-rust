@@ -576,7 +576,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
                     let apm_app_guard = components.apm_app.read().await;
                     if let Some(ref app) = *apm_app_guard {
-                        send_error_for_shutdown_reason(app, shutdown_reason, &last_request_id, &last_arn).await;
+                        send_error_for_shutdown_reason(app, shutdown_reason, &last_request_id, &last_arn, &components.config).await;
                     } else {
                         // Drop the read lock before calling write().await on the same RwLock —
                         // holding a read guard while awaiting a write lock on the same lock deadlocks.
@@ -615,7 +615,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         match shutdown_app {
                             Ok(app) => {
                                 info!("APM reconnect succeeded during shutdown - Entity GUID: {}", app.get_entity_guid());
-                                send_error_for_shutdown_reason(&app, shutdown_reason, &last_request_id, &last_arn).await;
+                                send_error_for_shutdown_reason(&app, shutdown_reason, &last_request_id, &last_arn, &components.config).await;
                                 let mut w = components.apm_app.write().await;
                                 *w = Some(app);
                             }
@@ -1670,33 +1670,52 @@ async fn wait_for_runtime_done_with_grace(
 
 /// Sends the appropriate APM error event for a given shutdown reason.
 /// Called from the SHUTDOWN handler whether APM was already connected or just reconnected.
+///
+/// Consults `config.extension.ignore_errors`/`expected_errors`
+/// (`NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`) so a
+/// matching class is either dropped entirely or sent with `error.expected: true`.
+/// Ignore takes precedence if a class is listed in both.
 pub(crate) async fn send_error_for_shutdown_reason(
     app: &crate::apm::ApmApp,
     reason: runtime::ShutdownReason,
     request_id: &str,
     arn: &str,
+    config: &crate::config::ExtensionConfig,
 ) {
+    async fn send(
+        app: &crate::apm::ApmApp,
+        config: &crate::config::ExtensionConfig,
+        class: &str,
+        message: &str,
+        request_id: &str,
+        arn: &str,
+    ) {
+        let key = class.to_ascii_lowercase();
+        if config.extension.ignore_errors.contains(&key) {
+            debug!("{} ignored via NEW_RELIC_EXTENSION_IGNORE_ERRORS - not sending (request: {})", class, request_id);
+            return;
+        }
+        let is_expected = config.extension.expected_errors.contains(&key);
+        if let Err(e) = app.send_shutdown_error_event(class, message, request_id, arn, is_expected).await {
+            error!("Failed to send {} error event to APM: {}", class, e);
+        }
+    }
+
     match reason {
         runtime::ShutdownReason::Timeout => {
             info!("Shutdown due to timeout - sending error event to APM for request: {}", request_id);
-            if let Err(e) = app.send_shutdown_error_event("LambdaTimeout", "Task timed out", request_id, arn).await {
-                error!("Failed to send timeout error event to APM: {}", e);
-            }
+            send(app, config, "LambdaTimeout", "Task timed out", request_id, arn).await;
         }
         runtime::ShutdownReason::Failure => {
             info!("Shutdown due to failure - sending error event to APM for request: {}", request_id);
-            if let Err(e) = app.send_shutdown_error_event("LambdaPlatformFault", "AWS Lambda platform fault caused a shutdown", request_id, arn).await {
-                error!("Failed to send platform fault error event to APM: {}", e);
-            }
+            send(app, config, "LambdaPlatformFault", "AWS Lambda platform fault caused a shutdown", request_id, arn).await;
         }
         runtime::ShutdownReason::Spindown => {
             debug!("Normal spindown shutdown - no error event needed");
         }
         runtime::ShutdownReason::Unknown => {
             warn!("Unknown shutdown reason - sending error event to APM for request: {}", request_id);
-            if let Err(e) = app.send_shutdown_error_event("LambdaShutdown", "Lambda shutdown with unknown reason", request_id, arn).await {
-                error!("Failed to send shutdown error event to APM: {}", e);
-            }
+            send(app, config, "LambdaShutdown", "Lambda shutdown with unknown reason", request_id, arn).await;
         }
     }
 }

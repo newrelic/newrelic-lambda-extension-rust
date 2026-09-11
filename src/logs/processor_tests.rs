@@ -1235,6 +1235,63 @@ mod tests {
             "estimate_log_size({}) must exceed raw message length", sz);
     }
 
+    // Direct coverage of estimate_json_value_size's branches — estimate_log_size's
+    // one test above only exercises the String variant via a plain-message
+    // LogMessage; these hit every serde_json::Value variant (including nested
+    // Array/Object) since size estimation must stay non-allocating and correct
+    // for the full range of attribute values agents can send.
+    #[test]
+    fn test_estimate_json_value_size_string() {
+        let v = serde_json::json!("hello");
+        assert_eq!(super::super::estimate_json_value_size(&v), "hello".len() + 2);
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_number() {
+        let v = serde_json::json!(12345);
+        assert_eq!(super::super::estimate_json_value_size(&v), "12345".len());
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_bool() {
+        assert_eq!(super::super::estimate_json_value_size(&serde_json::json!(true)), 4);
+        assert_eq!(super::super::estimate_json_value_size(&serde_json::json!(false)), 5);
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_null() {
+        assert_eq!(super::super::estimate_json_value_size(&serde_json::json!(null)), 4);
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_empty_array() {
+        let v = serde_json::json!([]);
+        assert_eq!(super::super::estimate_json_value_size(&v), 2); // just "[]"
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_array_with_commas() {
+        let v = serde_json::json!([1, 2, 3]);
+        // "[" + "1" + "," + "2" + "," + "3" + "]" = 2 brackets + 3 digits + 2 commas
+        assert_eq!(super::super::estimate_json_value_size(&v), 2 + 3 + 2);
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_object_with_key_overhead() {
+        let v = serde_json::json!({"a": 1});
+        // {} (2) + "a" quoted+colon+space (1 + 4) + value "1" (1)
+        assert_eq!(super::super::estimate_json_value_size(&v), 2 + (1 + 4 + 1));
+    }
+
+    #[test]
+    fn test_estimate_json_value_size_nested_object_and_array() {
+        let v = serde_json::json!({"list": [true, null]});
+        let expected = 2 // outer {}
+            + ("list".len() + 4) // "list":
+            + (2 + 4 + 4 + 1); // inner array: [] + true(4) + null(4) + comma(1)
+        assert_eq!(super::super::estimate_json_value_size(&v), expected);
+    }
+
     // H2 regression — calling start_invocation_retry twice without flush() between
     // must NOT abort the prior task (data loss). Instead the counter ticks and a
     // background task awaits the prior handle.

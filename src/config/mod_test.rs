@@ -493,6 +493,41 @@ fn test_extension_settings_default() {
     assert!(!settings.send_platform_logs);
     assert_eq!(settings.log_level, "info");
     assert!(settings.extension_logs_enabled);
+    assert!(settings.ignore_errors.is_empty());
+    assert!(settings.expected_errors.is_empty());
+}
+
+// ============================================================================
+// parse_error_class_list (NEW_RELIC_EXTENSION_IGNORE_ERRORS / _EXPECTED_ERRORS)
+// ============================================================================
+
+#[test]
+fn test_parse_error_class_list_valid_classes() {
+    let set = parse_error_class_list("LambdaTimeout,LambdaPlatformFault", "TEST_VAR");
+    assert_eq!(set.len(), 2);
+    assert!(set.contains("lambdatimeout"));
+    assert!(set.contains("lambdaplatformfault"));
+}
+
+#[test]
+fn test_parse_error_class_list_mixed_case_and_whitespace() {
+    let set = parse_error_class_list(" LambdaSHUTDOWN , lambdatimeout ", "TEST_VAR");
+    assert_eq!(set.len(), 2);
+    assert!(set.contains("lambdashutdown"));
+    assert!(set.contains("lambdatimeout"));
+}
+
+#[test]
+fn test_parse_error_class_list_ignores_unknown_tokens() {
+    let set = parse_error_class_list("LambdaTimeout,SomeUnknownClass", "TEST_VAR");
+    assert_eq!(set.len(), 1);
+    assert!(set.contains("lambdatimeout"));
+}
+
+#[test]
+fn test_parse_error_class_list_empty_string() {
+    let set = parse_error_class_list("", "TEST_VAR");
+    assert!(set.is_empty());
 }
 
 // ============================================================================
@@ -1458,6 +1493,8 @@ fn test_extension_settings_all_fields() {
         runtime_done_grace_ms: 250,
         pipeline_flush: false,
         lmi_flush_interval_ms: 30_000,
+        ignore_errors: std::collections::HashSet::new(),
+        expected_errors: std::collections::HashSet::new(),
     };
     
     assert!(settings.send_function_logs);
