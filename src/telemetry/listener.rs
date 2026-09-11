@@ -299,23 +299,45 @@ async fn handle_telemetry_request(
                         function_completed = true;
                     }
                     "platform.initStart" => {
-                        // LMI host metadata (instanceId + instanceMaxMemory,
-                        // both AWS-documented on the 2025-01-29 schema). Captured
-                        // once into the global static, then read by every
-                        // outbound attribute composer. See
-                        // src/telemetry/managed_instance.rs.
-                        if let Some(meta) =
-                            crate::telemetry::managed_instance::extract_managed_instance_metadata(&record.record)
+                        // `instanceId` on `platform.initStart` is documented generically
+                        // (optional on every `platform.initStart`, NOT LMI-exclusive), but
+                        // what it MEANS differs by deployment context — gate on `is_lmi`
+                        // (DeploymentContext), never on field presence alone:
+                        //   - LMI: `instanceId` is the managed-instance host id (+
+                        //     `instanceMaxMemory`). See src/telemetry/managed_instance.rs.
+                        //   - Standard Lambda: live traffic showed the SAME field, when
+                        //     present, holds the CloudWatch log-stream name for this
+                        //     execution environment instead — best-effort, AWS
+                        //     implementation detail, not a documented guarantee. See
+                        //     src/telemetry/normal_log_stream.rs.
+                        // Captured once per cold start into the relevant global static,
+                        // then read by every outbound attribute composer.
+                        if is_lmi {
+                            if let Some(meta) =
+                                crate::telemetry::managed_instance::extract_managed_instance_metadata(&record.record)
+                            {
+                                let mut guard =
+                                    crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA
+                                        .write()
+                                        .await;
+                                debug!(
+                                    "Captured managed-instance metadata: instance_id={} instance_max_memory={:?}",
+                                    meta.instance_id, meta.instance_max_memory
+                                );
+                                *guard = Some(meta);
+                            }
+                        } else if let Some(instance_id) = record
+                            .record
+                            .get("instanceId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
                         {
                             let mut guard =
-                                crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA
+                                crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM
                                     .write()
                                     .await;
-                            debug!(
-                                "Captured managed-instance metadata: instance_id={} instance_max_memory={:?}",
-                                meta.instance_id, meta.instance_max_memory
-                            );
-                            *guard = Some(meta);
+                            debug!("Captured best-effort log stream from initStart: {}", instance_id);
+                            *guard = Some(instance_id.to_string());
                         }
                         // Existing log-emission path stays the source of truth
                         // for surfacing platform.initStart as a log entry.

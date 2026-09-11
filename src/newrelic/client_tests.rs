@@ -4,6 +4,7 @@
 //! Tests for `newrelic::client`
 
 use super::*;
+use serial_test::serial;
 
 #[test]
 fn test_get_extension_name_with_version() {
@@ -234,4 +235,114 @@ fn test_summarize_response_body_no_title_truncates() {
 #[test]
 fn test_summarize_response_body_short_plain_text_unchanged() {
     assert_eq!(summarize_response_body("  plain error  "), "plain error");
+}
+
+#[test]
+fn test_common_log_attrs_include_aws_log_group_derived_from_function_name() {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.aws.function_name = "my-function".to_string();
+
+    let client = NewRelicClient::new(&config);
+    let common_json = client.get_or_build_common_json(&config, "arn:aws:lambda:us-east-1:123456789012:function:my-function");
+
+    let parsed: serde_json::Value = serde_json::from_str(&common_json).expect("common attrs must be valid JSON");
+    assert_eq!(parsed["aws.logGroup"], serde_json::json!("/aws/lambda/my-function"));
+    // Sanity check: added alongside faas.name, not instead of it.
+    assert_eq!(parsed["faas.name"], serde_json::json!("my-function"));
+}
+
+#[test]
+fn test_common_log_attrs_omit_aws_log_group_when_function_name_unresolved() {
+    // Default AwsConfig::function_name is "unknown" before registration completes.
+    let config = crate::config::ExtensionConfig::default();
+
+    let client = NewRelicClient::new(&config);
+    let common_json = client.get_or_build_common_json(&config, "arn:aws:lambda:us-east-1:123456789012:function:placeholder");
+
+    let parsed: serde_json::Value = serde_json::from_str(&common_json).expect("common attrs must be valid JSON");
+    assert!(parsed.get("aws.logGroup").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn test_common_log_attrs_include_aws_log_stream_when_captured_from_telemetry() {
+    {
+        let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+        *guard = Some("2026/09/07/[$LATEST]abcdef".to_string());
+    }
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.aws.function_name = "my-function".to_string();
+
+    let client = NewRelicClient::new(&config);
+    let common_json = client.get_or_build_common_json(&config, "arn:aws:lambda:us-east-1:123456789012:function:log-stream-set");
+
+    let parsed: serde_json::Value = serde_json::from_str(&common_json).expect("common attrs must be valid JSON");
+    assert_eq!(parsed["aws.logStream"], serde_json::json!("2026/09/07/[$LATEST]abcdef"));
+
+    let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+    *guard = None;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn test_common_log_attrs_omit_aws_log_stream_when_not_yet_captured() {
+    {
+        let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+        *guard = None;
+    }
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.aws.function_name = "my-function".to_string();
+
+    let client = NewRelicClient::new(&config);
+    let common_json = client.get_or_build_common_json(&config, "arn:aws:lambda:us-east-1:123456789012:function:log-stream-unset");
+
+    let parsed: serde_json::Value = serde_json::from_str(&common_json).expect("common attrs must be valid JSON");
+    assert!(parsed.get("aws.logStream").is_none());
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn test_common_log_attrs_per_arn_cache_locks_in_first_seen_log_stream() {
+    // Regression/documentation test for a real limitation: get_or_build_common_json
+    // early-returns from `cached_common_json_by_arn` before ever consulting
+    // normal_log_stream::try_read() again. So despite aws.logStream being read
+    // "fresh" on the code path that builds the JSON, once a given ARN's JSON is
+    // cached (on the first call for that ARN) it is baked in for the rest of the
+    // client's lifetime — a later change to the global does NOT get picked up by
+    // a second call with the SAME ARN. This is the same accepted limitation the
+    // aws.lambda.managedInstance.* attributes already have; this test locks in
+    // that behavior for aws.logStream so a future maintainer doesn't mistake it
+    // for a bug (or silently break the caching without noticing the behavior
+    // change).
+    {
+        let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+        *guard = Some("2026/09/08/[$LATEST]first".to_string());
+    }
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.aws.function_name = "my-function".to_string();
+    let client = NewRelicClient::new(&config);
+    let arn = "arn:aws:lambda:us-east-1:123456789012:function:same-arn-twice";
+
+    let first_json = client.get_or_build_common_json(&config, arn);
+    let first: serde_json::Value = serde_json::from_str(&first_json).expect("valid JSON");
+    assert_eq!(first["aws.logStream"], serde_json::json!("2026/09/08/[$LATEST]first"));
+
+    {
+        let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+        *guard = Some("2026/09/08/[$LATEST]second".to_string());
+    }
+
+    let second_json = client.get_or_build_common_json(&config, arn);
+    let second: serde_json::Value = serde_json::from_str(&second_json).expect("valid JSON");
+    assert_eq!(
+        second["aws.logStream"],
+        serde_json::json!("2026/09/08/[$LATEST]first"),
+        "per-ARN cache hit must return the ORIGINALLY cached value, not the updated global"
+    );
+
+    let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
+    *guard = None;
 }

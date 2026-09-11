@@ -517,6 +517,15 @@ impl ExtensionConfig {
 
         // Note: function_name is set from extension registration response, not from env var
 
+        // AWS_LAMBDA_LOG_GROUP_NAME / AWS_LAMBDA_LOG_STREAM_NAME are deliberately NOT
+        // read here: AWS's Extensions API docs explicitly exclude both from the
+        // extension process's environment (they're "specific to the runtime
+        // process"), so `env::var` on them would always be empty on real Lambda.
+        // `aws.logGroup`/`aws.logStream` are resolved elsewhere — see
+        // `NewRelicClient::get_or_build_common_json` (logGroup, derived from
+        // function_name) and `telemetry::normal_log_stream` (logStream, captured
+        // from the Telemetry API).
+
         // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
         if !send_logs_str.is_empty() {
             let (function, extension, platform, platform_log_filter) = Self::parse_send_logs(&send_logs_str);

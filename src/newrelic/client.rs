@@ -158,8 +158,10 @@ pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
 pub struct NewRelicClient {
     client: Client,
     cached_version_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
-    /// Static log common-attributes: plugin name, faas.name, NR_TAGS, and version tags.
-    /// faas.arn is per-call and inserted separately. Cached on first log send.
+    /// Static log common-attributes: plugin name, faas.name, aws.logGroup, NR_TAGS,
+    /// and version tags. faas.arn and aws.logStream are per-call and inserted
+    /// separately (aws.logStream can change/appear after this is first cached — see
+    /// `telemetry::normal_log_stream`). Cached on first log send.
     cached_static_log_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
     /// Per-ARN cached common-attributes JSON string (includes faas.arn).
     /// Avoids re-serializing the common block on every send — only the logs array changes.
@@ -293,6 +295,19 @@ impl NewRelicClient {
             let mut attrs = serde_json::Map::new();
             attrs.insert("plugin".to_string(), serde_json::json!(get_extension_name_with_version()));
             attrs.insert("faas.name".to_string(), serde_json::json!(&config.aws.function_name));
+            // Extensions cannot read AWS_LAMBDA_LOG_GROUP_NAME directly (excluded from
+            // the extension process's environment per AWS's Extensions API docs), so
+            // this is derived from function_name using AWS's default log-group naming
+            // convention — same precedent as `error_synthesis.rs`/`agent/payload.rs`.
+            // Wrong only for functions with a customer-configured custom log group.
+            // Guarded the same way as faas.arn's empty-ARN check in `send_logs`: never
+            // stamp a placeholder before function_name is resolved from registration.
+            if !config.aws.function_name.is_empty() && config.aws.function_name != "unknown" {
+                attrs.insert(
+                    "aws.logGroup".to_string(),
+                    serde_json::json!(format!("/aws/lambda/{}", config.aws.function_name)),
+                );
+            }
             for (key, value) in crate::config::get_nr_tags() {
                 debug!("Adding NR_TAGS to log payload: {}={}", key, value);
                 attrs.insert(key.clone(), serde_json::json!(value));
@@ -339,6 +354,15 @@ impl NewRelicClient {
                     serde_json::json!(max_memory),
                 );
             }
+        }
+
+        // Best-effort `aws.logStream` on Standard Lambda only — see
+        // `telemetry::normal_log_stream` for why this can't just be an env var read.
+        // `None` on LMI (that deployment's `instanceId` means something different;
+        // see the managed-instance block above) and on Standard Lambda until the
+        // first `platform.initStart` of the cold start has been processed.
+        if let Some(log_stream) = crate::telemetry::normal_log_stream::try_read() {
+            common_attributes.insert("aws.logStream".to_string(), serde_json::json!(log_stream));
         }
 
         let json = serde_json::to_string(&common_attributes).unwrap_or_else(|_| "{}".to_string());
