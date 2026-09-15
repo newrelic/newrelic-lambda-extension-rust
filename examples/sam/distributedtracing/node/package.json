@@ -4,14 +4,13 @@
     "version": "0.0.1",
     "private": true,
     "devDependencies": {
-        "jest": "^29.7.0",
-        "uuid": "^8.3.2"
+        "jest": "^30.5.1"
     },
     "scripts": {
         "test": "jest --roots __tests__/unit",
         "integ-test": "jest --roots __tests__/integration"
     },
     "dependencies": {
-        "aws-sdk": "^2.1692.0"
+        "@aws-sdk/client-sns": "^3.1129.0"
     }
 }

@@ -18,7 +18,7 @@
             <dependency>
                 <groupId>com.amazonaws</groupId>
                 <artifactId>aws-java-sdk-bom</artifactId>
-                <version>1.11.956</version>
+                <version>1.12.797</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -30,40 +30,40 @@
         <dependency>
             <groupId>com.amazonaws</groupId>
             <artifactId>aws-lambda-java-core</artifactId>
-            <version>1.2.3</version>
+            <version>1.4.0</version>
         </dependency>
         <dependency>
             <groupId>com.amazonaws</groupId>
             <artifactId>aws-lambda-java-events</artifactId>
-            <version>3.15.0</version>
+            <version>3.16.1</version>
         </dependency>
          <!-- These SDK components are "provided" dependencies of the New Relic OpenTracing agent, except
         that the Java 17 runtime does not appear to provide them, so we need to be explicit here. -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>aws-core</artifactId>
-            <version>2.30.23</version>
+            <version>2.54.15</version>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>s3</artifactId>
-            <version>2.30.23</version>
+            <version>2.54.15</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>kinesis</artifactId>
-            <version>2.30.23</version>
+            <version>2.54.15</version>
         </dependency>
         <dependency>
             <groupId>com.newrelic.opentracing</groupId>
             <artifactId>newrelic-java-lambda</artifactId>
-            <version>2.2.0</version>
+            <version>2.2.5</version>
         </dependency>
         <dependency>
             <groupId>com.newrelic.opentracing</groupId>
             <artifactId>java-aws-lambda</artifactId>
-            <version>2.1.0</version>
+            <version>3.5.0</version>
         </dependency>
         <dependency>
             <groupId>io.opentracing</groupId>
@@ -82,7 +82,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
-                <version>3.2.4</version>
+                <version>3.6.2</version>
                 <executions>
                     <execution>
                         <phase>package</phase>
@@ -95,7 +95,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.8.1</version> <!-- Ensure this or later versions-->
+                <version>3.16.0</version> <!-- Ensure this or later versions-->
                 <configuration>
                     <source>${maven.compiler.source}</source>
                     <target>${maven.compiler.target}</target>
