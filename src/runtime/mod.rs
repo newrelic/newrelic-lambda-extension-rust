@@ -317,3 +317,7 @@ pub async fn fetch_next_event(
 #[cfg(test)]
 #[path = "telemetry_subscribe_test.rs"]
 mod telemetry_subscribe_test;
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod mod_tests;
