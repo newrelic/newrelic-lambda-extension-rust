@@ -344,7 +344,13 @@ async fn test_send_error_unknown_swallows_network_error() {
 // NR-616580: a class listed in NEW_RELIC_EXTENSION_IGNORE_ERRORS must skip the
 // network call entirely (unlike Timeout/Failure/Unknown above, which always attempt
 // one) — verified the same way spindown's no-network-call case is verified.
+//
+// #[serial] here and below: these tests inspect the process-global
+// FAILED_TELEMETRY_BUFFER (via get_buffer_count()), which every test in the
+// suite that buffers telemetry shares — matching the crate-wide convention
+// (see apm::telemetry_buffer_tests) of serializing tests that touch it.
 #[tokio::test]
+#[serial]
 async fn test_send_error_ignored_class_no_network_call() {
     let app = make_test_apm_app();
     let mut config = crate::config::ExtensionConfig::default();
@@ -362,6 +368,69 @@ async fn test_send_error_ignored_class_no_network_call() {
         t0.elapsed().as_millis() < 100,
         "Ignored error class should not make any network call (took {}ms)",
         t0.elapsed().as_millis()
+    );
+}
+
+// NR-616580: a class listed in NEW_RELIC_EXTENSION_EXPECTED_ERRORS (and NOT in
+// ignore_errors) must still attempt the send — unlike the ignored case above.
+// The send targets a fake collector host (127.0.0.1:1) so it fails fast and
+// gets buffered via telemetry_buffer::buffer_failed_telemetry; that buffering
+// only happens on the path that actually calls
+// ApmApp::send_shutdown_error_event, so an increased buffer count is proof the
+// is_expected=true forwarding path was reached rather than skipped.
+#[tokio::test]
+#[serial]
+async fn test_send_error_expected_class_still_attempts_send() {
+    crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap().clear();
+    let app = make_test_apm_app();
+    let mut config = crate::config::ExtensionConfig::default();
+    config.extension.expected_errors.insert("lambdatimeout".to_string());
+    send_error_for_shutdown_reason(
+        &app,
+        crate::runtime::ShutdownReason::Timeout,
+        "req-998",
+        "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
+    )
+    .await;
+    assert_eq!(
+        crate::apm::telemetry_buffer::get_buffer_count(),
+        1,
+        "expected-but-not-ignored class must still attempt the send (and get buffered on failure)"
+    );
+    crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap().clear();
+}
+
+// NR-616580: README states ignore_errors takes precedence over expected_errors
+// when a class appears in both. Verify that precedence end-to-end: with the
+// same class in both sets, the send must be skipped exactly like the
+// ignore-only case (no network call, nothing buffered).
+#[tokio::test]
+#[serial]
+async fn test_send_error_ignore_takes_precedence_over_expected_for_same_class() {
+    crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap().clear();
+    let app = make_test_apm_app();
+    let mut config = crate::config::ExtensionConfig::default();
+    config.extension.ignore_errors.insert("lambdatimeout".to_string());
+    config.extension.expected_errors.insert("lambdatimeout".to_string());
+    let t0 = std::time::Instant::now();
+    send_error_for_shutdown_reason(
+        &app,
+        crate::runtime::ShutdownReason::Timeout,
+        "req-997",
+        "arn:aws:lambda:us-east-1:123:function:test",
+        &config,
+    )
+    .await;
+    assert!(
+        t0.elapsed().as_millis() < 100,
+        "ignore_errors must win when a class is in both sets — no network call (took {}ms)",
+        t0.elapsed().as_millis()
+    );
+    assert_eq!(
+        crate::apm::telemetry_buffer::get_buffer_count(),
+        0,
+        "ignore_errors must win when a class is in both sets — nothing buffered"
     );
 }
 
