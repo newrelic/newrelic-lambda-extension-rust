@@ -1,14 +1,14 @@
 module github.com/newrelic/go-agent/examples/sam/go
 
-go 1.25.0
+go 1.26
 
 require (
-	github.com/newrelic/go-agent/v3 v3.35.1
-	github.com/newrelic/go-agent/v3/integrations/nrlambda v1.2.2
+	github.com/newrelic/go-agent/v3 v3.44.2
+	github.com/newrelic/go-agent/v3/integrations/nrlambda v1.2.7
 )
 
 require (
-	github.com/aws/aws-lambda-go v1.41.0 // indirect
+	github.com/aws/aws-lambda-go v1.55.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect

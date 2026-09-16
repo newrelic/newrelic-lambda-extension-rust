@@ -65,6 +65,21 @@ All of the New Relic Lambda Layers include the Extension and the latest Agent ve
 New Relic Lambda Layer ARNs for your runtime and region are available [here](https://layers.newrelic-external.com/). The 
 `NewRelicLambdaExtension` layer is suitable for Go runtime Lambda.
 
+### Supported Layers
+
+This extension is bundled into every New Relic language layer below, and paired with the New Relic serverless agent for that runtime. Each layer is published for both `x86_64` and `arm64`; exact per-version ARNs are available [here](https://layers.newrelic-external.com/).
+
+| Runtime | Versions |
+|---------|----------|
+| Python | `python3.9`, `python3.10`, `python3.11`, `python3.12`, `python3.13`, `python3.14` |
+| Node.js | `nodejs22.x`, `nodejs24.x` |
+| .NET | `dotnet6`, `dotnet8`, `dotnet10` |
+| Java | `java17`, `java21`, `java25` |
+| Provided | `provided.al2`, `provided.al2023` |
+| Ruby | `ruby3.2`, `ruby3.3`, `ruby3.4`, `ruby4.0` |
+
+For Go and other OS-only runtimes (`provided.al2`, `provided.al2023`), use the `NewRelicLambdaExtension` layer, which ships the extension without a bundled agent.
+
 ## APM Mode
 
 The extension supports an **APM (Application Performance Monitoring) Mode** that enables Lambda functions to report telemetry directly to New Relic's APM platform, providing deep application insights and entity-level correlation with other APM services.
@@ -234,6 +249,8 @@ The New Relic Lambda Extension offers various features, which can be configured 
 | `NEW_RELIC_APM_BLOCKING_HANDSHAKE` | `false` | `true`, `false`, `1`, `0` | When `true`, the extension holds `/next` after `platform.runtimeDone` until the APM PreConnect+Connect handshake finishes (or the remaining invoke deadline is exhausted). Improves the likelihood that APM is connected before the sandbox is frozen — useful for sparse-traffic functions (infrequent invocations) or very short function timeouts where the background handshake may not complete in time. When `false` (default), the handshake runs in the background and APM connects within a few invocations for high-frequency functions. |
 | `NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS` | `5` | Number (min: 1) | Maximum seconds to wait for each individual APM PreConnect or Connect request to the New Relic collector. Increase if your function runs in a high-latency network (e.g., cross-region VPC). The total handshake (PreConnect + Connect) can take up to `2 × timeout`. |
 | `NEW_RELIC_APM_DISABLE_TELEMETRY` | _(empty)_ | Comma-separated list of: `metric_data`, `custom_event_data`, `log_event_data`, `analytic_event_data`, `error_event_data`, `error_data`, `span_event_data`, `sql_trace_data`, `transaction_sample_data`, `platform_metrics` | APM mode only. Telemetry types listed here are **not sent** (and not buffered/retried). Unknown tokens are ignored with a warning. Example: `NEW_RELIC_APM_DISABLE_TELEMETRY=platform_metrics,sql_trace_data` drops the per-invocation `apm.lambda.*` platform metrics and SQL traces. `platform_metrics` also skips REPORT→metric conversion entirely. Does not affect the APM handshake or error synthesis memory capture. |
+| `NEW_RELIC_EXTENSION_IGNORE_ERRORS` | _(empty)_ | Comma-separated, case-insensitive list of: `LambdaTimeout`, `LambdaPlatformFault`, `LambdaShutdown` | APM mode only. Extension-synthesized shutdown errors matching a listed class are **not sent to New Relic at all**. Unknown tokens are ignored with a warning. Takes precedence over `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` if a class is listed in both. Example: `NEW_RELIC_EXTENSION_IGNORE_ERRORS=LambdaTimeout` suppresses timeout errors entirely — use for noisy, non-actionable shutdown errors. |
+| `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` | _(empty)_ | Comma-separated, case-insensitive list of: `LambdaTimeout`, `LambdaPlatformFault`, `LambdaShutdown` | APM mode only. Extension-synthesized shutdown errors matching a listed class are still sent, but flagged `error.expected: true` on the `TransactionError` event — so New Relic excludes them from error rate/Apdex while still surfacing them in Errors Inbox. Unknown tokens are ignored with a warning. Example: `NEW_RELIC_EXTENSION_EXPECTED_ERRORS=LambdaPlatformFault` marks platform faults as expected. |
 | `NEW_RELIC_RUNTIME_DONE_GRACE_MS` | `25` | Number (0–2000) | Grace period in milliseconds added after the `platform.runtimeDone` signal before the end-of-invocation log flush. Only active when the log batch is not already fully drained. Increasing this gives trailing telemetry (emitted by the agent just before the function returns) more time to arrive. Clamped to `[0, 2000]`. |
 | `NEW_RELIC_COLLECT_TRACE_ID` | `false` | `true`, `false`, `1`, `0` |Add `trace.id` attribute to Lambda logs for distributed tracing correlation. |
 | `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` | `2000` | Number (1–100000) | Only used when `NEW_RELIC_COLLECT_TRACE_ID=true`. Max logs parked per invocation while waiting for the agent payload (the `trace.id` source). On overflow, excess logs are sent without `trace.id` (a trace that isn't known yet can't be stamped). Clamped to `[1, 100000]`; invalid values fall back to the default. |

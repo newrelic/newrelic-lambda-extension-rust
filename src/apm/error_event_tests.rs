@@ -41,6 +41,7 @@ fn test_generate_error_event_for_shutdown_timeout() {
         "Task timed out",
         "abc123",
         "arn:aws:lambda:us-east-1:123456789:function:my-function:1",
+        false,
     );
 
     assert_eq!(events.len(), 1);
@@ -50,6 +51,27 @@ fn test_generate_error_event_for_shutdown_timeout() {
 
     assert_eq!(event_detail["error.class"], "LambdaTimeout");
     assert_eq!(event_detail["error.message"], "Task timed out");
+    assert_eq!(event_detail["error.expected"], false);
     assert_eq!(event_detail["type"], "TransactionError");
     assert_eq!(user_attrs["aws.requestId"], "abc123");
+}
+
+// NR-616580: NEW_RELIC_EXTENSION_EXPECTED_ERRORS should surface as `error.expected:
+// true` on the generated TransactionError event, so New Relic excludes it from error
+// rate/Apdex while still keeping it visible in Errors Inbox.
+#[test]
+fn test_generate_error_event_marks_expected() {
+    let events = generate_error_event(
+        "LambdaPlatformFault",
+        "AWS Lambda platform fault caused a shutdown",
+        "abc123",
+        "arn:aws:lambda:us-east-1:123456789:function:my-function:1",
+        true,
+    );
+
+    assert_eq!(events.len(), 1);
+    let event_detail = &events[0].as_array().unwrap()[0];
+
+    assert_eq!(event_detail["error.class"], "LambdaPlatformFault");
+    assert_eq!(event_detail["error.expected"], true);
 }

@@ -1,6 +1,6 @@
 "use strict";
 const newrelic = require("newrelic");
-const AWS = require("aws-sdk");
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 
 /**
  * A Lambda function that processes S3 events, retrieves trace context from object metadata,
@@ -11,7 +11,7 @@ exports.s3Handler = async (event, context) => {
   console.info(JSON.stringify(event));
 
   const transaction = newrelic.getTransaction();
-  const s3 = new AWS.S3();
+  const s3 = new S3Client();
 
   await Promise.all(
     event.Records.map(async (record) => {
@@ -22,15 +22,15 @@ exports.s3Handler = async (event, context) => {
       console.log(`Processing S3 object: ${bucket}/${key}`);
 
       // Get the object including its metadata
-      const s3Object = await s3
-        .getObject({
+      const s3Object = await s3.send(
+        new GetObjectCommand({
           Bucket: bucket,
           Key: key,
         })
-        .promise();
+      );
 
       // The object body contains the word
-      const word = s3Object.Body.toString("utf-8");
+      const word = await s3Object.Body.transformToString("utf-8");
 
       // The trace context is stored in the object's metadata
       const traceContext = s3Object.Metadata || {};
