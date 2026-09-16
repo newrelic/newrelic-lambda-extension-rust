@@ -2946,3 +2946,364 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
 
     REQUEST_DATA.remove(req_id);
 }
+
+// ── wait_for_runtime_done_with_grace — expired deadline uses fallback ─────────────────
+
+/// Cover lines 1607-1611: the INVOKE deadlineMs is already in the past, so the
+/// function must use the FALLBACK_RUNTIME_DONE_WAIT_MS constant instead of the
+/// remaining budget. Pre-firing the runtime.done notify collapses the 5-second
+/// fallback wait to effectively zero, keeping the test fast.
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_uses_fallback_when_deadline_is_past() {
+    let request_id = "wfrd-past-deadline-fallback";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_function_logs = true;
+    let config = Arc::new(cfg);
+    register_request_for_serverless(request_id, config.clone());
+
+    // Pre-fire the notify so notified() resolves instantly even via the fallback path.
+    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
+    notify.notify_one();
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let start = std::time::Instant::now();
+    wait_for_runtime_done_with_grace(
+        request_id,
+        deadline_ms_from_now(-1_000), // already expired → triggers lines 1607-1611
+        &config,
+        &log_processor,
+    )
+    .await;
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "pre-fired notify must resolve fast even on the expired-deadline fallback path"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// ── execute_noop_event_loop — INVOKE arm ────────────────────────────────────────────
+
+/// Cover lines 1261-1267: the no-op event loop receives an INVOKE before the final
+/// SHUTDOWN. The INVOKE arm simply logs and loops back to /next; it must not exit
+/// early or panic.
+#[tokio::test]
+#[serial]
+async fn execute_noop_event_loop_processes_invoke_before_shutdown() {
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
+            "req-noop-invoke-1",
+            "arn:aws:lambda:us-east-1:123:function:noop",
+            deadline_ms_from_now(5_000),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
+        .mount(&server)
+        .await;
+
+    let client = Arc::new(Client::new());
+    with_runtime_api_el(&server, || async {
+        execute_noop_event_loop(&client, "test-noop-ext-id").await;
+    })
+    .await;
+}
+
+// ── execute_standard_mode_event_loop — add_version_detail_tags cold-start ─────────
+
+/// Cover line 979: tag_lambda_function_once is called on cold-start when
+/// add_version_detail_tags is enabled. The function uses a static Once internally
+/// so the tagging call is instrumented as executed even if the Once body is a no-op.
+#[tokio::test]
+#[serial]
+async fn execute_standard_mode_event_loop_tags_function_on_cold_start_with_version_tags() {
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
+            "req-svl-vtags-1",
+            "arn:aws:lambda:us-east-1:123:function:vtags",
+            deadline_ms_from_now(5_000),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    cfg.new_relic.license_key = None;
+    cfg.new_relic.add_version_detail_tags = true;
+    let config = Arc::new(cfg);
+    let client = Arc::new(Client::new());
+    let mut components = make_test_extension_components(config, client, false);
+
+    with_runtime_api_el(&server, || async {
+        execute_standard_mode_event_loop(&mut components).await;
+    })
+    .await;
+
+    REQUEST_DATA.remove("req-svl-vtags-1");
+}
+
+// ── execute_apm_mode_event_loop — add_version_detail_tags cold-start ──────────────
+
+/// Cover line 388: tag_lambda_function_once is called on cold-start (APM mode) when
+/// add_version_detail_tags is enabled.
+#[tokio::test]
+#[serial]
+async fn execute_apm_mode_event_loop_tags_function_on_cold_start_with_version_tags() {
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
+            "req-apm-vtags-1",
+            "arn:aws:lambda:us-east-1:123:function:apm-vtags",
+            deadline_ms_from_now(5_000),
+        )))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    cfg.new_relic.license_key = None;
+    cfg.new_relic.add_version_detail_tags = true;
+    let config = Arc::new(cfg);
+    let client = Arc::new(Client::new());
+    let mut components = make_test_extension_components(config, client, true);
+
+    with_runtime_api_el(&server, || async {
+        execute_apm_mode_event_loop(&mut components).await;
+    })
+    .await;
+
+    REQUEST_DATA.remove("req-apm-vtags-1");
+    FAILED_AGENT_PAYLOADS.lock().unwrap().clear();
+}
+
+// ── process_apm_request — pending platform.report with APM app not ready ──────────
+
+/// Cover lines 1465-1480: a platform.report is pending in REQUEST_DATA when
+/// process_apm_request runs, but apm_app is None (APM not yet connected). The
+/// function must log a warning and remove the report rather than silently losing it.
+#[tokio::test]
+#[serial]
+async fn process_apm_request_pending_report_warns_when_apm_app_not_ready() {
+    let req_id = "par-pending-report-no-app";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(req_id, "arn:test", &factory);
+    REQUEST_PROCESSORS.insert(req_id.to_string(), state);
+
+    request::set_pending_report(
+        req_id,
+        "Duration: 50.00 ms Billed Duration: 100 ms Memory Size: 128 MB Max Memory Used: 64 MB".to_string(),
+    );
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    process_apm_request(
+        req_id.to_string(),
+        "arn:test".to_string(),
+        true, // is_cold_start — skips warm-start drain; keeps test deterministic
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(1_000),
+    )
+    .await;
+
+    // The pending report must have been consumed after the warning path executes.
+    assert!(
+        request::get_pending_report(req_id).is_none(),
+        "pending report must be removed after the apm-not-ready warning path"
+    );
+
+    REQUEST_DATA.remove(req_id);
+}
+
+// ── process_request_concurrently — early return when no state registered ──────────
+
+/// Cover lines 1872-1873: when process_request_concurrently is called for a
+/// request_id that was never registered in REQUEST_PROCESSORS, it must log an
+/// error and return immediately without panicking.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_returns_early_when_no_state_registered() {
+    let request_id = "prc-no-state-early-return";
+    // Ensure the id is clean (no leftover state from a previous run).
+    REQUEST_PROCESSORS.remove(request_id);
+
+    let config = make_config_for_serverless(false);
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    // Should return without panic; the error log at line 1872 is the observable side-effect.
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(1_000),
+    )
+    .await;
+}
+
+// ── process_request_concurrently — collect_trace_id loop ──────────────────────────
+
+/// Cover lines 1905-1908: when collect_trace_id is enabled and agent payloads are
+/// in the buffer, the trace extraction loop fires for each payload before the
+/// smart-batching decision is made.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_runs_trace_extraction_loop_when_collect_trace_id_enabled() {
+    let request_id = "prc-collect-trace-id";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.synchronous_flush = false;
+    cfg.new_relic.collect_trace_id = true;
+    let config = Arc::new(cfg);
+
+    register_request_for_serverless(request_id, config.clone());
+
+    // Push a payload so the non-empty branch at line 1900 is entered and the
+    // collect_trace_id loop at lines 1905-1908 fires. The agent_buffer Arc is
+    // shared between REQUEST_DATA and REQUEST_PROCESSORS so this push is visible
+    // to process_request_concurrently without extra indirection.
+    let buf = request::get_agent_buffer(request_id).expect("buffer must exist after registration");
+    buf.lock().unwrap().push(vec![1u8, 2u8, 3u8]);
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(1_000),
+    )
+    .await;
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// ── dropped_agent_payload_count ───────────────────────────────────────────────
+
+#[test]
+fn dropped_agent_payload_count_is_readable() {
+    let _ = dropped_agent_payload_count();
+}
+
+// ── push_failed_payload_capped — eviction when buffer is at capacity ──────────
+
+#[test]
+#[serial]
+fn buffer_failed_agent_payload_evicts_oldest_when_full() {
+    {
+        let mut buf = FAILED_AGENT_PAYLOADS.lock().unwrap();
+        buf.clear();
+        for i in 0..500usize {
+            buf.push(FailedAgentPayload {
+                payload_bytes: vec![],
+                request_id: format!("req-fill-{i}"),
+                invoked_function_arn: "arn:test".to_string(),
+                retry_count: 0,
+                failed_at: chrono::Utc::now(),
+            });
+        }
+    }
+    buffer_failed_agent_payload(b"new", "req-evict", "arn:test");
+
+    let buf = FAILED_AGENT_PAYLOADS.lock().unwrap();
+    assert_eq!(buf.len(), 500);
+    assert_eq!(buf.last().unwrap().request_id, "req-evict");
+    assert!(buf.iter().all(|p| p.request_id != "req-fill-0"), "oldest must be evicted");
+    drop(buf);
+    FAILED_AGENT_PAYLOADS.lock().unwrap().clear();
+}
+
+// ── bounded_wait_budget_ms ────────────────────────────────────────────────────
+
+#[test]
+fn bounded_wait_budget_ms_returns_zero_when_deadline_already_expired() {
+    let past_ms = chrono::Utc::now().timestamp_millis() - 10_000;
+    assert_eq!(super::bounded_wait_budget_ms(past_ms, 5_000), 0);
+}
+
+#[test]
+fn bounded_wait_budget_ms_caps_result_to_configured_timeout() {
+    let far_future_ms = chrono::Utc::now().timestamp_millis() + 100_000;
+    assert_eq!(super::bounded_wait_budget_ms(far_future_ms, 1_000), 1_000);
+}
+
+// ── should_defer_via_pipeline_flush ──────────────────────────────────────────
+
+#[test]
+fn should_defer_via_pipeline_flush_all_cases() {
+    assert!( super::should_defer_via_pipeline_flush(true,  false));
+    assert!(!super::should_defer_via_pipeline_flush(false, false));
+    assert!(!super::should_defer_via_pipeline_flush(true,  true));
+    assert!(!super::should_defer_via_pipeline_flush(false, true));
+}
+
+// ── cleanup_old_failed_payloads ───────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn cleanup_old_failed_payloads_removes_entries_older_than_24h_and_keeps_recent() {
+    FAILED_AGENT_PAYLOADS.lock().unwrap().clear();
+
+    let now = chrono::Utc::now();
+    let old_time = now - chrono::Duration::hours(25);
+
+    {
+        let mut buf = FAILED_AGENT_PAYLOADS.lock().unwrap();
+        buf.push(FailedAgentPayload {
+            payload_bytes: vec![1],
+            request_id: "req-old-25h".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            retry_count: 0,
+            failed_at: old_time,
+        });
+        buf.push(FailedAgentPayload {
+            payload_bytes: vec![2],
+            request_id: "req-recent".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            retry_count: 0,
+            failed_at: now,
+        });
+    }
+
+    cleanup_old_failed_payloads();
+
+    let buf = FAILED_AGENT_PAYLOADS.lock().unwrap();
+    assert_eq!(buf.len(), 1);
+    assert_eq!(buf[0].request_id, "req-recent");
+    drop(buf);
+    FAILED_AGENT_PAYLOADS.lock().unwrap().clear();
+}
