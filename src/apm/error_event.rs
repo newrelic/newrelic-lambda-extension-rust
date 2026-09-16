@@ -10,14 +10,19 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 /// Generate error event directly from error class and message
-/// Used for shutdown events (timeout, failure) where we don't parse from log lines
+/// Used for shutdown events (timeout, failure) where we don't parse from log lines.
+/// `is_expected` sets `error.expected` on the event — driven by
+/// `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` (see `config::parse_error_class_list`) — so
+/// New Relic excludes matching classes from error rate/Apdex while still surfacing
+/// them in Errors Inbox.
 pub fn generate_error_event(
     error_class: &str,
     error_message: &str,
     request_id: &str,
     function_arn: &str,
+    is_expected: bool,
 ) -> Vec<Value> {
-    generate_error_event_internal(error_class, error_message, request_id, function_arn)
+    generate_error_event_internal(error_class, error_message, request_id, function_arn, is_expected)
         .unwrap_or_else(Vec::new)
 }
 
@@ -27,6 +32,7 @@ fn generate_error_event_internal(
     error_message: &str,
     request_id: &str,
     function_arn: &str,
+    is_expected: bool,
 ) -> Option<Vec<Value>> {
     debug!(
         "Generating error event for request {}: {} - {}",
@@ -49,7 +55,7 @@ fn generate_error_event_internal(
     let event_detail = json!({
         "duration": 0.1,
         "error.class": error_class,
-        "error.expected": false,
+        "error.expected": is_expected,
         "error.message": error_message,
         "guid": guid,
         "nr.transactionGuid": guid,

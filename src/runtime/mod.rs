@@ -317,3 +317,40 @@ pub async fn fetch_next_event(
 #[cfg(test)]
 #[path = "telemetry_subscribe_test.rs"]
 mod telemetry_subscribe_test;
+
+#[cfg(test)]
+mod shutdown_reason_tests {
+    use super::ShutdownReason;
+
+    #[test]
+    fn as_str_matches_every_variant() {
+        assert_eq!(ShutdownReason::Spindown.as_str(), "spindown");
+        assert_eq!(ShutdownReason::Timeout.as_str(), "timeout");
+        assert_eq!(ShutdownReason::Failure.as_str(), "failure");
+        assert_eq!(ShutdownReason::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        assert_eq!(ShutdownReason::Spindown.to_string(), "spindown");
+        assert_eq!(ShutdownReason::Timeout.to_string(), "timeout");
+        assert_eq!(ShutdownReason::Failure.to_string(), "failure");
+        assert_eq!(ShutdownReason::Unknown.to_string(), "unknown");
+    }
+
+    #[test]
+    fn deserializes_known_reasons_from_lowercase() {
+        let de = |s: &str| serde_json::from_str::<ShutdownReason>(&format!("\"{s}\"")).unwrap();
+        assert_eq!(de("spindown"), ShutdownReason::Spindown);
+        assert_eq!(de("timeout"), ShutdownReason::Timeout);
+        assert_eq!(de("failure"), ShutdownReason::Failure);
+    }
+
+    #[test]
+    fn deserializes_unrecognized_reason_as_unknown() {
+        // AWS may introduce new shutdown reasons over time; #[serde(other)]
+        // must map anything unrecognized to Unknown rather than failing to parse.
+        let de: ShutdownReason = serde_json::from_str("\"some-future-reason\"").unwrap();
+        assert_eq!(de, ShutdownReason::Unknown);
+    }
+}

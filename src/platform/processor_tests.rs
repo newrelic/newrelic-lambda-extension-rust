@@ -442,8 +442,12 @@ mod check_and_send_platform_errors_tests {
     use std::sync::{Arc, Mutex};
 
     fn processor() -> PlatformProcessor {
+        processor_with_config(ExtensionConfig::default())
+    }
+
+    fn processor_with_config(config: ExtensionConfig) -> PlatformProcessor {
         let client = Arc::new(NewRelicClient::new_noop());
-        let config = Arc::new(ExtensionConfig::default());
+        let config = Arc::new(config);
         let context = Arc::new(Mutex::new(InvocationContext::default()));
         let log_processor = Arc::new(LogProcessor::new(
             client.clone(),
@@ -464,6 +468,21 @@ mod check_and_send_platform_errors_tests {
 
     fn clear_last_error() {
         *LAST_DETECTED_ERROR.lock().unwrap() = None;
+    }
+
+    // NR-616580: "failure" must map to "LambdaPlatformFault", matching
+    // error_synthesis::send_platform_fault_error's class, so the shared
+    // SENT_ERRORS de-dup (keyed by (request_id, error_type)) catches the case
+    // where both the SHUTDOWN-reason path and this Telemetry-API-status path fire
+    // for the same request — otherwise a genuine platform fault in non-APM mode
+    // gets reported twice under two different class names.
+    #[test]
+    fn lambda_error_type_for_status_matches_shutdown_path_classes() {
+        assert_eq!(PlatformProcessor::lambda_error_type_for_status(Some("timeout")), "LambdaTimeout");
+        assert_eq!(PlatformProcessor::lambda_error_type_for_status(Some("failure")), "LambdaPlatformFault");
+        assert_eq!(PlatformProcessor::lambda_error_type_for_status(Some("error")), "LambdaError");
+        assert_eq!(PlatformProcessor::lambda_error_type_for_status(None), "LambdaError");
+        assert_eq!(PlatformProcessor::lambda_error_type_for_status(Some("success")), "LambdaError");
     }
 
     #[test]
@@ -524,6 +543,28 @@ mod check_and_send_platform_errors_tests {
         ));
         let last = LAST_DETECTED_ERROR.lock().unwrap().clone().expect("should record error");
         assert_eq!(last.error_type, "Sandbox.Timedout");
+    }
+
+    // NR-616580: in APM mode, `event_loop::send_error_for_shutdown_reason` is the
+    // sole, ignore/expected-gated signal for timeout/platform-fault errors. This
+    // Telemetry-API-status-based path must stay silent in APM mode, or it
+    // duplicates that signal (and bypasses NEW_RELIC_EXTENSION_IGNORE_ERRORS /
+    // EXPECTED_ERRORS entirely, since it has no knowledge of them).
+    #[test]
+    #[serial]
+    fn apm_mode_skips_platform_error_detection_entirely() {
+        clear_last_error();
+        let mut config = ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let p = processor_with_config(config);
+        p.process_record(record(
+            "platform.runtimeDone",
+            serde_json::json!({"requestId": "r-apm", "status": "timeout", "errorType": "Sandbox.Timedout", "metrics": {"durationMs": 3000.0}}),
+        ));
+        assert!(
+            LAST_DETECTED_ERROR.lock().unwrap().is_none(),
+            "APM mode must not run check_and_send_platform_errors at all"
+        );
     }
 
     #[test]
