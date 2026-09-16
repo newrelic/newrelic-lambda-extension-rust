@@ -297,6 +297,7 @@ async fn test_send_error_spindown_no_network_call() {
 
 // Timeout → attempts network, error is swallowed (returns () not Result).
 #[tokio::test]
+#[serial]
 async fn test_send_error_timeout_swallows_network_error() {
     let app = make_test_apm_app();
     let config = crate::config::ExtensionConfig::default();
@@ -313,6 +314,7 @@ async fn test_send_error_timeout_swallows_network_error() {
 
 // Failure → attempts network, error is swallowed.
 #[tokio::test]
+#[serial]
 async fn test_send_error_failure_swallows_network_error() {
     let app = make_test_apm_app();
     let config = crate::config::ExtensionConfig::default();
@@ -328,6 +330,7 @@ async fn test_send_error_failure_swallows_network_error() {
 
 // Unknown → attempts network, error is swallowed.
 #[tokio::test]
+#[serial]
 async fn test_send_error_unknown_swallows_network_error() {
     let app = make_test_apm_app();
     let config = crate::config::ExtensionConfig::default();
