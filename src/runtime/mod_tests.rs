@@ -154,3 +154,41 @@ async fn fetch_next_event_retries_connection_errors_then_fails() {
 
     assert!(result.is_err(), "should fail after exhausting retries");
 }
+
+// The connection-refused tests above cover `e.is_connect()` — this test covers the
+// sibling `e.is_timeout()` branch at runtime/mod.rs:292 by using a wiremock server
+// that delays its response beyond the client's total request timeout.
+#[tokio::test]
+#[serial]
+async fn fetch_next_event_timeout_branch_is_retried_then_fails() {
+    let server = MockServer::start().await;
+
+    // Each request is accepted but the response is held for 500 ms — far longer than
+    // the 50 ms client timeout — so every attempt returns a reqwest timeout error.
+    Mock::given(method("GET"))
+        .and(path("/2020-01-01/extension/event/next"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(500))
+                .set_body_json(serde_json::json!({
+                    "eventType": "INVOKE",
+                    "requestId": "req-timeout-test",
+                    "invokedFunctionArn": "arn:test",
+                    "deadlineMs": 9_999_999_999_i64
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(50))
+        .build()
+        .unwrap();
+
+    let result = with_runtime_api(&server, || async {
+        fetch_next_event(&client, TEST_EXT_ID).await
+    })
+    .await;
+
+    assert!(result.is_err(), "must fail after exhausting retries on timeout");
+}

@@ -3408,3 +3408,182 @@ fn cleanup_old_failed_payloads_removes_entries_older_than_24h_and_keeps_recent()
     drop(buf);
     FAILED_AGENT_PAYLOADS.lock().unwrap().clear();
 }
+
+// ── send_batched_payloads_with_reports_only — mid-invocation threshold path ──
+//
+// Covers event_loop.rs:1048-1053: when should_send_batch_by_threshold() returns
+// true the function send_batched_payloads_with_reports_only is called.  This test
+// exercises it directly (it's pub async in agent::batch) and confirms the
+// send-success path clears paired entries while unpaired ones remain.
+#[tokio::test]
+#[serial]
+async fn send_batched_payloads_with_reports_only_clears_paired_entries_leaves_unpaired() {
+    crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+    // Add 3 paired entries (with report_line) — enough to pass the threshold
+    for i in 0..3u8 {
+        let req = format!("req-threshold-{i}");
+        crate::agent::batch::add_to_batch(
+            req.clone(),
+            vec![i],
+            Some(format!("REPORT Duration: {}ms", i * 10)),
+            "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        );
+    }
+    // Add one unpaired entry (no report_line) — must survive the call
+    crate::agent::batch::add_to_batch(
+        "req-threshold-unpaired".to_string(),
+        vec![99],
+        None, // no report
+        "arn:test".to_string(),
+    );
+
+    assert!(
+        crate::agent::batch::should_send_batch_by_threshold(),
+        "precondition: 3 paired entries must trip the threshold"
+    );
+
+    // No license key → send_agent_payload short-circuits with Ok(()), items cleared
+    let config = Arc::new(config::ExtensionConfig::default());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    crate::agent::batch::send_batched_payloads_with_reports_only(newrelic_client, config).await;
+
+    // Paired entries must be cleared after a successful (noop) send
+    for i in 0..3u8 {
+        assert!(
+            crate::agent::batch::AGENT_BATCH_BUFFER.get(&format!("req-threshold-{i}")).is_none(),
+            "paired entry req-threshold-{i} must be removed after send"
+        );
+    }
+
+    // Unpaired entry must remain in the buffer for the next cycle
+    assert!(
+        crate::agent::batch::AGENT_BATCH_BUFFER.get("req-threshold-unpaired").is_some(),
+        "unpaired entry must NOT be removed by send_batched_payloads_with_reports_only"
+    );
+
+    crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+}
+
+// ── pipeline flush handle cap — execute_standard_mode_event_loop:1025-1030 ───
+//
+// With pipeline_flush=true and 9 rapid INVOKE events the cap check fires:
+// when pending_flush_handles already holds 8 entries the oldest is awaited
+// synchronously before adding the next.  Uses multi-thread so spawned
+// process_request_concurrently tasks can actually run concurrently.
+#[tokio::test]
+#[serial]
+async fn execute_standard_mode_event_loop_awaits_oldest_handle_when_pipeline_flush_cap_reached() {
+    let server = wiremock::MockServer::start().await;
+
+    // 9 INVOKE events so the pipeline-flush Vec can fill past 8
+    for i in 0..9u32 {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
+                &format!("req-cap-{i}"),
+                "arn:aws:lambda:us-east-1:123:function:cap-test",
+                deadline_ms_from_now(5_000),
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+    }
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    cfg.new_relic.license_key = Some("fake-key".to_string());
+    cfg.extension.pipeline_flush = true; // enable pipeline flush to exercise the cap path
+    let config = Arc::new(cfg);
+    let client = Arc::new(reqwest::Client::new());
+    let mut components = make_test_extension_components(config, client, false);
+
+    let event_count = with_runtime_api_el(&server, || async {
+        execute_standard_mode_event_loop(&mut components).await
+    })
+    .await;
+
+    assert_eq!(event_count, 10, "must count all 9 INVOKEs + 1 SHUTDOWN");
+
+    for i in 0..9u32 {
+        REQUEST_DATA.remove(&format!("req-cap-{i}"));
+    }
+}
+
+// ── shutdown log-flush failure — execute_standard_mode_event_loop:1229-1233 ──
+//
+// When flush_on_shutdown returns Err the event loop must log it and continue
+// to shutdown cleanly rather than panicking.  We achieve the error by giving
+// the log processor a real client with a license key + an unreachable endpoint
+// so the HTTP call fails, and pre-populate the log batch so flush is attempted.
+#[tokio::test]
+#[serial]
+async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefully() {
+    let server = wiremock::MockServer::start().await;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    // License key + unreachable endpoint so send_logs fails, making flush_on_shutdown return Err
+    cfg.new_relic.license_key = Some("fake-key-flush-fail".to_string());
+    cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+    let config = Arc::new(cfg);
+
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let processor_factory = Arc::new(request::ProcessorFactory::new(
+        newrelic_client.clone(),
+        config.clone(),
+        apm_app.clone(),
+    ));
+
+    // Build a log processor backed by the failing client and seed it with a log entry
+    // so flush() actually attempts (and fails) a network send rather than returning
+    // early on an empty batch.
+    let ctx = Arc::new(Mutex::new(crate::context::InvocationContext::default()));
+    let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+        newrelic_client.clone(),
+        config.clone(),
+        ctx,
+        None,
+    ));
+    log_processor.add_log_to_batch(crate::newrelic::payload::LogMessage::diagnostic(
+        "shutdown-flush-fail-test",
+        "test message".to_string(),
+    ));
+
+    let mut components = ExtensionComponents {
+        client: Arc::new(reqwest::Client::new()),
+        extension_id: "test-ext-id".to_string(),
+        processor_factory,
+        newrelic_client,
+        config,
+        global_log_processor: log_processor,
+        apm_app,
+        apm_mode_enabled: false,
+        apm_client: reqwest::Client::new(),
+        reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+        deployment: crate::config::deployment::DeploymentContext::Normal {
+            mode: crate::config::deployment::TelemetryMode::Serverless,
+        },
+    };
+
+    // Must complete without panicking — the error is logged, not propagated
+    let event_count = with_runtime_api_el(&server, || async {
+        execute_standard_mode_event_loop(&mut components).await
+    })
+    .await;
+
+    assert_eq!(event_count, 1, "single SHUTDOWN must count as one event");
+}

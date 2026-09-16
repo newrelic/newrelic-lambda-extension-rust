@@ -1789,4 +1789,118 @@ mod tests {
 
         clear_request_state();
     }
+
+    // ── spawn_immediate_agent_payload_send — ARN falls back to global ─────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_uses_global_fallback_arn_when_request_arn_is_empty() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        // Set a known global fallback ARN in the process-wide context
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = "arn:aws:lambda:us-east-1:999:function:global-fallback".to_string();
+        }
+
+        let request_id = "req-arn-fallback-test";
+        // Empty per-request ARN — spawn_immediate_agent_payload_send must fall back to the global
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: String::new(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        // License key + unreachable endpoint so the send fails and buffers the payload
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-arn-fallback".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(request_id, vec![1, 2, 3], newrelic_client, config);
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for h in handles {
+            h.await.expect("send task must not panic");
+        }
+
+        // The buffered entry must carry the global fallback ARN, not the empty per-request one
+        let buffered_arn = crate::agent::batch::AGENT_BATCH_BUFFER
+            .get(request_id)
+            .map(|e| e.invoked_function_arn.clone())
+            .expect("failed send must buffer the payload");
+
+        assert_eq!(
+            buffered_arn,
+            "arn:aws:lambda:us-east-1:999:function:global-fallback",
+            "must use the global fallback ARN when per-request ARN is empty"
+        );
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = String::new();
+        }
+    }
+
+    // ── cleanup_old_request_buffers — proceeds with removal on send failure ───
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_removes_stale_entry_despite_send_failure() {
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "stale-req-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:stale-fn".to_string();
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 8, 7]])), // non-empty so send is attempted
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn,
+        });
+
+        // Advance counter to make the entry stale (>= 5 invocations old)
+        for _ in 0..5 {
+            increment_invocation_counter();
+        }
+
+        // License key + unreachable endpoint so send_agent_payload_to_newrelic returns Err
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-cleanup-fail".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        cleanup_old_request_buffers(newrelic_client, config).await;
+
+        // Stale entry must be removed even though the NR send failed
+        assert!(
+            REQUEST_DATA.get(request_id).is_none(),
+            "stale request must be removed even when the send to New Relic fails"
+        );
+
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
 }
