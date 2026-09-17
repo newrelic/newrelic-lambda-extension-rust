@@ -319,6 +319,9 @@ pub async fn fetch_next_event(
 mod telemetry_subscribe_test;
 
 #[cfg(test)]
+#[path = "mod_tests.rs"]
+mod mod_tests;
+#[cfg(test)]
 mod shutdown_reason_tests {
     use super::ShutdownReason;
 
