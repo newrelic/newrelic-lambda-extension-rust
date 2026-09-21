@@ -50,6 +50,7 @@ fn test_generate_error_event_for_shutdown_timeout() {
 
     assert_eq!(event_detail["error.class"], "LambdaTimeout");
     assert_eq!(event_detail["error.message"], "Task timed out");
+    assert_eq!(event_detail["error.expected"], false);
     assert_eq!(event_detail["type"], "TransactionError");
     assert_eq!(user_attrs["aws.requestId"], "abc123");
 }

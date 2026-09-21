@@ -6,6 +6,37 @@ use crate::apm::collector::CollectorError;
 use serde_json::json;
 use serial_test::serial;
 
+fn old_item(telemetry_type: &str) -> FailedTelemetry {
+    FailedTelemetry {
+        telemetry_type: telemetry_type.into(),
+        data: vec![json!(null), json!({})],
+        request_id: "req-old".into(),
+        run_id: "run-old".into(),
+        collector_host: "127.0.0.1:1".into(),
+        // > 60 minutes ago → should be dropped by the age check
+        failed_at: chrono::Utc::now() - chrono::TimeDelta::try_minutes(65).unwrap(),
+        retry_count: 0,
+    }
+}
+
+fn fresh_item(telemetry_type: &str) -> FailedTelemetry {
+    FailedTelemetry {
+        telemetry_type: telemetry_type.into(),
+        data: vec![json!(null), json!({})],
+        request_id: "req-1".into(),
+        run_id: "run-1".into(),
+        collector_host: "127.0.0.1:1".into(),
+        failed_at: chrono::Utc::now(),
+        retry_count: 0,
+    }
+}
+
+fn push_item(item: FailedTelemetry) {
+    if let Ok(mut b) = FAILED_TELEMETRY_BUFFER.lock() {
+        b.push(item);
+    }
+}
+
 fn clear() {
     if let Ok(mut b) = FAILED_TELEMETRY_BUFFER.lock() {
         b.clear();
@@ -173,4 +204,151 @@ fn restart_rebuffer_respects_cap() {
         "buffer must not exceed cap after re-buffering a RestartException item"
     );
     clear();
+}
+
+// ── retry_buffered_telemetry ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_empty_buffer_is_noop() {
+    clear();
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+    assert_eq!(get_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_connection_refused_rebuffers_item() {
+    clear();
+    push_item(fresh_item("metric_data"));
+    assert_eq!(get_buffer_count(), 1);
+
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+
+    // Connection refused → generic error → re-buffered with retry_count incremented.
+    assert_eq!(get_buffer_count(), 1);
+    if let Ok(b) = FAILED_TELEMETRY_BUFFER.lock() {
+        assert_eq!(b[0].retry_count, 1);
+    }
+    clear();
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_override_run_id_and_host_are_used() {
+    // Stored run_id/host are irrelevant; current_run_id and current_collector_host
+    // override them for the HTTP call (lines 131-132).
+    clear();
+    push_item(FailedTelemetry {
+        telemetry_type: "span_event_data".into(),
+        data: vec![json!(null), json!({})],
+        request_id: "req-override".into(),
+        run_id: "old-run".into(),
+        collector_host: "old-host".into(),
+        failed_at: chrono::Utc::now(),
+        retry_count: 0,
+    });
+
+    let client = reqwest::Client::new();
+    // current_collector_host points to a refusing port so the call fails and re-buffers.
+    retry_buffered_telemetry(&client, "key", Some("new-run"), Some("127.0.0.1:1")).await;
+
+    assert_eq!(get_buffer_count(), 1);
+    // The stored run_id/host are unchanged — only the call used the overrides.
+    if let Ok(b) = FAILED_TELEMETRY_BUFFER.lock() {
+        assert_eq!(b[0].run_id, "old-run");
+        assert_eq!(b[0].collector_host, "old-host");
+        assert_eq!(b[0].retry_count, 1);
+    }
+    clear();
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_drops_item_older_than_one_hour() {
+    clear();
+    push_item(old_item("log_event_data"));
+    assert_eq!(get_buffer_count(), 1);
+
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+
+    // Age > 60 minutes → dropped, not re-buffered.
+    assert_eq!(get_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_unknown_type_is_skipped_and_dropped() {
+    clear();
+    push_item(fresh_item("totally_unknown_type"));
+
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+
+    // Unknown type hits the `_ => { warn!(...); continue; }` arm — item is dropped.
+    assert_eq!(get_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_synthesized_error_events_connection_refused() {
+    clear();
+    push_item(fresh_item(SYNTHESIZED_ERROR_EVENTS));
+
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+
+    // send_error_events path → connection refused → re-buffered with retry_count=1.
+    assert_eq!(get_buffer_count(), 1);
+    if let Ok(b) = FAILED_TELEMETRY_BUFFER.lock() {
+        assert_eq!(b[0].retry_count, 1);
+    }
+    clear();
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_drops_after_ten_retries() {
+    clear();
+    // Push item that has already been retried 9 times (one below the drop threshold).
+    push_item(FailedTelemetry {
+        telemetry_type: "error_data".into(),
+        data: vec![json!(null), json!({})],
+        request_id: "req-max".into(),
+        run_id: "run-max".into(),
+        collector_host: "127.0.0.1:1".into(),
+        failed_at: chrono::Utc::now(),
+        retry_count: 9,
+    });
+    assert_eq!(get_buffer_count(), 1);
+
+    let client = reqwest::Client::new();
+    retry_buffered_telemetry(&client, "key", None, None).await;
+
+    // retry_count bumps to 10 → 10 < 10 is false → item is dropped.
+    assert_eq!(get_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn retry_buffered_telemetry_covers_remaining_command_types() {
+    // Exercise the remaining match arms in the command mapping.
+    for telemetry_type in [
+        "error_event_data",
+        "analytic_event_data",
+        "custom_event_data",
+        "transaction_sample_data",
+        "sql_trace_data",
+    ] {
+        clear();
+        push_item(fresh_item(telemetry_type));
+        let client = reqwest::Client::new();
+        retry_buffered_telemetry(&client, "key", None, None).await;
+        // Each type routes to a known command → connection refused → re-buffered.
+        assert_eq!(get_buffer_count(), 1, "type '{telemetry_type}' should re-buffer on failure");
+        clear();
+    }
 }
