@@ -261,7 +261,38 @@ impl PlatformProcessor {
     /// Check platform events for errors and send to telemetry endpoint
     /// Platform events that can have errors: platform.initReport, platform.initRuntimeDone,
     /// platform.runtimeDone, platform.restoreRuntimeDone, platform.restoreReport
+    /// Maps a Telemetry API `status` field to the extension's Lambda error class.
+    ///
+    /// "failure" must resolve to the same class ("LambdaPlatformFault") as
+    /// `error_synthesis::send_platform_fault_error` (the SHUTDOWN-reason-based
+    /// path in non-APM mode) — both funnel into `send_lambda_error`'s `SENT_ERRORS`
+    /// de-dup, keyed by `(request_id, error_type)`. Matching class names is what
+    /// lets this path act as a fallback (still sends if the SHUTDOWN-based send
+    /// never happens) without double-sending when both fire for the same request,
+    /// exactly like "timeout" already does.
+    pub(crate) fn lambda_error_type_for_status(status: Option<&str>) -> &'static str {
+        match status {
+            Some("timeout") => "LambdaTimeout",
+            Some("failure") => "LambdaPlatformFault",
+            Some("error") => "LambdaError",
+            _ => "LambdaError",
+        }
+    }
+
     fn check_and_send_platform_errors(&self, record: &TelemetryRecord) {
+        // In APM mode, `event_loop::send_error_for_shutdown_reason` is the
+        // authoritative signal for timeout/platform-fault/unknown-shutdown errors —
+        // it fires on the actual SHUTDOWN runtime event and is the only path that
+        // honors NEW_RELIC_EXTENSION_IGNORE_ERRORS/EXPECTED_ERRORS. Without this
+        // guard, this Telemetry-API-status-based path would independently
+        // synthesize and send a second (ungated) `platform.error` log entry for the
+        // same failure, duplicating the signal New Relic receives. Non-APM
+        // (serverless) mode has no such shutdown-reason path, so this stays the
+        // only synthesis mechanism there.
+        if self.config.new_relic.apm_lambda_mode {
+            return;
+        }
+
         // Check if this event type can have errors
         let event_type = record.record_type.as_str();
         let can_have_errors = matches!(
@@ -429,13 +460,7 @@ impl PlatformProcessor {
             }
         };
         
-        // Map platform error to appropriate Lambda error type
-        let lambda_error_type = match status {
-            Some("timeout") => "LambdaTimeout",
-            Some("failure") => "LambdaFatalError",
-            Some("error") => "LambdaError",
-            _ => "LambdaError",
-        };
+        let lambda_error_type = Self::lambda_error_type_for_status(status);
 
         // Store detailed error information for potential use in shutdown error synthesis
         // Platform events have more accurate error types than function logs
