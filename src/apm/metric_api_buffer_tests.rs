@@ -245,3 +245,55 @@ fn ages_out_old_items_without_sending() {
     );
     clear();
 }
+
+/// A 400 response on retry is a permanent error — the item must be dropped,
+/// not re-buffered (retrying a permanent error is pointless).
+/// Exercises the `Err(e) if e.is_permanent()` arm in retry_buffered_metric_api.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn permanent_error_on_retry_drops_item() {
+    clear();
+    let url = mock_server(vec![400]).await;
+    buffer_failed_metric_api(vec![json!({"name": "m"})], url, None);
+    assert_eq!(get_metric_api_buffer_count(), 1);
+
+    let client = reqwest::Client::new();
+    retry_buffered_metric_api(&client, "lk").await;
+
+    assert_eq!(
+        get_metric_api_buffer_count(),
+        0,
+        "permanent error on retry must drop the item without re-buffering"
+    );
+    clear();
+}
+
+/// An item that has already been retried MAX_RETRY_ATTEMPTS-1 times must be
+/// dropped (not re-buffered) when the next attempt also fails.
+/// Exercises the `else { error!("Dropping...") }` branch in retry_buffered_metric_api.
+#[tokio::test]
+#[serial]
+async fn drop_after_max_retries_removes_item() {
+    clear();
+    if let Ok(mut b) = FAILED_METRIC_API_BUFFER.lock() {
+        b.push(FailedMetricApi {
+            metrics: vec![json!({"name": "m"})],
+            endpoint: "http://127.0.0.1:1/metrics".into(),
+            failed_at: Utc::now(),
+            retry_count: 9,
+            next_retry_at: None,
+        });
+    }
+    assert_eq!(get_metric_api_buffer_count(), 1);
+
+    let client = reqwest::Client::new();
+    retry_buffered_metric_api(&client, "lk").await;
+
+    // retry_count bumps to 10; 10 < MAX_RETRY_ATTEMPTS (10) is false → dropped.
+    assert_eq!(
+        get_metric_api_buffer_count(),
+        0,
+        "item must be dropped after reaching the maximum retry limit"
+    );
+    clear();
+}

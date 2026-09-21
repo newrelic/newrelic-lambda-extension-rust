@@ -1512,6 +1512,184 @@ mod tests {
     }
 
     // ========================================================================
+    // set_pending_report
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn set_pending_report_stores_value() {
+        clear_request_state();
+        REQUEST_DATA.insert("req-set-report".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        set_pending_report("req-set-report", "REPORT Duration: 123ms".to_string());
+
+        assert_eq!(
+            get_pending_report("req-set-report"),
+            Some("REPORT Duration: 123ms".to_string())
+        );
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn set_pending_report_is_noop_for_unknown_request() {
+        clear_request_state();
+        // Must not panic when request_id is not in REQUEST_DATA.
+        set_pending_report("nonexistent-req", "report".to_string());
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // get_runtime_done_notify
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn get_runtime_done_notify_returns_some_for_known_request_and_none_for_unknown() {
+        clear_request_state();
+        REQUEST_DATA.insert("req-notify".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        assert!(get_runtime_done_notify("req-notify").is_some());
+        assert!(get_runtime_done_notify("no-such-req").is_none());
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // record_prefired_runtime_done + request_data_len
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn record_prefired_runtime_done_inserts_into_prefired_map() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-prefired-1");
+
+        assert!(PREFIRED_RUNTIME_DONE.contains_key("req-prefired-1"));
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn request_data_len_reflects_current_entry_count() {
+        clear_request_state();
+        assert_eq!(request_data_len(), 0);
+
+        REQUEST_DATA.insert("req-len-a".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        assert_eq!(request_data_len(), 1);
+
+        clear_request_state();
+        assert_eq!(request_data_len(), 0);
+    }
+
+    // ========================================================================
+    // ensure_lmi_request_slot — prefired runtimeDone + orphaned-payload drain
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn ensure_lmi_request_slot_consumes_prefired_runtime_done_and_signals_notify() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-lmi-prefired");
+        assert!(PREFIRED_RUNTIME_DONE.contains_key("req-lmi-prefired"));
+
+        ensure_lmi_request_slot("req-lmi-prefired");
+
+        // Pre-fire entry must be consumed.
+        assert!(!PREFIRED_RUNTIME_DONE.contains_key("req-lmi-prefired"));
+        // Slot must be created.
+        assert!(REQUEST_DATA.contains_key("req-lmi-prefired"));
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_lmi_request_slot_drains_orphaned_payloads_into_new_slot() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        // Pre-load orphaned payloads before the slot is created.
+        {
+            let mut orphaned = ORPHANED_PAYLOADS.lock().unwrap();
+            orphaned.push(vec![11, 22]);
+            orphaned.push(vec![33, 44]);
+        }
+
+        ensure_lmi_request_slot("req-lmi-drain");
+
+        // Orphaned buffer must be empty.
+        assert!(ORPHANED_PAYLOADS.lock().unwrap().is_empty());
+
+        // Both payloads must be in the new slot's buffer.
+        let buf_len = get_agent_buffer("req-lmi-drain")
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(buf_len, 2);
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // create_request_processing_state — prefired runtimeDone branch
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn create_request_processing_state_fires_notify_when_runtime_done_was_prefired() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-create-prefired");
+
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
+
+        create_request_processing_state("req-create-prefired", "arn:test", &factory);
+
+        // Pre-fire entry must be consumed.
+        assert!(!PREFIRED_RUNTIME_DONE.contains_key("req-create-prefired"));
+        // Entry must exist in REQUEST_DATA.
+        assert!(REQUEST_DATA.contains_key("req-create-prefired"));
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    // ========================================================================
     // route_payload_to_request_buffer must extract trace.id the instant the payload
     // arrives, on the DEFAULT (buffered, synchronous_flush=off) path — not just under
     // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH. Before this, extraction on the default
@@ -1610,5 +1788,119 @@ mod tests {
         assert_eq!(buffered, Some(1), "payload must still be buffered normally");
 
         clear_request_state();
+    }
+
+    // ── spawn_immediate_agent_payload_send — ARN falls back to global ─────────
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_uses_global_fallback_arn_when_request_arn_is_empty() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        // Set a known global fallback ARN in the process-wide context
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = "arn:aws:lambda:us-east-1:999:function:global-fallback".to_string();
+        }
+
+        let request_id = "req-arn-fallback-test";
+        // Empty per-request ARN — spawn_immediate_agent_payload_send must fall back to the global
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: String::new(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        // License key + unreachable endpoint so the send fails and buffers the payload
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-arn-fallback".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(request_id, vec![1, 2, 3], newrelic_client, config);
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for h in handles {
+            h.await.expect("send task must not panic");
+        }
+
+        // The buffered entry must carry the global fallback ARN, not the empty per-request one
+        let buffered_arn = crate::agent::batch::AGENT_BATCH_BUFFER
+            .get(request_id)
+            .map(|e| e.invoked_function_arn.clone())
+            .expect("failed send must buffer the payload");
+
+        assert_eq!(
+            buffered_arn,
+            "arn:aws:lambda:us-east-1:999:function:global-fallback",
+            "must use the global fallback ARN when per-request ARN is empty"
+        );
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = String::new();
+        }
+    }
+
+    // ── cleanup_old_request_buffers — proceeds with removal on send failure ───
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_removes_stale_entry_despite_send_failure() {
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "stale-req-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:stale-fn".to_string();
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 8, 7]])), // non-empty so send is attempted
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn,
+        });
+
+        // Advance counter to make the entry stale (>= 5 invocations old)
+        for _ in 0..5 {
+            increment_invocation_counter();
+        }
+
+        // License key + unreachable endpoint so send_agent_payload_to_newrelic returns Err
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-cleanup-fail".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        cleanup_old_request_buffers(newrelic_client, config).await;
+
+        // Stale entry must be removed even though the NR send failed
+        assert!(
+            REQUEST_DATA.get(request_id).is_none(),
+            "stale request must be removed even when the send to New Relic fails"
+        );
+
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
     }
 }

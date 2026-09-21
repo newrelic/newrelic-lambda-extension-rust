@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::deployment::TelemetryMode;
+use crate::telemetry::managed_instance::ManagedInstanceMetadata;
 use anyhow::anyhow;
 use serial_test::serial;
 
@@ -162,4 +163,162 @@ fn compress_inline_shrinks_repetitive_data() {
 fn compress_inline_handles_empty_input() {
     let compressed = compress_inline(&[]).expect("compression of empty input should succeed");
     assert!(!compressed.is_empty(), "gzip stream still has header/footer bytes");
+}
+
+// ── get_labels: lambda.runtime.version branch ────────────────────────────────
+
+#[test]
+#[serial]
+fn labels_include_runtime_version_when_execution_env_provides_detail() {
+    // AWS_EXECUTION_ENV=AWS_Lambda_python3.11 → get_runtime_version() returns "python3.11"
+    // which is longer than "python", so the label must be emitted.
+    let prev = std::env::var("AWS_EXECUTION_ENV").ok();
+    std::env::set_var("AWS_EXECUTION_ENV", "AWS_Lambda_python3.11");
+
+    let labels = get_labels("arn:aws:lambda:us-east-1:123:function:fn", "python", DeploymentContext::Normal { mode: TelemetryMode::Apm });
+
+    match prev {
+        Some(v) => std::env::set_var("AWS_EXECUTION_ENV", v),
+        None => std::env::remove_var("AWS_EXECUTION_ENV"),
+    }
+
+    assert!(
+        labels.iter().any(|l| l.label_type == "lambda.runtime.version" && l.label_value == "python3.11"),
+        "expected lambda.runtime.version=python3.11, got {labels:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn labels_omit_runtime_version_when_execution_env_is_absent() {
+    let prev = std::env::var("AWS_EXECUTION_ENV").ok();
+    std::env::remove_var("AWS_EXECUTION_ENV");
+
+    let labels = get_labels("arn:aws:lambda:us-east-1:123:function:fn", "unknown", DeploymentContext::Normal { mode: TelemetryMode::Apm });
+
+    match prev {
+        Some(v) => std::env::set_var("AWS_EXECUTION_ENV", v),
+        None => std::env::remove_var("AWS_EXECUTION_ENV"),
+    }
+
+    assert!(
+        !labels.iter().any(|l| l.label_type == "lambda.runtime.version"),
+        "lambda.runtime.version must be absent when runtime is 'unknown', got {labels:?}"
+    );
+}
+
+// ── preconnect / connect: network error paths ─────────────────────────────────
+// The success and HTTP-response paths (200/401/403/5xx) require intercepting
+// HTTPS traffic. Without a test-only hook in production code, those paths are
+// covered by integration tests against a real or containerised collector.
+// Port 1 always refuses at the TCP level (before TLS), so connection-error
+// handling is fully exercisable here without touching production code.
+
+fn normal_apm() -> DeploymentContext {
+    DeploymentContext::Normal { mode: TelemetryMode::Apm }
+}
+
+#[tokio::test]
+#[serial]
+async fn preconnect_connection_refused_records_failure_reason() {
+    reset_connect_stats();
+    let client = reqwest::Client::new();
+    let err = preconnect(&client, "test-key", "127.0.0.1:1", 5).await.unwrap_err();
+
+    assert!(is_permanent_auth_error(&err).is_none());
+    let reason = last_failure_reason().expect("failure reason must be recorded on connection error");
+    assert!(
+        reason.contains("connection error") || reason.contains("PreConnect"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_connection_refused_records_failure_reason() {
+    reset_connect_stats();
+    let client = reqwest::Client::new();
+    let err = connect(
+        &client, "test-key", "127.0.0.1:1",
+        "fn", "arn:test", "123", "us-east-1", "1", "python", "1.0.0", 5, None, normal_apm(),
+    ).await.unwrap_err();
+
+    assert!(is_permanent_auth_error(&err).is_none());
+    let reason = last_failure_reason().expect("failure reason must be recorded on connection error");
+    assert!(
+        reason.contains("connection error") || reason.contains("Connect"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_with_lmi_metadata_covers_some_branch() {
+    // Port 1 → ECONNREFUSED. The test's only goal is to enter the
+    // `Some(meta) => (Some(meta.instance_id), meta.instance_max_memory)` arm,
+    // which is skipped by every other test that passes `None` for lmi_metadata.
+    reset_connect_stats();
+    let client = reqwest::Client::new();
+    let meta = ManagedInstanceMetadata {
+        instance_id: "lmi-host-42".into(),
+        instance_max_memory: Some(2_147_483_648),
+    };
+    let result = connect(
+        &client, "test-key", "127.0.0.1:1",
+        "fn", "arn:test", "123", "us-east-1", "1", "python", "1.0.0", 5,
+        Some(meta), normal_apm(),
+    ).await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+#[serial]
+async fn preconnect_timeout_covers_is_timeout_branch() {
+    // A TCP listener that accepts the connection but never sends any data
+    // forces the TLS handshake to stall until the 1-second request timeout
+    // fires — exercising the `is_timeout()` arm in preconnect's map_err.
+    reset_connect_stats();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            // Hold the stream open so the client doesn't get ECONNRESET.
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        }
+    });
+    let client = reqwest::Client::new();
+    let result = preconnect(&client, "test-key", &format!("127.0.0.1:{port}"), 1).await;
+    assert!(result.is_err());
+    let reason = last_failure_reason().expect("failure reason must be recorded");
+    assert!(
+        reason.starts_with("PreConnect"),
+        "unexpected reason: {reason}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn connect_timeout_covers_is_timeout_branch() {
+    // Same stall pattern as preconnect_timeout — exercises the `is_timeout()`
+    // arm in connect's map_err.
+    reset_connect_stats();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((_stream, _)) = listener.accept().await {
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        }
+    });
+    let client = reqwest::Client::new();
+    let result = connect(
+        &client, "test-key", &format!("127.0.0.1:{port}"),
+        "fn", "arn:test", "123", "us-east-1", "1", "python", "1.0.0", 1,
+        None, normal_apm(),
+    ).await;
+    assert!(result.is_err());
+    let reason = last_failure_reason().expect("failure reason must be recorded");
+    assert!(
+        reason.starts_with("Connect"),
+        "unexpected reason: {reason}"
+    );
 }

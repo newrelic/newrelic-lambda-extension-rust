@@ -66,6 +66,8 @@ where
         "NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS",
         "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH",
         "NEW_RELIC_APM_DISABLE_TELEMETRY",
+        "NEW_RELIC_EXTENSION_IGNORE_ERRORS",
+        "NEW_RELIC_EXTENSION_EXPECTED_ERRORS",
         "NEW_RELIC_EXTENSION_SEND_LOGS",
         "NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS",
         "NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS",
@@ -493,6 +495,86 @@ fn test_extension_settings_default() {
     assert!(!settings.send_platform_logs);
     assert_eq!(settings.log_level, "info");
     assert!(settings.extension_logs_enabled);
+    assert!(settings.ignore_errors.is_empty());
+    assert!(settings.expected_errors.is_empty());
+}
+
+// ============================================================================
+// parse_error_class_list (NEW_RELIC_EXTENSION_IGNORE_ERRORS / _EXPECTED_ERRORS)
+// ============================================================================
+
+#[test]
+fn test_parse_error_class_list_valid_classes() {
+    let set = parse_error_class_list("LambdaTimeout,LambdaPlatformFault", "TEST_VAR");
+    assert_eq!(set.len(), 2);
+    assert!(set.contains("lambdatimeout"));
+    assert!(set.contains("lambdaplatformfault"));
+}
+
+#[test]
+fn test_parse_error_class_list_mixed_case_and_whitespace() {
+    let set = parse_error_class_list(" LambdaSHUTDOWN , lambdatimeout ", "TEST_VAR");
+    assert_eq!(set.len(), 2);
+    assert!(set.contains("lambdashutdown"));
+    assert!(set.contains("lambdatimeout"));
+}
+
+#[test]
+fn test_parse_error_class_list_ignores_unknown_tokens() {
+    let set = parse_error_class_list("LambdaTimeout,SomeUnknownClass", "TEST_VAR");
+    assert_eq!(set.len(), 1);
+    assert!(set.contains("lambdatimeout"));
+}
+
+#[test]
+fn test_parse_error_class_list_empty_string() {
+    let set = parse_error_class_list("", "TEST_VAR");
+    assert!(set.is_empty());
+}
+
+// NEW_RELIC_EXTENSION_IGNORE_ERRORS / NEW_RELIC_EXTENSION_EXPECTED_ERRORS env
+// var round-trip through ExtensionConfig::from_env(). parse_error_class_list
+// itself is unit-tested directly above; this exercises the actual wiring in
+// from_env() that reads the env vars and assigns them onto
+// config.extension.{ignore_errors,expected_errors}.
+#[test]
+#[serial]
+fn test_ignore_and_expected_errors_env_vars_populate_config() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_IGNORE_ERRORS", "LambdaTimeout");
+        env::set_var("NEW_RELIC_EXTENSION_EXPECTED_ERRORS", "LambdaPlatformFault");
+        let config = ExtensionConfig::from_env();
+        assert!(config.extension.ignore_errors.contains("lambdatimeout"));
+        assert!(config.extension.expected_errors.contains("lambdaplatformfault"));
+    });
+}
+
+#[test]
+#[serial]
+fn test_ignore_and_expected_errors_env_vars_default_empty() {
+    with_full_clean_env(|| {
+        let config = ExtensionConfig::from_env();
+        assert!(config.extension.ignore_errors.is_empty());
+        assert!(config.extension.expected_errors.is_empty());
+    });
+}
+
+// If a class is listed in both env vars, ignore must win — the class ends up
+// in both sets here (parse_error_class_list has no cross-set knowledge; the
+// precedence is enforced downstream by event_loop::send_error_for_shutdown_reason
+// checking ignore_errors first, see the event_loop_tests.rs coverage for that),
+// but from_env() itself must still populate both sets faithfully rather than
+// deduplicating one against the other.
+#[test]
+#[serial]
+fn test_same_class_in_both_ignore_and_expected_populates_both_sets() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_IGNORE_ERRORS", "LambdaTimeout");
+        env::set_var("NEW_RELIC_EXTENSION_EXPECTED_ERRORS", "LambdaTimeout");
+        let config = ExtensionConfig::from_env();
+        assert!(config.extension.ignore_errors.contains("lambdatimeout"));
+        assert!(config.extension.expected_errors.contains("lambdatimeout"));
+    });
 }
 
 // ============================================================================
@@ -1458,6 +1540,8 @@ fn test_extension_settings_all_fields() {
         runtime_done_grace_ms: 250,
         pipeline_flush: false,
         lmi_flush_interval_ms: 30_000,
+        ignore_errors: std::collections::HashSet::new(),
+        expected_errors: std::collections::HashSet::new(),
     };
     
     assert!(settings.send_function_logs);

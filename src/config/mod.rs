@@ -29,6 +29,13 @@ const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
 
+/// Extension-controlled shutdown error classes, lowercased. These are the only
+/// classes `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`
+/// can match — function-level exceptions are the APM agent's responsibility, not
+/// the extension's. See `event_loop::send_error_for_shutdown_reason`.
+const KNOWN_SHUTDOWN_ERROR_CLASSES: [&str; 3] =
+    ["lambdatimeout", "lambdaplatformfault", "lambdashutdown"];
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
@@ -150,6 +157,16 @@ pub struct ExtensionSettings {
     /// Default 30_000, floored at 1000. Read ONLY by the LMI loop; ignored on
     /// standard Lambda.
     pub lmi_flush_interval_ms: u64,
+    /// `NEW_RELIC_EXTENSION_IGNORE_ERRORS` — extension-synthesized shutdown error
+    /// classes (lowercased) that are never sent to APM at all. APM mode only; see
+    /// `KNOWN_SHUTDOWN_ERROR_CLASSES`. Takes precedence over `expected_errors` when
+    /// a class appears in both.
+    pub ignore_errors: HashSet<String>,
+    /// `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` — extension-synthesized shutdown error
+    /// classes (lowercased) that are still sent to APM but flagged
+    /// `error.expected: true` on the `TransactionError` event, excluding them from
+    /// error rate/Apdex while keeping them visible in Errors Inbox. APM mode only.
+    pub expected_errors: HashSet<String>,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -292,6 +309,8 @@ impl Default for ExtensionSettings {
             runtime_done_grace_ms: 25,
             pipeline_flush: false,
             lmi_flush_interval_ms: 30_000,
+            ignore_errors: HashSet::new(),
+            expected_errors: HashSet::new(),
         }
     }
 }
@@ -322,6 +341,39 @@ pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
         let mut types: Vec<&str> = set.iter().map(String::as_str).collect();
         types.sort_unstable();
         debug!("APM telemetry disabled for types: {}", types.join(", "));
+    }
+    set
+}
+
+/// Parse `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`
+/// into a set of lowercased shutdown error classes.
+///
+/// Comma-separated, case-insensitive, whitespace-trimmed. Only the extension-
+/// controlled classes in [`KNOWN_SHUTDOWN_ERROR_CLASSES`] are accepted; unknown
+/// tokens are warned about and ignored (fail-soft), matching
+/// `parse_disabled_telemetry`.
+pub(crate) fn parse_error_class_list(raw: &str, env_var_name: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if KNOWN_SHUTDOWN_ERROR_CLASSES.contains(&t.as_str()) {
+            set.insert(t);
+        } else {
+            warn!(
+                "{}: ignoring unknown error class '{}' (valid: {})",
+                env_var_name,
+                t,
+                KNOWN_SHUTDOWN_ERROR_CLASSES.join(", ")
+            );
+        }
+    }
+    if !set.is_empty() {
+        let mut classes: Vec<&str> = set.iter().map(String::as_str).collect();
+        classes.sort_unstable();
+        debug!("{}: {}", env_var_name, classes.join(", "));
     }
     set
 }
@@ -568,6 +620,18 @@ impl ExtensionConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30_000)
             .max(1000);
+
+        // NEW_RELIC_EXTENSION_IGNORE_ERRORS / NEW_RELIC_EXTENSION_EXPECTED_ERRORS:
+        // classify extension-synthesized shutdown errors (APM mode only). See
+        // event_loop::send_error_for_shutdown_reason for where these are consumed.
+        config.extension.ignore_errors = parse_error_class_list(
+            &env::var("NEW_RELIC_EXTENSION_IGNORE_ERRORS").unwrap_or_default(),
+            "NEW_RELIC_EXTENSION_IGNORE_ERRORS",
+        );
+        config.extension.expected_errors = parse_error_class_list(
+            &env::var("NEW_RELIC_EXTENSION_EXPECTED_ERRORS").unwrap_or_default(),
+            "NEW_RELIC_EXTENSION_EXPECTED_ERRORS",
+        );
 
         let synchronous_flush_str =
             env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();
