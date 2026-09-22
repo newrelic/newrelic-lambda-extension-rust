@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::deployment::{DeploymentContext, TelemetryMode};
+use crate::telemetry::managed_instance::{MANAGED_INSTANCE_METADATA, ManagedInstanceMetadata};
 use serial_test::serial;
 
 const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Apm };
@@ -206,4 +207,41 @@ fn convert_to_apm_metrics_empty_arn_omits_arn_attribute() {
         !attrs.contains_key("aws.lambda.arn"),
         "empty ARN must not produce an aws.lambda.arn attribute"
     );
+}
+
+/// Covers the LMI metadata block (lines 265-276 of metric_converter.rs).
+/// MANAGED_INSTANCE_METADATA is a public RwLock so tests can populate it directly,
+/// simulating a cold-start platform.initStart event without modifying production code.
+#[tokio::test]
+#[serial]
+async fn convert_to_apm_metrics_attaches_lmi_metadata_when_present() {
+    {
+        let mut guard = MANAGED_INSTANCE_METADATA.write().await;
+        *guard = Some(ManagedInstanceMetadata {
+            instance_id: "i-lmi-host-abc".to_string(),
+            instance_max_memory: Some(2147483648),
+        });
+    }
+
+    let metrics = LambdaMetrics {
+        request_id: "req-lmi-meta".to_string(),
+        duration: Some(10.0),
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: None,
+        error_type: None,
+    };
+    let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "arn");
+
+    let attrs = apm[0]["attributes"].as_object().expect("attributes must be an object");
+    assert_eq!(attrs["aws.lambda.managedInstance.instanceId"], "i-lmi-host-abc");
+    assert_eq!(attrs["aws.lambda.managedInstance.instanceMaxMemory"], 2147483648u64);
+
+    // Cleanup so other tests see None.
+    {
+        let mut guard = MANAGED_INSTANCE_METADATA.write().await;
+        *guard = None;
+    }
 }

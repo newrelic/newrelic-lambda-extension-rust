@@ -146,3 +146,59 @@ fn extract_from_bytes_none_for_garbage() {
     assert_eq!(extract_request_id_from_payload_bytes(b"not a payload"), None);
     assert_eq!(extract_request_id_from_payload_bytes(b""), None);
 }
+
+// ── error-path coverage ───────────────────────────────────────────────────────
+
+fn encode_gzip_b64(data: &[u8]) -> String {
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data).unwrap();
+    general_purpose::STANDARD.encode(enc.finish().unwrap())
+}
+
+/// Fewer than 2 comma-separated components after stripping brackets → Err.
+#[test]
+fn parse_agent_payload_single_component_returns_error() {
+    let result = parse_agent_payload(b"[\"2\"]");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Insufficient"));
+}
+
+/// An encoded part that is not valid base64 → decode_uncompress returns Err.
+#[test]
+fn decode_uncompress_invalid_base64_returns_error() {
+    let payload = b"[\"2\", \"NR_LAMBDA_MONITORING\", \"!!not_valid!!\"]";
+    let result = parse_agent_payload(payload);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Base64"));
+}
+
+/// Valid base64 that decodes to non-gzip bytes → gzip decompression returns Err.
+#[test]
+fn decode_uncompress_invalid_gzip_returns_error() {
+    let bad = general_purpose::STANDARD.encode(b"this is not gzip");
+    let payload = format!("[\"2\", \"NR_LAMBDA_MONITORING\", \"{bad}\"]").into_bytes();
+    let result = parse_agent_payload(&payload);
+    assert!(result.is_err());
+    let msg = result.unwrap_err().to_string();
+    assert!(msg.contains("Gzip") || msg.contains("decompression"), "unexpected: {msg}");
+}
+
+/// Valid base64+gzip but content is a JSON array, not an object → v2 parse fails.
+#[test]
+fn parse_v2_array_content_returns_parse_error() {
+    let encoded = encode_gzip_b64(b"[1, 2, 3]");
+    let payload = format!("[\"2\", \"NR_LAMBDA_MONITORING\", \"{encoded}\"]").into_bytes();
+    let result = parse_agent_payload(&payload);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("v2"));
+}
+
+/// Same for v1: JSON array instead of `{"data": {...}}` → v1 parse fails.
+#[test]
+fn parse_v1_array_content_returns_parse_error() {
+    let encoded = encode_gzip_b64(b"[1, 2, 3]");
+    let payload = format!("[\"1\", \"NR_LAMBDA_MONITORING\", \"{encoded}\"]").into_bytes();
+    let result = parse_agent_payload(&payload);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("v1"));
+}
