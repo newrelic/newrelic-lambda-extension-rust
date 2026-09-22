@@ -643,6 +643,7 @@ async fn process_agent_payload_disabled_type_is_skipped() {
 }
 
 #[tokio::test]
+#[serial]
 async fn process_agent_payload_all_known_types_buffer_on_network_failure() {
     // Port 1 → every send fails → buffers → returns Ok(())
     let payload = make_v1_payload(serde_json::json!({
@@ -793,6 +794,7 @@ async fn send_error_events_buffered_noop_when_disabled() {
 }
 
 #[tokio::test]
+#[serial]
 async fn send_error_events_buffered_buffers_on_network_failure() {
     // Port 1 → ECONNREFUSED → buffers → returns Ok(())
     let result = test_apm_app()
@@ -852,6 +854,7 @@ async fn process_agent_payload_v2_ruby_normalizes_all_six_data_types() {
 // ── send_shutdown_error_event ─────────────────────────────────────────────────
 
 #[tokio::test]
+#[serial]
 async fn send_shutdown_error_event_buffers_on_network_failure() {
     let result = test_apm_app()
         .send_shutdown_error_event(

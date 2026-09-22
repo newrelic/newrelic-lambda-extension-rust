@@ -280,9 +280,12 @@ async fn preconnect_timeout_covers_is_timeout_branch() {
     reset_connect_stats();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    // Intentional: the spawned task holds the connection open with a 30s sleep so
+    // the TLS handshake stalls and the client-side 1s timeout fires. The runtime
+    // drops the task when the test-scoped tokio runtime is torn down — do not
+    // await or abort it, as that would defeat the purpose of the stall.
     tokio::spawn(async move {
         if let Ok((_stream, _)) = listener.accept().await {
-            // Hold the stream open so the client doesn't get ECONNRESET.
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     });
@@ -304,6 +307,8 @@ async fn connect_timeout_covers_is_timeout_branch() {
     reset_connect_stats();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    // Intentional: see preconnect_timeout_covers_is_timeout_branch above —
+    // same stall pattern; the task is dropped by the test runtime, not awaited.
     tokio::spawn(async move {
         if let Ok((_stream, _)) = listener.accept().await {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
