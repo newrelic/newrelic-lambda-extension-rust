@@ -859,6 +859,7 @@ async fn send_shutdown_error_event_buffers_on_network_failure() {
             "Task timed out after 30.00 seconds",
             "req-1",
             "arn:aws:lambda:us-east-1:123:function:fn",
+            false,
         )
         .await;
     assert!(result.is_ok());

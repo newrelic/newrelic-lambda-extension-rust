@@ -1,8 +1,6 @@
 use super::*;
 use serde_json::json;
 use serial_test::serial;
-use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn clear() {
     if let Ok(mut b) = FAILED_METRIC_API_BUFFER.lock() {
