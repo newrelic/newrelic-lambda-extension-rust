@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::config::deployment::{DeploymentContext, TelemetryMode};
+use crate::telemetry::managed_instance::{MANAGED_INSTANCE_METADATA, ManagedInstanceMetadata};
 use serial_test::serial;
 
 const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Apm };
@@ -134,4 +135,113 @@ fn test_convert_to_apm_metrics() {
     assert_eq!(first_metric["type"], "gauge");
     assert_eq!(first_metric["value"], 123.45);
     assert_eq!(first_metric["attributes"]["entity.guid"], "entity-guid-123");
+}
+
+#[test]
+fn convert_to_apm_metrics_error_with_error_type_adds_error_metric() {
+    let metrics = LambdaMetrics {
+        request_id: "req-err".to_string(),
+        duration: Some(10.0),
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: Some("error".to_string()),
+        error_type: Some("Runtime.ExitError".to_string()),
+    };
+    let apm = convert_to_apm_metrics(
+        &metrics,
+        "guid",
+        "fn",
+        "arn:aws:lambda:us-east-1:123:function:fn",
+    );
+    // duration metric + error metric = 2
+    assert_eq!(apm.len(), 2);
+    let err_m = apm
+        .iter()
+        .find(|m| m["name"] == "apm.lambda.transaction.error")
+        .expect("error metric must be present");
+    assert_eq!(err_m["type"], "count");
+    assert_eq!(err_m["value"], 1);
+    assert_eq!(err_m["attributes"]["Error Type"], "Runtime.ExitError");
+}
+
+#[test]
+fn convert_to_apm_metrics_error_without_error_type_omits_error_type_attr() {
+    let metrics = LambdaMetrics {
+        request_id: "req-err2".to_string(),
+        duration: None,
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: Some("error".to_string()),
+        error_type: None,
+    };
+    let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "arn");
+    assert_eq!(apm.len(), 1);
+    assert_eq!(apm[0]["name"], "apm.lambda.transaction.error");
+    let attrs = apm[0]["attributes"].as_object().expect("attributes must be an object");
+    assert!(
+        !attrs.contains_key("Error Type"),
+        "Error Type must be absent when error_type is None"
+    );
+}
+
+#[test]
+fn convert_to_apm_metrics_empty_arn_omits_arn_attribute() {
+    let metrics = LambdaMetrics {
+        request_id: "req-1".to_string(),
+        duration: Some(5.0),
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: None,
+        error_type: None,
+    };
+    let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "");
+    assert_eq!(apm.len(), 1);
+    let attrs = apm[0]["attributes"].as_object().expect("attributes must be an object");
+    assert!(
+        !attrs.contains_key("aws.lambda.arn"),
+        "empty ARN must not produce an aws.lambda.arn attribute"
+    );
+}
+
+/// Covers the LMI metadata block (lines 265-276 of metric_converter.rs).
+/// MANAGED_INSTANCE_METADATA is a public RwLock so tests can populate it directly,
+/// simulating a cold-start platform.initStart event without modifying production code.
+#[tokio::test]
+#[serial]
+async fn convert_to_apm_metrics_attaches_lmi_metadata_when_present() {
+    {
+        let mut guard = MANAGED_INSTANCE_METADATA.write().await;
+        *guard = Some(ManagedInstanceMetadata {
+            instance_id: "i-lmi-host-abc".to_string(),
+            instance_max_memory: Some(2147483648),
+        });
+    }
+
+    let metrics = LambdaMetrics {
+        request_id: "req-lmi-meta".to_string(),
+        duration: Some(10.0),
+        billed_duration: None,
+        memory_size: None,
+        max_memory_used: None,
+        init_duration: None,
+        error: None,
+        error_type: None,
+    };
+    let apm = convert_to_apm_metrics(&metrics, "guid", "fn", "arn");
+
+    let attrs = apm[0]["attributes"].as_object().expect("attributes must be an object");
+    assert_eq!(attrs["aws.lambda.managedInstance.instanceId"], "i-lmi-host-abc");
+    assert_eq!(attrs["aws.lambda.managedInstance.instanceMaxMemory"], 2147483648u64);
+
+    // Cleanup so other tests see None.
+    {
+        let mut guard = MANAGED_INSTANCE_METADATA.write().await;
+        *guard = None;
+    }
 }
