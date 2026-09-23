@@ -346,3 +346,337 @@ async fn test_common_log_attrs_per_arn_cache_locks_in_first_seen_log_stream() {
     let mut guard = crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM.write().await;
     *guard = None;
 }
+
+// ========================================================================
+// new_noop
+// ========================================================================
+
+#[test]
+fn test_new_noop_creates_a_valid_client() {
+    let client = NewRelicClient::new_noop();
+    drop(client);
+}
+
+// ========================================================================
+// send_logs guard paths (no network)
+// ========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_empty_batch_returns_ok() {
+    let config = crate::config::ExtensionConfig::default();
+    let client = NewRelicClient::new(&config);
+    let result = client
+        .send_logs(&config, &[], "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_no_license_key_returns_ok() {
+    let config = crate::config::ExtensionConfig::default();
+    let client = NewRelicClient::new(&config);
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "hello".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_empty_arn_returns_ok() {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    let client = NewRelicClient::new(&config);
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "hello".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client.send_logs(&config, &batch, "").await;
+    assert!(result.is_ok());
+}
+
+// ========================================================================
+// send_agent_payload guard (no network)
+// ========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_agent_payload_no_license_key_returns_ok() {
+    let config = crate::config::ExtensionConfig::default();
+    let client = NewRelicClient::new(&config);
+    let result = client
+        .send_agent_payload(&config, r#"{"test": true}"#)
+        .await;
+    assert!(result.is_ok());
+}
+
+// ========================================================================
+// send_logs via send_payload_raw — wiremock network tests
+// ========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_success_small_body() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.log_endpoint = mock.uri();
+    let client = NewRelicClient::new(&config);
+
+    // Small batch → body < 512 bytes → no gzip
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 1000,
+        message: "hi".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_success_large_body_gzipped() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.log_endpoint = mock.uri();
+    let client = NewRelicClient::new(&config);
+
+    // 20 messages with long strings → body >= 512 bytes → gzip path
+    let batch: Vec<crate::newrelic::payload::LogMessage> = (0..20)
+        .map(|i| crate::newrelic::payload::LogMessage {
+            timestamp: i,
+            message: format!(
+                "log message number {} with plenty of content to push the serialized body over the 512-byte gzip threshold",
+                i
+            ),
+            attributes: serde_json::Map::new(),
+        })
+        .collect();
+    let result = client
+        .send_logs(
+            &config,
+            &batch,
+            "arn:aws:lambda:us-east-1:123456789012:function:my-fn",
+        )
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_client_error_returns_client_rejected() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(413).set_body_string("payload too large"))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.log_endpoint = mock.uri();
+    let client = NewRelicClient::new(&config);
+
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "test".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(
+        matches!(result, Err(SendError::ClientRejected { status: 413 })),
+        "expected ClientRejected(413), got {:?}",
+        result
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_server_error_returns_server_exhausted() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.log_endpoint = mock.uri();
+    // Zero budget → retry_allowed returns false immediately
+    config.new_relic.data_collection_timeout = Some(std::time::Duration::ZERO);
+    let client = NewRelicClient::new(&config);
+
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "test".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(
+        matches!(result, Err(SendError::ServerExhausted { status: 503 })),
+        "expected ServerExhausted(503), got {:?}",
+        result
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_logs_network_error_returns_network_err() {
+    // Nothing listening on port 1; OS returns connection refused immediately.
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.log_endpoint = "http://127.0.0.1:1".to_string();
+    config.new_relic.data_collection_timeout = Some(std::time::Duration::ZERO);
+    let client = NewRelicClient::new(&config);
+
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "test".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let result = client
+        .send_logs(&config, &batch, "arn:aws:lambda:us-east-1:123456789012:function:f")
+        .await;
+    assert!(
+        matches!(result, Err(SendError::Network(_))),
+        "expected Network error, got {:?}",
+        result
+    );
+}
+
+// ========================================================================
+// send_agent_payload — wiremock network tests
+// ========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_agent_payload_success() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.telemetry_endpoint = mock.uri();
+    let client = NewRelicClient::new(&config);
+
+    let result = client
+        .send_agent_payload(&config, r#"{"agent":"payload"}"#)
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_agent_payload_client_error_not_retried() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.telemetry_endpoint = mock.uri();
+    let client = NewRelicClient::new(&config);
+
+    // 4xx → warn and return Ok without retrying
+    let result = client
+        .send_agent_payload(&config, r#"{"agent":"payload"}"#)
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_agent_payload_server_error_exhausts_retries() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock)
+        .await;
+
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.telemetry_endpoint = mock.uri();
+    config.new_relic.data_collection_timeout = Some(std::time::Duration::ZERO);
+    let client = NewRelicClient::new(&config);
+
+    // 5xx with zero budget → exhausted → warn and return Ok
+    let result = client
+        .send_agent_payload(&config, r#"{"agent":"payload"}"#)
+        .await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_send_agent_payload_network_error_returns_err() {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.license_key = Some("test-key".to_string());
+    config.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+    config.new_relic.data_collection_timeout = Some(std::time::Duration::ZERO);
+    let client = NewRelicClient::new(&config);
+
+    let result = client
+        .send_agent_payload(&config, r#"{"agent":"payload"}"#)
+        .await;
+    assert!(result.is_err(), "expected Err(reqwest::Error), got Ok");
+}
+
+// ========================================================================
+// get_or_build_common_json — add_version_detail_tags branch
+// ========================================================================
+
+#[test]
+fn test_get_or_build_common_json_with_version_tags() {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.aws.function_name = "version-fn".to_string();
+    config.new_relic.add_version_detail_tags = true;
+    let client = NewRelicClient::new(&config);
+    let json = client.get_or_build_common_json(
+        &config,
+        "arn:aws:lambda:us-east-1:123456789012:function:version-fn",
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("common attrs must be valid JSON");
+    assert!(
+        parsed.get("plugin").is_some(),
+        "plugin attribute must be present; got: {}",
+        json
+    );
+}

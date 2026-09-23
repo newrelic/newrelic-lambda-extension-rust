@@ -2115,3 +2115,519 @@ mod lmi_process_record_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::super::LogProcessor;
+    use crate::config::{ExtensionConfig, ExtensionSettings};
+    use crate::config::deployment::DeploymentContext;
+    use crate::context::InvocationContext;
+    use crate::newrelic::client::NewRelicClient;
+    use crate::newrelic::flush::Flush;
+    use crate::newrelic::payload::LogMessage;
+    use crate::telemetry::listener::TelemetryRecord;
+    use serial_test::serial;
+    use std::sync::{Arc, Mutex};
+
+    fn make_log(msg: &str) -> LogMessage {
+        LogMessage { timestamp: 0, message: msg.to_string(), attributes: serde_json::Map::new() }
+    }
+
+    fn fast_fail_processor() -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        LogProcessor::new(client, config, ctx, None)
+    }
+
+    fn fast_fail_processor_with_context(arn: &str, request_id: &str) -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: request_id.to_string(),
+            invoked_function_arn: arn.to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(client, config, ctx, None)
+    }
+
+    // ── set_fallback_arn (lines 1087-1092) ─────────────────────────────────────
+
+    #[test]
+    fn set_fallback_arn_stores_value() {
+        let p = fast_fail_processor();
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:f");
+        let guard = p.fallback_function_arn.lock().unwrap();
+        assert_eq!(guard.as_deref(), Some("arn:aws:lambda:us-east-1:123:function:f"));
+    }
+
+    #[test]
+    fn set_fallback_arn_overwrites_previous() {
+        let p = fast_fail_processor();
+        p.set_fallback_arn("arn:first");
+        p.set_fallback_arn("arn:second");
+        let guard = p.fallback_function_arn.lock().unwrap();
+        assert_eq!(guard.as_deref(), Some("arn:second"));
+    }
+
+    // ── process_pre_invoke_logs_lmi (lines 1361-1397) ─────────────────────────
+
+    #[test]
+    fn process_pre_invoke_logs_lmi_calls_arn_check() {
+        // Exercises the fn entry and ARN lookup (lines 1362-1365).
+        // Global ARN may or may not be set; we only verify no panic.
+        let p = fast_fail_processor();
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("hi"));
+        p.process_pre_invoke_logs_lmi();
+        // If ARN was found from global context, log may have moved to batch — both outcomes OK.
+        let in_batch = p.log_batch.lock().unwrap().len();
+        let in_buf   = p.pre_invoke_buffer.lock().unwrap().len();
+        assert_eq!(in_batch + in_buf, 1, "log must be in exactly one of batch or buffer");
+    }
+
+    #[test]
+    fn process_pre_invoke_logs_lmi_noop_when_buffer_empty() {
+        let p = fast_fail_processor();
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:f");
+        p.process_pre_invoke_logs_lmi();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "empty buffer → no-op");
+    }
+
+    #[test]
+    fn process_pre_invoke_logs_lmi_moves_logs_to_batch() {
+        let p = fast_fail_processor();
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:f");
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("init-1"));
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("init-2"));
+        p.process_pre_invoke_logs_lmi();
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 2, "both logs moved to batch");
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 0, "buffer drained");
+        let arn = batch[0].attributes.get("faas.arn").and_then(|v| v.as_str());
+        assert_eq!(arn, Some("arn:aws:lambda:us-east-1:123:function:f"), "faas.arn stamped");
+    }
+
+    // ── try_spawn_auto_flush (lines 505-621) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn auto_flush_triggers_at_25_logs() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-af",
+        );
+        // Pre-fill batch to 24
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..24 {
+                batch.push(make_log(&format!("log-{i}")));
+            }
+        }
+        // process_record adds log-24 → total 25 → try_spawn_auto_flush fires
+        let rec = crate::telemetry::listener::TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "timestamp": 0, "level": "INFO",
+                "requestId": "req-af", "message": "log-24"
+            }),
+        };
+        p.process_record(rec).await;
+        // Batch is taken synchronously inside try_spawn_auto_flush before spawn
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch drained at threshold");
+        // Let the spawned network task execute so its body (lines 560-615) is covered
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // ── notify_if_drained via send_and_clear_batch_simple (lines 468-472) ────
+
+    #[tokio::test]
+    async fn notify_if_drained_fires_after_flush() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-drain",
+        );
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..3 { batch.push(make_log(&format!("m{i}"))); }
+        }
+        let notify = p.drain_notify();
+        let _ = p.flush().await;
+        // After flush: batch empty, no pending handles → is_drained()=true → notify_one() fires
+        let fired = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            notify.notified(),
+        ).await;
+        assert!(fired.is_ok(), "drain_notify must fire after flush clears the batch");
+    }
+
+    // ── flush_pre_invoke_buffer_on_shutdown (lines 1403-1526) ─────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn flush_pre_invoke_buffer_shutdown_uses_last_context() {
+        // Some((request_id, arn)) branch → logs stamped with request_id and sent
+        *crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap() =
+            Some(("req-prev".to_string(), "arn:aws:lambda:us-east-1:1:function:f".to_string()));
+        let p = fast_fail_processor();
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("pre-log-a"));
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("pre-log-b"));
+        let result = p.flush_pre_invoke_buffer_on_shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 0, "buffer drained");
+        *crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap() = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn flush_pre_invoke_buffer_shutdown_force_flush_without_context() {
+        // None branch: no last context → force-flush with nr.forceFlushed marker
+        *crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap() = None;
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "",
+        );
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("pre-force"));
+        let result = p.flush_pre_invoke_buffer_on_shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 0, "buffer drained");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn flush_pre_invoke_buffer_shutdown_drops_when_no_arn_no_context() {
+        // None context + no ARN → error path: returns Ok(()) without network call
+        *crate::event_loop::LAST_REQUEST_CONTEXT.lock().unwrap() = None;
+        let p = fast_fail_processor(); // no ARN in context, no fallback ARN
+        p.pre_invoke_buffer.lock().unwrap().push(make_log("orphan"));
+        let result = p.flush_pre_invoke_buffer_on_shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 0, "buffer drained on error path too");
+    }
+
+    // ── managed instance metadata (lines 808-822) ─────────────────────────────
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_instance_metadata_stamped_with_max_memory() {
+        use crate::telemetry::managed_instance::{MANAGED_INSTANCE_METADATA, ManagedInstanceMetadata};
+        *MANAGED_INSTANCE_METADATA.write().await = Some(ManagedInstanceMetadata {
+            instance_id: "lmi-host-777".to_string(),
+            instance_max_memory: Some(2_147_483_648),
+        });
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-lmi",
+        );
+        let stamped = p.apply_current_invocation_metadata(make_log("lmi-log"), None);
+        assert_eq!(
+            stamped.attributes.get("aws.lambda.managedInstance.instanceId")
+                .and_then(|v| v.as_str()),
+            Some("lmi-host-777"),
+            "instance_id must be stamped"
+        );
+        assert_eq!(
+            stamped.attributes.get("aws.lambda.managedInstance.instanceMaxMemory")
+                .and_then(|v| v.as_u64()),
+            Some(2_147_483_648),
+            "instance_max_memory must be stamped"
+        );
+        *MANAGED_INSTANCE_METADATA.write().await = None;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn managed_instance_metadata_stamped_without_max_memory() {
+        use crate::telemetry::managed_instance::{MANAGED_INSTANCE_METADATA, ManagedInstanceMetadata};
+        *MANAGED_INSTANCE_METADATA.write().await = Some(ManagedInstanceMetadata {
+            instance_id: "lmi-host-888".to_string(),
+            instance_max_memory: None,
+        });
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-lmi2",
+        );
+        let stamped = p.apply_current_invocation_metadata(make_log("lmi-log2"), None);
+        assert_eq!(
+            stamped.attributes.get("aws.lambda.managedInstance.instanceId")
+                .and_then(|v| v.as_str()),
+            Some("lmi-host-888"),
+        );
+        assert!(
+            stamped.attributes.get("aws.lambda.managedInstance.instanceMaxMemory").is_none(),
+            "max_memory absent when None"
+        );
+        *MANAGED_INSTANCE_METADATA.write().await = None;
+    }
+
+    // ── send_and_clear_batch_simple (lines 1779-1994) ─────────────────────────
+
+    #[tokio::test]
+    async fn send_and_clear_batch_drains_and_notifies() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-send",
+        );
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..5 { batch.push(make_log(&format!("msg-{i}"))); }
+        }
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch cleared by send_and_clear");
+    }
+
+    #[tokio::test]
+    async fn send_and_clear_batch_all_types_disabled_clears_batch() {
+        // All log types disabled → early-return path (lines 1786-1793), clears batch
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension = ExtensionSettings {
+            send_function_logs: false,
+            send_extension_logs: false,
+            send_platform_logs: false,
+            ..ExtensionSettings::default()
+        };
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "req-disabled".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:1:function:f".to_string(),
+            trace_id: None,
+        }));
+        let p = LogProcessor::new(client, config, ctx, None);
+        p.log_batch.lock().unwrap().push(make_log("disabled-log"));
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "all-disabled path clears batch");
+    }
+
+    // ── send_and_clear_batch_simple with fallback ARN (lines 1900-1930) ────────
+    // When invocation context ARN is empty but a fallback ARN is available, the
+    // function warns and uses the fallback instead.
+
+    #[tokio::test]
+    async fn send_and_clear_batch_uses_fallback_arn_when_context_arn_empty() {
+        let p = fast_fail_processor(); // context ARN is ""
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:fallback");
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            batch.push(make_log("needs-fallback-arn"));
+        }
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch cleared via fallback ARN path");
+    }
+
+    #[tokio::test]
+    async fn send_and_clear_batch_uses_fallback_arn_with_empty_request_id() {
+        // Covers the heartbeat-flush warning variant (lines 1920-1924):
+        // context ARN empty, request_id also empty → "heartbeat flush" warning branch
+        let p = fast_fail_processor(); // request_id="" and ARN=""
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:heartbeat");
+        p.log_batch.lock().unwrap().push(make_log("heartbeat-log"));
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn send_and_clear_batch_uses_fallback_arn_with_request_id_set() {
+        // Covers the other fallback-ARN warning variant (lines 1925-1929):
+        // context ARN empty but request_id non-empty
+        let p = fast_fail_processor_with_context("", "req-no-arn");
+        p.set_fallback_arn("arn:aws:lambda:us-east-1:123:function:fallback2");
+        p.log_batch.lock().unwrap().push(make_log("no-context-arn-log"));
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+    }
+
+    // ── flush_on_shutdown (lines 641-668) ────────────────────────────────────
+    // Basic path: no failed logs → returns after first flush.
+
+    #[tokio::test]
+    async fn flush_on_shutdown_returns_ok_when_nothing_to_drain() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-shutdown",
+        );
+        let result = p.flush_on_shutdown().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_on_shutdown_drains_batch_and_failed_buffer() {
+        use super::super::{FailedLogEntry, LogType};
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-shutdown2",
+        );
+        p.log_batch.lock().unwrap().push(make_log("batch-log"));
+        // Push a failed log so start_invocation_retry is called
+        p.push_to_failed_buffer(FailedLogEntry {
+            log_type: LogType::Function,
+            log_message: make_log("failed-log"),
+            original_request_id: "req-shutdown2".to_string(),
+            retry_count: 0,
+        });
+        let result = p.flush_on_shutdown().await;
+        assert!(result.is_ok());
+    }
+
+    // ── start_invocation_retry double-call conflict (lines 1208-1231) ─────────
+    // Calling start_invocation_retry() twice without flush() should not panic;
+    // the second call detects the prior handle still running and spawns a background await.
+
+    #[tokio::test]
+    async fn start_invocation_retry_double_call_does_not_panic() {
+        use super::super::{FailedLogEntry, LogType};
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-double",
+        );
+        // First call: sets invocation_retry_handle
+        p.push_to_failed_buffer(FailedLogEntry {
+            log_type: LogType::Function,
+            log_message: make_log("log-a"),
+            original_request_id: "req-double".to_string(),
+            retry_count: 0,
+        });
+        p.start_invocation_retry();
+        assert!(p.invocation_retry_handle.lock().unwrap().is_some());
+
+        // Second call without flush: triggers the "prior task still running" path (lines 1208-1231)
+        p.push_to_failed_buffer(FailedLogEntry {
+            log_type: LogType::Function,
+            log_message: make_log("log-b"),
+            original_request_id: "req-double".to_string(),
+            retry_count: 0,
+        });
+        p.start_invocation_retry(); // must not panic
+        // Clean up by awaiting via flush
+        let _ = p.flush().await;
+    }
+
+    // ── process_record with unknown record type (line 855) ────────────────────
+
+    #[tokio::test]
+    async fn process_record_unknown_type_falls_through() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-unk",
+        );
+        let rec = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "custom.unknown.type".to_string(),
+            record: serde_json::json!({"message": "custom log"}),
+        };
+        p.process_record(rec).await;
+        // Unknown type falls through to add to batch (no early return)
+        assert_eq!(p.log_batch.lock().unwrap().len(), 1,
+            "unknown log type still adds to batch");
+    }
+
+    // ── process_record with platform type ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn process_record_platform_type_with_send_enabled() {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_platform_logs = true;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "req-plat".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        let p = LogProcessor::new(client, config, ctx, None);
+        let rec = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "platform".to_string(),
+            record: serde_json::json!({"message": "platform event"}),
+        };
+        p.process_record(rec).await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 1, "platform log accepted");
+    }
+
+    // ── flush_pre_invoke_buffer_on_shutdown: empty buffer early return ─────────
+
+    #[tokio::test]
+    async fn flush_pre_invoke_buffer_shutdown_noop_when_empty() {
+        let p = fast_fail_processor();
+        // Buffer already empty → returns Ok(()) immediately (lines 1409-1411)
+        let result = p.flush_pre_invoke_buffer_on_shutdown().await;
+        assert!(result.is_ok());
+        assert_eq!(p.pre_invoke_buffer.lock().unwrap().len(), 0);
+    }
+
+    // ── process_record LMI mode with ARN present → goes to batch ──────────────
+
+    #[tokio::test]
+    async fn process_record_lmi_with_arn_goes_to_batch() {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_function_logs = true;
+        config.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        let p = LogProcessor::new(client, config, ctx, None);
+        let rec = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "timestamp": 0, "level": "INFO",
+                "requestId": "r-lmi", "message": "lmi-func-log"
+            }),
+        };
+        p.process_record(rec).await;
+        // LMI with ARN but no valid context request_id → should go to batch (not request_id_buffer)
+        assert!(p.request_id_buffer.lock().unwrap().is_empty(), "LMI must not park");
+        assert_eq!(p.log_batch.lock().unwrap().len(), 1);
+    }
+
+    // ── auto_flush: already-flushing guard (lines 517-519) ────────────────────
+    // When is_auto_flushing is already true, try_spawn_auto_flush returns without spawning.
+
+    #[tokio::test]
+    async fn auto_flush_skips_when_already_flushing() {
+        use std::sync::atomic::Ordering;
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-skip",
+        );
+        // Manually set the flushing flag before filling the batch
+        p.is_auto_flushing.store(true, Ordering::Release);
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..25 { batch.push(make_log(&format!("l{i}"))); }
+        }
+        p.try_spawn_auto_flush();
+        // Batch NOT taken because is_auto_flushing was true (lines 517-519)
+        assert_eq!(p.log_batch.lock().unwrap().len(), 25, "batch untouched when already flushing");
+        p.is_auto_flushing.store(false, Ordering::Release);
+    }
+
+    // ── dedup inside send_and_clear_batch_simple (lines 1830-1884) ─────────────
+    // Duplicate logs are collapsed to 1 before sending.
+
+    #[tokio::test]
+    async fn send_and_clear_batch_deduplicates_identical_logs() {
+        let p = fast_fail_processor_with_context(
+            "arn:aws:lambda:us-east-1:123:function:f",
+            "req-dedup",
+        );
+        // Push the same log 3 times → after dedup only 1 unique log
+        let dup = make_log("duplicate-message");
+        p.log_batch.lock().unwrap().extend(vec![dup.clone(), dup.clone(), dup]);
+        assert_eq!(p.log_batch.lock().unwrap().len(), 3);
+        let _ = p.send_and_clear_batch_simple().await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch cleared after dedup + send");
+    }
+}

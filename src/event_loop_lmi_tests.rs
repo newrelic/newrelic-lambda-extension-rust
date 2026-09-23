@@ -877,3 +877,302 @@ async fn drain_on_shutdown_with_reason_unknown() {
     clear_failed_agent_payloads();
     clear_last_request_context();
 }
+
+// ── flush_lmi_telemetry — reconnect_needed=true but apm already None ──────
+
+/// When `take_reconnect_needed()` returns true but `apm_app` is already `None`,
+/// the `if w.is_some()` block is not entered (line 143 `}` — else branch covered).
+#[tokio::test]
+#[serial]
+async fn flush_lmi_reconnect_needed_with_apm_already_disconnected() {
+    clear_failed_agent_payloads();
+    crate::apm::collector::signal_reconnect_needed();
+
+    // apm_app is already None — reconnect_needed fires but w.is_none() so no assignment
+    let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+    // block reconnect spawn so no network calls happen
+    let reconnect_in_flight = Arc::new(AtomicBool::new(true));
+
+    let h = build_lmi_flush_handles(Arc::clone(&apm_app), Arc::clone(&reconnect_in_flight));
+    flush_lmi_telemetry(&h, false).await;
+
+    assert!(
+        apm_app.read().await.is_none(),
+        "apm_app must remain None — reconnect_needed was true but app was already disconnected"
+    );
+    clear_failed_agent_payloads();
+}
+
+// ── spawn_lmi_heartbeat — tick fires before cancel ────────────────────────
+
+/// Heartbeat must fire at least one periodic flush tick when the cancel signal
+/// is delayed. Uses a very short interval (10 ms) so the tick fires quickly.
+/// Covers the `ticker.tick()` select arm (lines 290-291).
+#[tokio::test]
+#[serial]
+async fn heartbeat_fires_at_least_one_tick_before_cancel() {
+    clear_failed_agent_payloads();
+    let _ = crate::apm::collector::take_reconnect_needed();
+    crate::apm::connection::reset_handshake_fatal_for_test();
+
+    let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+    let reconnect_in_flight = Arc::new(AtomicBool::new(true)); // block reconnect spawn
+
+    let h = {
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::context::InvocationContext;
+
+        let mut config = ExtensionConfig::default();
+        config.deployment = DeploymentContext::Lmi;
+        config.extension.lmi_flush_interval_ms = 10; // very short so tick fires quickly
+        let config = Arc::new(config);
+
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        LmiFlushHandles {
+            config,
+            global_log_processor: log_processor,
+            apm_app: Arc::clone(&apm_app),
+            client: Arc::new(Client::new()),
+            apm_client: Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap_or_default(),
+            reconnect_in_flight: Arc::clone(&reconnect_in_flight),
+        }
+    };
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let handle = spawn_lmi_heartbeat(h, cancel_rx);
+
+    // Sleep long enough for at least one 10-ms tick to fire before we cancel.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    cancel_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("heartbeat must stop within 5s after cancel")
+        .expect("heartbeat task must not panic");
+
+    clear_failed_agent_payloads();
+}
+
+// ── spawn_lmi_heartbeat — cancel_rx fires with false (does NOT break) ────
+
+/// When `cancel_rx.changed()` fires but the value is `false`, the heartbeat
+/// must NOT break — it continues to the next select iteration (line 296 `}`).
+/// Sends `false` first (wakes changed() without cancelling), then `true` to stop.
+#[tokio::test]
+#[serial]
+async fn heartbeat_continues_when_cancel_rx_fires_with_false() {
+    clear_failed_agent_payloads();
+    let _ = crate::apm::collector::take_reconnect_needed();
+    crate::apm::connection::reset_handshake_fatal_for_test();
+
+    let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+    let reconnect_in_flight = Arc::new(AtomicBool::new(true)); // block reconnect spawn
+
+    let h = {
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::context::InvocationContext;
+
+        let mut config = ExtensionConfig::default();
+        config.deployment = DeploymentContext::Lmi;
+        config.extension.lmi_flush_interval_ms = 60_000; // long interval — tick won't fire
+        let config = Arc::new(config);
+
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        LmiFlushHandles {
+            config,
+            global_log_processor: log_processor,
+            apm_app: Arc::clone(&apm_app),
+            client: Arc::new(Client::new()),
+            apm_client: Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap_or_default(),
+            reconnect_in_flight: Arc::clone(&reconnect_in_flight),
+        }
+    };
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let handle = spawn_lmi_heartbeat(h, cancel_rx);
+
+    // Give the heartbeat task time to enter its select! loop.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Send false — wakes cancel_rx.changed() but borrow() is false so loop continues (line 296).
+    cancel_tx.send(false).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Now actually cancel.
+    cancel_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("heartbeat must stop within 5s after real cancel")
+        .expect("heartbeat task must not panic");
+
+    clear_failed_agent_payloads();
+}
+
+// ── flush_lmi_telemetry — reconnect spawn body (Err path) ────────────────
+
+/// When reconnect conditions are met (apm=None, no fatal, flag=false), flush must
+/// enter the spawn block (lines 158-179), kick off the task, and the task must run
+/// `ApmApp::new` to completion (Err path, lines 181-211). Uses port 1 so the
+/// connection fails fast (ECONNREFUSED), then polls for LmiReconnectGuard drop.
+#[tokio::test]
+#[serial]
+async fn flush_lmi_spawns_reconnect_and_task_fails_on_bad_host() {
+    clear_failed_agent_payloads();
+    let _ = crate::apm::collector::take_reconnect_needed();
+    crate::apm::connection::reset_handshake_fatal_for_test();
+    crate::apm::connection::reset_connect_stats();
+
+    let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(None));
+    // Start with false so compare_exchange(false→true) succeeds and spawn fires.
+    let reconnect_in_flight = Arc::new(AtomicBool::new(false));
+
+    let h = {
+        use crate::config::{ExtensionConfig, deployment::DeploymentContext};
+        use crate::context::InvocationContext;
+
+        let mut config = ExtensionConfig::default();
+        config.deployment = DeploymentContext::Lmi;
+        // Port 1 → ECONNREFUSED on every attempt; fails fast without TLS setup.
+        config.new_relic.apm_host = "127.0.0.1:1".to_string();
+        let config = Arc::new(config);
+
+        let nr_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            Arc::clone(&nr_client),
+            Arc::clone(&config),
+            Arc::new(std::sync::Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        LmiFlushHandles {
+            config,
+            global_log_processor: log_processor,
+            apm_app: Arc::clone(&apm_app),
+            client: Arc::new(Client::new()),
+            // 50 ms timeout — irrelevant for port 1 (ECONNREFUSED is instant)
+            apm_client: Client::builder()
+                .timeout(Duration::from_millis(50))
+                .build()
+                .unwrap_or_default(),
+            reconnect_in_flight: Arc::clone(&reconnect_in_flight),
+        }
+    };
+
+    // flush_lmi_telemetry claims the flag (false→true) and spawns the reconnect task.
+    flush_lmi_telemetry(&h, false).await;
+
+    // Flag must be true immediately after flush (spawn was kicked off but not done yet).
+    assert!(
+        reconnect_in_flight.load(Ordering::Acquire),
+        "reconnect_in_flight must be true after flush spawns the reconnect task"
+    );
+
+    // Wait for the spawn to finish. LmiReconnectGuard::drop sets the flag back to false.
+    // ApmApp::new retries 3x with 200ms + 500ms backoff → allow up to 10s.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !reconnect_in_flight.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("LmiReconnectGuard must drop (reconnect_in_flight to false) within 10s");
+
+    // Spawn completed with Err (port 1 ECONNREFUSED) — apm_app stays None.
+    assert!(
+        apm_app.read().await.is_none(),
+        "apm_app must remain None after a failed reconnect attempt"
+    );
+
+    crate::apm::connection::reset_connect_stats();
+    crate::apm::connection::reset_handshake_fatal_for_test();
+    clear_failed_agent_payloads();
+}
+
+// ── retry_lmi_failed_agent_payloads — Ok branch ───────────────────────────
+
+/// Build a minimal valid v1 agent payload (base64-gzip-JSON).
+/// process_agent_payload returns Ok even on network failure — errors are
+/// buffered internally, not propagated up to the caller.
+fn make_valid_v1_agent_payload() -> Vec<u8> {
+    use base64::Engine as _;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    let wrapper = serde_json::json!({"data": {"analytic_event_data": [null, {}, []]}});
+    let json = serde_json::to_string(&wrapper).unwrap();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(json.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&compressed);
+    format!("[\"1\",\"{b64}\"]").into_bytes()
+}
+
+/// When `process_agent_payload` returns Ok (valid payload, network errors are
+/// buffered internally), the Ok branch (lines 459-464) must be taken and the
+/// payload must be removed from the retry buffer (succeeded += 1, not re-queued).
+#[tokio::test]
+#[serial]
+async fn retry_lmi_ok_branch_covered_with_valid_payload() {
+    clear_failed_agent_payloads();
+
+    let payload = make_valid_v1_agent_payload();
+    let entry = crate::event_loop::FailedAgentPayload {
+        payload_bytes: payload,
+        request_id: "req-ok-branch".to_string(),
+        invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:fn".to_string(),
+        retry_count: 0,
+        failed_at: chrono::Utc::now(),
+    };
+    crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap().push(entry);
+
+    // ApmApp with port 1 — process_agent_payload returns Ok even though network
+    // sends fail (errors go to telemetry buffer, not propagated as Err).
+    let apm_val = crate::apm::ApmApp {
+        run_id: "run-ok".to_string(),
+        entity_guid: "guid-ok".to_string(),
+        app_name: "test-app".to_string(),
+        collector_host: "127.0.0.1:1".to_string(),
+        license_key: "test-key".to_string(),
+        metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+        client: Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap_or_default(),
+        deployment: crate::config::deployment::DeploymentContext::Lmi,
+    };
+    let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(apm_val)));
+
+    retry_lmi_failed_agent_payloads(&apm_app).await;
+
+    // Ok path: payload was "sent" (buffered internally) — must NOT be re-queued.
+    let remaining = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap().len();
+    assert_eq!(
+        remaining, 0,
+        "valid payload must take Ok branch and not be re-queued in FAILED_AGENT_PAYLOADS"
+    );
+    clear_failed_agent_payloads();
+}

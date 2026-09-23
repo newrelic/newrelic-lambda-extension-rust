@@ -83,3 +83,41 @@ fn rejected_400_and_404_are_terminal_for_retry() {
 fn missing_runtime_api_is_terminal_for_retry() {
     assert!(!TelemetrySubscriptionError::MissingRuntimeApi.is_retryable());
 }
+
+fn make_transport_error() -> reqwest::Error {
+    reqwest::Client::new()
+        .get("http://example.com")
+        .header("bad\nheader", "value")
+        .build()
+        .unwrap_err()
+}
+
+#[test]
+fn transport_is_retryable() {
+    let err = TelemetrySubscriptionError::Transport(make_transport_error());
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn transport_display_includes_transport_failure_prefix() {
+    let err = TelemetrySubscriptionError::Transport(make_transport_error());
+    let msg = format!("{err}");
+    assert!(msg.contains("HTTP transport failure"), "got: {msg}");
+}
+
+#[test]
+fn error_source_is_some_for_transport_and_none_for_others() {
+    use std::error::Error;
+
+    let transport = TelemetrySubscriptionError::Transport(make_transport_error());
+    assert!(transport.source().is_some());
+
+    assert!(TelemetrySubscriptionError::MissingRuntimeApi.source().is_none());
+    assert!(TelemetrySubscriptionError::Rejected {
+        status: 400,
+        body: String::new(),
+        schema: TelemetrySchema::V2022_07_01,
+    }
+    .source()
+    .is_none());
+}
