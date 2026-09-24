@@ -302,8 +302,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "expected Ok(license_key), got {:?}",
-            result
+            "expected Ok(license_key)"
         );
         assert_eq!(result.unwrap(), "test-license-key-12345");
     }

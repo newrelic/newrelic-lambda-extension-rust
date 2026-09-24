@@ -86,7 +86,7 @@ fn missing_runtime_api_is_terminal_for_retry() {
 
 fn make_transport_error() -> reqwest::Error {
     reqwest::Client::new()
-        .get("http://example.com")
+        .get("https://example.com")
         .header("bad\nheader", "value")
         .build()
         .unwrap_err()
