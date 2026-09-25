@@ -193,6 +193,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_get_license_key_fails_when_not_in_lambda_env() {
+        let prev_runtime_api = std::env::var("AWS_LAMBDA_RUNTIME_API").ok();
         std::env::remove_var("AWS_LAMBDA_RUNTIME_API");
 
         let conf = crate::config::Configuration {
@@ -202,6 +203,12 @@ mod tests {
         };
 
         let result = super::super::get_new_relic_license_key(&conf).await;
+
+        match prev_runtime_api {
+            Some(v) => std::env::set_var("AWS_LAMBDA_RUNTIME_API", v),
+            None => std::env::remove_var("AWS_LAMBDA_RUNTIME_API"),
+        }
+
         assert!(result.is_err(), "expected Err when not in Lambda env");
         let msg = result.unwrap_err().to_string();
         assert!(
