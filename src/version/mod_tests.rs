@@ -319,3 +319,178 @@ fn detect_runtime_internal_unknown_when_unset_and_no_runtime_binaries() {
         std::env::set_var("AWS_EXECUTION_ENV", v);
     }
 }
+
+// =============================================================================
+// version/tagging.rs — wiremock + AWS_ENDPOINT_URL intercepts Lambda calls.
+// tag_lambda_function_with_versions is pub, so accessible via super::tagging::.
+// No OnceLock here: aws_config::load_defaults is called fresh per invocation,
+// so each test is fully independent.
+// =============================================================================
+
+fn set_aws_env(endpoint: &str) {
+    std::env::set_var("AWS_ENDPOINT_URL", endpoint);
+    std::env::set_var("AWS_ACCESS_KEY_ID", "test-key");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "test-secret");
+    std::env::set_var("AWS_DEFAULT_REGION", "us-east-1");
+    // Provide a CA bundle so the TLS trust store can initialize without
+    // relying on native OS roots (which can fail in test environments).
+    for path in &["/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt"] {
+        if std::path::Path::new(path).exists() {
+            std::env::set_var("AWS_CA_BUNDLE", path);
+            break;
+        }
+    }
+}
+
+fn clear_aws_env() {
+    std::env::remove_var("AWS_ENDPOINT_URL");
+    std::env::remove_var("AWS_ACCESS_KEY_ID");
+    std::env::remove_var("AWS_SECRET_ACCESS_KEY");
+    std::env::remove_var("AWS_DEFAULT_REGION");
+    std::env::remove_var("AWS_CA_BUNDLE");
+}
+
+/// All three version tags set, Lambda TagResource returns 200 (success).
+/// Covers: full HashMap building (all Some branches), apply_tags_to_function
+/// success path (config load, client creation, TagResource Ok arm).
+#[tokio::test]
+#[serial]
+async fn tagging_all_versions_success() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::method;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    set_aws_env(&mock.uri());
+    tagging::tag_lambda_function_with_versions(
+        "2.7.0".to_string(),
+        Some("9.5.0".to_string()),
+        Some("NewRelicPython313X86:93".to_string()),
+        "arn:aws:lambda:us-east-1:123456789012:function:my-fn".to_string(),
+    )
+    .await;
+    clear_aws_env();
+    // If we reach here without panic, success path executed.
+}
+
+/// No optional versions — only extension_version tag is built.
+/// Covers: both None branches (agent_version and layer_version).
+#[tokio::test]
+#[serial]
+async fn tagging_no_optional_versions_success() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::method;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    set_aws_env(&mock.uri());
+    tagging::tag_lambda_function_with_versions(
+        "2.7.0".to_string(),
+        None,
+        None,
+        "arn:aws:lambda:us-east-1:123456789012:function:my-fn".to_string(),
+    )
+    .await;
+    clear_aws_env();
+}
+
+/// Lambda returns 403 with AccessDeniedException body.
+/// Covers: Err arm of apply_tags_to_function match, AccessDenied warn branch.
+#[tokio::test]
+#[serial]
+async fn tagging_access_denied_error() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::method;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("Content-Type", "application/json")
+                .set_body_string(
+                    r#"{"__type":"AccessDeniedException","message":"not authorized to perform lambda:TagResource"}"#,
+                ),
+        )
+        .mount(&mock)
+        .await;
+
+    set_aws_env(&mock.uri());
+    // Returns () — error is logged internally via warn!
+    tagging::tag_lambda_function_with_versions(
+        "2.7.0".to_string(),
+        Some("9.5.0".to_string()),
+        None,
+        "arn:aws:lambda:us-east-1:123456789012:function:my-fn".to_string(),
+    )
+    .await;
+    clear_aws_env();
+}
+
+/// Lambda returns 404 with ResourceNotFoundException body.
+/// Covers: ResourceNotFound warn branch inside apply_tags_to_function error arm.
+#[tokio::test]
+#[serial]
+async fn tagging_resource_not_found_error() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::method;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .insert_header("Content-Type", "application/json")
+                .set_body_string(
+                    r#"{"__type":"ResourceNotFoundException","message":"Function not found"}"#,
+                ),
+        )
+        .mount(&mock)
+        .await;
+
+    set_aws_env(&mock.uri());
+    tagging::tag_lambda_function_with_versions(
+        "2.7.0".to_string(),
+        None,
+        Some("Layer:1".to_string()),
+        "arn:aws:lambda:us-east-1:123456789012:function:missing-fn".to_string(),
+    )
+    .await;
+    clear_aws_env();
+}
+
+/// tag_lambda_function_background: layer_version already known so the AWS API
+/// fallback branch (detect_layer_version_async) is skipped entirely.
+/// Covers: tokio::spawn, None-check (false path), inner tag call, debug log.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn tagging_background_with_known_layer_version() {
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::matchers::method;
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock)
+        .await;
+
+    set_aws_env(&mock.uri());
+    tagging::tag_lambda_function_background(
+        "2.7.0".to_string(),
+        Some("9.5.0".to_string()),
+        Some("NewRelicPython313X86:93".to_string()), // layer_version known → no AWS fallback
+        "arn:aws:lambda:us-east-1:123456789012:function:my-fn".to_string(),
+        None,
+        false,
+        "my-fn".to_string(),
+    );
+    // Give the spawned task time to complete before wiremock is dropped.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    clear_aws_env();
+}

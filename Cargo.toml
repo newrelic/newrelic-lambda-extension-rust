@@ -16,6 +16,7 @@ exclude = [
 	"scripts/",                    # Excludes all test and layer scripts
 	"examples/",                   # Excludes the examples folder (if you add one)
 	"src/**/*_test.rs",            # Excludes unit test files ending in _test.rs
+	"src/*_tests.rs",              # Exclude unit test files in src folder
 	"src/**/*_tests.rs",           # Excludes unit test files ending in _tests.rs
 	"README.md",                   # Excludes the README.md file
 	"CODE_OF_CONDUCT.md",          # Excludes contributing guidelines

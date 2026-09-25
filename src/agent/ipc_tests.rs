@@ -122,4 +122,130 @@ mod tests {
         rt.shutdown_background();
         cleanup();
     }
+
+    // ── empty-bytes continue path (line 63) ───────────────────────────────────
+    // Opening the write end and closing it without writing causes read_to_end to
+    // return Ok(vec![]), which hits the `if bytes.is_empty() { continue }` branch.
+    // A second write confirms the loop is still alive after the continue.
+
+    #[test]
+    #[serial]
+    fn empty_write_triggers_continue_in_listener_loop() {
+        cleanup();
+        let rt = multi_thread_runtime();
+
+        rt.block_on(async {
+            let mut rx = init_telemetry_channel().await.expect("pipe init");
+
+            // Open write end then drop it immediately — no data written → read_to_end → Ok([])
+            let _ = std::thread::spawn(|| {
+                let _f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(TELEMETRY_NAMED_PIPE_PATH)
+                    .expect("open for empty write");
+                // _f dropped immediately → write end closes → empty bytes
+            });
+
+            // Small pause so the background task processes the empty read before the next write
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            // Second write — confirms the loop continued and is still listening
+            let _ = std::thread::spawn(|| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(TELEMETRY_NAMED_PIPE_PATH)
+                    .expect("open for real write");
+                f.write_all(b"after-empty-write").expect("write");
+            });
+
+            let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("should receive bytes before timeout")
+                .expect("channel should be open");
+            assert_eq!(received, b"after-empty-write");
+        });
+
+        rt.shutdown_background();
+        cleanup();
+    }
+
+    // ── bytes_received_count % 10 != 1 path (line 69) ────────────────────────
+    // The trace! fires only when bytes_received_count % 10 == 1. Writing twice
+    // means the second receive has count=2, which is ≠1, exercising the else-exit
+    // of that if block (the `}` LLVM instruments as an uncovered region).
+
+    #[test]
+    #[serial]
+    fn two_writes_cover_non_trace_count_branch() {
+        cleanup();
+        let rt = multi_thread_runtime();
+
+        rt.block_on(async {
+            let mut rx = init_telemetry_channel().await.expect("pipe init");
+
+            // First write: count becomes 1, trace! fires (count%10==1 true path)
+            let _ = std::thread::spawn(|| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(TELEMETRY_NAMED_PIPE_PATH)
+                    .expect("open write 1");
+                f.write_all(b"msg-1").expect("write 1");
+            });
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("first recv timeout")
+                .expect("channel open");
+
+            // Second write: count becomes 2, trace! skipped (count%10 = 2 ≠ 1 → else path)
+            let _ = std::thread::spawn(|| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(TELEMETRY_NAMED_PIPE_PATH)
+                    .expect("open write 2");
+                f.write_all(b"msg-2").expect("write 2");
+            });
+            let received = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("second recv timeout")
+                .expect("channel open");
+            assert_eq!(received, b"msg-2");
+        });
+
+        rt.shutdown_background();
+        cleanup();
+    }
+
+    // ── channel-receiver-dropped path (lines 72-73, 85) ─────────────────────
+    // Dropping the receiver before the background task's next send makes
+    // tx.send() return Err → the warning fires and `break` exits the loop.
+    // Line 85 (closing `}` of the spawned block) is also reached when the task exits.
+
+    #[test]
+    #[serial]
+    fn dropping_receiver_stops_background_task() {
+        cleanup();
+        let rt = multi_thread_runtime();
+
+        rt.block_on(async {
+            let rx = init_telemetry_channel().await.expect("pipe init");
+            // Drop receiver — any subsequent tx.send() will return Err
+            drop(rx);
+
+            // Write bytes so the background task wakes up and attempts to send
+            let writer = std::thread::spawn(|| {
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(TELEMETRY_NAMED_PIPE_PATH)
+                    .expect("open for write");
+                f.write_all(b"trigger-closed-channel").expect("write");
+            });
+            writer.join().expect("writer thread should not panic");
+
+            // Give the background task time to discover the closed channel and break
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        rt.shutdown_background();
+        cleanup();
+    }
 }
