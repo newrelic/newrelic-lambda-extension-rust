@@ -160,6 +160,7 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
             let license_key = h.config.new_relic.license_key.clone().unwrap_or_default();
             let apm_host = h.config.new_relic.apm_host.clone();
             let metric_endpoint = h.config.new_relic.metric_endpoint.clone();
+            let otlp_metric_endpoint = h.config.new_relic.otlp_metric_endpoint.clone();
             let apm_client = h.apm_client.clone();
             let lambda_function_name = h.config.aws.function_name.clone();
             let function_name = std::env::var("NEW_RELIC_APP_NAME")
@@ -184,6 +185,7 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
                     license_key,
                     apm_host,
                     metric_endpoint,
+                    otlp_metric_endpoint,
                     apm_client,
                     function_name,
                     lambda_function_name,

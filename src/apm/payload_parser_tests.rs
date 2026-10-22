@@ -147,6 +147,123 @@ fn extract_from_bytes_none_for_garbage() {
     assert_eq!(extract_request_id_from_payload_bytes(b""), None);
 }
 
+// ---------------------------------------------------------------------------
+// otlp_payload extraction (OTLP metrics forwarding)
+// ---------------------------------------------------------------------------
+
+fn create_test_payload_with_json(json_body: &str) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(json_body.as_bytes()).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let encoded = general_purpose::STANDARD.encode(&compressed);
+    format!(r#"["2", "NR_LAMBDA_MONITORING", "{encoded}"]"#).into_bytes()
+}
+
+#[test]
+fn test_otlp_payload_snake_case_key() {
+    let payload = create_test_payload_with_json(r#"{"otlp_payload": ["abc123"]}"#);
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    let entries = data_map
+        .get("otlp_payload")
+        .expect("otlp_payload key missing");
+    assert_eq!(entries, &vec![Value::String("abc123".to_string())]);
+}
+
+#[test]
+fn test_otlp_payload_camel_case_key_fallback() {
+    // .NET-style JSON serializers commonly default to camelCase — must not
+    // silently drop otlp_payload if the agent emits "otlpPayload" instead.
+    let payload = create_test_payload_with_json(r#"{"otlpPayload": ["def456"]}"#);
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    let entries = data_map
+        .get("otlp_payload")
+        .expect("otlp_payload key missing (camelCase fallback failed)");
+    assert_eq!(entries, &vec![Value::String("def456".to_string())]);
+}
+
+#[test]
+fn test_otlp_payload_absent_key_yields_no_map_entry() {
+    let payload = create_test_payload_with_json(r#"{"metric_data": [[1, 2, 3]]}"#);
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    assert!(!data_map.contains_key("otlp_payload"));
+}
+
+#[test]
+fn test_otlp_payload_multi_element_array_keeps_every_entry_in_order() {
+    // The agent may batch several OTLP requests into one array. Every element
+    // must survive parsing (not just the first) and keep its original order,
+    // since send_otlp_payload numbers them 1..N for log correlation.
+    let payload =
+        create_test_payload_with_json(r#"{"otlp_payload": ["first", "second", "third", "fourth"]}"#);
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    let entries = data_map
+        .get("otlp_payload")
+        .expect("otlp_payload key missing");
+    assert_eq!(
+        entries,
+        &vec![
+            Value::String("first".to_string()),
+            Value::String("second".to_string()),
+            Value::String("third".to_string()),
+            Value::String("fourth".to_string()),
+        ],
+    );
+}
+
+#[test]
+fn test_otlp_payload_non_string_elements_are_skipped_not_fatal() {
+    // get_string_array filters on as_str(), so a malformed element is dropped
+    // rather than poisoning the whole batch. Assert that explicitly so the
+    // lenient behaviour is intentional and not an accident of refactoring.
+    let payload = create_test_payload_with_json(
+        r#"{"otlp_payload": ["good1", 42, null, {"a":1}, ["nested"], "good2"]}"#,
+    );
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    let entries = data_map
+        .get("otlp_payload")
+        .expect("otlp_payload key missing");
+    assert_eq!(
+        entries,
+        &vec![
+            Value::String("good1".to_string()),
+            Value::String("good2".to_string()),
+        ],
+    );
+}
+
+#[test]
+fn test_otlp_payload_non_array_is_ignored() {
+    // The contract is an array of base64 strings; every other shape yields nothing.
+    for body in [
+        r#"{"otlp_payload": "YmFyZQ=="}"#,
+        r#"{"otlp_payload": null}"#,
+        r#"{"otlp_payload": 42}"#,
+        r#"{"otlp_payload": true}"#,
+        r#"{"otlp_payload": {"a": 1}}"#,
+    ] {
+        let payload = create_test_payload_with_json(body);
+        let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+        assert!(!data_map.contains_key("otlp_payload"), "should ignore: {body}");
+    }
+}
+
+#[test]
+fn test_otlp_payload_empty_string_inside_array_is_skipped() {
+    // An empty blob carries no metrics; forwarding it would POST an empty request.
+    let payload = create_test_payload_with_json(r#"{"otlp_payload": ["", "abc", ""]}"#);
+    let (data_map, _version) = parse_agent_payload(&payload).unwrap();
+
+    assert_eq!(
+        data_map.get("otlp_payload"),
+        Some(&vec![Value::String("abc".to_string())])
+    );
+}
+
 // ── error-path coverage ───────────────────────────────────────────────────────
 
 fn encode_gzip_b64(data: &[u8]) -> String {

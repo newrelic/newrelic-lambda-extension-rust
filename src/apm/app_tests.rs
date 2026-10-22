@@ -49,6 +49,7 @@ fn test_apm_app() -> ApmApp {
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-key".to_string(),
         metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
+        otlp_metric_endpoint: "http://127.0.0.1:1/v1/metrics".to_string(),
         client: Client::new(),
         deployment: DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Apm,
@@ -66,6 +67,7 @@ fn test_apm_app_creation() {
         collector_host: "collector.newrelic.com".to_string(),
         license_key: "test_key".to_string(),
         metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
+        otlp_metric_endpoint: "https://collector.newrelic.com/v1/metrics".to_string(),
         client,
         deployment: DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Apm,
@@ -546,7 +548,8 @@ async fn apm_app_new_returns_error_immediately_when_handshake_is_fatal() {
 
     let result = ApmApp::new(
         "key".to_string(), "127.0.0.1:1".to_string(),
-        "http://127.0.0.1:1/metrics".to_string(), Client::new(),
+        "http://127.0.0.1:1/metrics".to_string(),
+        "http://127.0.0.1:1/v1/metrics".to_string(), Client::new(),
         "fn".to_string(), "fn".to_string(), "1".to_string(),
         None, None, 1,
         DeploymentContext::Normal { mode: crate::config::deployment::TelemetryMode::Apm },
@@ -565,7 +568,8 @@ async fn apm_app_new_retries_all_attempts_and_returns_error_on_connection_refuse
 
     let result = ApmApp::new(
         "key".to_string(), "127.0.0.1:1".to_string(),
-        "http://127.0.0.1:1/metrics".to_string(), Client::new(),
+        "http://127.0.0.1:1/metrics".to_string(),
+        "http://127.0.0.1:1/v1/metrics".to_string(), Client::new(),
         "fn".to_string(), "fn".to_string(), "1".to_string(),
         None, None, 1,
         DeploymentContext::Normal { mode: crate::config::deployment::TelemetryMode::Apm },
@@ -580,7 +584,7 @@ async fn apm_app_new_retries_all_attempts_and_returns_error_on_connection_refuse
 #[tokio::test]
 async fn try_connect_wraps_preconnect_failure_with_context() {
     let result = ApmApp::try_connect(
-        "key", "127.0.0.1:1", "http://metric", &Client::new(),
+        "key", "127.0.0.1:1", "http://metric", "http://otlp", &Client::new(),
         "fn", "fn", "1", &None, &None, 1,
         DeploymentContext::Normal { mode: crate::config::deployment::TelemetryMode::Apm },
     ).await;
@@ -595,7 +599,7 @@ async fn try_connect_wraps_preconnect_failure_with_context() {
 async fn try_connect_covers_explicit_account_id_and_region_path() {
     // Passes Some(..) for both optional args so the non-default branches run.
     let result = ApmApp::try_connect(
-        "key", "127.0.0.1:1", "http://metric", &Client::new(),
+        "key", "127.0.0.1:1", "http://metric", "http://otlp", &Client::new(),
         "fn", "fn", "1",
         &Some("123456789012".to_string()),
         &Some("eu-west-1".to_string()),

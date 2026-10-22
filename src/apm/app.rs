@@ -6,9 +6,9 @@
 //! Based on internal_app.go NewApp(), connectRoutine(), doHarvest()
 
 use super::collector::{
-    send_apm_telemetry, send_error_events, send_platform_metrics, CMD_ANALYTIC_EVENTS,
-    CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS, CMD_METRICS, CMD_SLOW_SQLS,
-    CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
+    send_apm_telemetry, send_error_events, send_otlp_payload, send_platform_metrics,
+    CMD_ANALYTIC_EVENTS, CMD_CUSTOM_EVENTS, CMD_ERROR_DATA, CMD_ERROR_EVENTS, CMD_LOG_EVENTS,
+    CMD_METRICS, CMD_SLOW_SQLS, CMD_SPAN_EVENTS, CMD_TRANSACTION_SAMPLES,
 };
 use super::connection::{
     connect, is_handshake_fatal, is_permanent_auth_error, last_failure_reason, preconnect,
@@ -32,6 +32,7 @@ pub struct ApmApp {
     pub collector_host: String,
     pub license_key: String,
     pub metric_endpoint: String,
+    pub otlp_metric_endpoint: String,
     pub client: Client,
     /// Deployment context (detected once at startup). Drives type-driven LMI vs Normal
     /// behavior in this app — e.g. strict vs lenient `platform.report` parsing.
@@ -43,6 +44,7 @@ impl ApmApp {
         license_key: String,
         apm_host: String,
         metric_endpoint: String,
+        otlp_metric_endpoint: String,
         client: Client,
         function_name: String,
         lambda_function_name: String,
@@ -76,6 +78,7 @@ impl ApmApp {
                 &license_key,
                 &apm_host,
                 &metric_endpoint,
+                &otlp_metric_endpoint,
                 &client,
                 &function_name,
                 &lambda_function_name,
@@ -141,6 +144,7 @@ impl ApmApp {
         license_key: &str,
         apm_host: &str,
         metric_endpoint: &str,
+        otlp_metric_endpoint: &str,
         client: &Client,
         function_name: &str,
         lambda_function_name: &str,
@@ -253,6 +257,7 @@ impl ApmApp {
             collector_host: connect_host,
             license_key: license_key.to_string(),
             metric_endpoint: metric_endpoint.to_string(),
+            otlp_metric_endpoint: otlp_metric_endpoint.to_string(),
             client: client.clone(),
             deployment,
         })
@@ -309,6 +314,43 @@ impl ApmApp {
         }
 
         let mut send_tasks = Vec::new();
+
+        // otlp_payload is removed from the map either way, so the generic loop below does not
+        // report it as an unknown telemetry type.
+        if super::collector::is_otlp_metric_enabled() {
+            let otlp_entries: Vec<String> = telemetry_map
+                .remove("otlp_payload")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+
+            if otlp_entries.is_empty() {
+                // Opted in but nothing to send: an agent without OTLP support, a bridge that
+                // did not start, or an app recording no OpenTelemetry metrics.
+                warn!(
+                    "NEW_RELIC_OTLP_METRIC_ENABLED=true but no otlp_payload found in the agent \
+                     payload for request {} - no OTLP metrics to forward",
+                    request_id
+                );
+            } else {
+                let client = self.client.clone();
+                let otlp_metric_endpoint = self.otlp_metric_endpoint.clone();
+                let license_key = self.license_key.clone();
+                let entity_guid = self.entity_guid.clone();
+                let request_id_owned = request_id.to_string();
+
+                send_tasks.push(tokio::spawn(async move {
+                    send_otlp_payload(&client, &otlp_metric_endpoint, &license_key, &otlp_entries, &entity_guid, &request_id_owned).await;
+                }));
+            }
+        } else if let Some(dropped) = telemetry_map.remove("otlp_payload") {
+            // Not opted in, so debug only. Flag-without-APM-mode warns once at startup.
+            debug!(
+                "Dropping {} OTLP payload(s) - OTLP forwarding is not enabled",
+                dropped.len()
+            );
+        }
 
         for (telemetry_type, mut data) in telemetry_map {
             if data.is_empty() {

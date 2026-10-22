@@ -25,6 +25,7 @@ fn build_fake_apm_app() -> crate::apm::ApmApp {
         collector_host: "http://unreachable.invalid.test".to_string(),
         license_key: "fake-license-key-for-unit-test".to_string(),
         metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+        otlp_metric_endpoint: "http://otlp.invalid.test/v1/metrics".to_string(),
         client: Client::builder()
             .timeout(Duration::from_millis(50))
             .build()
@@ -1158,6 +1159,7 @@ async fn retry_lmi_ok_branch_covered_with_valid_payload() {
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-key".to_string(),
         metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
+        otlp_metric_endpoint: "http://otlp.invalid.test/v1/metrics".to_string(),
         client: Client::builder()
             .timeout(Duration::from_millis(50))
             .build()

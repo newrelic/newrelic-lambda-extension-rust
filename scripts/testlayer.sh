@@ -104,7 +104,8 @@ build_nodejs_layer_all() {
   mkdir -p "$LAYER_DIR/nodejs/node_modules"
 
   npm install --install-strategy=nested --prefix "$LAYER_DIR/nodejs" newrelic@latest
-  rm -rf "$LAYER_DIR/nodejs/node_modules/newrelic/node_modules/@opentelemetry"
+  # The agent's nested @opentelemetry/* packages are required by its OpenTelemetry
+  # bridge, which produces otlp_payload; the production layer ships them too.
 
   # CommonJS wrapper
   echo "Adding CommonJS wrapper..." >&2
