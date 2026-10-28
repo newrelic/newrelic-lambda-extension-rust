@@ -5,10 +5,10 @@
 //!
 //! Based on collector.go CollectorRequest() and SendAPMTelemetry()
 
+use crate::newrelic::tls_fallback::DualTlsClient;
 use anyhow::Result;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use reqwest::Client;
 use serde_json::Value;
 use std::io::Write;
 use tracing::{debug, info, warn, error};
@@ -164,7 +164,7 @@ impl std::error::Error for MetricApiError {}
 /// Send error event telemetry to APM collector
 /// Error events have a special structure: [run_id, {events_seen, reservoir_size}, [events]]
 pub async fn send_error_events(
-    client: &Client,
+    client: &DualTlsClient,
     license_key: &str,
     collector_host: &str,
     run_id: &str,
@@ -203,6 +203,7 @@ pub async fn send_error_events(
 
     let start_time = std::time::Instant::now();
     let response = client
+        .active()
         .post(&url)
         .header("NR-Session", run_id)
         .header("Accept-Encoding", "identity, deflate")
@@ -215,7 +216,10 @@ pub async fn send_error_events(
         .await
         // Strip the request URL (carries `license_key`) from any error before it
         // propagates to a log site.
-        .map_err(|e| e.without_url())?;
+        .map_err(|e| {
+            crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
+            e.without_url()
+        })?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -258,7 +262,7 @@ pub async fn send_error_events(
 
 /// Send telemetry data to APM collector
 pub async fn send_apm_telemetry(
-    client: &Client,
+    client: &DualTlsClient,
     license_key: &str,
     collector_host: &str,
     run_id: &str,
@@ -308,6 +312,7 @@ pub async fn send_apm_telemetry(
 
     let start_time = std::time::Instant::now();
     let response = client
+        .active()
         .post(&url)
         .header("NR-Session", run_id)
         .header("Accept-Encoding", "identity, deflate")
@@ -320,7 +325,10 @@ pub async fn send_apm_telemetry(
         .await
         // Strip the request URL (carries `license_key`) from any error before it
         // propagates to a log site.
-        .map_err(|e| e.without_url())?;
+        .map_err(|e| {
+            crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
+            e.without_url()
+        })?;
     let duration = start_time.elapsed();
 
     let status = response.status();
@@ -368,7 +376,7 @@ pub async fn send_apm_telemetry(
 /// failures (buffer + retry) from permanent ones (drop). The caller retains
 /// ownership of `metrics` so it can re-buffer them on a retryable failure.
 pub async fn send_platform_metrics(
-    client: &Client,
+    client: &DualTlsClient,
     license_key: &str,
     metric_endpoint: &str,
     metrics: &[Value],
@@ -398,6 +406,7 @@ pub async fn send_platform_metrics(
 
     let start_time = std::time::Instant::now();
     let response = match client
+        .active()
         .post(metric_endpoint)
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
@@ -408,6 +417,7 @@ pub async fn send_platform_metrics(
     {
         Ok(resp) => resp,
         Err(e) => {
+            crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
             // license key travels in the `Api-Key` header here (not the URL), but
             // strip the URL anyway for defense-in-depth before logging.
             let e = e.without_url();

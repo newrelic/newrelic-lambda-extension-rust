@@ -333,7 +333,7 @@ async fn perform_one_time_initialization(
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
             apm_mode_enabled: false,
-            apm_client: Client::new(),
+            apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(Client::builder),
             reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
             deployment: config.deployment,
         });
@@ -700,7 +700,7 @@ async fn handle_no_license_key(
         global_log_processor: noop_log_processor,
         apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         apm_mode_enabled: false,
-        apm_client: Client::new(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(Client::builder),
         reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
         deployment: config.deployment,
     })

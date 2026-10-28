@@ -31,6 +31,14 @@ exclude = [
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
 # Reqwest - use newer version to match AWS SDK and reduce duplicates
 reqwest = { version = "0.13.1", features = ["json", "rustls"], default-features = false }
+# Direct deps (otherwise only pulled in transitively via reqwest) so
+# src/newrelic/tls_fallback.rs can hand-build a classical-only rustls
+# ClientConfig for the post-quantum TLS fallback (NR-617743). Versions chosen
+# to be compatible with the transitive resolution already locked by
+# reqwest/hyper-rustls (Cargo.lock confirms single resolved versions, no
+# duplicates introduced).
+rustls = "0.23.36"
+rustls-platform-verifier = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"

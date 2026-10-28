@@ -267,7 +267,7 @@ fn make_test_apm_app() -> crate::apm::ApmApp {
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-license-key".to_string(),
         metric_endpoint: "http://127.0.0.1:1/metrics".to_string(),
-        client: reqwest::Client::new(),
+        client: crate::newrelic::tls_fallback::test_client(),
         deployment: crate::config::deployment::DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Apm,
         },
@@ -1131,7 +1131,7 @@ fn make_test_extension_components(
         global_log_processor,
         apm_app,
         apm_mode_enabled,
-        apm_client: Client::new(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(Client::builder),
         reconnect_in_flight: Arc::new(watch::channel(false).0),
         deployment: crate::config::deployment::DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Serverless,
@@ -3575,7 +3575,7 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
         global_log_processor: log_processor,
         apm_app,
         apm_mode_enabled: false,
-        apm_client: reqwest::Client::new(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(reqwest::Client::builder),
         reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
         deployment: crate::config::deployment::DeploymentContext::Normal {
             mode: crate::config::deployment::TelemetryMode::Serverless,

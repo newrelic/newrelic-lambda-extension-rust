@@ -52,11 +52,9 @@ fn build_test_handles_with_tags_enabled(
         config,
         global_log_processor: log_processor,
         apm_app,
-        client: Arc::new(Client::new()),
-        apm_client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         reconnect_in_flight: Arc::new(AtomicBool::new(true)), // blocks reconnect spawn
     }
 }
@@ -84,11 +82,9 @@ fn build_test_handles_with_tags_disabled(
         config,
         global_log_processor: log_processor,
         apm_app,
-        client: Arc::new(Client::new()),
-        apm_client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         reconnect_in_flight: Arc::new(AtomicBool::new(true)),
     }
 }

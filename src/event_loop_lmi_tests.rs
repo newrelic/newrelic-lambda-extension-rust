@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use reqwest::Client;
 use serial_test::serial;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,10 +26,9 @@ fn build_fake_apm_app() -> crate::apm::ApmApp {
         collector_host: "http://unreachable.invalid.test".to_string(),
         license_key: "fake-license-key-for-unit-test".to_string(),
         metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
-        client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         deployment: crate::config::deployment::DeploymentContext::Lmi,
     }
 }
@@ -58,11 +58,9 @@ fn build_lmi_flush_handles(
         config,
         global_log_processor: log_processor,
         apm_app,
-        client: Arc::new(Client::new()),
-        apm_client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         reconnect_in_flight,
     }
 }
@@ -542,10 +540,9 @@ fn from_components_initializes_correctly() {
         global_log_processor: Arc::clone(&log_processor),
         apm_app: Arc::clone(&apm_app),
         apm_mode_enabled: true,
-        apm_client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         reconnect_in_flight: Arc::new(cancel_tx),
         deployment: DeploymentContext::Lmi,
     };
@@ -650,10 +647,9 @@ fn build_test_extension_components(
         global_log_processor: log_processor,
         apm_app,
         apm_mode_enabled: true,
-        apm_client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         reconnect_in_flight: Arc::new(cancel_tx),
         deployment: crate::config::deployment::DeploymentContext::Lmi,
     }
@@ -939,11 +935,9 @@ async fn heartbeat_fires_at_least_one_tick_before_cancel() {
             config,
             global_log_processor: log_processor,
             apm_app: Arc::clone(&apm_app),
-            client: Arc::new(Client::new()),
-            apm_client: Client::builder()
-                .timeout(Duration::from_millis(50))
-                .build()
-                .unwrap_or_default(),
+            apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
             reconnect_in_flight: Arc::clone(&reconnect_in_flight),
         }
     };
@@ -999,11 +993,9 @@ async fn heartbeat_continues_when_cancel_rx_fires_with_false() {
             config,
             global_log_processor: log_processor,
             apm_app: Arc::clone(&apm_app),
-            client: Arc::new(Client::new()),
-            apm_client: Client::builder()
-                .timeout(Duration::from_millis(50))
-                .build()
-                .unwrap_or_default(),
+            apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
             reconnect_in_flight: Arc::clone(&reconnect_in_flight),
         }
     };
@@ -1068,12 +1060,10 @@ async fn flush_lmi_spawns_reconnect_and_task_fails_on_bad_host() {
             config,
             global_log_processor: log_processor,
             apm_app: Arc::clone(&apm_app),
-            client: Arc::new(Client::new()),
             // 50 ms timeout — irrelevant for port 1 (ECONNREFUSED is instant)
-            apm_client: Client::builder()
-                .timeout(Duration::from_millis(50))
-                .build()
-                .unwrap_or_default(),
+            apm_client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
             reconnect_in_flight: Arc::clone(&reconnect_in_flight),
         }
     };
@@ -1158,10 +1148,9 @@ async fn retry_lmi_ok_branch_covered_with_valid_payload() {
         collector_host: "127.0.0.1:1".to_string(),
         license_key: "test-key".to_string(),
         metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
-        client: Client::builder()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .unwrap_or_default(),
+        client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+            Client::builder().timeout(Duration::from_millis(50))
+        }),
         deployment: crate::config::deployment::DeploymentContext::Lmi,
     };
     let apm_app: crate::apm::SharedApmApp = Arc::new(RwLock::new(Some(apm_val)));

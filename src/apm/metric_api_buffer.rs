@@ -74,7 +74,7 @@ pub fn buffer_failed_metric_api(metrics: Vec<Value>, endpoint: String, retry_aft
 }
 
 /// Retry all buffered platform-metric batches.
-pub async fn retry_buffered_metric_api(client: &reqwest::Client, license_key: &str) {
+pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::DualTlsClient, license_key: &str) {
     let buffered = {
         if let Ok(mut buffer) = FAILED_METRIC_API_BUFFER.lock() {
             std::mem::take(&mut *buffer)

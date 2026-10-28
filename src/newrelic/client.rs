@@ -1,7 +1,11 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{config::ExtensionConfig, newrelic::payload, version::VersionInfo};
+use crate::{
+    config::ExtensionConfig,
+    newrelic::{payload, tls_fallback::DualTlsClient},
+    version::VersionInfo,
+};
 use reqwest::{header, Client, NoProxy, Proxy};
 use tracing::{debug, info, warn};
 
@@ -137,26 +141,29 @@ pub fn build_proxy(proxy_url: &str) -> Option<Proxy> {
 /// - When `proxy_url` is `None`, auto-detection remains active as a fallback,
 ///   so `HTTPS_PROXY` still works for users who rely on it.
 /// - Localhost/loopback is always excluded from proxying via `NoProxy`.
-pub fn build_outbound_client(proxy_url: Option<&str>) -> Client {
-    let mut builder = Client::builder()
-        .timeout(std::time::Duration::from_millis(2400))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .pool_max_idle_per_host(10)
-        .tcp_keepalive(std::time::Duration::from_secs(30));
+pub fn build_outbound_client(proxy_url: Option<&str>) -> DualTlsClient {
+    let proxy_url = proxy_url.map(str::to_string);
+    DualTlsClient::build(move || {
+        let mut builder = Client::builder()
+            .timeout(std::time::Duration::from_millis(2400))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(10)
+            .tcp_keepalive(std::time::Duration::from_secs(30));
 
-    if let Some(url) = proxy_url {
-        if let Some(proxy) = build_proxy(url) {
-            builder = builder.proxy(proxy);
+        if let Some(url) = proxy_url.as_deref() {
+            if let Some(proxy) = build_proxy(url) {
+                builder = builder.proxy(proxy);
+            }
         }
-    }
 
-    builder.build().expect("Failed to build outbound HTTP client")
+        builder
+    })
 }
 
 #[derive(Debug)]
 pub struct NewRelicClient {
-    client: Client,
+    client: DualTlsClient,
     cached_version_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
     /// Static log common-attributes: plugin name, faas.name, aws.logGroup, NR_TAGS,
     /// and version tags. faas.arn and aws.logStream are per-call and inserted
@@ -187,22 +194,30 @@ impl NewRelicClient {
             header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
         );
 
-        let mut builder = Client::builder()
-            .default_headers(headers)
-            .timeout(config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400)))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(10)
-            .tcp_keepalive(std::time::Duration::from_secs(30));
+        let http_timeout = config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400));
+        let proxy_url = config.new_relic.proxy_url.clone();
+        let proxy_logged = std::sync::atomic::AtomicBool::new(false);
 
-        if let Some(ref proxy_url) = config.new_relic.proxy_url {
-            if let Some(proxy) = build_proxy(proxy_url) {
-                info!("Proxy configured for New Relic client");
-                builder = builder.proxy(proxy);
+        let client = DualTlsClient::build(move || {
+            let mut builder = Client::builder()
+                .default_headers(headers.clone())
+                .timeout(http_timeout)
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .pool_max_idle_per_host(10)
+                .tcp_keepalive(std::time::Duration::from_secs(30));
+
+            if let Some(ref proxy_url) = proxy_url {
+                if let Some(proxy) = build_proxy(proxy_url) {
+                    if !proxy_logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        info!("Proxy configured for New Relic client");
+                    }
+                    builder = builder.proxy(proxy);
+                }
             }
-        }
 
-        let client = builder.build().unwrap();
+            builder
+        });
 
         Self {
             client,
@@ -214,10 +229,11 @@ impl NewRelicClient {
 
     /// Creates a no-op New Relic client for disabled mode.
     pub fn new_noop() -> Self {
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_millis(100))
-            .build().unwrap();
+        let client = DualTlsClient::build(|| {
+            Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_millis(100))
+        });
 
         Self {
             client,
@@ -391,7 +407,7 @@ impl NewRelicClient {
 
         loop {
             
-            let res = self.client
+            let res = self.client.active()
                 .post(&config.new_relic.telemetry_endpoint)
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
@@ -433,6 +449,8 @@ impl NewRelicClient {
                     }
                 }
                 Err(e) => {
+                    crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
+
                     if retries == 0 {
                         let error_msg = e.to_string();
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
@@ -509,7 +527,7 @@ impl NewRelicClient {
         const MAX_RETRIES: usize = 3;
 
         loop {
-            let mut request = self.client
+            let mut request = self.client.active()
                 .post(endpoint)
                 .header("Content-Type", "application/json");
             if use_gzip {
@@ -552,6 +570,8 @@ impl NewRelicClient {
                     }
                 }
                 Err(e) => {
+                    crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
+
                     if retries == 0 {
                         warn!("Network error sending payload: {}", e);
                     }

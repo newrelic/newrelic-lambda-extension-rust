@@ -212,7 +212,7 @@ fn restart_rebuffer_respects_cap() {
 #[serial]
 async fn retry_buffered_telemetry_empty_buffer_is_noop() {
     clear();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
     assert_eq!(get_buffer_count(), 0);
 }
@@ -224,7 +224,7 @@ async fn retry_buffered_telemetry_connection_refused_rebuffers_item() {
     push_item(fresh_item("metric_data"));
     assert_eq!(get_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
 
     // Connection refused → generic error → re-buffered with retry_count incremented.
@@ -251,7 +251,7 @@ async fn retry_buffered_telemetry_override_run_id_and_host_are_used() {
         retry_count: 0,
     });
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     // current_collector_host points to a refusing port so the call fails and re-buffers.
     retry_buffered_telemetry(&client, "key", Some("new-run"), Some("127.0.0.1:1")).await;
 
@@ -272,7 +272,7 @@ async fn retry_buffered_telemetry_drops_item_older_than_one_hour() {
     push_item(old_item("log_event_data"));
     assert_eq!(get_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
 
     // Age > 60 minutes → dropped, not re-buffered.
@@ -285,7 +285,7 @@ async fn retry_buffered_telemetry_unknown_type_is_skipped_and_dropped() {
     clear();
     push_item(fresh_item("totally_unknown_type"));
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
 
     // Unknown type hits the `_ => { warn!(...); continue; }` arm — item is dropped.
@@ -298,7 +298,7 @@ async fn retry_buffered_telemetry_synthesized_error_events_connection_refused() 
     clear();
     push_item(fresh_item(SYNTHESIZED_ERROR_EVENTS));
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
 
     // send_error_events path → connection refused → re-buffered with retry_count=1.
@@ -325,7 +325,7 @@ async fn retry_buffered_telemetry_drops_after_ten_retries() {
     });
     assert_eq!(get_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_telemetry(&client, "key", None, None).await;
 
     // retry_count bumps to 10 → 10 < 10 is false → item is dropped.
@@ -345,7 +345,7 @@ async fn retry_buffered_telemetry_covers_remaining_command_types() {
     ] {
         clear();
         push_item(fresh_item(telemetry_type));
-        let client = reqwest::Client::new();
+        let client = crate::newrelic::tls_fallback::test_client();
         retry_buffered_telemetry(&client, "key", None, None).await;
         // Each type routes to a known command → connection refused → re-buffered.
         assert_eq!(get_buffer_count(), 1, "type '{telemetry_type}' should re-buffer on failure");

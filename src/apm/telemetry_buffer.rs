@@ -83,7 +83,7 @@ pub fn buffer_failed_telemetry(
 /// lets buffered items succeed against the fresh connection. When `None` (e.g.
 /// not connected), the stored values are used as a best-effort fallback.
 pub async fn retry_buffered_telemetry(
-    client: &reqwest::Client,
+    client: &crate::newrelic::tls_fallback::DualTlsClient,
     license_key: &str,
     current_run_id: Option<&str>,
     current_collector_host: Option<&str>,

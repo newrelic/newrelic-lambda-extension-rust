@@ -7,3 +7,4 @@
 pub mod client;
 pub mod payload;
 pub mod flush;
+pub mod tls_fallback;

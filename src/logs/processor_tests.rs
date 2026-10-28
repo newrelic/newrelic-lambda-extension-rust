@@ -1439,7 +1439,7 @@ mod tests {
             collector_host: "collector.newrelic.com".to_string(),
             license_key: "test-key".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
-            client: reqwest::Client::new(),
+            client: crate::newrelic::tls_fallback::DualTlsClient::build(reqwest::Client::builder),
             deployment: crate::config::deployment::DeploymentContext::Lmi,
         };
         let apm_arc: Arc<tokio::sync::RwLock<Option<ApmApp>>> =
