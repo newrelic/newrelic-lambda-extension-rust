@@ -856,6 +856,15 @@ impl LogProcessor {
             }
         }
         
+        // Debug visibility into exactly what AWS delivered for this record, before any
+        // of our own extraction/forwarding logic runs. Lets operators confirm (via
+        // RUST_LOG=trace) whether a given field was present in the raw Telemetry API
+        // payload, independent of what New Relic Logs ends up showing.
+        trace!(
+            "Raw telemetry record: type={} record={:?}",
+            record.record_type, record.record
+        );
+
         // Compute message string ONCE, passed to to_log_message to avoid
         // double-serialization of non-String records.
         let message_owned: String = match &record.record {
@@ -873,6 +882,31 @@ impl LogProcessor {
         };
 
         if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {
+            // AWS Telemetry API schemas >= 2022-12-13 deliver JSON-formatted function/
+            // extension logs as a parsed object (schema reference: "record" is an open
+            // value `{}`, no restricted field set — confirmed both in AWS's OpenAPI specs
+            // and via live capture of the raw payload, NR case 00366014). Everything
+            // besides `message` was previously discarded here: this was harmless under
+            // the older `2022-07-01` schema (the record was always a string, so this
+            // branch never ran), but became a real data-loss bug once the extension
+            // started requesting the newer schema for LMI support (PR #79) — AWS hands
+            // us the custom fields intact, we just weren't forwarding them.
+            //
+            // `or_insert` (not blind `insert`) so a customer field that happens to share
+            // a name with one of our reserved attribute keys (level, newrelic.source,
+            // etc. — already set by `to_log_message_with_msg` above) never clobbers it.
+            if let serde_json::Value::Object(obj) = &record.record {
+                for (key, value) in obj {
+                    if key == "message" {
+                        continue;
+                    }
+                    log_message
+                        .attributes
+                        .entry(key.clone())
+                        .or_insert_with(|| value.clone());
+                }
+            }
+
             // Per-record request id (JSON logs >= 2022-12-13 carry `requestId`; some runtimes
             // use `AWSRequestId`). Plain-text logs carry neither → None → shipped uncorrelated.
             let per_record_request_id = crate::request::record_request_id(&record.record);

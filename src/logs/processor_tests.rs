@@ -2037,6 +2037,136 @@ mod lmi_process_record_tests {
         );
     }
 
+    // NR case 00366014: a direct `process.stdout.write(JSON.stringify({...}))` under
+    // AWS_LAMBDA_LOG_FORMAT=JSON arrives as a flat object (schema >= 2022-12-13) where
+    // custom application keys are siblings of `message`, not nested inside it. AWS
+    // delivers them intact (confirmed via the customer's own raw-payload capture) —
+    // this test locks in that the extension now forwards them as attributes instead
+    // of silently discarding everything but `message`.
+    #[tokio::test]
+    async fn custom_json_keys_on_direct_stdout_object_are_forwarded_as_attributes() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "log.level": "info",
+                "log.logger": "repro.grpc",
+                "message": "Handled request",
+                "grpc.method": "CheckResources",
+                "repro.marker": "OBJ-MARKER-0001",
+                "nested": {"call_id": "repro-call-1"}
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let attrs = &batch[0].attributes;
+        assert_eq!(batch[0].message, "Handled request");
+        assert_eq!(attrs.get("grpc.method").and_then(|v| v.as_str()), Some("CheckResources"));
+        assert_eq!(attrs.get("repro.marker").and_then(|v| v.as_str()), Some("OBJ-MARKER-0001"));
+        assert_eq!(attrs.get("log.logger").and_then(|v| v.as_str()), Some("repro.grpc"));
+        assert_eq!(
+            attrs.get("nested").and_then(|v| v.get("call_id")).and_then(|v| v.as_str()),
+            Some("repro-call-1")
+        );
+        // Reserved keys stay owned by the extension, not clobbered by a colliding
+        // customer field name (log.level here vs. our own computed `level`).
+        assert_eq!(attrs.get("level").and_then(|v| v.as_str()), Some("INFO"));
+    }
+
+    // Same fix, LMI deployment: the merge must not be accidentally scoped to Normal
+    // Lambda only. LMI logs route through pre_invoke_buffer rather than log_batch
+    // (no INVOKE-populated context), so this exercises a different code path than
+    // the Normal-mode test above.
+    #[tokio::test]
+    async fn lmi_custom_json_keys_on_direct_stdout_object_are_forwarded_as_attributes() {
+        let p = processor(DeploymentContext::Lmi, "", "");
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "requestId": "r-lmi-1",
+                "message": "Handled request",
+                "grpc.method": "CheckResources",
+                "repro.marker": "OBJ-MARKER-0001"
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let buf = p.pre_invoke_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1);
+        let attrs = &buf[0].attributes;
+        assert_eq!(buf[0].message, "Handled request");
+        assert_eq!(attrs.get("grpc.method").and_then(|v| v.as_str()), Some("CheckResources"));
+        assert_eq!(attrs.get("repro.marker").and_then(|v| v.as_str()), Some("OBJ-MARKER-0001"));
+        // The per-record requestId is both consumed (stamped as lambda_request_id /
+        // faas.execution for LMI correlation) AND forwarded verbatim as its own
+        // "requestId" attribute by the new merge — both are expected, not conflicting.
+        assert_eq!(req_id(&buf[0]).as_deref(), Some("r-lmi-1"));
+        assert_eq!(attrs.get("requestId").and_then(|v| v.as_str()), Some("r-lmi-1"));
+    }
+
+    // Root-cause documentation test: a `console.log(JSON.stringify(obj))` call gets
+    // nested by Lambda's console wrapper so the ENTIRE original object becomes the
+    // *value* of the record's `message` key, rather than sitting as siblings of it.
+    // `obj.get("message")` then hits the `other.to_string()` fallback arm (not the
+    // plain-String arm), which re-serializes that nested object whole — so custom
+    // keys end up folded into the message text, not promoted to separate attributes.
+    // This is why "switch to console.log" appeared to "fix" the symptom: it's an
+    // incidental side effect of the fallback branch, not special handling on our part.
+    #[tokio::test]
+    async fn console_log_style_nested_message_keeps_keys_inside_message_text_not_as_attributes() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "timestamp": "2026-10-28T00:00:00.000Z",
+                "level": "INFO",
+                "requestId": "r-1",
+                "message": {
+                    "message": "Handled request",
+                    "grpc.method": "CheckResources"
+                }
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        // The nested object was serialized whole into the message text by the
+        // existing `other.to_string()` fallback — custom keys travel inside the
+        // string, not as a separate "grpc.method" attribute.
+        assert!(batch[0].message.contains("CheckResources"));
+        assert!(batch[0].attributes.get("grpc.method").is_none());
+    }
+
+    // Sanity guard: a plain-text (string) record must be completely unaffected by the
+    // new merge logic — the `serde_json::Value::Object` branch should never run for
+    // it, so no stray attributes appear beyond the extension's own reserved ones.
+    #[tokio::test]
+    async fn plaintext_string_record_gets_no_extra_attributes_from_merge() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        p.process_record(function_record(None, "plain text line, no JSON here")).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].message, "plain text line, no JSON here");
+        let attrs = &batch[0].attributes;
+        let reserved = ["level", "newrelic.logPattern", "newrelic.source", "_nr.logType", "aws", "faas.execution", "faas.arn"];
+        for key in attrs.keys() {
+            assert!(
+                reserved.contains(&key.as_str()),
+                "unexpected attribute `{key}` on a plain-text record — merge logic should not run for non-Object records"
+            );
+        }
+    }
+
     // Plain-text logs carry no requestId → shipped uncorrelated, never mis-stamped.
     #[tokio::test]
     async fn lmi_plaintext_log_ships_uncorrelated() {
