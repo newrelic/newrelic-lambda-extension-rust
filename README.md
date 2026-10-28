@@ -1,11 +1,33 @@
 [![Community Plus header](https://github.com/newrelic/opensource-website/raw/main/src/images/categories/Community_Plus.png)](https://opensource.newrelic.com/oss-category/#community-plus)
 
-# newrelic-lambda-extension (Rust) ![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+# newrelic-lambda-extension (Rust) [![Build Status](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/test-layers-pr.yml) [![CI](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/newrelic/newrelic-lambda-extension-rust/actions/workflows/ci.yml) [![Coverage](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust/branch/main/graph/badge.svg)](https://codecov.io/gh/newrelic/newrelic-lambda-extension-rust)
 
 A high-performance Rust implementation of the AWS Lambda extension to collect, enhance, and transport telemetry data from your AWS Lambda functions to New Relic without requiring an external transport such as CloudWatch Logs or Kinesis.
 
 This lightweight AWS Lambda Extension runs alongside your AWS Lambda functions and automatically handles the collection and transport of telemetry data from
 supported New Relic serverless agents. The extension requires a telemetry payload from a New Relic agent. Conditions that delay or prevent that payload from being written may result in longer-than-expected invocation durations.
+
+## New: Lambda Managed Instances (LMI) Support
+
+Starting with extension version **`2.7.0`**, this extension supports [AWS Lambda Managed
+Instances (LMI)](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances.html)
+— run your Lambda functions on EC2 instances you control (instance type, VPC placement,
+EC2 Savings Plans/Reserved Instances) while AWS still manages scaling, patching, and
+routing for you.
+
+> [!TIP]
+> - **No new layer to learn.** Configure the layer exactly the way you already do for a
+>   standard APM-mode Lambda function — there's no separate LMI-specific layer or ARN.
+> - **LMI always runs in APM mode.** There is no serverless-telemetry-mode option on
+>   LMI; the extension detects LMI automatically and forces APM mode for you.
+> - **Multi-concurrency aware.** LMI can run several invocations at once on the same
+>   execution environment (standard Lambda runs one at a time) — the extension and the
+>   supported agent wrappers already account for this.
+> - Just make sure your layer is version `2.7.0` or later — check the layer description
+>   before deploying.
+
+Ready-to-deploy SAM examples for Python, Node.js, Java, .NET, and Go are in
+[`examples/LMI`](examples/LMI).
 
 ## Installation
 
@@ -42,6 +64,21 @@ The New Relic Extension uses the AWS [Lambda Extensions API](https://docs.aws.am
 All of the New Relic Lambda Layers include the Extension and the latest Agent version for the Layer's runtime. The latest 
 New Relic Lambda Layer ARNs for your runtime and region are available [here](https://layers.newrelic-external.com/). The 
 `NewRelicLambdaExtension` layer is suitable for Go runtime Lambda.
+
+### Supported Layers
+
+This extension is bundled into every New Relic language layer below, and paired with the New Relic serverless agent for that runtime. Each layer is published for both `x86_64` and `arm64`; exact per-version ARNs are available [here](https://layers.newrelic-external.com/).
+
+| Runtime | Versions |
+|---------|----------|
+| Python | `python3.9`, `python3.10`, `python3.11`, `python3.12`, `python3.13`, `python3.14` |
+| Node.js | `nodejs22.x`, `nodejs24.x` |
+| .NET | `dotnet6`, `dotnet8`, `dotnet10` |
+| Java | `java17`, `java21`, `java25` |
+| Provided | `provided.al2`, `provided.al2023` |
+| Ruby | `ruby3.2`, `ruby3.3`, `ruby3.4`, `ruby4.0` |
+
+For Go and other OS-only runtimes (`provided.al2`, `provided.al2023`), use the `NewRelicLambdaExtension` layer, which ships the extension without a bundled agent.
 
 ## APM Mode
 
@@ -180,14 +217,15 @@ The New Relic Lambda Extension can send your function's logs to New Relic. If yo
 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
-| `NEW_RELIC_EXTENSION_SEND_LOGS` | | `platform`, `extension`, `function`, `all` | **Unified log configuration** - Send specific log types to New Relic using comma-separated values. Use `all` to send all log types. Examples: `function`, `function,platform`, `all`. This takes precedence over individual log flags below. |
+| `NEW_RELIC_EXTENSION_SEND_LOGS` | | `platform`, `extension`, `function`, `all`, or specific `platform.<event>` names | **Unified log configuration** - Send specific log types to New Relic using comma-separated values. Use `all` to send all log types. Examples: `function`, `function,platform`, `all`. To send only specific platform event types instead of all of them, list them by name instead of the bare `platform` keyword, e.g. `platform.report` or `platform.start,platform.report`. The bare `platform` keyword (or `all`) always sends every platform event type and overrides any specific names listed alongside it. This takes precedence over individual log flags below. |
 | `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send function logs to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
 | `NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS` | `false` | `true`, `false`, `1`, `0` | Send extension logs in addition to the function logs to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
 | `NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS` | `false` | `true`, `false`, `1`, `0` | Send platform logs (START, END, REPORT, etc.) to New Relic. Used only if `NEW_RELIC_EXTENSION_SEND_LOGS` is not set. |
 | `NEW_RELIC_EXTENSION_LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug`, `trace` | Set the log level for extension logging. |
 | `NEW_RELIC_EXTENSION_LOGS_ENABLED` | `true` | `true`, `false`, `1`, `0` | Enable or disable [NR_EXT] extension log output in CloudWatch. When false, suppresses all extension logs while keeping functionality intact. |
-| `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Each tag is composed of a colon-delimited key and value. Multiple key-value pairs are semicolon-delimited; for example, `env:prod;team:myTeam`. |
+| `NR_TAGS` |  | | Specify tags to be added to all log events. **Optional**. Format: `env:prod;team:myTeam` (colon-delimited key/value, semicolon-delimited pairs).<br><br>**Notes:**<br>- Only affects log events and APM connect Entity Tags.<br>- Does **not** feed Transaction/Span custom attributes — only `NEW_RELIC_LABELS` does (see below). |
 | `NR_ENV_DELIMITER` | `;` | Any string | Custom delimiter for `NR_TAGS`. Some users in UTF-8 environments might face difficulty with the default semicolon `;` delimiter. |
+| `NEW_RELIC_LABELS` |  | | Specify labels in the standard New Relic cross-agent format. **Optional**. Format: `type1:value1;type2:value2` (fixed `:`/`;` delimiters, not affected by `NR_ENV_DELIMITER`).<br><br>**Where it is used:**<br>- Forwarded log events → `tags.<type>` attributes.<br>- In APM mode (`NEW_RELIC_APM_LAMBDA_MODE=true`), every Transaction and Span event → `tags.<type>` custom attributes (equivalent to calling `newrelic.addCustomAttributes()` in every function). Existing attributes already set by the agent or your code are not overwritten.<br><br>**Validation:**<br>- Duplicate type in `NEW_RELIC_LABELS`: last value wins.<br>- Type/value over 255 chars: truncated, with a warning.<br>- Over 64 entries: list capped, with a warning.<br>- Malformed pair (bad delimiter count, empty type/value): the **entire** list is discarded, with a warning (never partial).<br><br>**With `NR_TAGS`:**<br>- Independent variables: if both are set, both are sent.<br>- `NR_TAGS` does **not** feed Transaction/Span custom attributes; only `NEW_RELIC_LABELS` does.<br>- No cross-variable deduplication.<br>- Entity-level APM connect labels are unprefixed for both variables, so duplicate keys can override each other.<br>- Forwarded logs can also override when keys resolve to the same final attribute name.<br>  Example: `NR_TAGS=tags.team:dev` and `NEW_RELIC_LABELS=team:prod` both become `tags.team` in logs, so `NEW_RELIC_LABELS` wins (`tags.team=prod`). |
 
 ## Extension Environment Variables
 
@@ -206,18 +244,42 @@ The New Relic Lambda Extension offers various features, which can be configured 
 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
+| `NEW_RELIC_APP_NAME` | Lambda function name | String | Sets the APM entity name for this Lambda function in New Relic. When set, the function reports under a named entity instead of using the Lambda function name. Also used to group multiple Lambda functions (across regions or deployments) into a single APM entity. Each language runtime creates its own entity — same name across different runtimes results in separate entities. |
 | `NEW_RELIC_APM_LAMBDA_MODE` | `false` | `true`, `false`, `1`, `0` | Enable APM mode for deep application monitoring and entity correlation. |
-| `NEW_RELIC_COLLECT_TRACE_ID` | `false` | `true`, `false`, `1`, `0` | Add `trace.id` attribute to Lambda logs for distributed tracing correlation. |
+| `NEW_RELIC_APM_BLOCKING_HANDSHAKE` | `false` | `true`, `false`, `1`, `0` | When `true`, the extension holds `/next` after `platform.runtimeDone` until the APM PreConnect+Connect handshake finishes (or the remaining invoke deadline is exhausted). Improves the likelihood that APM is connected before the sandbox is frozen — useful for sparse-traffic functions (infrequent invocations) or very short function timeouts where the background handshake may not complete in time. When `false` (default), the handshake runs in the background and APM connects within a few invocations for high-frequency functions. |
+| `NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS` | `5` | Number (min: 1) | Maximum seconds to wait for each individual APM PreConnect or Connect request to the New Relic collector. Increase if your function runs in a high-latency network (e.g., cross-region VPC). The total handshake (PreConnect + Connect) can take up to `2 × timeout`. |
+| `NEW_RELIC_APM_DISABLE_TELEMETRY` | _(empty)_ | Comma-separated list of: `metric_data`, `custom_event_data`, `log_event_data`, `analytic_event_data`, `error_event_data`, `error_data`, `span_event_data`, `sql_trace_data`, `transaction_sample_data`, `platform_metrics` | APM mode only. Telemetry types listed here are **not sent** (and not buffered/retried). Unknown tokens are ignored with a warning. Example: `NEW_RELIC_APM_DISABLE_TELEMETRY=platform_metrics,sql_trace_data` drops the per-invocation `apm.lambda.*` platform metrics and SQL traces. `platform_metrics` also skips REPORT→metric conversion entirely. Does not affect the APM handshake or error synthesis memory capture. |
+| `NEW_RELIC_EXTENSION_IGNORE_ERRORS` | _(empty)_ | Comma-separated, case-insensitive list of: `LambdaTimeout`, `LambdaPlatformFault`, `LambdaShutdown` | APM mode only. Extension-synthesized shutdown errors matching a listed class are **not sent to New Relic at all**. Unknown tokens are ignored with a warning. Takes precedence over `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` if a class is listed in both. Example: `NEW_RELIC_EXTENSION_IGNORE_ERRORS=LambdaTimeout` suppresses timeout errors entirely — use for noisy, non-actionable shutdown errors. |
+| `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` | _(empty)_ | Comma-separated, case-insensitive list of: `LambdaTimeout`, `LambdaPlatformFault`, `LambdaShutdown` | APM mode only. Extension-synthesized shutdown errors matching a listed class are still sent, but flagged `error.expected: true` on the `TransactionError` event — so New Relic excludes them from error rate/Apdex while still surfacing them in Errors Inbox. Unknown tokens are ignored with a warning. Example: `NEW_RELIC_EXTENSION_EXPECTED_ERRORS=LambdaPlatformFault` marks platform faults as expected. |
+| `NEW_RELIC_RUNTIME_DONE_GRACE_MS` | `25` | Number (0–2000) | Grace period in milliseconds added after the `platform.runtimeDone` signal before the end-of-invocation log flush. Only active when the log batch is not already fully drained. Increasing this gives trailing telemetry (emitted by the agent just before the function returns) more time to arrive. Clamped to `[0, 2000]`. |
+| `NEW_RELIC_COLLECT_TRACE_ID` | `false` | `true`, `false`, `1`, `0` |Add `trace.id` attribute to Lambda logs for distributed tracing correlation. |
+| `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` | `2000` | Number (1–100000) | Only used when `NEW_RELIC_COLLECT_TRACE_ID=true`. Max logs parked per invocation while waiting for the agent payload (the `trace.id` source). On overflow, excess logs are sent without `trace.id` (a trace that isn't known yet can't be stamped). Clamped to `[1, 100000]`; invalid values fall back to the default. |
 | `NEW_RELIC_ADD_VERSION_DETAIL_TAGS` | `false` | `true`, `false`, `1`, `0` | Add version detail tags to telemetry. |
 | `NEW_RELIC_LAYER_VERSION` | | String | Specify the layer version for tracking purposes. |
 | `NEW_RELIC_LAMBDA_HANDLER` | | String | Override the Lambda handler value (for agent initialization). |
 | `NEW_RELIC_HARVEST_INTERVAL_SECONDS` | `5` | Number | Interval in seconds for periodically flushing logs to reduce memory usage. Does not affect telemetry, which is sent when the Lambda REPORT line is detected. |
+
+### Serverless Mode Configuration
+
+Serverless mode (the default, `NEW_RELIC_APM_LAMBDA_MODE=false`) normally pairs each agent payload with its Lambda `platform.report` before sending, batching complete pairs until 3+ have accumulated. For low-invocation-frequency functions, that threshold can otherwise leave a payload sitting unsent until `SHUTDOWN`, several minutes later — this variable closes that gap.
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` | `false` | `true`, `false`, `1`, `0` | When `true`, the agent payload is sent to New Relic the instant it's received — as its own request, independent of `platform.report` — instead of buffering it to pair with the report and waiting for the 3+ batch threshold or `SHUTDOWN`. The extension awaits that send (bounded by the invocation's remaining deadline) before the invocation ends, so delivery completes within the same invoke. `platform.report` handling (used for `billed_duration`/`memory_used` enrichment) is unaffected by this flag and keeps following its existing pairing/threshold/`SHUTDOWN` path — the two are independent by design, since the Telemetry API only emits `platform.report` after every extension has already called `/next`, so there's nothing to gain by waiting for it. Takes precedence over `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` on invocations where the immediate send is exercised. When `false` (default), behavior is unchanged. |
+
+### Performance Optimization
+
+| Environment variable | Default value | Options | Description |
+|--------|-----------|-------------|-------------|
+| `NEW_RELIC_EXTENSION_PIPELINE_FLUSH` | `false` | `true`, `false`, `1`, `0` | **Pipeline flush mode** — when enabled, the extension calls GET /next immediately after `runtimeDone` and flushes telemetry in the background. This removes flush latency from **billed duration** (typically saving 50–200ms per invocation). The in-flight flush is always awaited at the start of the next invocation or during shutdown, so no data is lost. If the TCP connection is broken during a Lambda freeze, the extension retries with exponential backoff on thaw. Recommended for high-frequency functions where per-invocation cost savings matter. |
 
 ### Network / Proxy Configuration
 
 | Environment variable | Default value | Options | Description |
 |--------|-----------|-------------|-------------|
 | `NEW_RELIC_LAMBDA_EXTENSION_PROXY` | | URL | HTTP proxy for the extension's outbound traffic to New Relic. Only affects the extension — does not interfere with your Lambda function's own traffic. Supports `http://`, `https://`, and `socks5://` schemes. Credentials are supported via `http://user:pass@proxy:port` format and are masked in all log output. Localhost traffic (Lambda Extensions API) is never proxied. When not set, the extension respects standard `HTTPS_PROXY`/`HTTP_PROXY` environment variables as a fallback. |
+| `NEW_RELIC_DATA_COLLECTION_TIMEOUT` | _(unset)_ | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in total retry budget for sending telemetry and logs. When unset, the extension keeps its original fixed 3-attempt retry behavior unchanged. When set, retries continue with a growing backoff (200ms, doubling every 3 attempts, capped at 3s) until this much wall-clock time has elapsed, with a 20-attempt safety cap. Invalid values (e.g. a bare number with no unit) fall back to a 10s budget. |
+| `NEW_RELIC_HTTP_TIMEOUT` | `2400ms` | Duration string (e.g. `500ms`, `30s`, `2m`, `1h`) | **(Serverless mode only)** Opt-in per-request timeout for telemetry and log sends to New Relic, overriding the default 2.4s. Invalid values fall back to the 2400ms default.<br><br>**Cold-start race condition:** Lambda cold starts typically add 200ms–1s+ of latency before the first response arrives. If this timeout is set too close to your function's average response time, it can fire just before a legitimate response completes — causing a failure even though the Lambda succeeded. To avoid this, set `NEW_RELIC_HTTP_TIMEOUT` at least 1–1.5s above the average cold-start duration of your function. Requests that finish faster close immediately; the extra headroom is only used when needed. |
 
 **When to use `NEW_RELIC_LAMBDA_EXTENSION_PROXY`:**
 
@@ -283,10 +345,10 @@ New Relic hosts and moderates an online forum where customers can interact with 
 
 ## Contributing
 
-We encourage your contributions to improve `newrelic-lambda-extension`! Keep in mind when you submit your pull request, you'll need to sign the CLA via the click-through using CLA-Assistant. You only have to sign the CLA one time per project.
+We encourage your contributions to improve `newrelic-lambda-extension-rust`! Keep in mind when you submit your pull request, you'll need to sign the CLA via the click-through using CLA-Assistant. You only have to sign the CLA one time per project.
 
 If you have any questions, or to execute our corporate CLA, required if your contribution is on behalf of a company, please drop us an email at opensource@newrelic.com.
 
 ## License
 
-`newrelic-lambda-extension` is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License. The `newrelic-lambda-extension` also uses source code from third-party libraries. You can find full details on which libraries are used and the terms under which they are licensed in the third-party notices document.
+`newrelic-lambda-extension-rust` is licensed under the [Apache 2.0](http://apache.org/licenses/LICENSE-2.0.txt) License. The `newrelic-lambda-extension-rust` also uses source code from third-party libraries. You can find full details on which libraries are used and the terms under which they are licensed in the [third-party notices document](THIRD_PARTY_NOTICES.md).

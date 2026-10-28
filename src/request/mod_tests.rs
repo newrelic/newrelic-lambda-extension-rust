@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Unit tests for request processing module
 //!
 //! Tests cover:
@@ -15,6 +18,12 @@ mod tests {
 
     use crate::request::*;
     use crate::context::InvocationContext;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+
+    /// Normal-Lambda context for routing tests (mode is irrelevant to routing).
+    const NORMAL: DeploymentContext = DeploymentContext::Normal { mode: TelemetryMode::Serverless };
+    /// LMI context — routes agent payloads by their embedded aws.requestId.
+    const LMI: DeploymentContext = DeploymentContext::Lmi;
 
     /// Helper: clear all global request state between tests
     fn clear_request_state() {
@@ -189,9 +198,11 @@ mod tests {
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: buffer.clone(),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         {
@@ -199,7 +210,7 @@ mod tests {
             *active = Some("req-1".to_string());
         }
 
-        route_payload_to_request_buffer(vec![10, 20, 30]).await;
+        route_payload_to_request_buffer(vec![10, 20, 30], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -220,12 +231,14 @@ mod tests {
         REQUEST_DATA.insert("some-req".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: buffer.clone(),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
-        route_payload_to_request_buffer(vec![99]).await;
+        route_payload_to_request_buffer(vec![99], NORMAL).await;
 
         {
             let stored = buffer.lock().unwrap();
@@ -242,7 +255,7 @@ mod tests {
         clear_request_state();
 
         // No active request, no buffers → orphaned
-        route_payload_to_request_buffer(vec![42]).await;
+        route_payload_to_request_buffer(vec![42], NORMAL).await;
 
         {
             let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
@@ -253,36 +266,134 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // NR-579361: LMI routes agent payloads by their OWN embedded aws.requestId
+    // (never the racy CURRENT_ACTIVE_REQUEST_ID global). Normal stays unchanged.
+    // ========================================================================
 
+    /// Build a v2 wire agent payload carrying a Transaction event with `aws.requestId`.
+    /// `None` → an id-less, metrics-only harvest (no transaction event).
+    fn lmi_wire_payload(request_id: Option<&str>) -> Vec<u8> {
+        use base64::Engine as _;
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+
+        let data = match request_id {
+            Some(rid) => serde_json::json!({
+                "analytic_event_data": [null, { "reservoir_size": 10 },
+                    [ [ { "type": "Transaction" }, {}, { "aws.requestId": rid } ] ]]
+            }),
+            None => serde_json::json!({
+                "metric_data": [null, [["Custom/x", [1, 2.0, 2.0, 2.0, 2.0, 4.0]]]]
+            }),
+        };
+        let json_bytes = serde_json::to_vec(&data).unwrap();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&json_bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&compressed);
+        format!(r#"["2", "NR_LAMBDA_MONITORING", "{}"]"#, encoded).into_bytes()
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[serial]
-    async fn test_route_signals_coordination_channel() {
+    async fn test_lmi_routes_by_embedded_request_id_ignoring_global() {
         clear_request_state();
 
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-1".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
+        // Global points at the WRONG request (the racy concurrency case).
         {
             let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-1".to_string());
+            *active = Some("req-B".to_string());
         }
 
-        route_payload_to_request_buffer(vec![1]).await;
+        // Payload self-identifies as req-A.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
 
-        // Coordination channel should have been signaled
-        let received = rx.try_recv();
-        assert!(received.is_ok(), "Coordination signal should be sent");
+        // It landed in req-A's slot (auto-created), NOT the global's req-B.
+        let a_len = get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0);
+        assert_eq!(a_len, 1, "payload must be attributed to its own request req-A");
+        assert!(
+            REQUEST_DATA.get("req-B").is_none(),
+            "the CURRENT_ACTIVE_REQUEST_ID global must not be used under LMI"
+        );
 
         clear_request_state();
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_interleaved_requests_no_cross_contamination() {
+        clear_request_state();
+
+        // Two concurrent invocations' payloads arrive interleaved.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), LMI).await;
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-C")), LMI).await;
+
+        assert_eq!(get_agent_buffer("req-A").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+        assert_eq!(get_agent_buffer("req-C").map(|b| b.lock().unwrap().len()).unwrap_or(0), 1);
+
+        clear_request_state();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_lmi_idless_payload_parks_in_orphaned_without_global() {
+        clear_request_state();
+
+        // Even with the global set, an id-less harvest must NOT consult it.
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-Z".to_string());
+        }
+
+        route_payload_to_request_buffer(lmi_wire_payload(None), LMI).await;
+
+        {
+            let orphaned = ORPHANED_PAYLOADS.lock().unwrap();
+            assert_eq!(orphaned.len(), 1, "id-less harvest is parked in the orphaned buffer");
+        }
+        assert!(
+            REQUEST_DATA.get("req-Z").is_none(),
+            "LMI must not route id-less payloads via the global"
+        );
+
+        clear_request_state();
+    }
+
+    /// Normal-Lambda regression: the embedded id is IGNORED; routing uses the active global.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_ignores_embedded_id_uses_active_global() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-B".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // Payload embeds req-A, but NORMAL routes by the active global (req-B).
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
+
+        assert_eq!(buffer.lock().unwrap().len(), 1, "Normal routes to active req-B");
+        assert!(
+            REQUEST_DATA.get("req-A").is_none(),
+            "Normal must not parse or route by the embedded id"
+        );
+
+        clear_request_state();
+    }
+
+
 
     // ========================================================================
     // cleanup_request_processing_state tests
@@ -298,13 +409,14 @@ mod tests {
             invoked_function_arn: "arn".to_string(),
             trace_id: None,
         }));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: Some(tx),
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         cleanup_request_processing_state("req-1");
@@ -320,13 +432,14 @@ mod tests {
         clear_request_state();
 
         let ctx = Arc::new(Mutex::new(InvocationContext::default()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         REQUEST_DATA.insert("req-1".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: Some(tx),
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         cleanup_request_processing_state_internal("req-1", true);
@@ -336,13 +449,18 @@ mod tests {
             let entry = REQUEST_DATA.get("req-1");
             assert!(entry.is_some());
             let entry = entry.unwrap();
-            // Context, buffer, creation_invocation preserved
+            // Context and buffer are preserved
             assert!(entry.context.lock().is_ok());
             assert!(entry.agent_buffer.lock().is_ok());
-            // coordination_tx is always cleaned (receiver consumed by process_request_concurrently)
-            assert!(entry.coordination_tx.is_none());
-            // pending_report is always cleaned
-            assert!(entry.pending_report.is_none());
+            // pending_report is preserved too — NOT cleared on partial cleanup. It's
+            // normally already None by this point (remove_pending_report() already took
+            // it at the start of the caller's processing), but process_request_concurrently
+            // can legitimately re-set it (restoring a report whose payload never showed up
+            // within the blocking-agent-payload wait window) so the next invocation or
+            // SHUTDOWN can still find it. Unconditionally clearing it here would silently
+            // undo that restoration — this was a real bug, fixed alongside
+            // NEW_RELIC_BLOCKING_AGENT_PAYLOAD.
+            assert_eq!(entry.pending_report, Some("r".to_string()));
         }
 
         clear_request_state();
@@ -394,16 +512,8 @@ mod tests {
             assert!(buf.is_empty());
         }
 
-        // Verify coordination channel exists
-        assert!(state.coordination_rx.is_some());
-
-        // Verify global maps were populated
-        {
-            let entry = REQUEST_DATA.get("req-create-1");
-            assert!(entry.is_some());
-            let entry = entry.unwrap();
-            assert!(entry.coordination_tx.is_some());
-        }
+        // Verify global REQUEST_DATA was populated
+        assert!(REQUEST_DATA.get("req-create-1").is_some());
 
         clear_request_state();
     }
@@ -468,9 +578,11 @@ mod tests {
         REQUEST_DATA.insert("recent-req".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         let (client, config) = make_test_client_and_config();
@@ -496,9 +608,11 @@ mod tests {
         REQUEST_DATA.insert("old-req".to_string(), RequestData {
             context: ctx,
             agent_buffer: Arc::new(Mutex::new(vec![vec![1, 2, 3]])),
-            coordination_tx: None,
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
         // Advance counter to invocation 10
         for _ in 0..10 {
@@ -514,6 +628,55 @@ mod tests {
         clear_request_state();
     }
 
+    // cleanup_old_request_buffers is the only production path that removes a
+    // REQUEST_DATA entry outright — a NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send still
+    // outstanding for a request that's about to be evicted as stale must be drained
+    // and awaited first, or nothing (not this function, not the SHUTDOWN sweep, which
+    // can only see handles still reachable from a live REQUEST_DATA entry) would ever
+    // come back to await it.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_awaits_pending_send_before_evicting() {
+        clear_request_state();
+
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "old-req-with-pending-send".to_string(),
+            invoked_function_arn: "arn:test".to_string(),
+            trace_id: None,
+        }));
+        REQUEST_DATA.insert("old-req-with-pending-send".to_string(), RequestData {
+            context: ctx,
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_clone = completed.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            completed_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        push_pending_send_handle("old-req-with-pending-send", handle);
+
+        let (client, config) = make_test_client_and_config();
+        cleanup_old_request_buffers(client, config).await;
+
+        assert!(
+            completed.load(std::sync::atomic::Ordering::SeqCst),
+            "the pending send must be awaited before its request's REQUEST_DATA entry is evicted"
+        );
+        assert!(REQUEST_DATA.get("old-req-with-pending-send").is_none());
+
+        clear_request_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_cleanup_old_request_buffers_empty_buffer() {
@@ -523,9 +686,11 @@ mod tests {
         REQUEST_DATA.insert("old-empty".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::<Vec<u8>>::new())),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
         for _ in 0..10 {
             increment_invocation_counter();
@@ -537,6 +702,61 @@ mod tests {
         // Should still be cleaned up even with empty buffer
         assert!(REQUEST_DATA.get("old-empty").is_none());
 
+        clear_request_state();
+    }
+
+    // In APM mode the periodic cleanup must NOT use the serverless ingest
+    // endpoint. A stranded stale payload must be re-queued to the APM retry
+    // buffer (FAILED_AGENT_PAYLOADS) so retry_failed_agent_payloads resends it
+    // to the APM collector — never leaked to serverless.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_apm_mode_routes_stale_payload_to_apm_retry_buffer() {
+        clear_request_state();
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
+
+        // Stale request (created 10 invocations ago) holding an un-drained payload.
+        REQUEST_DATA.insert("apm-old-req".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: "apm-old-req".to_string(),
+                invoked_function_arn: "arn:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 9, 9]])),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: "arn:test".to_string(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+
+        // APM mode ON.
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.apm_lambda_mode = true;
+        let config = Arc::new(cfg);
+
+        cleanup_old_request_buffers(client, config).await;
+
+        // Entry removed, and its payload routed to the APM retry buffer.
+        assert!(REQUEST_DATA.get("apm-old-req").is_none());
+        let routed_to_apm = crate::event_loop::FAILED_AGENT_PAYLOADS
+            .lock()
+            .map(|b| b.iter().any(|p| p.request_id == "apm-old-req"))
+            .unwrap_or(false);
+        assert!(
+            routed_to_apm,
+            "APM-mode stale payload must be re-queued to the APM retry buffer, not sent to serverless"
+        );
+
+        if let Ok(mut b) = crate::event_loop::FAILED_AGENT_PAYLOADS.lock() {
+            b.clear();
+        }
         clear_request_state();
     }
 
@@ -554,17 +774,21 @@ mod tests {
         REQUEST_DATA.insert("recent".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
         // "old" created at invocation 0 — stale (10 invocations ago >= 5)
         REQUEST_DATA.insert("old".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         let (client, config) = make_test_client_and_config();
@@ -616,9 +840,11 @@ mod tests {
         REQUEST_DATA.insert("req-old".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         // Now clear active (simulating cleanup between invocations)
@@ -628,7 +854,7 @@ mod tests {
         }
 
         // Late payload should fall back to any existing buffer
-        route_payload_to_request_buffer(vec![88]).await;
+        route_payload_to_request_buffer(vec![88], NORMAL).await;
 
         // Should be in req-old's buffer (fallback to any existing buffer)
         let stored = get_agent_buffer("req-old")
@@ -675,104 +901,6 @@ mod tests {
             let buf = state2.agent_buffer.lock().unwrap();
             assert!(buf.is_empty());
         }
-
-        clear_request_state();
-    }
-
-    /// Payload routing should signal coordination channel exactly once per payload
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_coordination_channel_signaled_per_payload() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-coord".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-coord".to_string());
-        }
-
-        // Send 3 payloads
-        route_payload_to_request_buffer(vec![1]).await;
-        route_payload_to_request_buffer(vec![2]).await;
-        route_payload_to_request_buffer(vec![3]).await;
-
-        // Should receive exactly 3 signals
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_ok());
-        assert!(rx.try_recv().is_err()); // No more
-
-        clear_request_state();
-    }
-
-    /// Cleanup with skip_buffer should still clean coordination_tx
-    /// since the receiver is already consumed by process_request_concurrently
-    #[test]
-    #[serial]
-    fn test_cleanup_skip_buffer_still_cleans_coordination() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        REQUEST_DATA.insert("req-sk".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer,
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-
-        cleanup_request_processing_state_internal("req-sk", true);
-
-        // Entry preserved with buffer intact
-        {
-            let entry = REQUEST_DATA.get("req-sk");
-            assert!(entry.is_some());
-            // But coordination sender should be cleaned (receiver already consumed)
-            assert!(entry.unwrap().coordination_tx.is_none());
-        }
-
-        clear_request_state();
-    }
-
-    /// Sending to a dropped coordination channel should not panic
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn test_send_to_dropped_coordination_channel_is_safe() {
-        clear_request_state();
-
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        // Create channel and immediately drop receiver
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        REQUEST_DATA.insert("req-drop".to_string(), RequestData {
-            context: Arc::new(Mutex::new(InvocationContext::default())),
-            agent_buffer: buffer.clone(),
-            coordination_tx: Some(tx),
-            pending_report: None,
-            creation_invocation: 0,
-        });
-        drop(rx);
-
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("req-drop".to_string());
-        }
-
-        // Should NOT panic even though receiver is dropped
-        route_payload_to_request_buffer(vec![42]).await;
-
-        // Payload should still be in buffer
-        let stored = buffer.lock().unwrap().len();
-        assert_eq!(stored, 1);
 
         clear_request_state();
     }
@@ -862,16 +990,20 @@ mod tests {
         REQUEST_DATA.insert("req-A".to_string(), RequestData {
             context: ctx_a,
             agent_buffer: Arc::new(Mutex::new(vec![vec![1]])),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-B".to_string(), RequestData {
             context: ctx_b,
             agent_buffer: Arc::new(Mutex::new(vec![vec![2]])),
-            coordination_tx: None,
             pending_report: None,
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         // Clean only A
@@ -907,16 +1039,20 @@ mod tests {
         REQUEST_DATA.insert("req-X".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
         REQUEST_DATA.insert("req-Y".to_string(), RequestData {
             context: Arc::new(Mutex::new(InvocationContext::default())),
             agent_buffer: Arc::new(Mutex::new(Vec::new())),
-            coordination_tx: None,
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
         });
 
         // Each request has its own report
@@ -931,70 +1067,840 @@ mod tests {
         clear_request_state();
     }
 
+    // ========================================================================
+    // record_request_id: per-record correlation source (NR-579360)
+    // ========================================================================
 
+    #[test]
+    fn record_request_id_reads_request_id_field() {
+        let rec = serde_json::json!({ "requestId": "abc-123", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("abc-123"));
+    }
 
-    /// Coordination channel: payload arriving BEFORE coordination_rx is polled
-    /// should still be received (buffered in unbounded channel)
-    #[tokio::test(flavor = "current_thread")]
+    #[test]
+    fn record_request_id_falls_back_to_aws_request_id() {
+        let rec = serde_json::json!({ "AWSRequestId": "aws-456", "message": "hi" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("aws-456"));
+    }
+
+    #[test]
+    fn record_request_id_prefers_request_id_over_aws_request_id() {
+        let rec = serde_json::json!({ "requestId": "primary", "AWSRequestId": "fallback" });
+        assert_eq!(record_request_id(&rec).as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn record_request_id_none_for_plaintext_string_record() {
+        // Plain-text log records are a bare JSON string - no requestId to correlate by.
+        let rec = serde_json::Value::String("ERROR something failed".to_string());
+        assert_eq!(record_request_id(&rec), None);
+    }
+
+    #[test]
+    fn record_request_id_none_when_absent_or_empty() {
+        assert_eq!(record_request_id(&serde_json::json!({ "message": "hi" })), None);
+        assert_eq!(record_request_id(&serde_json::json!({ "requestId": "" })), None);
+    }
+
+    // ── Phase 3: concurrent LMI routing — no cross-contamination ─────────────
+
+    /// 20 concurrent `ensure_lmi_request_slot` calls for distinct IDs must each
+    /// create an isolated slot with no cross-contamination.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial]
-    async fn test_coordination_payload_before_poll() {
+    async fn test_concurrent_lmi_slot_creation_no_cross_contamination() {
         clear_request_state();
 
-        let config = Arc::new(crate::config::ExtensionConfig::default());
-        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
-        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
+        let ids: Vec<String> = (0..20).map(|i| format!("lmi-req-{:03}", i)).collect();
 
-        let mut state = create_request_processing_state("coord-req", "arn:test", &factory);
-        {
-            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
-            *active = Some("coord-req".to_string());
+        // Create all slots concurrently
+        let tasks: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let id = id.clone();
+                tokio::spawn(async move {
+                    ensure_lmi_request_slot(&id);
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        // Each slot must exist and be empty (no cross-write)
+        for id in &ids {
+            let buf_len = get_agent_buffer(id)
+                .map(|b| b.lock().unwrap().len())
+                .unwrap_or(0);
+            assert_eq!(
+                buf_len, 0,
+                "slot for {} must exist and start empty (no payload cross-contamination)",
+                id
+            );
+        }
+        // No orphaned payloads must have leaked
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 0, "no payloads must reach the orphan buffer during slot creation");
+
+        clear_request_state();
+    }
+
+    /// `ensure_lmi_request_slot` is idempotent: calling it multiple times for the
+    /// same id must not reset, duplicate, or corrupt existing buffer contents.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_concurrent_ensure_lmi_slot_idempotent() {
+        clear_request_state();
+
+        let id = "lmi-idempotent";
+        ensure_lmi_request_slot(id);
+
+        // Write a sentinel byte directly into the buffer
+        if let Some(buf) = get_agent_buffer(id) {
+            buf.lock().unwrap().push(vec![0xAB]);
         }
 
-        // Payload arrives BEFORE anyone polls coordination_rx
-        route_payload_to_request_buffer(vec![11, 22]).await;
+        // Concurrent re-calls must not wipe the existing entry
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let id = id.to_string();
+                tokio::spawn(async move { ensure_lmi_request_slot(&id); })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
 
-        // Now poll coordination_rx — should immediately receive the signal
-        let rx = state.coordination_rx.as_mut().expect("has rx");
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            rx.recv(),
-        ).await;
-
-        assert!(result.is_ok(), "Signal should be available immediately (buffered)");
-        assert!(result.unwrap().is_some(), "Channel should not be closed");
+        let buf_len = get_agent_buffer(id)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(buf_len, 1, "idempotent slot creation must preserve existing buffer contents");
 
         clear_request_state();
     }
 
-    /// Coordination channel: timeout when no payload arrives
-    /// (simulates the 100ms wait in process_request_concurrently)
-    #[tokio::test(flavor = "current_thread")]
+    /// Under LMI, payloads without an extractable embedded request-id must end up in
+    /// the orphan buffer, not attributed to any live slot. This tests the "no id" path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn test_coordination_timeout_no_payload() {
+    async fn test_concurrent_orphan_drain_atomic() {
         clear_request_state();
+
+        // Pre-create a slot so Normal fallback doesn't interfere
+        ensure_lmi_request_slot("lmi-orphan-target");
+
+        // 10 concurrent payloads without valid embedded ids → all go to orphan buffer
+        let tasks: Vec<_> = (0..10)
+            .map(|i| {
+                tokio::spawn(async move {
+                    // Bytes that don't start with `[` → parse_agent_payload returns empty map
+                    // → extract_request_id_from_payload_bytes returns None → orphan buffer
+                    let payload = format!("no-id-payload-{}", i).into_bytes();
+                    route_payload_to_request_buffer(payload, LMI).await;
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(
+            orphan_count, 10,
+            "all 10 id-less LMI payloads must land in the orphan buffer"
+        );
+
+        clear_request_state();
+    }
+
+    /// Under LMI, two concurrent invocations must not cross-attribute payloads:
+    /// payloads for slot A never appear in slot B's buffer and vice versa.
+    /// We test this via `ensure_lmi_request_slot` + direct buffer writes to
+    /// simulate the post-routing state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn test_lmi_two_concurrent_invocations_no_cross_attribution() {
+        clear_request_state();
+
+        let id_a = "lmi-invoc-a";
+        let id_b = "lmi-invoc-b";
+        ensure_lmi_request_slot(id_a);
+        ensure_lmi_request_slot(id_b);
+
+        // Write 5 payloads for A and 5 for B concurrently
+        let writes: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let id = if i % 2 == 0 { "lmi-invoc-a" } else { "lmi-invoc-b" };
+                    if let Some(buf) = get_agent_buffer(id) {
+                        buf.lock().unwrap().push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+        for w in writes { w.await.unwrap(); }
+
+        let a_len = get_agent_buffer(id_a)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        let b_len = get_agent_buffer(id_b)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+
+        assert_eq!(a_len, 5, "slot A must have exactly 5 payloads");
+        assert_eq!(b_len, 5, "slot B must have exactly 5 payloads");
+        assert_eq!(a_len + b_len, 10, "total payloads must be 10 (no duplication or loss)");
+
+        clear_request_state();
+    }
+
+    // ── Phase 5: thread-safety / no-deadlock harness ──────────────────────────
+
+    /// No deadlock: 20 concurrent tasks — half writing to ORPHANED_PAYLOADS,
+    /// half reading REQUEST_DATA — must all complete without hanging.
+    /// If a deadlock occurs, the test times out under tokio's default test timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_concurrent_payload_routing() {
+        clear_request_state();
+
+        // Pre-create 5 slots
+        for i in 0..5u8 {
+            ensure_lmi_request_slot(&format!("td-slot-{}", i));
+        }
+
+        // 10 writers: push to orphan buffer; 10 readers: inspect slot buffers
+        let writers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    if let Ok(mut g) = ORPHANED_PAYLOADS.lock() {
+                        g.push(vec![i]);
+                    }
+                })
+            })
+            .collect();
+
+        let readers: Vec<_> = (0..10u8)
+            .map(|i| {
+                tokio::spawn(async move {
+                    let _ = get_agent_buffer(&format!("td-slot-{}", i % 5));
+                })
+            })
+            .collect();
+
+        for w in writers { w.await.unwrap(); }
+        for r in readers { r.await.unwrap(); }
+
+        // All 10 orphaned payloads must be present (no loss under concurrent writes)
+        let orphan_count = ORPHANED_PAYLOADS.lock().unwrap().len();
+        assert_eq!(orphan_count, 10, "all 10 orphan payloads must be written without loss");
+
+        clear_request_state();
+    }
+
+    /// No deadlock: concurrent writes to the same slot's buffer from multiple tasks.
+    /// Verifies the inner `Arc<Mutex<Vec<Vec<u8>>>>` per-slot locking is sound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn no_deadlock_orphaned_buffer_concurrent_writes() {
+        clear_request_state();
+
+        let slot = "td-inner-lock-slot";
+        ensure_lmi_request_slot(slot);
+
+        // 20 concurrent tasks each push one payload to the same slot
+        let tasks: Vec<_> = (0..20u8)
+            .map(|i| {
+                let id = slot.to_string();
+                tokio::spawn(async move {
+                    if let Some(buf) = get_agent_buffer(&id) {
+                        if let Ok(mut g) = buf.lock() {
+                            g.push(vec![i]);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in tasks { t.await.unwrap(); }
+
+        let slot_len = get_agent_buffer(slot)
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(slot_len, 20, "all 20 concurrent writes to the same slot must succeed without loss or deadlock");
+
+        clear_request_state();
+    }
+
+    // pending_send_handles / spawn_immediate_agent_payload_send tests
+    // (NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH)
+    //
+    // route_payload_to_request_buffer reads event_loop::SERVERLESS_SEND_CONTEXT, a
+    // process-wide OnceLock that's only ever populated by main.rs (never set during
+    // `cargo test`) and can only be set ONCE for the whole test binary run — so at
+    // most one test in this file may call `.set()` on it, and that test must use
+    // synchronous_flush=false so every other (unrelated, order-independent) test
+    // still exercising the default buffering path isn't silently diverted into the
+    // immediate-send branch. spawn_immediate_agent_payload_send itself takes its
+    // client/config as plain parameters instead of reading the global, so most of its
+    // behavior is tested directly, without touching SERVERLESS_SEND_CONTEXT at all.
+    // The one exception is `test_route_payload_to_request_buffer_extracts_trace_id_...`
+    // below, which needs the real global-reading code path to prove trace-id
+    // extraction fires from route_payload_to_request_buffer itself.
+    // ========================================================================
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_no_license_key_completes_without_buffering() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "req-immediate-send-noop";
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        });
+
+        let config = Arc::new(crate::config::ExtensionConfig::default()); // no license key
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![1, 2, 3],
+            newrelic_client,
+            config,
+        );
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for handle in handles {
+            handle.await.expect("send task must not panic");
+        }
+
+        assert!(
+            crate::agent::batch::AGENT_BATCH_BUFFER.get(request_id).is_none(),
+            "a successful (short-circuited) send must not fall back to buffering"
+        );
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_buffers_on_network_failure() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "req-immediate-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:test-fn".to_string();
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn.clone(),
+        });
+
+        let mut cfg = crate::config::ExtensionConfig::default();
+        // A license key is required so send_agent_payload doesn't take its no-key
+        // short-circuit — we need it to actually attempt (and fail) a send.
+        cfg.new_relic.license_key = Some("fake-license-key".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        // new_noop()'s 100ms *overall* request timeout bounds the whole send attempt
+        // (connect included) regardless of how the sandbox's network stack handles an
+        // unroutable loopback port — a real NewRelicClient's 10s connect_timeout can
+        // hang far longer than that if the environment silently drops the SYN instead
+        // of refusing it.
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(
+            request_id,
+            vec![9, 9, 9],
+            newrelic_client,
+            config,
+        );
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1);
+        for handle in handles {
+            handle.await.expect("send task must not panic");
+        }
+
+        {
+            // Scope the DashMap Ref so the shard lock is released before .clear() below.
+            let buffered = crate::agent::batch::AGENT_BATCH_BUFFER
+                .get(request_id)
+                .expect("failed send must buffer the payload for retry, not drop it");
+            assert_eq!(buffered.report_line, None, "must be buffered unpaired");
+            assert_eq!(buffered.invoked_function_arn, arn);
+        }
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
+
+    // drain_and_await_all_pending_send_handles must catch a pending send regardless of
+    // which request_id it's under — the SHUTDOWN-time gap this closes is a payload
+    // whose own invocation's process_request_concurrently already returned (so nothing
+    // else will ever call take_pending_send_handles for that specific request_id again).
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_awaits_across_multiple_requests() {
+        clear_request_state();
+
+        for request_id in ["req-shutdown-sweep-a", "req-shutdown-sweep-b"] {
+            REQUEST_DATA.insert(request_id.to_string(), RequestData {
+                context: Arc::new(Mutex::new(InvocationContext::default())),
+                agent_buffer: Arc::new(Mutex::new(Vec::new())),
+                pending_report: None,
+                creation_invocation: 0,
+                runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+                pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: String::new(),
+            });
+        }
+
+        let completed_a = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_b = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        for (request_id, flag) in [
+            ("req-shutdown-sweep-a", completed_a.clone()),
+            ("req-shutdown-sweep-b", completed_b.clone()),
+        ] {
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            push_pending_send_handle(request_id, handle);
+        }
+
+        drain_and_await_all_pending_send_handles().await;
+
+        assert!(
+            completed_a.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-a must be awaited"
+        );
+        assert!(
+            completed_b.load(std::sync::atomic::Ordering::SeqCst),
+            "pending send under req-shutdown-sweep-b must be awaited"
+        );
+
+        // Nothing left to drain a second time.
+        assert!(take_pending_send_handles("req-shutdown-sweep-a").is_empty());
+        assert!(take_pending_send_handles("req-shutdown-sweep-b").is_empty());
+
+        clear_request_state();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_drain_and_await_all_pending_send_handles_is_a_noop_when_nothing_pending() {
+        clear_request_state();
+        // Must return promptly and without panicking when REQUEST_DATA is empty.
+        drain_and_await_all_pending_send_handles().await;
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // set_pending_report
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn set_pending_report_stores_value() {
+        clear_request_state();
+        REQUEST_DATA.insert("req-set-report".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        set_pending_report("req-set-report", "REPORT Duration: 123ms".to_string());
+
+        assert_eq!(
+            get_pending_report("req-set-report"),
+            Some("REPORT Duration: 123ms".to_string())
+        );
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn set_pending_report_is_noop_for_unknown_request() {
+        clear_request_state();
+        // Must not panic when request_id is not in REQUEST_DATA.
+        set_pending_report("nonexistent-req", "report".to_string());
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // get_runtime_done_notify
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn get_runtime_done_notify_returns_some_for_known_request_and_none_for_unknown() {
+        clear_request_state();
+        REQUEST_DATA.insert("req-notify".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        assert!(get_runtime_done_notify("req-notify").is_some());
+        assert!(get_runtime_done_notify("no-such-req").is_none());
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // record_prefired_runtime_done + request_data_len
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn record_prefired_runtime_done_inserts_into_prefired_map() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-prefired-1");
+
+        assert!(PREFIRED_RUNTIME_DONE.contains_key("req-prefired-1"));
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn request_data_len_reflects_current_entry_count() {
+        clear_request_state();
+        assert_eq!(request_data_len(), 0);
+
+        REQUEST_DATA.insert("req-len-a".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        assert_eq!(request_data_len(), 1);
+
+        clear_request_state();
+        assert_eq!(request_data_len(), 0);
+    }
+
+    // ========================================================================
+    // ensure_lmi_request_slot — prefired runtimeDone + orphaned-payload drain
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn ensure_lmi_request_slot_consumes_prefired_runtime_done_and_signals_notify() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-lmi-prefired");
+        assert!(PREFIRED_RUNTIME_DONE.contains_key("req-lmi-prefired"));
+
+        ensure_lmi_request_slot("req-lmi-prefired");
+
+        // Pre-fire entry must be consumed.
+        assert!(!PREFIRED_RUNTIME_DONE.contains_key("req-lmi-prefired"));
+        // Slot must be created.
+        assert!(REQUEST_DATA.contains_key("req-lmi-prefired"));
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_lmi_request_slot_drains_orphaned_payloads_into_new_slot() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        // Pre-load orphaned payloads before the slot is created.
+        {
+            let mut orphaned = ORPHANED_PAYLOADS.lock().unwrap();
+            orphaned.push(vec![11, 22]);
+            orphaned.push(vec![33, 44]);
+        }
+
+        ensure_lmi_request_slot("req-lmi-drain");
+
+        // Orphaned buffer must be empty.
+        assert!(ORPHANED_PAYLOADS.lock().unwrap().is_empty());
+
+        // Both payloads must be in the new slot's buffer.
+        let buf_len = get_agent_buffer("req-lmi-drain")
+            .map(|b| b.lock().unwrap().len())
+            .unwrap_or(0);
+        assert_eq!(buf_len, 2);
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // create_request_processing_state — prefired runtimeDone branch
+    // ========================================================================
+
+    #[test]
+    #[serial]
+    fn create_request_processing_state_fires_notify_when_runtime_done_was_prefired() {
+        clear_request_state();
+        PREFIRED_RUNTIME_DONE.clear();
+
+        record_prefired_runtime_done("req-create-prefired");
 
         let config = Arc::new(crate::config::ExtensionConfig::default());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
         let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
         let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
 
-        let mut state = create_request_processing_state("timeout-req", "arn:test", &factory);
+        create_request_processing_state("req-create-prefired", "arn:test", &factory);
 
-        // No payload sent — should timeout
-        let rx = state.coordination_rx.as_mut().expect("has rx");
-        let result = tokio::time::timeout(
-            tokio::time::Duration::from_millis(50),
-            rx.recv(),
-        ).await;
+        // Pre-fire entry must be consumed.
+        assert!(!PREFIRED_RUNTIME_DONE.contains_key("req-create-prefired"));
+        // Entry must exist in REQUEST_DATA.
+        assert!(REQUEST_DATA.contains_key("req-create-prefired"));
 
-        assert!(result.is_err(), "Should timeout since no payload arrived");
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    // ========================================================================
+    // route_payload_to_request_buffer must extract trace.id the instant the payload
+    // arrives, on the DEFAULT (buffered, synchronous_flush=off) path — not just under
+    // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH. Before this, extraction on the default
+    // path only happened much later (telemetry::listener's platform.report handler,
+    // or rarely in process_request_concurrently's own early snapshot), leaving
+    // held function/extension logs parked longer than necessary.
+    //
+    // This is the ONE test in this file allowed to call SERVERLESS_SEND_CONTEXT.set()
+    // (a process-wide OnceLock — see the module-level comment above). It uses
+    // synchronous_flush=false so it cannot divert any other test's payload into the
+    // immediate-send branch, regardless of test execution order.
+    // ========================================================================
+
+    /// Build a payload in the exact wrapped/base64/gzip format
+    /// `trace::extract_trace_id_from_payload` expects (mirrors
+    /// `trace::mod_tests::create_test_payload_with_trace_id`).
+    fn build_trace_bearing_payload(trace_id: &str) -> Vec<u8> {
+        use base64::engine::general_purpose;
+        use base64::Engine as _;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let test_data = format!(
+            r#"{{"analytic_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]], "span_event_data": [null, null, [[{{"traceId": "{trace_id}"}}]]]}}"#
+        );
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(test_data.as_bytes()).unwrap();
+        let compressed = gz.finish().unwrap();
+        let b64 = general_purpose::STANDARD.encode(&compressed);
+        let payload_array = format!(r#"[2,"NR_LAMBDA_MONITORING","","{b64}"]"#);
+        general_purpose::STANDARD.encode(payload_array.as_bytes()).into_bytes()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_route_payload_to_request_buffer_extracts_trace_id_on_default_path() {
+        clear_request_state();
+
+        let request_id = "req-trace-on-arrival";
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.collect_trace_id = true;
+        cfg.new_relic.synchronous_flush = false; // must not divert other tests
+        let config = Arc::new(cfg);
+
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+        let log_processor = Arc::new(crate::logs::processor::LogProcessor::new(
+            newrelic_client.clone(),
+            config.clone(),
+            Arc::new(Mutex::new(InvocationContext::default())),
+            None,
+        ));
+
+        // A function log held for this request, waiting on a trace.id — the thing
+        // route_payload_to_request_buffer's new early extraction should unblock.
+        log_processor.test_hold_log(request_id, "held-before-payload-arrives");
+        assert_eq!(log_processor.test_pending_logs_len_for(request_id), 1);
+        assert_eq!(log_processor.test_log_batch_len(), 0);
+
+        // Only ever set once for the whole test binary — see the module comment above.
+        let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((newrelic_client, config, log_processor.clone()));
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some(request_id.to_string());
+        }
+
+        let payload = build_trace_bearing_payload("trace-on-arrival-123");
+        route_payload_to_request_buffer(payload.clone(), NORMAL).await;
+
+        // Trace extraction ran synchronously inside route_payload_to_request_buffer,
+        // before/without any platform.report — the held log must already be routed.
+        assert_eq!(
+            log_processor.test_pending_logs_len_for(request_id),
+            0,
+            "the held log must have been drained by the immediate extraction"
+        );
+        assert_eq!(
+            log_processor.test_log_batch_len(),
+            1,
+            "the held log must have been stamped and routed to the outbound batch"
+        );
+
+        // And the default (synchronous_flush=false) buffering behavior is unaffected:
+        // the payload itself still lands in agent_buffer, not sent immediately.
+        let buffered = get_agent_buffer(request_id).and_then(|b| b.lock().ok().map(|g| g.len()));
+        assert_eq!(buffered, Some(1), "payload must still be buffered normally");
 
         clear_request_state();
     }
 
+    // ── spawn_immediate_agent_payload_send — ARN falls back to global ─────────
 
+    #[tokio::test]
+    #[serial]
+    async fn test_spawn_immediate_agent_payload_send_uses_global_fallback_arn_when_request_arn_is_empty() {
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
 
+        // Set a known global fallback ARN in the process-wide context
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = "arn:aws:lambda:us-east-1:999:function:global-fallback".to_string();
+        }
 
+        let request_id = "req-arn-fallback-test";
+        // Empty per-request ARN — spawn_immediate_agent_payload_send must fall back to the global
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: String::new(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
 
+        // License key + unreachable endpoint so the send fails and buffers the payload
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-arn-fallback".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        spawn_immediate_agent_payload_send(request_id, vec![1, 2, 3], newrelic_client, config);
+
+        let handles = take_pending_send_handles(request_id);
+        assert_eq!(handles.len(), 1, "exactly one send task must be registered");
+        for h in handles {
+            h.await.expect("send task must not panic");
+        }
+
+        // The buffered entry must carry the global fallback ARN, not the empty per-request one
+        let buffered_arn = crate::agent::batch::AGENT_BATCH_BUFFER
+            .get(request_id)
+            .map(|e| e.invoked_function_arn.clone())
+            .expect("failed send must buffer the payload");
+
+        assert_eq!(
+            buffered_arn,
+            "arn:aws:lambda:us-east-1:999:function:global-fallback",
+            "must use the global fallback ARN when per-request ARN is empty"
+        );
+
+        clear_request_state();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+        if let Ok(mut ctx) = crate::CURRENT_INVOCATION_CONTEXT.write() {
+            ctx.invoked_function_arn = String::new();
+        }
+    }
+
+    // ── cleanup_old_request_buffers — proceeds with removal on send failure ───
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_removes_stale_entry_despite_send_failure() {
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+
+        let request_id = "stale-req-send-failure";
+        let arn = "arn:aws:lambda:us-east-1:123:function:stale-fn".to_string();
+
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.clone(),
+                trace_id: None,
+            })),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![9, 8, 7]])), // non-empty so send is attempted
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: arn,
+        });
+
+        // Advance counter to make the entry stale (>= 5 invocations old)
+        for _ in 0..5 {
+            increment_invocation_counter();
+        }
+
+        // License key + unreachable endpoint so send_agent_payload_to_newrelic returns Err
+        let mut cfg = crate::config::ExtensionConfig::default();
+        cfg.new_relic.license_key = Some("fake-key-cleanup-fail".to_string());
+        cfg.new_relic.telemetry_endpoint = "http://127.0.0.1:1".to_string();
+        let config = Arc::new(cfg);
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        cleanup_old_request_buffers(newrelic_client, config).await;
+
+        // Stale entry must be removed even though the NR send failed
+        assert!(
+            REQUEST_DATA.get(request_id).is_none(),
+            "stale request must be removed even when the send to New Relic fails"
+        );
+
+        clear_request_state();
+        reset_invocation_counter();
+        crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
 }

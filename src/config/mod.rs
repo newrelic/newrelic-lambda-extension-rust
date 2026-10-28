@@ -1,3 +1,7 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::{env, time::Duration};
 use tracing::{debug, warn, Event, Subscriber};
@@ -7,12 +11,42 @@ use tracing_subscriber::{
     EnvFilter,
 };
 
+pub mod deployment;
+
+use deployment::{DeploymentContext, TelemetryMode};
+
+/// Default per-invocation cap on logs parked while waiting for the trace.id.
+const DEFAULT_TRACE_ID_LOG_BUFFER_MAX: usize = 2000;
+/// Lower/upper clamp for `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` to avoid 0 (drop
+/// everything) and pathological values that could exhaust sandbox memory.
+const MIN_TRACE_ID_LOG_BUFFER_MAX: usize = 1;
+const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
+
+/// Fallback used when `NEW_RELIC_DATA_COLLECTION_TIMEOUT` is set but not a valid
+/// duration string. Matches the Go extension's default.
+const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
+
+/// Extension-controlled shutdown error classes, lowercased. These are the only
+/// classes `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`
+/// can match — function-level exceptions are the APM agent's responsibility, not
+/// the extension's. See `event_loop::send_error_for_shutdown_reason`.
+const KNOWN_SHUTDOWN_ERROR_CLASSES: [&str; 3] =
+    ["lambdatimeout", "lambdaplatformfault", "lambdashutdown"];
+
 /// Global configuration for the New Relic Lambda Extension
 #[derive(Debug, Clone)]
 pub struct ExtensionConfig {
     pub new_relic: NewRelicConfig,
     pub aws: AwsConfig,
     pub extension: ExtensionSettings,
+    /// Detected once at startup — single source of truth for the deployment
+    /// environment (Normal Lambda vs LMI). All loop-dispatch and mode-aware
+    /// branching reads this rather than re-parsing env vars. See
+    /// `LMI_SUPPORT.md` §2.
+    pub deployment: DeploymentContext,
 }
 
 /// New Relic specific configuration
@@ -28,12 +62,55 @@ pub struct NewRelicConfig {
     #[allow(dead_code)]
     pub harvest_interval: Duration,
     pub collect_trace_id: bool,
+    /// Max number of logs parked per invocation while waiting for the agent
+    /// payload (the `trace.id` source) to arrive. Only used when
+    /// `collect_trace_id` is true. Configurable via
+    /// `NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX` (default 2000). On overflow, logs are
+    /// sent without `trace.id` (we cannot stamp a trace we don't yet have).
+    pub trace_id_log_buffer_max: usize,
     pub add_version_detail_tags: bool,
     pub layer_version: Option<String>,
     pub apm_lambda_mode: bool,
+    pub apm_blocking_handshake: bool,
+    pub apm_handshake_timeout_secs: u64,
+    /// Telemetry types the customer has opted to drop (APM mode only) via
+    /// `NEW_RELIC_APM_DISABLE_TELEMETRY`. Excluded types are neither sent nor
+    /// buffered. See `crate::apm::collector::KNOWN_TELEMETRY_TYPES`.
+    pub apm_disabled_telemetry: HashSet<String>,
     pub apm_host: String,
     pub metric_endpoint: String,
     pub proxy_url: Option<String>,
+    /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — master switch for serverless-mode
+    /// (standard/non-APM mode only) immediate delivery of the agent payload. When
+    /// `true`, the agent payload is sent to New Relic the instant it's received on the
+    /// named pipe (`request::route_payload_to_request_buffer`), as its own background
+    /// task — instead of buffering it to pair with `platform.report` and waiting for
+    /// the 3+ batch threshold or `SHUTDOWN`. `process_request_concurrently` awaits any
+    /// outstanding send for its request (bounded by the invocation's remaining
+    /// deadline) before the invocation ends, so delivery completes within the same
+    /// invoke without the sandbox freezing mid-flight.
+    ///
+    /// There is no wait for a late `platform.report`, and report handling is otherwise
+    /// unaffected by this flag: the Telemetry API only emits `platform.report` after
+    /// every extension has already called `/next` for the invocation, so a fresh
+    /// request's own report can never be "already arrived" in practice — waiting for it
+    /// would either time out every time or delay the extension's own `/next` call. The
+    /// report keeps following its existing pairing/threshold/`SHUTDOWN` path
+    /// (`AGENT_BATCH_BUFFER`, `set_pending_report`) exactly as it does when this flag is
+    /// off; since the payload no longer sits in `agent_buffer` waiting to pair, a report
+    /// that arrives later simply finds nothing to pair with, same as today.
+    ///
+    /// Default `false` — no behavior change unless explicitly enabled. Distinct from
+    /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
+    pub synchronous_flush: bool,
+    /// Total wall-clock budget for retrying a send, set via
+    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
+    /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
+    /// switches to retrying until `d` has elapsed instead of a fixed count.
+    pub data_collection_timeout: Option<Duration>,
+    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in, same as
+    /// data_collection_timeout.
+    pub http_timeout: Option<Duration>,
 }
 
 /// AWS Lambda specific configuration
@@ -52,11 +129,44 @@ pub struct ExtensionSettings {
     pub send_function_logs: bool,
     pub send_extension_logs: bool,
     pub send_platform_logs: bool,
+    /// Specific `platform.*` event type names to send, e.g. `["platform.start", "platform.report"]`.
+    /// Empty means no filter — every platform event type is sent (today's behavior).
+    /// Populated only when `NEW_RELIC_EXTENSION_SEND_LOGS` lists `platform.<event>` tokens
+    /// without the bare `platform` token; bare `platform` (or `all`) always means "no filter".
+    pub platform_log_filter: HashSet<String>,
     pub log_level: String,
     /// NEW_RELIC_EXTENSION_LOGS_ENABLED - Master switch for [NR_EXT] log output
     /// Default: true (logs enabled)
     /// If false, suppresses all [NR_EXT] prefixed logs from appearing in CloudWatch
     pub extension_logs_enabled: bool,
+    /// NEW_RELIC_RUNTIME_DONE_GRACE_MS — grace period (ms) added AFTER
+    /// `platform.runtimeDone` before the end-of-invocation flush, only when
+    /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
+    /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
+    pub runtime_done_grace_ms: u64,
+    /// NEW_RELIC_EXTENSION_PIPELINE_FLUSH — when true, the extension calls
+    /// GET /next immediately after runtimeDone and flushes telemetry in the
+    /// background during the freeze/thaw gap. Reduces billed duration but
+    /// may lose data on final shutdown if flush doesn't complete in time.
+    /// Default: false (safe mode — flush completes before GET /next).
+    pub pipeline_flush: bool,
+    /// NEW_RELIC_LMI_FLUSH_INTERVAL_MS — heartbeat flush cadence (ms) for the
+    /// Lambda Managed Instances (LMI) event loop. LMI runs continuously (no
+    /// freeze between invokes), so buffered telemetry is drained on this
+    /// interval by a background task rather than at `platform.runtimeDone`.
+    /// Default 30_000, floored at 1000. Read ONLY by the LMI loop; ignored on
+    /// standard Lambda.
+    pub lmi_flush_interval_ms: u64,
+    /// `NEW_RELIC_EXTENSION_IGNORE_ERRORS` — extension-synthesized shutdown error
+    /// classes (lowercased) that are never sent to APM at all. APM mode only; see
+    /// `KNOWN_SHUTDOWN_ERROR_CLASSES`. Takes precedence over `expected_errors` when
+    /// a class appears in both.
+    pub ignore_errors: HashSet<String>,
+    /// `NEW_RELIC_EXTENSION_EXPECTED_ERRORS` — extension-synthesized shutdown error
+    /// classes (lowercased) that are still sent to APM but flagged
+    /// `error.expected: true` on the `TransactionError` event, excluding them from
+    /// error rate/Apdex while keeping them visible in Errors Inbox. APM mode only.
+    pub expected_errors: HashSet<String>,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -83,6 +193,9 @@ impl Default for ExtensionConfig {
             new_relic: NewRelicConfig::default(),
             aws: AwsConfig::default(),
             extension: ExtensionSettings::default(),
+            // Default for tests / non-Lambda contexts. Production code paths
+            // overwrite this in `from_env()` via `deployment::detect()`.
+            deployment: DeploymentContext::Normal { mode: TelemetryMode::Serverless },
         }
     }
 }
@@ -99,12 +212,19 @@ impl Default for NewRelicConfig {
             log_endpoint: "https://log-api.newrelic.com/log/v1".to_string(),
             harvest_interval: Duration::from_secs(2),
             collect_trace_id: false,
+            trace_id_log_buffer_max: DEFAULT_TRACE_ID_LOG_BUFFER_MAX,
             add_version_detail_tags: false,
             layer_version: None,
             apm_lambda_mode: false,
+            apm_blocking_handshake: false,
+            apm_handshake_timeout_secs: 5,
+            apm_disabled_telemetry: HashSet::new(),
             apm_host: "collector.newrelic.com".to_string(),
             metric_endpoint: "https://metric-api.newrelic.com/metric/v1".to_string(),
             proxy_url: None,
+            synchronous_flush: false,
+            data_collection_timeout: None,
+            http_timeout: None,
         }
     }
 }
@@ -183,10 +303,99 @@ impl Default for ExtensionSettings {
             send_function_logs: false,
             send_extension_logs: false,
             send_platform_logs: false,
+            platform_log_filter: HashSet::new(),
             log_level: "info".to_string(),
             extension_logs_enabled: true,
+            runtime_done_grace_ms: 25,
+            pipeline_flush: false,
+            lmi_flush_interval_ms: 30_000,
+            ignore_errors: HashSet::new(),
+            expected_errors: HashSet::new(),
         }
     }
+}
+
+/// Parse `NEW_RELIC_APM_DISABLE_TELEMETRY` into a set of telemetry types to drop.
+///
+/// Comma-separated, case-insensitive, whitespace-trimmed. Only the canonical
+/// types in [`crate::apm::collector::KNOWN_TELEMETRY_TYPES`] are accepted;
+/// unknown tokens are warned about and ignored (fail-soft).
+pub(crate) fn parse_disabled_telemetry(raw: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if crate::apm::collector::KNOWN_TELEMETRY_TYPES.contains(&t.as_str()) {
+            set.insert(t);
+        } else {
+            warn!(
+                "NEW_RELIC_APM_DISABLE_TELEMETRY: ignoring unknown telemetry type '{}' (valid: {})",
+                t,
+                crate::apm::collector::KNOWN_TELEMETRY_TYPES.join(", ")
+            );
+        }
+    }
+    if !set.is_empty() {
+        let mut types: Vec<&str> = set.iter().map(String::as_str).collect();
+        types.sort_unstable();
+        debug!("APM telemetry disabled for types: {}", types.join(", "));
+    }
+    set
+}
+
+/// Parse `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`
+/// into a set of lowercased shutdown error classes.
+///
+/// Comma-separated, case-insensitive, whitespace-trimmed. Only the extension-
+/// controlled classes in [`KNOWN_SHUTDOWN_ERROR_CLASSES`] are accepted; unknown
+/// tokens are warned about and ignored (fail-soft), matching
+/// `parse_disabled_telemetry`.
+pub(crate) fn parse_error_class_list(raw: &str, env_var_name: &str) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for token in raw.split(',') {
+        let t = token.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            continue;
+        }
+        if KNOWN_SHUTDOWN_ERROR_CLASSES.contains(&t.as_str()) {
+            set.insert(t);
+        } else {
+            warn!(
+                "{}: ignoring unknown error class '{}' (valid: {})",
+                env_var_name,
+                t,
+                KNOWN_SHUTDOWN_ERROR_CLASSES.join(", ")
+            );
+        }
+    }
+    if !set.is_empty() {
+        let mut classes: Vec<&str> = set.iter().map(String::as_str).collect();
+        classes.sort_unstable();
+        debug!("{}: {}", env_var_name, classes.join(", "));
+    }
+    set
+}
+
+/// Parse a Go-style duration string (`"200ms"`, `"30s"`, `"1m"`, `"2h"`).
+/// Bare numbers with no unit are rejected, matching Go's `time.ParseDuration`.
+pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
+    let raw = raw.trim();
+    let unit_start = raw.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (num_part, unit) = raw.split_at(unit_start);
+    let value: f64 = num_part.parse().ok()?;
+    if value < 0.0 {
+        return None;
+    }
+    let millis = match unit {
+        "ms" => value,
+        "s" => value * 1_000.0,
+        "m" => value * 60_000.0,
+        "h" => value * 3_600_000.0,
+        _ => return None,
+    };
+    Some(Duration::from_millis(millis as u64))
 }
 
 impl ExtensionConfig {
@@ -203,29 +412,47 @@ impl ExtensionConfig {
     }
 
     /// Parse "NEW_RELIC_EXTENSION_SEND_LOGS" environment variable
-    /// Accepts comma-separated values: platform, extension, function, all. Returns (send_function_logs, send_extension_logs, send_platform_logs)
-    fn parse_send_logs(value: &str) -> (bool, bool, bool) {
+    /// Accepts comma-separated values: platform, extension, function, all, or specific
+    /// platform.<event> names (e.g. platform.start, platform.report). Returns
+    /// (send_function_logs, send_extension_logs, send_platform_logs, platform_log_filter).
+    /// platform_log_filter is empty (no filter, send every platform event type) unless
+    /// only platform.<event> tokens were given (no bare "platform"/"all").
+    fn parse_send_logs(value: &str) -> (bool, bool, bool, HashSet<String>) {
         let normalized = value.to_lowercase();
         let parts: Vec<&str> = normalized.split(',').map(|s| s.trim()).collect();
-        
+
         // NEW: Check for empty string
         if normalized.is_empty() {
             eprintln!("NEW_RELIC_EXTENSION_SEND_LOGS is empty. No logs will be sent");
-            return (false, false, false);
+            return (false, false, false, HashSet::new());
         }
         // Check for "all" first
         if parts.contains(&"all") {
            if parts.len() > 1 {
                 eprintln!("[NR_EXT] INFO: 'all' specified in SEND_LOGS;defaulting to 'all'");
             }
-            return (true, true, true);
+            return (true, true, true, HashSet::new());
         }
-        
+
         let send_function = parts.contains(&"function");
         let send_extension = parts.contains(&"extension");
-        let send_platform = parts.contains(&"platform");
-        
-        (send_function, send_extension, send_platform)
+        let bare_platform = parts.contains(&"platform");
+
+        let platform_event_tokens: HashSet<String> = parts.iter()
+            .filter(|p| p.starts_with("platform.") && p.len() > "platform.".len())
+            .map(|p| p.to_string())
+            .collect();
+
+        // Bare "platform" always means "no filter, send everything" — it wins over
+        // any specific platform.<event> tokens listed alongside it.
+        let send_platform = bare_platform || !platform_event_tokens.is_empty();
+        let platform_log_filter = if bare_platform {
+            HashSet::new()
+        } else {
+            platform_event_tokens
+        };
+
+        (send_function, send_extension, send_platform, platform_log_filter)
     }
 
     pub fn from_env() -> Self {
@@ -253,6 +480,16 @@ impl ExtensionConfig {
         let collect_trace_id_str = env::var("NEW_RELIC_COLLECT_TRACE_ID").unwrap_or_default();
         config.new_relic.collect_trace_id = parse_bool(&collect_trace_id_str);
 
+        // Per-invocation parking cap for trace.id buffering. Only meaningful when
+        // collect_trace_id is on; clamped to a sane range so a typo can't drop all
+        // logs (0) or exhaust memory.
+        config.new_relic.trace_id_log_buffer_max = env::var("NEW_RELIC_TRACE_ID_LOG_BUFFER_MAX")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map_or(DEFAULT_TRACE_ID_LOG_BUFFER_MAX, |n| {
+                n.clamp(MIN_TRACE_ID_LOG_BUFFER_MAX, MAX_TRACE_ID_LOG_BUFFER_MAX)
+            });
+
         let add_version_detail_tags_str = env::var("NEW_RELIC_ADD_VERSION_DETAIL_TAGS").unwrap_or_default();
         config.new_relic.add_version_detail_tags = parse_bool(&add_version_detail_tags_str);
 
@@ -261,14 +498,64 @@ impl ExtensionConfig {
         let apm_lambda_mode_str = env::var("NEW_RELIC_APM_LAMBDA_MODE").unwrap_or_default();
         config.new_relic.apm_lambda_mode = parse_bool(&apm_lambda_mode_str);
 
+        // Detect deployment context exactly once. On LMI, APM mode is forced
+        // regardless of the user-supplied `NEW_RELIC_APM_LAMBDA_MODE` value —
+        // `deployment::detect()` already logs a warning when the user explicitly
+        // disabled it. See `LMI_SUPPORT.md` §7.
+        config.deployment = deployment::detect();
+        if config.deployment.is_lmi() {
+            config.new_relic.apm_lambda_mode = true;
+        }
+
+        let apm_blocking_handshake_str = env::var("NEW_RELIC_APM_BLOCKING_HANDSHAKE").unwrap_or_default();
+        config.new_relic.apm_blocking_handshake = parse_bool(&apm_blocking_handshake_str);
+
+        config.new_relic.apm_handshake_timeout_secs = env::var("NEW_RELIC_APM_HANDSHAKE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(5)
+            .max(1);
+
+        // Comma-separated telemetry types the customer wants dropped (APM mode).
+        config.new_relic.apm_disabled_telemetry =
+            parse_disabled_telemetry(&env::var("NEW_RELIC_APM_DISABLE_TELEMETRY").unwrap_or_default());
+
         config.new_relic.proxy_url = env::var("NEW_RELIC_LAMBDA_EXTENSION_PROXY")
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Opt-in: only set (and thus only change retry behavior) when the customer
+        // explicitly provides this env var. Unset means data_collection_timeout stays
+        // None and existing fixed-retry-count behavior is untouched.
+        config.new_relic.data_collection_timeout = env::var("NEW_RELIC_DATA_COLLECTION_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_DATA_COLLECTION_TIMEOUT value '{}', defaulting to 10s",
+                        raw
+                    );
+                    DEFAULT_DATA_COLLECTION_TIMEOUT
+                })
+            });
+
+        // Opt-in, same pattern as data_collection_timeout.
+        config.new_relic.http_timeout = env::var("NEW_RELIC_HTTP_TIMEOUT")
+            .ok()
+            .map(|raw| {
+                parse_duration(&raw).unwrap_or_else(|| {
+                    warn!(
+                        "Invalid NEW_RELIC_HTTP_TIMEOUT value '{}', defaulting to 2400ms",
+                        raw
+                    );
+                    DEFAULT_HTTP_TIMEOUT
+                })
+            });
+
         if let Some(ref url) = config.new_relic.proxy_url {
             // Log proxy activation at startup (eprintln ensures visibility before tracing is initialized)
             // Mask credentials: http://user:pass@host -> http://***:***@host
-            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.find('@')) {
+            let masked = if let (Some(scheme_end), Some(at_pos)) = (url.find("://"), url.rfind('@')) {
                 format!("{}***:***{}", &url[..scheme_end + 3], &url[at_pos..])
             } else {
                 url.clone()
@@ -282,12 +569,22 @@ impl ExtensionConfig {
 
         // Note: function_name is set from extension registration response, not from env var
 
+        // AWS_LAMBDA_LOG_GROUP_NAME / AWS_LAMBDA_LOG_STREAM_NAME are deliberately NOT
+        // read here: AWS's Extensions API docs explicitly exclude both from the
+        // extension process's environment (they're "specific to the runtime
+        // process"), so `env::var` on them would always be empty on real Lambda.
+        // `aws.logGroup`/`aws.logStream` are resolved elsewhere — see
+        // `NewRelicClient::get_or_build_common_json` (logGroup, derived from
+        // function_name) and `telemetry::normal_log_stream` (logStream, captured
+        // from the Telemetry API).
+
         // Parse NEW_RELIC_EXTENSION_SEND_LOGS (takes precedence over individual flags)
         if !send_logs_str.is_empty() {
-            let (function, extension, platform) = Self::parse_send_logs(&send_logs_str);
+            let (function, extension, platform, platform_log_filter) = Self::parse_send_logs(&send_logs_str);
             config.extension.send_function_logs = function;
             config.extension.send_extension_logs = extension;
             config.extension.send_platform_logs = platform;
+            config.extension.platform_log_filter = platform_log_filter;
         } else {
             // Fall back to individual environment variables for backward compatibility
             config.extension.send_function_logs = parse_bool(&send_function_logs_str);
@@ -300,6 +597,59 @@ impl ExtensionConfig {
 
         let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
+
+        // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
+        // Default 25 ms — matches the Telemetry API buffer flush window.
+        config.extension.runtime_done_grace_ms = env::var("NEW_RELIC_RUNTIME_DONE_GRACE_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(25)
+            .min(2000);
+
+        // NEW_RELIC_EXTENSION_PIPELINE_FLUSH: opt-in to pipeline GET /next pattern.
+        // When enabled, the extension calls GET /next immediately after runtimeDone
+        // and flushes telemetry in the background, reducing billed duration.
+        let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
+        config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        // NEW_RELIC_LMI_FLUSH_INTERVAL_MS: heartbeat flush cadence for the LMI
+        // event loop. Floored at 1000 ms to avoid pathological flush storms.
+        // Default 30_000 ms.
+        config.extension.lmi_flush_interval_ms = env::var("NEW_RELIC_LMI_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30_000)
+            .max(1000);
+
+        // NEW_RELIC_EXTENSION_IGNORE_ERRORS / NEW_RELIC_EXTENSION_EXPECTED_ERRORS:
+        // classify extension-synthesized shutdown errors (APM mode only). See
+        // event_loop::send_error_for_shutdown_reason for where these are consumed.
+        config.extension.ignore_errors = parse_error_class_list(
+            &env::var("NEW_RELIC_EXTENSION_IGNORE_ERRORS").unwrap_or_default(),
+            "NEW_RELIC_EXTENSION_IGNORE_ERRORS",
+        );
+        config.extension.expected_errors = parse_error_class_list(
+            &env::var("NEW_RELIC_EXTENSION_EXPECTED_ERRORS").unwrap_or_default(),
+            "NEW_RELIC_EXTENSION_EXPECTED_ERRORS",
+        );
+
+        let synchronous_flush_str =
+            env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();
+        config.new_relic.synchronous_flush = parse_bool(&synchronous_flush_str);
+
+        // synchronous_flush takes precedence over pipeline_flush on any invocation
+        // where an immediate send is exercised (see event_loop.rs
+        // execute_standard_mode_event_loop) — the delivery guarantee the customer
+        // explicitly opted into must not be silently defeated by the deferred-send
+        // optimization. Surface that trade-off once at startup rather than leaving it silent.
+        if config.extension.pipeline_flush && config.new_relic.synchronous_flush {
+            warn!(
+                "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
+                 deferred-send behavior on invocations where an immediate send is exercised — you \
+                 will not get pipeline_flush's billed-duration savings on those invocations. This is \
+                 intentional: the delivery guarantee takes precedence over the throughput optimization."
+            );
+        }
 
         config
     }
@@ -457,6 +807,119 @@ static NR_TAGS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
 /// Subsequent warm-start invocations reuse the cached result with zero allocation.
 pub fn get_nr_tags() -> &'static [(String, String)] {
     NR_TAGS_CACHE.get_or_init(parse_nr_tags)
+}
+
+/// Maximum length (in Unicode scalar values) allowed for a `NEW_RELIC_LABELS` type or
+/// value, per the cross-agent Labels spec (agent-specs/Labels.md). Longer values are
+/// truncated with a warning, not rejected.
+const MAX_LABEL_LEN: usize = 255;
+/// Maximum number of `NEW_RELIC_LABELS` type/value pairs sent per agent run, per the
+/// cross-agent Labels spec. Applied to `NEW_RELIC_LABELS`'s own output only — independent
+/// of the (uncapped, untouched) `NR_TAGS` output.
+const MAX_LABELS: usize = 64;
+
+/// Parse the `NEW_RELIC_LABELS` environment variable into key-value pairs.
+///
+/// Format: `type1:value1;type2:value2`, per the cross-agent Labels spec
+/// (agent-specs/Labels.md). Deliberately independent of `NR_TAGS`/`parse_nr_tags`, which
+/// this does not touch or share state with:
+/// - The delimiters are fixed (no `NR_ENV_DELIMITER`-style override).
+/// - A duplicate label type keeps only the value from its *last* occurrence.
+/// - A malformed pair (wrong delimiter count, empty type, or empty value — including a
+///   non-leading/trailing empty pair like `foo:bar;;zip:zap`) hard-fails the whole list
+///   to empty, with a warning. Purely leading/trailing separators (`;;foo:bar;;`) are
+///   stripped and not treated as malformed.
+/// - Each type/value longer than 255 chars is truncated, with a warning.
+/// - The list is capped at 64 entries, with a warning.
+///
+/// # Example
+/// ```
+/// std::env::set_var("NEW_RELIC_LABELS", "env:prod;team:backend");
+/// let labels = parse_new_relic_labels();
+/// assert_eq!(labels, vec![("env".to_string(), "prod".to_string()), ("team".to_string(), "backend".to_string())]);
+/// ```
+pub fn parse_new_relic_labels() -> Vec<(String, String)> {
+    let raw = match env::var("NEW_RELIC_LABELS") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => return Vec::new(),
+    };
+
+    let raw_segments: Vec<&str> = raw.split(';').collect();
+
+    // Strip purely leading/trailing empty segments (stray `;` at either end); a middle
+    // empty segment is a malformed pair per spec, not tolerated the same way.
+    let Some(start) = raw_segments.iter().position(|s| !s.trim().is_empty()) else {
+        // Nothing but separators/whitespace (e.g. ";;;") - no labels configured, not an error.
+        return Vec::new();
+    };
+    let Some(end) = raw_segments.iter().rposition(|s| !s.trim().is_empty()) else {
+        return Vec::new();
+    };
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for segment in &raw_segments[start..=end] {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            warn!(
+                "NEW_RELIC_LABELS is malformed (empty label pair between valid entries); discarding all labels"
+            );
+            return Vec::new();
+        }
+
+        let parts: Vec<&str> = segment.split(':').collect();
+        let (label_type, label_value) = match parts.as_slice() {
+            [t, v] if !t.trim().is_empty() && !v.trim().is_empty() => (t.trim(), v.trim()),
+            _ => {
+                warn!(
+                    "NEW_RELIC_LABELS is malformed at \"{segment}\" (expected exactly one non-empty \"type:value\" pair); discarding all labels"
+                );
+                return Vec::new();
+            }
+        };
+
+        let label_type = truncate_label_part(label_type, "label type");
+        let label_value = truncate_label_part(label_value, "label value");
+
+        // Duplicate type: last occurrence wins, updating the value in place.
+        if let Some(existing) = pairs.iter_mut().find(|(t, _)| *t == label_type) {
+            existing.1 = label_value;
+        } else {
+            pairs.push((label_type, label_value));
+        }
+    }
+
+    if pairs.len() > MAX_LABELS {
+        warn!(
+            "NEW_RELIC_LABELS has {} entries, exceeding the {MAX_LABELS}-label limit; truncating",
+            pairs.len()
+        );
+        pairs.truncate(MAX_LABELS);
+    }
+
+    pairs
+}
+
+/// Truncate a `NEW_RELIC_LABELS` type/value to `MAX_LABEL_LEN` chars, warning if truncated.
+fn truncate_label_part(part: &str, kind: &str) -> String {
+    if part.chars().count() > MAX_LABEL_LEN {
+        let truncated: String = part.chars().take(MAX_LABEL_LEN).collect();
+        warn!(
+            "NEW_RELIC_LABELS {kind} \"{part}\" exceeds {MAX_LABEL_LEN} characters; truncating to \"{truncated}\""
+        );
+        truncated
+    } else {
+        part.to_string()
+    }
+}
+
+/// Cached `NEW_RELIC_LABELS` parsed once at cold start. Use `get_new_relic_labels()` to access.
+static NEW_RELIC_LABELS_CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+/// Returns cached `NEW_RELIC_LABELS`, parsing from environment only on first call (cold
+/// start). Subsequent warm-start invocations reuse the cached result with zero allocation.
+pub fn get_new_relic_labels() -> &'static [(String, String)] {
+    NEW_RELIC_LABELS_CACHE.get_or_init(parse_new_relic_labels)
 }
 
 /// Global configuration instance

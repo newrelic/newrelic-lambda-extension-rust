@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests for ID generation
 //! 
 //! Unit tests for trace ID, span ID generation and random number generation

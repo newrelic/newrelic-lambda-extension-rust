@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Trace ID extraction module for New Relic Lambda Extension
 //!
 //! This module provides optimized functions to extract trace IDs from New Relic agent payloads.

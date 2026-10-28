@@ -1,0 +1,16 @@
+{
+    "name": "replaced-by-user-input",
+    "description": "replaced-by-user-input",
+    "version": "0.0.1",
+    "private": true,
+    "devDependencies": {
+        "jest": "^30.5.1"
+    },
+    "scripts": {
+        "test": "jest --roots __tests__/unit",
+        "integ-test": "jest --roots __tests__/integration"
+    },
+    "dependencies": {
+        "@aws-sdk/client-s3": "^3.1129.0"
+    }
+}

@@ -1,5 +1,9 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     config::ExtensionConfig,
+    config::deployment::DeploymentContext,
     context::InvocationContext,
     newrelic::{client::NewRelicClient, flush::Flush},
     telemetry::listener::TelemetryRecord,
@@ -87,6 +91,12 @@ impl PlatformProcessor {
             "version": crate::EXTENSION_VERSION.to_string()
         }));
         attributes.insert("log_type".to_string(), serde_json::json!("platform"));
+        // _nr.logType is the internal key used by LogProcessor::log_type_from_message for
+        // eviction priority in failed_logs_buffer (Platform < Function) and by the dedup hash.
+        // Without it, failed platform logs are misclassified as Function and never evicted.
+        attributes.insert("_nr.logType".to_string(), serde_json::json!("platform"));
+        // newrelic.source is required by the NR Logs API ingest endpoint.
+        attributes.insert("newrelic.source".to_string(), serde_json::json!("api.logs"));
         attributes.insert("level".to_string(), serde_json::json!(level));
         attributes.insert("platform_event_type".to_string(), serde_json::json!(record.record_type));
         
@@ -96,16 +106,24 @@ impl PlatformProcessor {
             attributes,
         };
         
-        if self.config.extension.send_platform_logs {
-            // Stamp AWS attributes (request_id, ARN) before adding to batch
-            // This prevents logs from being requeued with wrong request_id
-            let stamped_log = self.log_processor.apply_current_invocation_metadata(log_message);
+        let platform_type_allowed = self.config.extension.platform_log_filter.is_empty()
+            || self.config.extension.platform_log_filter.contains(&record.record_type.to_lowercase());
+
+        if self.config.extension.send_platform_logs && platform_type_allowed {
+            // Stamp AWS attributes (request_id, ARN) before adding to batch.
+            // This prevents logs from being requeued with wrong request_id.
+            // platform.* records carry `requestId`; pass it so LMI correlates per-record
+            // (ignored on Normal Lambda, which stamps from the current-invocation context).
+            let per_record_request_id = self.extract_request_id_from_record(&record);
+            let stamped_log = self
+                .log_processor
+                .apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
             self.log_processor.add_log_to_batch(stamped_log);
         }
     }
 
    
-    fn create_platform_log_message(&self, record: &TelemetryRecord) -> (String, String) {
+    pub(crate) fn create_platform_log_message(&self, record: &TelemetryRecord) -> (String, String) {
         match record.record_type.as_str() {
             "platform.report" => {
                 if let Some(report_line) = self.convert_platform_report_to_log_line(record) {
@@ -192,22 +210,47 @@ impl PlatformProcessor {
     pub fn convert_platform_report_to_log_line(&self, record: &TelemetryRecord) -> Option<String> {
         let request_id = record.record.get("requestId")?.as_str()?;
         let metrics = record.record.get("metrics")?;
-        
+
         let duration_ms = metrics.get("durationMs")?.as_f64()?;
-        let billed_duration_ms = metrics.get("billedDurationMs")?.as_u64()?;
-        let memory_size_mb = metrics.get("memorySizeMB")?.as_u64()?;
-        let max_memory_used_mb = metrics.get("maxMemoryUsedMB")?.as_u64()?;
-        
+
         let init_duration_part = if let Some(init_duration) = metrics.get("initDurationMs").and_then(|v| v.as_f64()) {
             format!("\tInit Duration: {:.2} ms", init_duration)
         } else {
             String::new()
         };
-        
-        Some(format!(
-            "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\tMax Memory Used: {} MB{}",
-            request_id, duration_ms, billed_duration_ms, memory_size_mb, max_memory_used_mb, init_duration_part
-        ))
+
+        // Type-driven so Standard Lambda is provably untouched (LMI_SUPPORT.md §6).
+        match self.config.deployment {
+            // Normal Lambda: platform.report always carries the full metric set —
+            // keep the original strict behavior verbatim (all fields required).
+            DeploymentContext::Normal { .. } => {
+                let billed_duration_ms = metrics.get("billedDurationMs")?.as_u64()?;
+                let memory_size_mb = metrics.get("memorySizeMB")?.as_u64()?;
+                let max_memory_used_mb = metrics.get("maxMemoryUsedMB")?.as_u64()?;
+                Some(format!(
+                    "REPORT RequestId: {}\tDuration: {:.2} ms\tBilled Duration: {} ms\tMemory Size: {} MB\tMax Memory Used: {} MB{}",
+                    request_id, duration_ms, billed_duration_ms, memory_size_mb, max_memory_used_mb, init_duration_part
+                ))
+            }
+            // LMI: AWS strips billedDurationMs / memorySizeMB / maxMemoryUsedMB
+            // ("not applicable in the concurrent execution environment"). Require only
+            // durationMs and append whatever else is present, so the report still yields
+            // a REPORT line instead of being dropped as "missing required fields".
+            DeploymentContext::Lmi => {
+                let mut line = format!("REPORT RequestId: {}\tDuration: {:.2} ms", request_id, duration_ms);
+                if let Some(billed_duration_ms) = metrics.get("billedDurationMs").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tBilled Duration: {} ms", billed_duration_ms));
+                }
+                if let Some(memory_size_mb) = metrics.get("memorySizeMB").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tMemory Size: {} MB", memory_size_mb));
+                }
+                if let Some(max_memory_used_mb) = metrics.get("maxMemoryUsedMB").and_then(|v| v.as_u64()) {
+                    line.push_str(&format!("\tMax Memory Used: {} MB", max_memory_used_mb));
+                }
+                line.push_str(&init_duration_part);
+                Some(line)
+            }
+        }
     }
 
    
@@ -218,7 +261,38 @@ impl PlatformProcessor {
     /// Check platform events for errors and send to telemetry endpoint
     /// Platform events that can have errors: platform.initReport, platform.initRuntimeDone,
     /// platform.runtimeDone, platform.restoreRuntimeDone, platform.restoreReport
+    /// Maps a Telemetry API `status` field to the extension's Lambda error class.
+    ///
+    /// "failure" must resolve to the same class ("LambdaPlatformFault") as
+    /// `error_synthesis::send_platform_fault_error` (the SHUTDOWN-reason-based
+    /// path in non-APM mode) — both funnel into `send_lambda_error`'s `SENT_ERRORS`
+    /// de-dup, keyed by `(request_id, error_type)`. Matching class names is what
+    /// lets this path act as a fallback (still sends if the SHUTDOWN-based send
+    /// never happens) without double-sending when both fire for the same request,
+    /// exactly like "timeout" already does.
+    pub(crate) fn lambda_error_type_for_status(status: Option<&str>) -> &'static str {
+        match status {
+            Some("timeout") => "LambdaTimeout",
+            Some("failure") => "LambdaPlatformFault",
+            Some("error") => "LambdaError",
+            _ => "LambdaError",
+        }
+    }
+
     fn check_and_send_platform_errors(&self, record: &TelemetryRecord) {
+        // In APM mode, `event_loop::send_error_for_shutdown_reason` is the
+        // authoritative signal for timeout/platform-fault/unknown-shutdown errors —
+        // it fires on the actual SHUTDOWN runtime event and is the only path that
+        // honors NEW_RELIC_EXTENSION_IGNORE_ERRORS/EXPECTED_ERRORS. Without this
+        // guard, this Telemetry-API-status-based path would independently
+        // synthesize and send a second (ungated) `platform.error` log entry for the
+        // same failure, duplicating the signal New Relic receives. Non-APM
+        // (serverless) mode has no such shutdown-reason path, so this stays the
+        // only synthesis mechanism there.
+        if self.config.new_relic.apm_lambda_mode {
+            return;
+        }
+
         // Check if this event type can have errors
         let event_type = record.record_type.as_str();
         let can_have_errors = matches!(
@@ -386,13 +460,7 @@ impl PlatformProcessor {
             }
         };
         
-        // Map platform error to appropriate Lambda error type
-        let lambda_error_type = match status {
-            Some("timeout") => "LambdaTimeout",
-            Some("failure") => "LambdaFatalError",
-            Some("error") => "LambdaError",
-            _ => "LambdaError",
-        };
+        let lambda_error_type = Self::lambda_error_type_for_status(status);
 
         // Store detailed error information for potential use in shutdown error synthesis
         // Platform events have more accurate error types than function logs
@@ -438,7 +506,7 @@ impl PlatformProcessor {
     /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
     /// but the compiler cannot detect it in certain build configurations
     #[allow(dead_code)]
-    fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
+    pub(crate) fn extract_request_id_from_message(&self, message: &str) -> Option<String> {
         if message.starts_with("REPORT RequestId: ") {
             if let Some(start) = message.find("REPORT RequestId: ") {
                 let after_prefix = &message[start + "REPORT RequestId: ".len()..];
@@ -456,7 +524,7 @@ impl PlatformProcessor {
     /// Suppress dead_code warning: This method is actually used in send_and_clear_batch_simple
     /// but the compiler cannot detect it in certain build configurations
     #[allow(dead_code)]
-    fn extract_log_level_from_message(&self, message: &str) -> &'static str {
+    pub(crate) fn extract_log_level_from_message(&self, message: &str) -> &'static str {
         let message_upper = message.to_uppercase();
         
         if message_upper.contains("ERROR") || 

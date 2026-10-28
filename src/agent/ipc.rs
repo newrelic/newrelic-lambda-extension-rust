@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use nix::sys::stat;
 use nix::unistd;
 use std::fs;
@@ -6,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 pub const TELEMETRY_NAMED_PIPE_PATH: &str = "/tmp/newrelic-telemetry";
 const TELEMETRY_NAMED_PIPE_RETRIES: u32 = 10;
@@ -73,7 +76,7 @@ pub async fn init_telemetry_channel() -> Result<mpsc::Receiver<Vec<u8>>> {
                 Err(e) => {
                     consecutive_errors += 1;
                     if consecutive_errors % 5 == 1 {
-                        error!("Error polling for telemetry: {} (count: {}). Retrying in 1s.", e, consecutive_errors);
+                        warn!("Error polling for telemetry: {} (count: {}). Retrying in 1s.", e, consecutive_errors);
                     }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }

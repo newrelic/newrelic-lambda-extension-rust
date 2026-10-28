@@ -1,3 +1,6 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 #![deny(clippy::all)]
 #![deny(clippy::pedantic)]
 #![deny(clippy::unwrap_used)]
@@ -17,7 +20,10 @@ mod apm;
 mod runtime;
 mod request;
 mod event_loop;
+mod event_loop_lmi;
 mod error_synthesis;
+#[cfg(test)]
+mod error_synthesis_tests;
 
 #[cfg(debug_assertions)]
 mod test_telemetry;
@@ -37,11 +43,7 @@ use reqwest::Client;
 use crate::{
     context::InvocationContext,
     telemetry::listener::setup_telemetry_listener,
-    newrelic::{
-        client::NewRelicClient,
-        harvester::Harvester,
-        flush::Flush,
-    },
+    newrelic::client::NewRelicClient,
     credentials::get_new_relic_license_key,
     request::ProcessorFactory,
     event_loop::{
@@ -81,6 +83,21 @@ pub fn get_global_fallback_arn() -> String {
 
 /// Global flag to track if this is a warm start (for performance optimization)
 static IS_WARM_START: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+/// Set to true when platform.initReport is received under LMI — the only reliable
+/// cold-start signal available when INVOKE events are not delivered.
+/// Used to trigger version-detail tagging exactly once per execution environment.
+static LMI_COLD_START_SEEN: Lazy<Arc<std::sync::atomic::AtomicBool>> =
+    Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+/// Set once a SHUTDOWN event is being handled. While set, the extension stops
+/// forwarding its OWN (`extension`-type) logs to New Relic: the authoritative
+/// "telemetry dropped" record is sent directly as a single structured diagnostic, so
+/// the re-ingested stdout copies of the extension's shutdown lines would only be
+/// duplicates. CloudWatch still receives everything (stdout is unaffected); function
+/// and platform logs are still forwarded. One-way latch — never reset.
+pub(crate) static IS_SHUTTING_DOWN: Lazy<Arc<std::sync::atomic::AtomicBool>> =
     Lazy::new(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
 /// Global APM app instance (for sending platform.report metrics in APM mode)
@@ -167,6 +184,7 @@ async fn run_noop_extension() -> Result<(), Box<dyn std::error::Error + Send + S
             Ok(runtime::LambdaRuntimeEvent::Invoke {
                 request_id,
                 invoked_function_arn: _,
+                deadline_ms: _,
             }) => {
                 debug!(
                     "No-op mode: Received INVOKE event for request {}, doing nothing",
@@ -229,14 +247,9 @@ async fn run_extension() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         extension_startup_time.elapsed()
     );
 
-    let (total_events_processed, harvester_handle) =
-        run_infinite_event_loop(extension_components).await;
+    let total_events_processed = run_infinite_event_loop(extension_components).await;
 
-    perform_extension_shutdown_cleanup(
-        total_events_processed,
-        harvester_handle,
-    )
-    .await;
+    perform_extension_shutdown_cleanup(total_events_processed).await;
 
     Ok(())
 }
@@ -317,10 +330,12 @@ async fn perform_one_time_initialization(
             processor_factory: noop_processor_factory,
             newrelic_client: noop_newrelic_client,
             config: config.clone(),
-            harvester_handle: tokio::spawn(async {}),
             global_log_processor: noop_log_processor,
             apm_app: Arc::new(tokio::sync::RwLock::new(None)),
             apm_mode_enabled: false,
+            apm_client: Client::new(),
+            reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+            deployment: config.deployment,
         });
     }
 
@@ -366,8 +381,19 @@ async fn perform_one_time_initialization(
         
         Some(arn)
     } else {
-        warn!("Account ID not provided by Lambda runtime (local testing?) - ARN will be populated from first INVOKE event");
-        None
+        // On LMI, INVOKE never fires so the ARN would never be populated from an INVOKE event.
+        // AWS_LAMBDA_FUNCTION_ARN is always set by the Lambda runtime — use it as the fallback ARN.
+        let env_arn = std::env::var("AWS_LAMBDA_FUNCTION_ARN").unwrap_or_default();
+        if !env_arn.is_empty() {
+            info!("Account ID not in registration response; using AWS_LAMBDA_FUNCTION_ARN as fallback ARN: {}", env_arn);
+            if let Ok(mut global_context) = CURRENT_INVOCATION_CONTEXT.write() {
+                global_context.invoked_function_arn = env_arn.clone();
+            }
+            Some(env_arn)
+        } else {
+            warn!("Account ID not provided by Lambda runtime and AWS_LAMBDA_FUNCTION_ARN not set (local testing?) - ARN will be populated from first INVOKE event");
+            None
+        }
     };
 
     debug!(
@@ -421,73 +447,114 @@ async fn perform_one_time_initialization(
         extension_id
     );
 
-    start_agent_payload_collector_background_task(agent_telemetry_rx);
+    start_agent_payload_collector_background_task(agent_telemetry_rx, config.deployment);
 
     cleanup_old_failed_payloads();
 
 
-    // Smart conditional parallelization: only use tokio::join! when APM enabled
-    // This avoids async overhead for standard mode (most common case)
+    // Build APM client once — stored in ExtensionComponents for reconnects on every invoke
+    let apm_client = newrelic::client::build_outbound_client(
+        config.new_relic.proxy_url.as_deref(),
+    );
+    if config.new_relic.proxy_url.is_some() {
+        info!("Proxy configured for APM client");
+    }
+
+    // Declared before the APM if-else so the INIT spawn and ExtensionComponents share the same channel.
+    let reconnect_in_flight = Arc::new(tokio::sync::watch::channel(false).0);
+
+    // Mirror the disabled-telemetry set into the apm module so code paths without
+    // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
+    apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
+
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {
-            debug!("APM Lambda mode enabled - non-blocking connection strategy");
+            // Reuse the global APM_APP Arc so the telemetry listener (which reads crate::APM_APP)
+            // and the event loop both observe the same RwLock. Previously these were two separate
+            // Arc instances — the listener's fast-path always saw None.
+            let apm_app = Arc::clone(&*APM_APP);
 
-            // Spawn APM connection as background task - event loop starts immediately
-            let apm_app = Arc::new(tokio::sync::RwLock::new(None));
-            
             let license_key = config
                 .new_relic
                 .license_key
                 .clone()
                 .expect("License key must be available for APM mode");
 
-            tokio::spawn({
-                let license_key_clone = license_key.clone();
-                let apm_host = config.new_relic.apm_host.clone();
-                let metric_endpoint = config.new_relic.metric_endpoint.clone();
-                let apm_client = newrelic::client::build_outbound_client(
-                    config.new_relic.proxy_url.as_deref(),
-                );
-                if config.new_relic.proxy_url.is_some() {
-                    info!("Proxy configured for APM client");
-                }
-                let function_name = config.aws.function_name.clone();
-                let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
-                let account_id = config.aws.account_id.clone();
-                let region = config.aws.region.clone();
-                let apm_app_clone = Arc::clone(&apm_app);
+            let handshake_timeout = config.new_relic.apm_handshake_timeout_secs;
 
-                async move {
-                    debug!("Background APM connection started...");
-                    match apm::ApmApp::new(
-                        license_key_clone,
-                        apm_host,
-                        metric_endpoint,
-                        apm_client,
-                        function_name,
-                        function_version,
-                        account_id,
-                        region,
-                    )
-                    .await
-                    {
-                        Ok(app) => {
-                            info!(
-                                "APM app initialized successfully - Entity GUID: {}",
-                                app.get_entity_guid()
-                            );
-                            let mut global_apm = apm_app_clone.write().await;
-                            *global_apm = Some(app);
-                            info!("APM connection complete - ready for agent payloads");
-                        }
-                        Err(e) => {
-                            error!("CRITICAL: Failed to initialize APM app: {}", e);
-                            error!("APM mode was explicitly enabled but connection failed");
-                            error!("Extension will enter NO-OP mode - no telemetry will be processed");
-                            warn!("Lambda function will continue but without New Relic monitoring");
+            let apm_host = config.new_relic.apm_host.clone();
+            let metric_endpoint = config.new_relic.metric_endpoint.clone();
+            let function_name = std::env::var("NEW_RELIC_APP_NAME")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| config.aws.function_name.clone());
+            let lambda_function_name = config.aws.function_name.clone();
+            let function_version = config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string());
+            let account_id = config.aws.account_id.clone();
+            let region = config.aws.region.clone();
+
+            // Background path: handshake starts immediately during INIT, runs in parallel with
+            // the first function invocation. If NEW_RELIC_APM_BLOCKING_HANDSHAKE=true, the
+            // event loop will delay calling /next after runtimeDone until run_id + entity_guid
+            // are obtained — sandbox stays warm throughout, no freeze risk.
+            if config.new_relic.apm_blocking_handshake {
+                debug!(
+                    "APM Lambda mode enabled - BLOCKING_HANDSHAKE active: will wait after runtimeDone for handshake to complete (timeout: {}s)",
+                    handshake_timeout
+                );
+            } else {
+                debug!("APM Lambda mode enabled - background connection strategy (timeout: {}s)", handshake_timeout);
+            }
+
+            // Set the flag BEFORE spawning so the first-invoke reconnect guard in the event loop
+            // sees it and does not launch a duplicate concurrent handshake.
+            // send_replace() always writes the value regardless of receiver count.
+            // send() silently fails (returns Err) when no receivers exist, so borrow() would
+            // still return false and the guard would fire a duplicate spawn.
+            reconnect_in_flight.send_replace(true);
+            let flag_clone = reconnect_in_flight.clone();
+            let apm_app_clone = Arc::clone(&apm_app);
+            let apm_client_clone = apm_client.clone();
+            // DeploymentContext is Copy — capture it before the move closure so we don't
+            // move/borrow `config` (still used after the spawn).
+            let deployment = config.deployment;
+            tokio::spawn(async move {
+                debug!("Background APM connection started...");
+                match apm::ApmApp::new(
+                    license_key,
+                    apm_host,
+                    metric_endpoint,
+                    apm_client_clone,
+                    function_name,
+                    lambda_function_name,
+                    function_version,
+                    account_id,
+                    region,
+                    handshake_timeout,
+                    deployment,
+                )
+                .await
+                {
+                    Ok(app) => {
+                        info!(
+                            "APM app initialized successfully - Entity GUID: {}",
+                            app.get_entity_guid()
+                        );
+                        let mut global_apm = apm_app_clone.write().await;
+                        *global_apm = Some(app);
+                        info!("APM connection complete - ready for agent payloads");
+                    }
+                    Err(e) => {
+                        // A permanent auth failure already logged an error and latched APM
+                        // off inside ApmApp::new — don't promise a retry that won't happen.
+                        if !crate::apm::connection::is_handshake_fatal() {
+                            warn!("APM handshake failed at startup: {} - will retry on each invoke until connected", e);
                         }
                     }
                 }
+                // Clear the flag whether the handshake succeeded or failed — the event loop
+                // reconnect guard will retry on the next invoke if needed.
+                flag_clone.send_replace(false);
             });
 
             let processor_factory = Arc::new(ProcessorFactory::new(
@@ -510,6 +577,7 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 config.new_relic.apm_lambda_mode,
+                config.deployment.is_lmi(),
             )
             .await?;
 
@@ -540,36 +608,40 @@ async fn perform_one_time_initialization(
                 temp_log_processor.clone(),
                 temp_platform_processor,
                 config.new_relic.apm_lambda_mode,
+                config.deployment.is_lmi(),
             )
             .await?;
 
             (apm_app, processor_factory, temp_log_processor, telemetry_listener_address)
         };
 
-    runtime::subscribe_to_telemetry(&client, &extension_id, telemetry_listener_address.port())
-        .await?;
+    // Standing (client, config, log processor) handle for code that runs independently
+    // of the event loop — the standard-mode telemetry listener's platform.report
+    // handler, and route_payload_to_request_buffer's immediate agent-payload send
+    // under NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH — see event_loop::SERVERLESS_SEND_CONTEXT.
+    // All three are stable from here on (only ARN-related fields on config are ever
+    // overridden after this point).
+    let _ = crate::event_loop::SERVERLESS_SEND_CONTEXT.set((
+        newrelic_client.clone(),
+        config.clone(),
+        temp_log_processor.clone(),
+    ));
 
-    // Harvester enabled for periodic log flushing to reduce memory usage
-    // Flushes function logs (if NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=true),
-    // extension logs (if NEW_RELIC_EXTENSION_SEND_EXTENSION_LOGS=true),
-    // and platform logs (if NEW_RELIC_EXTENSION_SEND_PLATFORM_LOGS=true)
-    let harvest_interval_secs = std::env::var("NEW_RELIC_HARVEST_INTERVAL_SECONDS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5); // Default: 5 seconds for frequent log flushing
-    
-    debug!("Starting log harvester with {}s interval (function_logs={}, extension_logs={}, platform_logs={})",
-        harvest_interval_secs,
-        config.extension.send_function_logs,
-        config.extension.send_extension_logs,
-        config.extension.send_platform_logs
+    let telemetry_schema = runtime::subscribe_to_telemetry(
+        &client,
+        &extension_id,
+        telemetry_listener_address.port(),
+    )
+    .await?;
+    debug!(
+        "Telemetry API subscription active using schema={}",
+        telemetry_schema.name()
     );
-    
-    let (_harvester, harvester_handle) = start_harvester_background_task(
-        vec![], // No processors - only log/platform flushing
-        Duration::from_secs(harvest_interval_secs),
-        &processor_factory,
-    );
+
+    // Log flushing is event-driven: size-based auto-flush inside LogProcessor, plus
+    // end-of-execution flush in the event loop gated on platform.runtimeDone, plus
+    // shutdown flushes. No periodic wall-clock harvester (the sandbox freezes
+    // between invocations so tokio interval timers cannot fire).
 
     Ok(ExtensionComponents {
         client,
@@ -577,10 +649,12 @@ async fn perform_one_time_initialization(
         processor_factory,
         newrelic_client,
         config: config.clone(),
-        harvester_handle,
         global_log_processor: temp_log_processor,
         apm_app,
         apm_mode_enabled: config.new_relic.apm_lambda_mode,
+        apm_client,
+        reconnect_in_flight,
+        deployment: config.deployment,
     })
 }
 
@@ -623,10 +697,12 @@ async fn handle_no_license_key(
         processor_factory: noop_processor_factory,
         newrelic_client: noop_newrelic_client,
         config: config.clone(),
-        harvester_handle: tokio::spawn(async {}),
         global_log_processor: noop_log_processor,
         apm_app: Arc::new(tokio::sync::RwLock::new(None)),
         apm_mode_enabled: false,
+        apm_client: Client::new(),
+        reconnect_in_flight: Arc::new(tokio::sync::watch::channel(false).0),
+        deployment: config.deployment,
     })
 }
 
@@ -682,7 +758,19 @@ async fn initialize_lambda_runtime_client_and_register(
         .pool_max_idle_per_host(10)
         .build()?);
 
-    let (registration, extension_id) = runtime::register_extension(&lambda_runtime_client, EXTENSION_NAME).await?;
+    // Detect deployment context once and dispatch the matching registration
+    // schema. Standard Lambda subscribes to INVOKE+SHUTDOWN; Lambda Managed
+    // Instances subscribes to SHUTDOWN only (AWS rejects INVOKE on LMI).
+    // See LMI_SUPPORT.md §3.
+    let deployment = config::deployment::detect();
+    let schema = runtime::schema_for(deployment);
+
+    let (registration, extension_id) = runtime::register_extension(
+        &lambda_runtime_client,
+        EXTENSION_NAME,
+        schema,
+    )
+    .await?;
     Ok((lambda_runtime_client, extension_id, registration))
 }
 
@@ -708,12 +796,20 @@ async fn initialize_agent_telemetry_ipc_channel(
 }
 
 /// Start agent payload collector as background task with request handling
-fn start_agent_payload_collector_background_task(agent_telemetry_rx: mpsc::Receiver<Vec<u8>>) {
-    start_concurrent_agent_payload_collector(agent_telemetry_rx);
+fn start_agent_payload_collector_background_task(
+    agent_telemetry_rx: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
+    start_concurrent_agent_payload_collector(agent_telemetry_rx, deployment);
 }
 
-/// Channel-based agent payload collector with immediate processing and notification
-fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>>) {
+/// Channel-based agent payload collector with immediate processing and notification.
+/// `deployment` (Copy) selects the routing strategy: Normal uses the active-request global,
+/// LMI routes each payload by its own embedded `aws.requestId` (NR-579361).
+fn start_concurrent_agent_payload_collector(
+    mut receiver: mpsc::Receiver<Vec<u8>>,
+    deployment: config::deployment::DeploymentContext,
+) {
     tokio::spawn(async move {
         debug!("Agent payload collector started - continuously listening for agent payloads");
         let mut payload_count = 0;
@@ -734,50 +830,19 @@ fn start_concurrent_agent_payload_collector(mut receiver: mpsc::Receiver<Vec<u8>
                 debug!("Agent Payload (complete): {}", sanitized);
             }
 
-            // Route to currently active request using 2.4.1 approach (simple and reliable)
-            request::route_payload_to_request_buffer(payload_bytes).await;
+            // Route per deployment context: Normal → active-request global (2.4.1);
+            // LMI → the payload's own embedded aws.requestId (NR-579361, race-free).
+            request::route_payload_to_request_buffer(payload_bytes, deployment).await;
         }
 
         debug!("Agent payload collector channel closed. No more agent payloads will be received");
     });
 }
 
-/// Start harvester as background task
-fn start_harvester_background_task(
-    processors: Vec<Arc<dyn Flush>>,
-    harvest_interval: Duration,
-    processor_factory: &Arc<ProcessorFactory>,
-) -> (Arc<Harvester>, tokio::task::JoinHandle<()>) {
-    let dummy_context = Arc::new(Mutex::new(InvocationContext {
-        request_id: "harvester".to_string(),
-        invoked_function_arn: "harvester".to_string(),
-        trace_id: None,
-    }));
-    let dummy_log_processor = processor_factory.create_log_processor(dummy_context.clone());
-    let dummy_platform_processor = processor_factory.create_platform_processor(dummy_context, dummy_log_processor.clone());
-
-    let harvester = Arc::new(Harvester::new(
-        processors,
-        harvest_interval,
-        dummy_log_processor,
-        dummy_platform_processor,
-    ));
-    let harvester_clone = Arc::clone(&harvester);
-    let handle = tokio::spawn(async move {
-        harvester_clone.run().await;
-    });
-    (harvester, handle)
-}
-
 /// Perform extension shutdown cleanup
-async fn perform_extension_shutdown_cleanup(
-    total_events_processed: u32,
-    harvester_handle: tokio::task::JoinHandle<()>,
-) {
+async fn perform_extension_shutdown_cleanup(total_events_processed: u32) {
     info!(
         "New Relic Extension shutting down after {} events",
         total_events_processed
     );
-
-    harvester_handle.abort();
 }

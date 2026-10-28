@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: LMI SAM example for nodejs runtime (creates capacity provider + function)
+
+Parameters:
+  NewRelicLayerArn:
+    Type: String
+    Description: Full New Relic layer ARN for this runtime
+
+  NewRelicAccountId:
+    Type: String
+    Description: Your New Relic account ID
+
+  NewRelicLicenseKey:
+    Type: String
+    NoEcho: true
+    Description: Your New Relic ingest license key
+
+  CapacityProviderName:
+    Type: String
+    Default: lmi-example-cp
+    Description: Name for the Lambda capacity provider resource
+
+  CapacityProviderOperatorRoleArn:
+    Type: String
+    Description: IAM role ARN used by the capacity provider to manage compute resources
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for capacity provider-managed instances
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security group IDs for capacity provider-managed instances
+
+  MaxVCpuCount:
+    Type: Number
+    Default: 48
+    MinValue: 2
+    Description: Maximum vCPU count for the capacity provider. AWS enforces an undocumented, account/region-dependent minimum beyond the API's stated floor of 2 (observed: 2 and 8 were rejected as "below the recommended minimum"); 48 is a value verified to work, not a documented AWS minimum
+
+  PerExecutionEnvironmentMaxConcurrency:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 1600
+    Description: Max concurrent invokes per execution environment
+
+  NodeUseEsm:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set to true when your original Node handler is an ES module
+
+Conditions:
+  IsNodeEsm: !Equals [!Ref NodeUseEsm, "true"]
+
+Resources:
+  LmiCapacityProvider:
+    Type: AWS::Lambda::CapacityProvider
+    Properties:
+      CapacityProviderName: !Ref CapacityProviderName
+      PermissionsConfig:
+        CapacityProviderOperatorRoleArn: !Ref CapacityProviderOperatorRoleArn
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds: !Ref SecurityGroupIds
+      InstanceRequirements:
+        Architectures: [x86_64]
+      CapacityProviderScalingConfig:
+        ScalingMode: Auto
+        MaxVCpuCount: !Ref MaxVCpuCount
+
+  LmiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: !If
+        - IsNodeEsm
+        - /opt/nodejs/node_modules/newrelic-esm-lambda-wrapper/index.handler
+        - newrelic-lambda-wrapper.handler
+      CodeUri: src/
+      Architectures: [x86_64]
+      Timeout: 30
+      MemorySize: 2048
+      Layers:
+        - !Ref NewRelicLayerArn
+      CapacityProviderConfig:
+        Arn: !GetAtt LmiCapacityProvider.Arn
+      Environment:
+        Variables:
+          NEW_RELIC_ACCOUNT_ID: !Ref NewRelicAccountId
+          NEW_RELIC_LICENSE_KEY: !Ref NewRelicLicenseKey
+          NEW_RELIC_LAMBDA_HANDLER: index.handler
+          NEW_RELIC_USE_ESM: !If [IsNodeEsm, "true", "false"]
+          NEW_RELIC_APM_LAMBDA_MODE: "true"
+          NEW_RELIC_EXTENSION_SEND_LOGS: "function,platform"
+
+Outputs:
+  CapacityProviderArn:
+    Value: !GetAtt LmiCapacityProvider.Arn
+
+  LmiFunctionName:
+    Value: !Ref LmiFunction

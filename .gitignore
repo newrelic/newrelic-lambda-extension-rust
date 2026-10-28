@@ -9,3 +9,5 @@ dist/
 .vscode/
 .DS_Store
 build/
+venv/
+benchmark_nr609043.py

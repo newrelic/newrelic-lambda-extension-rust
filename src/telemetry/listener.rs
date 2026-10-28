@@ -1,8 +1,14 @@
+// Copyright New Relic, Inc. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::{
     logs::processor::LogProcessor,
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
-    request::{get_agent_buffer, get_request_context, set_pending_report, TELEMETRY_CURRENT_REQUEST_ID},
+    request::{
+        get_agent_buffer, get_request_context, get_runtime_done_notify, set_pending_report,
+        CURRENT_ACTIVE_REQUEST_ID, TELEMETRY_CURRENT_REQUEST_ID,
+    },
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +26,30 @@ use hyper_util::rt::TokioIo;
 use http_body_util::{BodyExt, Full};
 use tokio::net::TcpListener;
 
+/// After a successful standard-mode `platform.report`/agent-payload pairing, trigger
+/// an immediate batch send when `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` is enabled.
+/// Pairing happens here, in this listener's `platform.report` handler, which runs
+/// independently of `process_request_concurrently` — so without this the paired
+/// payload would just sit in `AGENT_BATCH_BUFFER` until the 3+ threshold or `SHUTDOWN`
+/// even with the flag on. (This is a report-side concern only: the flag's primary
+/// effect — sending the agent payload itself immediately on arrival — lives in
+/// `request::route_payload_to_request_buffer` instead.)
+///
+/// Reads `newrelic_client`/`config` from `event_loop::SERVERLESS_SEND_CONTEXT` rather
+/// than threading them through `setup_telemetry_listener`/`handle_telemetry_request`
+/// (which have ~20 test call sites). A no-op (with a one-time debug log) if the context
+/// hasn't been set yet — only possible in the brief startup window before `main.rs`
+/// populates it, well before any `platform.report` can arrive.
+fn maybe_send_immediately_if_blocking_enabled() {
+    let Some((client, config, _log_processor)) = crate::event_loop::SERVERLESS_SEND_CONTEXT.get() else {
+        debug!("SERVERLESS_SEND_CONTEXT not yet set - skipping immediate-send check");
+        return;
+    };
+    if config.new_relic.synchronous_flush {
+        let _ = crate::event_loop::maybe_spawn_batch_send(client.clone(), config.clone());
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TelemetryRecord {
     pub time: DateTime<Utc>,
@@ -33,6 +63,7 @@ pub async fn setup_telemetry_listener(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     is_apm_mode: bool,
+    is_lmi: bool,
 ) -> Result<SocketAddr> {
     let addr = "0.0.0.0:0";
     let listener = TcpListener::bind(addr).await.map_err(|e| Error::new(std::io::ErrorKind::AddrInUse, e))?;
@@ -45,6 +76,7 @@ pub async fn setup_telemetry_listener(
                     let log_processor = log_processor.clone();
                     let platform_processor = platform_processor.clone();
                     let is_apm_mode_clone = is_apm_mode;
+                    let is_lmi_clone = is_lmi;
 
                     tokio::spawn(async move {
                         let io = TokioIo::new(stream);
@@ -54,6 +86,7 @@ pub async fn setup_telemetry_listener(
                                 log_processor.clone(),
                                 platform_processor.clone(),
                                 is_apm_mode_clone,
+                                is_lmi_clone,
                             )
                         });
                         
@@ -82,6 +115,7 @@ async fn handle_telemetry_request(
     log_processor: Arc<LogProcessor>,
     platform_processor: Arc<PlatformProcessor>,
     is_apm_mode: bool,
+    is_lmi: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
@@ -114,6 +148,14 @@ async fn handle_telemetry_request(
                                 if let Ok(mut telemetry_req) = TELEMETRY_CURRENT_REQUEST_ID.lock() {
                                     *telemetry_req = Some(request_id_str.to_string());
                                 }
+                                // LMI: INVOKE never arrives, so set the active request and buffer slot
+                                // here. In normal APM mode INVOKE already did this — no-op.
+                                if is_apm_mode {
+                                    if let Ok(mut active) = CURRENT_ACTIVE_REQUEST_ID.lock() {
+                                        *active = Some(request_id_str.to_string());
+                                    }
+                                    crate::request::ensure_lmi_request_slot(request_id_str);
+                                }
                                 debug!("platform.start: Updated telemetry request_id to: {}", request_id_str);
                             }
                         }
@@ -131,6 +173,16 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
+                                // Wake the event loop's end-of-invocation flush waiter.
+                                // On fast functions (< ~50 ms), runtimeDone can arrive before
+                                // the event loop has created per-request state — get_runtime_done_notify
+                                // returns None in that case. Record it in PREFIRED_RUNTIME_DONE so
+                                // create_request_processing_state() fires the notify immediately.
+                                if let Some(notify) = get_runtime_done_notify(request_id_str) {
+                                    notify.notify_one();
+                                } else {
+                                    crate::request::record_prefired_runtime_done(request_id_str);
+                                }
                             }
                         }
                         platform_processor.process_record(record);
@@ -144,14 +196,22 @@ async fn handle_telemetry_request(
                                     if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
+                                        let current_arn = crate::get_global_fallback_arn();
                                         let send_failed = if let Some(ref app) = *apm_app_read {
-                                            if let Err(e) = app.send_platform_report_metrics(&report_line).await {
+                                            let failed = if let Err(e) = app.send_platform_report_metrics(&report_line, &current_arn).await {
                                                 warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id_str, e);
                                                 true
                                             } else {
                                                 debug!("APM mode: Sent platform.report metrics for request: {}", request_id_str);
                                                 false
+                                            };
+                                            // LMI: platform.runtimeDone never fires under LMI, so drain
+                                            // this request's agent buffer now that the invocation has
+                                            // ended. Also rebinds stale run_id failures to the live session.
+                                            if is_lmi {
+                                                drain_lmi_request_on_report(request_id_str, app).await;
                                             }
+                                            failed
                                         } else {
                                             warn!("APM mode: APM app not ready - storing report for retry");
                                             true
@@ -168,7 +228,9 @@ async fn handle_telemetry_request(
                                         // platform.report may arrive in same or next invocation (after freeze/thaw)
                                         if let Some(mut batch_item) = AGENT_BATCH_BUFFER.get_mut(request_id_str) {
                                             batch_item.report_line = Some(report_line);
-                                            debug!("Standard mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                            debug!("Serverless mode: Matched platform.report with batched agent for request: {}", request_id_str);
+                                            drop(batch_item);
+                                            maybe_send_immediately_if_blocking_enabled();
                                         }
                                         else if let Some(buffer) = get_agent_buffer(request_id_str) {
                                             let arn = get_request_context(request_id_str)
@@ -179,36 +241,51 @@ async fn handle_telemetry_request(
                                                         .filter(|arn| !arn.is_empty())
                                                 })
                                                 .unwrap_or_else(crate::get_global_fallback_arn);
-                                            let batched = if let Ok(mut buffer_guard) = buffer.lock() {
-                                                if buffer_guard.is_empty() {
-                                                    false
-                                                } else {
-                                                    debug!("Standard mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
-                                                    for payload_bytes in buffer_guard.iter() {
-                                                        add_to_batch(
-                                                            request_id_str.to_string(),
-                                                            payload_bytes.clone(),
-                                                            Some(report_line.clone()),
-                                                            arn.clone(),
-                                                        );
-                                                    }
-                                                    buffer_guard.clear();
-                                                    true
-                                                }
-                                            } else {
+                                            // Take ownership of the payloads and drop the
+                                            // buffer lock BEFORE any await (trace extraction is
+                                            // async; holding a std Mutex across await is unsound).
+                                            let payloads: Vec<Vec<u8>> = match buffer.lock() {
+                                                Ok(mut g) => std::mem::take(&mut *g),
+                                                Err(_) => Vec::new(),
+                                            };
+                                            let batched = if payloads.is_empty() {
                                                 false
+                                            } else {
+                                                debug!("Serverless mode: Found agent payload in buffer for platform.report: {} - adding to batch", request_id_str);
+                                                for payload_bytes in payloads {
+                                                    // Extract this payload's trace.id and stamp + flush the
+                                                    // request's held logs before batching (serverless: the
+                                                    // listener is the common pairing path).
+                                                    if log_processor.is_trace_collection_enabled() {
+                                                        if let Ok(Some(trace_id)) =
+                                                            crate::trace::extract_trace_id_from_payload(&payload_bytes)
+                                                        {
+                                                            let _ = log_processor
+                                                                .on_trace_id_extracted(request_id_str, &trace_id)
+                                                                .await;
+                                                        }
+                                                    }
+                                                    add_to_batch(
+                                                        request_id_str.to_string(),
+                                                        payload_bytes,
+                                                        Some(report_line.clone()),
+                                                        arn.clone(),
+                                                    );
+                                                }
+                                                true
                                             };
 
                                             if batched {
-                                                debug!("Standard mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                                debug!("Serverless mode: Cleared agent buffer for request {} after matching with report", request_id_str);
+                                                maybe_send_immediately_if_blocking_enabled();
                                             } else {
                                                 set_pending_report(request_id_str, report_line);
-                                                debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                                debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                             }
                                         }
                                         else {
                                             set_pending_report(request_id_str, report_line);
-                                            debug!("Standard mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
+                                            debug!("Serverless mode: Stored platform.report for request: {} (will be matched with agent payload)", request_id_str);
                                         }
                                     }
                                 }
@@ -220,6 +297,62 @@ async fn handle_telemetry_request(
                     "platform.end" => {
                         platform_processor.process_record(record);
                         function_completed = true;
+                    }
+                    "platform.initStart" => {
+                        // `instanceId` on `platform.initStart` is documented generically
+                        // (optional on every `platform.initStart`, NOT LMI-exclusive), but
+                        // what it MEANS differs by deployment context — gate on `is_lmi`
+                        // (DeploymentContext), never on field presence alone:
+                        //   - LMI: `instanceId` is the managed-instance host id (+
+                        //     `instanceMaxMemory`). See src/telemetry/managed_instance.rs.
+                        //   - Standard Lambda: live traffic showed the SAME field, when
+                        //     present, holds the CloudWatch log-stream name for this
+                        //     execution environment instead — best-effort, AWS
+                        //     implementation detail, not a documented guarantee. See
+                        //     src/telemetry/normal_log_stream.rs.
+                        // Captured once per cold start into the relevant global static,
+                        // then read by every outbound attribute composer.
+                        if is_lmi {
+                            if let Some(meta) =
+                                crate::telemetry::managed_instance::extract_managed_instance_metadata(&record.record)
+                            {
+                                let mut guard =
+                                    crate::telemetry::managed_instance::MANAGED_INSTANCE_METADATA
+                                        .write()
+                                        .await;
+                                debug!(
+                                    "Captured managed-instance metadata: instance_id={} instance_max_memory={:?}",
+                                    meta.instance_id, meta.instance_max_memory
+                                );
+                                *guard = Some(meta);
+                            }
+                        } else if let Some(instance_id) = record
+                            .record
+                            .get("instanceId")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut guard =
+                                crate::telemetry::normal_log_stream::NORMAL_LAMBDA_LOG_STREAM
+                                    .write()
+                                    .await;
+                            debug!("Captured best-effort log stream from initStart: {}", instance_id);
+                            *guard = Some(instance_id.to_string());
+                        }
+                        // Existing log-emission path stays the source of truth
+                        // for surfacing platform.initStart as a log entry.
+                        platform_processor.process_record(record);
+                    }
+                    "platform.initReport" => {
+                        // Fires only on cold start (never on warm invocations).
+                        // On LMI, INVOKE is never delivered, so this is the only reliable
+                        // cold-start signal. Set LMI_COLD_START_SEEN so the heartbeat can
+                        // fire version-detail tagging exactly once.
+                        if is_lmi {
+                            crate::LMI_COLD_START_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+                            debug!("LMI: platform.initReport received — cold start detected, version tagging eligible");
+                        }
+                        platform_processor.process_record(record);
                     }
                     _ => {
                         platform_count += 1;
@@ -252,4 +385,50 @@ async fn handle_telemetry_request(
         .status(StatusCode::OK)
         .body(Full::new(Bytes::from("OK")))
         .unwrap())
+}
+
+/// Drain all buffered agent payloads for `request_id` and retry any previously-failed
+/// telemetry with the live `run_id`/`collector_host`.
+///
+/// Called on `platform.report` under LMI because `platform.runtimeDone` is never
+/// delivered in that context (AWS only sends `platform.report` + `SHUTDOWN`).
+/// Without this drain the per-request buffers stay full until the next heartbeat flush.
+///
+/// The caller must already hold a reference to `app` from `APM_APP.read()`.
+async fn drain_lmi_request_on_report(request_id: &str, app: &crate::apm::ApmApp) {
+    let payloads = match crate::request::get_agent_buffer(request_id) {
+        Some(buffer_arc) => match buffer_arc.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(_) => {
+                warn!("LMI drain: failed to lock agent buffer for request {}", request_id);
+                return;
+            }
+        },
+        None => {
+            debug!("LMI drain: no agent buffer slot for request {}", request_id);
+            return;
+        }
+    };
+
+    if !payloads.is_empty() {
+        debug!("LMI drain: processing {} buffered payload(s) for request {}", payloads.len(), request_id);
+        for payload in payloads {
+            if let Err(e) = app.process_agent_payload(payload, request_id).await {
+                // Payload is now in FAILED_TELEMETRY_BUFFER; retry below will rebind it
+                // to the live run_id so it doesn't fail forever on a stale session.
+                warn!("LMI drain: payload send failed for request {}: {}", request_id, e);
+            }
+        }
+    }
+
+    // Rebind any previously-failed telemetry (from prior reconnects) to the
+    // current live run_id and collector_host so stale-session items don't sit
+    // in the buffer indefinitely.
+    crate::apm::telemetry_buffer::retry_buffered_telemetry(
+        &app.client,
+        &app.license_key,
+        Some(&app.run_id),
+        Some(&app.collector_host),
+    )
+    .await;
 }
