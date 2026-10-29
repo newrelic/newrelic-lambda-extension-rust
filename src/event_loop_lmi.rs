@@ -35,7 +35,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::Client;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
@@ -67,12 +66,9 @@ struct LmiFlushHandles {
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
-    /// Lambda runtime client — talks to localhost Extensions API only (`no_proxy()`).
-    /// Used for `/event/next`. Do NOT use for outbound APM collector calls.
-    client: Arc<Client>,
     /// Proxy-aware outbound client with correct timeout for NR APM collector calls.
     /// Built by `build_outbound_client(proxy_url)`. Cloned from `ExtensionComponents`.
-    apm_client: Client,
+    apm_client: crate::newrelic::tls_fallback::DualTlsClient,
     /// Prevents concurrent reconnect spawns. Set to `true` when a reconnect task is
     /// in flight; cleared by `LmiReconnectGuard` on task exit (success or failure).
     reconnect_in_flight: Arc<AtomicBool>,
@@ -84,7 +80,6 @@ impl LmiFlushHandles {
             config: Arc::clone(&c.config),
             global_log_processor: Arc::clone(&c.global_log_processor),
             apm_app: Arc::clone(&c.apm_app),
-            client: Arc::clone(&c.client),
             apm_client: c.apm_client.clone(),
             reconnect_in_flight: Arc::new(AtomicBool::new(false)),
         }
@@ -235,7 +230,7 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
     };
 
     crate::apm::telemetry_buffer::retry_buffered_telemetry(
-        &h.client,
+        &h.apm_client,
         license_key,
         cur_run_id.as_deref(),
         cur_collector_host.as_deref(),
@@ -245,7 +240,7 @@ async fn flush_lmi_telemetry(h: &LmiFlushHandles, final_drain: bool) {
     // Retry platform.report metrics that failed the Metric API send-on-arrival.
     // Under LMI these are buffered by send_platform_report_metrics and would
     // otherwise never resend (no INVOKE-driven retry on LMI).
-    crate::apm::metric_api_buffer::retry_buffered_metric_api(&h.client, license_key).await;
+    crate::apm::metric_api_buffer::retry_buffered_metric_api(&h.apm_client, license_key).await;
 
     if final_drain {
         if let Err(e) = h

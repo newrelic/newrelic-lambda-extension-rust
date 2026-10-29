@@ -17,8 +17,8 @@ use super::connection::{
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
 use super::payload_parser::parse_agent_payload;
 use crate::config::deployment::DeploymentContext;
+use crate::newrelic::tls_fallback::DualTlsClient;
 use anyhow::{Context, Result};
-use reqwest::Client;
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
@@ -32,7 +32,7 @@ pub struct ApmApp {
     pub collector_host: String,
     pub license_key: String,
     pub metric_endpoint: String,
-    pub client: Client,
+    pub client: DualTlsClient,
     /// Deployment context (detected once at startup). Drives type-driven LMI vs Normal
     /// behavior in this app — e.g. strict vs lenient `platform.report` parsing.
     pub deployment: DeploymentContext,
@@ -43,7 +43,7 @@ impl ApmApp {
         license_key: String,
         apm_host: String,
         metric_endpoint: String,
-        client: Client,
+        client: DualTlsClient,
         function_name: String,
         lambda_function_name: String,
         function_version: String,
@@ -141,7 +141,7 @@ impl ApmApp {
         license_key: &str,
         apm_host: &str,
         metric_endpoint: &str,
-        client: &Client,
+        client: &DualTlsClient,
         function_name: &str,
         lambda_function_name: &str,
         function_version: &str,

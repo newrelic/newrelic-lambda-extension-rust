@@ -222,7 +222,7 @@ fn normal_apm() -> DeploymentContext {
 #[serial]
 async fn preconnect_connection_refused_records_failure_reason() {
     reset_connect_stats();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let err = preconnect(&client, "test-key", "127.0.0.1:1", 5).await.unwrap_err();
 
     assert!(is_permanent_auth_error(&err).is_none());
@@ -237,7 +237,7 @@ async fn preconnect_connection_refused_records_failure_reason() {
 #[serial]
 async fn connect_connection_refused_records_failure_reason() {
     reset_connect_stats();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let err = connect(
         &client, "test-key", "127.0.0.1:1",
         "fn", "arn:test", "123", "us-east-1", "1", "python", "1.0.0", 5, None, normal_apm(),
@@ -258,7 +258,7 @@ async fn connect_with_lmi_metadata_covers_some_branch() {
     // `Some(meta) => (Some(meta.instance_id), meta.instance_max_memory)` arm,
     // which is skipped by every other test that passes `None` for lmi_metadata.
     reset_connect_stats();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let meta = ManagedInstanceMetadata {
         instance_id: "lmi-host-42".into(),
         instance_max_memory: Some(2_147_483_648),
@@ -289,7 +289,7 @@ async fn preconnect_timeout_covers_is_timeout_branch() {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     });
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let result = preconnect(&client, "test-key", &format!("127.0.0.1:{port}"), 1).await;
     assert!(result.is_err());
     let reason = last_failure_reason().expect("failure reason must be recorded");
@@ -314,7 +314,7 @@ async fn connect_timeout_covers_is_timeout_branch() {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     });
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let result = connect(
         &client, "test-key", &format!("127.0.0.1:{port}"),
         "fn", "arn:test", "123", "us-east-1", "1", "python", "1.0.0", 1,

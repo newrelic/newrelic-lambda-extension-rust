@@ -143,7 +143,7 @@ fn parse_retry_after_missing_header_returns_none() {
 #[tokio::test]
 async fn send_error_events_empty_slice_is_noop() {
     // No HTTP call is made — function returns Ok(()) immediately.
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &[]).await;
     assert!(result.is_ok());
 }
@@ -152,7 +152,7 @@ async fn send_error_events_empty_slice_is_noop() {
 #[serial]
 async fn send_error_events_connection_refused_returns_error() {
     let _ = take_reconnect_needed();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let events = vec![serde_json::json!({"type": "TransactionError"})];
     let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &events).await;
     assert!(result.is_err());
@@ -166,7 +166,7 @@ async fn send_error_events_connection_refused_returns_error() {
 #[serial]
 async fn send_apm_telemetry_connection_refused_returns_error() {
     let _ = take_reconnect_needed();
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let data = vec![serde_json::json!(null), serde_json::json!({})];
     let result = send_apm_telemetry(&client, "key", "127.0.0.1:1", "run-1", CMD_METRICS, &data).await;
     assert!(result.is_err());
@@ -178,7 +178,7 @@ async fn send_apm_telemetry_connection_refused_returns_error() {
 #[tokio::test]
 async fn send_platform_metrics_empty_is_noop() {
     // No HTTP call — returns Ok(()) immediately without touching port 1.
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let result = send_platform_metrics(&client, "key", "http://127.0.0.1:1/metrics", &[]).await;
     assert!(result.is_ok());
 }
@@ -191,7 +191,7 @@ async fn send_platform_metrics_success_202() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "apm.lambda.duration", "value": 1.0})];
     let result = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await;
     assert!(result.is_ok());
@@ -205,7 +205,7 @@ async fn send_platform_metrics_200_is_success() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "apm.lambda.billed_duration", "value": 100.0})];
     let result = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await;
     assert!(result.is_ok());
@@ -219,7 +219,7 @@ async fn send_platform_metrics_503_is_retryable() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
     let err = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await.unwrap_err();
 
@@ -238,7 +238,7 @@ async fn send_platform_metrics_429_is_retryable_with_retry_after() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
     let err = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await.unwrap_err();
 
@@ -254,7 +254,7 @@ async fn send_platform_metrics_400_is_permanent() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
     let err = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await.unwrap_err();
 
@@ -270,7 +270,7 @@ async fn send_platform_metrics_403_is_permanent() {
         .mount(&server)
         .await;
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
     let err = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await.unwrap_err();
 
@@ -280,7 +280,7 @@ async fn send_platform_metrics_403_is_permanent() {
 #[tokio::test]
 async fn send_platform_metrics_network_error_is_retryable() {
     // Port 1 → ECONNREFUSED → MetricApiError::Network.
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
     let err = send_platform_metrics(&client, "test-key", "http://127.0.0.1:1/metrics", &metrics)
         .await

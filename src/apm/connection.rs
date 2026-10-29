@@ -5,8 +5,8 @@
 //!
 //! Based on connect.go PreConnect() and Connect()
 
+use crate::newrelic::tls_fallback::DualTlsClient;
 use anyhow::{Result, anyhow};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::sync::Mutex;
@@ -223,7 +223,7 @@ pub struct ConnectReturnValue {
 
 /// Execute PreConnect to get regional collector host
 pub async fn preconnect(
-    client: &Client,
+    client: &DualTlsClient,
     license_key: &str,
     base_host: &str,
     timeout_secs: u64,
@@ -246,6 +246,7 @@ pub async fn preconnect(
     debug!("PreConnect request to {} (timeout: {}s)", redact_url(&url), timeout_secs);
 
     let response = client
+        .active()
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
@@ -259,6 +260,7 @@ pub async fn preconnect(
         // reqwest's error Display embeds the URL, which contains `license_key`.
         // These are transient and retried by the caller, so log at debug, not error.
         .map_err(|e| {
+            crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
             let sanitized = e.without_url();
             let reason = if sanitized.is_timeout() {
                 format!("timeout after {timeout_secs}s")
@@ -296,7 +298,7 @@ pub async fn preconnect(
 /// Execute Connect to get Run ID and Entity GUID
 #[allow(clippy::too_many_arguments)]
 pub async fn connect(
-    client: &Client,
+    client: &DualTlsClient,
     license_key: &str,
     collector_host: &str,
     function_name: &str,
@@ -351,6 +353,7 @@ pub async fn connect(
     debug!("Connect request to {} (timeout: {}s)", redact_url(&url), timeout_secs);
 
     let response = client
+        .active()
         .post(&url)
         .header("Content-Type", "application/octet-stream")
         .header("Content-Encoding", "gzip")
@@ -363,6 +366,7 @@ pub async fn connect(
         // Strip the request URL (contains `license_key`) before log/propagation.
         // Transient failure retried by the caller, so log at debug, not error.
         .map_err(|e| {
+            crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
             let sanitized = e.without_url();
             let reason = if sanitized.is_timeout() {
                 format!("timeout after {timeout_secs}s")

@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "newrelic-lambda-extension"
-version = "2.7.1"
+version = "2.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1464,6 +1464,8 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "reqwest",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_json",
  "serial_test",
@@ -1876,6 +1878,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

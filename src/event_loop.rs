@@ -70,7 +70,7 @@ pub struct ExtensionComponents {
     pub global_log_processor: Arc<LogProcessor>,
     pub apm_app: crate::apm::SharedApmApp,
     pub apm_mode_enabled: bool, // Actual mode after runtime detection (may differ from config for Java)
-    pub apm_client: Client,
+    pub apm_client: crate::newrelic::tls_fallback::DualTlsClient,
     pub reconnect_in_flight: Arc<watch::Sender<bool>>,
     /// Deployment context (Normal Lambda vs LMI). Drives top-level loop dispatch
     /// in `execute_main_telemetry_processing_loop` — Normal Lambda routes to the
@@ -265,11 +265,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             None => (None, None),
                         }
                     };
-                    let http_client = components.client.clone();
+                    let apm_client = components.apm_client.clone();
                     let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
                     tokio::spawn(async move {
                         crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                            &http_client,
+                            &apm_client,
                             &license_key,
                             cur_run_id.as_deref(),
                             cur_collector_host.as_deref(),
@@ -281,11 +281,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if components.apm_mode_enabled
                     && crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0
                 {
-                    let http_client = components.client.clone();
+                    let apm_client = components.apm_client.clone();
                     let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
                     tokio::spawn(async move {
                         crate::apm::metric_api_buffer::retry_buffered_metric_api(
-                            &http_client,
+                            &apm_client,
                             &license_key,
                         )
                         .await;
@@ -706,14 +706,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 };
                 crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.client,
+                    &components.apm_client,
                     &license_key,
                     cur_run_id.as_deref(),
                     cur_collector_host.as_deref(),
                 )
                 .await;
                 crate::apm::metric_api_buffer::retry_buffered_metric_api(
-                    &components.client,
+                    &components.apm_client,
                     &license_key,
                 )
                 .await;
@@ -962,11 +962,11 @@ pub async fn execute_standard_mode_event_loop(components: &mut ExtensionComponen
                     });
                 }
                 {
-                    let http_client = components.client.clone();
+                    let apm_client = components.apm_client.clone();
                     let license_key = components.config.new_relic.license_key.clone();
                     tokio::spawn(async move {
                         crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                            &http_client,
+                            &apm_client,
                             license_key.as_deref().unwrap_or(""),
                             None,
                             None,

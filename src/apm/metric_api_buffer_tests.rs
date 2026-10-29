@@ -90,7 +90,7 @@ async fn mock_server(codes: Vec<u16>) -> String {
 async fn retry_proceeds_without_apm_session() {
     clear();
     let url = mock_server(vec![202]).await;
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     buffer_failed_metric_api(
         vec![json!({"name": "apm.lambda.transaction.duration"})],
         url,
@@ -116,7 +116,7 @@ async fn transient_503_is_buffered_then_resent_successfully() {
     clear();
     // First request → 503, second request → 202.
     let url = mock_server(vec![503, 202]).await;
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
 
     // First send attempt: 503 → classified transient → buffered.
     let err = super::super::collector::send_platform_metrics(
@@ -151,7 +151,7 @@ async fn transient_503_is_buffered_then_resent_successfully() {
 async fn permanent_400_is_not_buffered() {
     clear();
     let url = mock_server(vec![400]).await;
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let err = super::super::collector::send_platform_metrics(
         &client,
         "lk",
@@ -193,7 +193,7 @@ fn retry_after_gates_send_and_rebuffers() {
         "http://127.0.0.1:1/never".into(),
         Some(Duration::from_secs(3600)),
     );
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -236,7 +236,7 @@ fn ages_out_old_items_without_sending() {
             next_retry_at: None,
         });
     }
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -261,7 +261,7 @@ async fn permanent_error_on_retry_drops_item() {
     buffer_failed_metric_api(vec![json!({"name": "m"})], url, None);
     assert_eq!(get_metric_api_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_metric_api(&client, "lk").await;
 
     assert_eq!(
@@ -285,7 +285,7 @@ async fn transient_429_on_retry_rebuffers_with_next_retry_at() {
     buffer_failed_metric_api(vec![json!({"name": "m"})], url, None);
     assert_eq!(get_metric_api_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_metric_api(&client, "lk").await;
 
     // Item must be re-buffered (retry_count=1 < MAX_RETRY_ATTEMPTS).
@@ -316,7 +316,7 @@ async fn drop_after_max_retries_removes_item() {
     }
     assert_eq!(get_metric_api_buffer_count(), 1);
 
-    let client = reqwest::Client::new();
+    let client = crate::newrelic::tls_fallback::test_client();
     retry_buffered_metric_api(&client, "lk").await;
 
     // retry_count bumps to 10; 10 < MAX_RETRY_ATTEMPTS (10) is false → dropped.

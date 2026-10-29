@@ -1728,7 +1728,9 @@ mod tests {
                 collector_host: "http://unreachable.invalid.test".to_string(),
                 license_key: "fake-license-for-drain-test".to_string(),
                 metric_endpoint: "http://metric.invalid.test/metric/v1".to_string(),
-                client: ReqwestClient::builder().timeout(Duration::from_millis(50)).build().unwrap_or_default(),
+                client: crate::newrelic::tls_fallback::DualTlsClient::build(|| {
+                    ReqwestClient::builder().timeout(Duration::from_millis(50))
+                }),
                 deployment: DeploymentContext::Lmi,
             };
             let mut guard = crate::APM_APP.write().await;
