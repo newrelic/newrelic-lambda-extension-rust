@@ -2114,6 +2114,88 @@ mod lmi_process_record_tests {
             "function log content must never synthesize an Errors Inbox entry"
         );
     }
+
+    // Object records are re-stringified so custom fields travel with the message,
+    // instead of keeping only `message` and dropping everything else.
+    #[tokio::test]
+    async fn custom_json_keys_on_direct_stdout_object_survive_via_restringify() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "log.level": "info",
+                "log.logger": "repro.grpc",
+                "message": "Handled request",
+                "grpc.method": "CheckResources",
+                "repro.marker": "OBJ-MARKER-0001",
+                "nested": {"call_id": "repro-call-1"}
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        let message = &batch[0].message;
+        // Every field from the original object must survive inside the re-stringified
+        // message — no attribute merging, just full fidelity of the original JSON.
+        assert!(message.contains("\"grpc.method\":\"CheckResources\""), "got: {message}");
+        assert!(message.contains("\"repro.marker\":\"OBJ-MARKER-0001\""), "got: {message}");
+        assert!(message.contains("\"log.logger\":\"repro.grpc\""), "got: {message}");
+        assert!(message.contains("\"call_id\":\"repro-call-1\""), "got: {message}");
+        assert!(message.contains("\"message\":\"Handled request\""), "got: {message}");
+    }
+
+    // A string record must pass through untouched, never re-serialized.
+    #[tokio::test]
+    async fn plaintext_string_record_is_never_restringified() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        p.process_record(function_record(None, "plain text line, not JSON at all")).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].message, "plain text line, not JSON at all",
+            "string records must be forwarded verbatim, byte-for-byte — never re-serialized"
+        );
+    }
+
+    // A string that happens to look like JSON must still pass through untouched.
+    #[tokio::test]
+    async fn json_shaped_string_record_is_not_reparsed_or_restringified() {
+        let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
+        let raw = r#"{"message":"hello","grpc.method":"CheckResources"}"#;
+        p.process_record(function_record(None, raw)).await;
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].message, raw,
+            "a Value::String record is forwarded as-is, even if its contents look like JSON"
+        );
+    }
+
+    // Same fix under LMI, which routes through pre_invoke_buffer instead of log_batch.
+    #[tokio::test]
+    async fn lmi_custom_json_keys_on_direct_stdout_object_survive_via_restringify() {
+        let p = processor(DeploymentContext::Lmi, "", "");
+        let record = TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "requestId": "r-lmi-1",
+                "message": "Handled request",
+                "grpc.method": "CheckResources"
+            }),
+        };
+
+        p.process_record(record).await;
+
+        let buf = p.pre_invoke_buffer.lock().unwrap();
+        assert_eq!(buf.len(), 1);
+        assert!(buf[0].message.contains("\"grpc.method\":\"CheckResources\""), "got: {}", buf[0].message);
+    }
 }
 
 #[cfg(test)]

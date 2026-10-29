@@ -858,16 +858,14 @@ impl LogProcessor {
         
         // Compute message string ONCE, passed to to_log_message to avoid
         // double-serialization of non-String records.
+        //
+        // An object record is re-serialized back into a string so every field the
+        // customer logged is preserved, instead of keeping only `message`. The
+        // String arm is untouched.
         let message_owned: String = match &record.record {
             serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Object(obj) => {
-                if let Some(serde_json::Value::String(s)) = obj.get("message") {
-                    s.clone()
-                } else if let Some(other) = obj.get("message") {
-                    other.to_string()
-                } else {
-                    serde_json::to_string(&record.record).unwrap_or_default()
-                }
+            serde_json::Value::Object(_) => {
+                serde_json::to_string(&record.record).unwrap_or_default()
             }
             other => other.to_string(),
         };
