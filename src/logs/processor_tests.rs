@@ -2115,11 +2115,8 @@ mod lmi_process_record_tests {
         );
     }
 
-    // NR case 00366014: AWS Telemetry API schemas >= 2022-12-13 deliver JSON-formatted
-    // function logs as a parsed OBJECT (previously always a STRING). The old code only
-    // read `obj.get("message")`, silently dropping every sibling key. Fix: re-stringify
-    // the whole object so custom fields travel with the message, same as they always
-    // did when AWS delivered a string. This locks in that behavior for the object path.
+    // Object records are re-stringified so custom fields travel with the message,
+    // instead of keeping only `message` and dropping everything else.
     #[tokio::test]
     async fn custom_json_keys_on_direct_stdout_object_survive_via_restringify() {
         let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
@@ -2150,10 +2147,7 @@ mod lmi_process_record_tests {
         assert!(message.contains("\"message\":\"Handled request\""), "got: {message}");
     }
 
-    // Sanity guard: a plain-text (string) record must take the untouched `String =>
-    // s.clone()` arm — never pass through `serde_json::to_string`, which would
-    // double-encode it (wrapping it in extra quotes / escaping). Only Object records
-    // are re-stringified.
+    // A string record must pass through untouched, never re-serialized.
     #[tokio::test]
     async fn plaintext_string_record_is_never_restringified() {
         let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
@@ -2167,10 +2161,7 @@ mod lmi_process_record_tests {
         );
     }
 
-    // A JSON string that itself looks like an object (e.g. a pre-serialized payload
-    // logged as a plain string by the function, not parsed by AWS into a `record`
-    // object) must ALSO take the untouched String arm — AWS's own parsing, not our
-    // `Value` variant, decides which branch runs, so no double round-trip occurs here.
+    // A string that happens to look like JSON must still pass through untouched.
     #[tokio::test]
     async fn json_shaped_string_record_is_not_reparsed_or_restringified() {
         let p = processor(DeploymentContext::Normal { mode: TelemetryMode::Serverless }, "arn:aws:lambda:us-east-1:1:function:f", "r-1");
@@ -2185,9 +2176,7 @@ mod lmi_process_record_tests {
         );
     }
 
-    // Object record under LMI: merge/forwarding behavior must be identical to Normal
-    // Lambda — the fix isn't scoped to one deployment context. LMI routes through
-    // pre_invoke_buffer rather than log_batch (no INVOKE-populated context).
+    // Same fix under LMI, which routes through pre_invoke_buffer instead of log_batch.
     #[tokio::test]
     async fn lmi_custom_json_keys_on_direct_stdout_object_survive_via_restringify() {
         let p = processor(DeploymentContext::Lmi, "", "");

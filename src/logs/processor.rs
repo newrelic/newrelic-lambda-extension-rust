@@ -859,22 +859,9 @@ impl LogProcessor {
         // Compute message string ONCE, passed to to_log_message to avoid
         // double-serialization of non-String records.
         //
-        // AWS Telemetry API schemas >= 2022-12-13 deliver JSON-formatted function/
-        // extension logs as a parsed OBJECT instead of the STRING every schema used
-        // to always send (NR case 00366014). AWS does not restrict which fields are
-        // present in either shape (confirmed via AWS's own OpenAPI spec — "record" is
-        // an unconstrained `true` schema — and via live capture of the raw payload);
-        // only the shape changes, never the data. Previously this branch read only
-        // `obj.get("message")`, silently discarding every sibling key once AWS started
-        // handing over a real object — harmless under the old schema (this branch
-        // never ran, since record was always a string), but a real data-loss bug once
-        // the extension requested the newer schema for LMI support.
-        //
-        // Fix: re-serialize the object back into a string, so the extension's output
-        // is the same shape (a string carrying the full logged content) regardless of
-        // which shape AWS delivered. This matches exactly what already happens for a
-        // String record below — that arm is untouched, so a plain-text or already-
-        // string JSON log is never re-processed or re-serialized here.
+        // An object record is re-serialized back into a string so every field the
+        // customer logged is preserved, instead of keeping only `message`. The
+        // String arm is untouched.
         let message_owned: String = match &record.record {
             serde_json::Value::String(s) => s.clone(),
             serde_json::Value::Object(_) => {
