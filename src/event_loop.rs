@@ -478,11 +478,21 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     .await;
                 });
 
-                // process_apm_request (current_task) resolves this invocation's own
-                // agent-payload send at its runtimeDone boundary (bounded by
-                // APM_SEND_RUNTIME_DONE_GRACE, then handed to FAILED_AGENT_PAYLOADS) — so
-                // it is always awaited inline here before returning to /next. There is no
-                // deferred-handle queue: every invocation closes out its own send.
+                // process_apm_request (current_task) is always awaited inline here
+                // before this loop returns to /next — that part is unconditional.
+                // What happens *inside* it depends on config.extension.send_tier:
+                // - SendTier::Default: resolves this invocation's own agent-payload
+                //   send at its runtimeDone boundary, bounded by
+                //   APM_SEND_RUNTIME_DONE_GRACE, then FAILED_AGENT_PAYLOADS on timeout.
+                //   Every invocation closes out its own send before this await returns.
+                // - SendTier::High: stashes this invocation's send into
+                //   PENDING_AGENT_SEND instead of waiting on it, and — at the very top
+                //   of the *next* call to process_apm_request — resolves whatever the
+                //   previous invocation stashed, with the same bound. The await below
+                //   still can't return until that resolution finishes; what changed is
+                //   *which* invocation's boundary pays for it, not whether /next can be
+                //   blocked at all. See PENDING_AGENT_SEND's doc comment for the full
+                //   design and REDESIGN_PLAN.md for why.
                 if let Err(e) = current_task.await {
                     error!("Error in APM request processing: {}", e);
                 }
