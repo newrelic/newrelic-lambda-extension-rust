@@ -37,19 +37,6 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT_MS: u64 = 1800;
 
-/// Bounded wait (APM mode, Normal Lambda) for this invocation's own agent-payload
-/// send to finish at the `runtimeDone` boundary before returning to `/next`.
-///
-/// The send is fired the instant the payload is ready (Flow-1 in `process_apm_request`),
-/// overlapping it with the function's remaining execution. At `runtimeDone` we check it:
-/// already finished → zero added latency; still in flight → wait up to this bound, then
-/// hand the payload to the existing durable `FAILED_AGENT_PAYLOADS` retry path (exactly
-/// as an HTTP failure would) and return to `/next`. This is UNCONDITIONAL behavior — not
-/// an env var, not customer-tunable — replacing the old `pipeline_flush` on/off branch.
-/// Deliberately never detaches a send past `/next` (the sandbox freezes once every
-/// extension has called `/next`, which would freeze the send mid-flight).
-const APM_SEND_RUNTIME_DONE_GRACE: Duration = Duration::from_millis(100);
-
 /// Safety margin (ms) reserved before a function's own remaining deadline when
 /// bound-waiting for something within an invocation (an APM handshake, a late agent
 /// payload, or a late `platform.report`) — leaves headroom for the downstream
@@ -151,6 +138,132 @@ fn push_failed_payload_capped(buf: &mut Vec<FailedAgentPayload>, payload: Failed
 /// Track last processed request for error synthesis on shutdown
 pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String, String)>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
+
+/// The scheduler driving the agent-payload Flow-1 send, for both tiers.
+/// Mode is resolved once from `NEW_RELIC_SEND_TIER` at first use — the env
+/// var doesn't change during a running process, so a `Lazy` built directly
+/// from `SendTier::from_env()` (mirroring `ExtensionConfig::from_env()`'s own
+/// parse) is equivalent to reading `config.extension.send_tier` here, without
+/// needing to thread `config` through static initialization.
+///
+/// `default` tier: spawn (fired the instant the payload is ready, overlapping
+/// the function's remaining execution — see the Flow-1 spawn site) then
+/// resolved at *this* invocation's own `runtimeDone` boundary.
+/// `high` tier: same spawn, but resolved at the *next* invocation's start
+/// instead. Either way, the bounded-wait/abort-on-timeout mechanics are
+/// `SendScheduler`'s, not duplicated here.
+static AGENT_SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
+    once_cell::sync::Lazy::new(|| crate::send::SendTier::from_env().build_scheduler());
+
+/// Metadata `SendScheduler` deliberately doesn't know about — the actual
+/// payload bytes and the request/ARN needed to buffer the unresolved tail
+/// into `FAILED_AGENT_PAYLOADS` on a timeout. Written alongside every
+/// `AGENT_SEND_SCHEDULER.spawn(...)` call, consumed by
+/// `resolve_pending_agent_batch`. At most one entry at a time, for the same
+/// reason `AGENT_SEND_SCHEDULER` only ever has at most one pending handle
+/// for `SendKind::ApmCollector`: Normal-mode Lambda never runs concurrent
+/// invocations in one environment.
+struct AgentBatchMeta {
+    payloads: Vec<Arc<Vec<u8>>>,
+    request_id: String,
+    invoked_function_arn: String,
+}
+
+static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<AgentBatchMeta>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// Buffer `payloads[resolved_cursor..]` into `FAILED_AGENT_PAYLOADS` — the
+/// re-buffering half of what the old `resolve_agent_send_at_boundary` did
+/// end-to-end; the scheduling/bounded-wait/abort half now lives entirely in
+/// `SendScheduler`. A no-op when `resolved_cursor >= payloads.len()` (the
+/// `Failed` case: the task ran to completion and every payload already
+/// buffered its own HTTP failure via `send_agent_payload_or_buffer` — only
+/// `TimedOut`, where the task was aborted mid-batch, ever has a genuinely
+/// unresolved tail here).
+fn buffer_unresolved_agent_payloads(
+    payloads: &[Arc<Vec<u8>>],
+    resolved_cursor: usize,
+    request_id: &str,
+    invoked_function_arn: &str,
+) {
+    let unresolved = payloads.get(resolved_cursor..).unwrap_or(&[]);
+    if unresolved.is_empty() {
+        return;
+    }
+    warn!(
+        "APM mode: agent send for {} did not finish in time — buffering {} of {} payload(s) for retry (resolved {})",
+        request_id,
+        unresolved.len(),
+        payloads.len(),
+        resolved_cursor
+    );
+    for payload_bytes in unresolved {
+        buffer_failed_agent_payload(payload_bytes.as_slice(), request_id, invoked_function_arn);
+    }
+}
+
+/// Resolve whatever agent-payload batch is currently pending in
+/// `AGENT_SEND_SCHEDULER` (if any) and buffer its unresolved tail. No-op if
+/// nothing is pending — including the first-invocation case, where nothing
+/// has ever been spawned yet.
+///
+/// Called from three places, all equivalent as far as this function is
+/// concerned (only *when* it's called differs, not what it does):
+/// - `SendTier::Default`: at this invocation's own `runtimeDone` boundary.
+/// - `SendTier::High`: at the start of the *next* invocation.
+/// - `SHUTDOWN`: there's no next invocation to defer to, so this is the
+///   final drain.
+async fn resolve_pending_agent_batch() {
+    let Some(outcome) = AGENT_SEND_SCHEDULER
+        .resolve_pending(crate::send::SendKind::ApmCollector)
+        .await
+    else {
+        return;
+    };
+
+    let meta = match AGENT_BATCH_META.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(e) => {
+            error!("AGENT_BATCH_META lock poisoned, cannot resolve: {}", e);
+            return;
+        }
+    };
+    let Some(meta) = meta else {
+        // AGENT_SEND_SCHEDULER and AGENT_BATCH_META are always written
+        // together at the spawn site below — this should be unreachable.
+        error!(
+            "AGENT_SEND_SCHEDULER had a pending agent batch but AGENT_BATCH_META was empty \
+             — payload metadata lost, cannot buffer any unresolved tail"
+        );
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: agent send for {} completed successfully",
+                meta.request_id
+            );
+        }
+        crate::send::DispatchResult::Failed | crate::send::DispatchResult::TimedOut => {
+            buffer_unresolved_agent_payloads(
+                &meta.payloads,
+                outcome.cursor.unwrap_or(0),
+                &meta.request_id,
+                &meta.invoked_function_arn,
+            );
+        }
+        crate::send::DispatchResult::Dropped | crate::send::DispatchResult::Deferred => {
+            // Unreachable in practice: resolve_pending never checks the
+            // breaker (Dropped is a dispatch()-only outcome) and never
+            // itself returns Deferred. Handled defensively, not assumed.
+            warn!(
+                "APM mode: unexpected {:?} resolving agent batch for {}",
+                outcome.result, meta.request_id
+            );
+        }
+    }
+}
 
 /// Event loop: handles cold start (first invoke) and warm starts (subsequent invokes)
 pub async fn run_infinite_event_loop(
@@ -482,17 +595,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // before this loop returns to /next — that part is unconditional.
                 // What happens *inside* it depends on config.extension.send_tier:
                 // - SendTier::Default: resolves this invocation's own agent-payload
-                //   send at its runtimeDone boundary, bounded by
-                //   APM_SEND_RUNTIME_DONE_GRACE, then FAILED_AGENT_PAYLOADS on timeout.
-                //   Every invocation closes out its own send before this await returns.
-                // - SendTier::High: stashes this invocation's send into
-                //   PENDING_AGENT_SEND instead of waiting on it, and — at the very top
-                //   of the *next* call to process_apm_request — resolves whatever the
-                //   previous invocation stashed, with the same bound. The await below
-                //   still can't return until that resolution finishes; what changed is
-                //   *which* invocation's boundary pays for it, not whether /next can be
-                //   blocked at all. See PENDING_AGENT_SEND's doc comment for the full
-                //   design and REDESIGN_PLAN.md for why.
+                //   send (spawned via AGENT_SEND_SCHEDULER) at its runtimeDone
+                //   boundary, bounded, then FAILED_AGENT_PAYLOADS on timeout. Every
+                //   invocation closes out its own send before this await returns.
+                // - SendTier::High: leaves this invocation's send pending in
+                //   AGENT_SEND_SCHEDULER instead of waiting on it, and — at the very
+                //   top of the *next* call to process_apm_request — resolves whatever
+                //   the previous invocation left pending, with the same bound. The
+                //   await below still can't return until that resolution finishes;
+                //   what changed is *which* invocation's boundary pays for it, not
+                //   whether /next can be blocked at all. See AGENT_SEND_SCHEDULER's
+                //   doc comment for the full design and REDESIGN_PLAN.md for why.
                 if let Err(e) = current_task.await {
                     error!("Error in APM request processing: {}", e);
                 }
@@ -619,11 +732,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 }
 
                 // SendTier::High: there is no "next invocation" at shutdown to defer
-                // to, so drain whatever the last invocation stashed here first, with
-                // the same bounded wait resolve_agent_send_at_boundary already uses.
-                // Harmless no-op under SendTier::Default (nothing is ever stashed
-                // there) and on the common case where nothing is pending.
-                resolve_previous_pending_agent_send().await;
+                // to, so drain whatever the last invocation left pending in
+                // AGENT_SEND_SCHEDULER first. Harmless no-op under SendTier::Default
+                // (already resolved at its own boundary) and on the common case
+                // where nothing is pending.
+                resolve_pending_agent_batch().await;
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
@@ -1244,9 +1357,10 @@ pub async fn process_apm_request(
     // SendTier::High: resolve whatever the previous invocation deferred before this
     // invocation does any of its own Flow-1 work. Gated on the tier so
     // SendTier::Default (the default, unchanged-behavior path) never even touches
-    // PENDING_AGENT_SEND's lock. No-op on the first invocation (nothing pending yet).
+    // AGENT_SEND_SCHEDULER's lock here (it resolves at its own boundary instead).
+    // No-op on the first invocation (nothing pending yet).
     if config.extension.send_tier == crate::send::SendTier::High {
-        resolve_previous_pending_agent_send().await;
+        resolve_pending_agent_batch().await;
     }
 
     if !is_cold_start {
@@ -1334,16 +1448,14 @@ pub async fn process_apm_request(
     // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
     //
-    // The Flow-1 send is fired here, the instant the payload is ready, overlapping it with
-    // the function's remaining execution. Its JoinHandle (and a copy of the payloads for
-    // the fallback buffer) are returned so the runtimeDone boundary below can resolve it
-    // within APM_SEND_RUNTIME_DONE_GRACE, then hand any still-unsent payload to
-    // FAILED_AGENT_PAYLOADS — never detach it past /next.
-    let send_agent_task: Option<(
-        tokio::task::JoinHandle<bool>,
-        Vec<Arc<Vec<u8>>>,
-        Arc<std::sync::atomic::AtomicUsize>,
-    )> = if has_run_id && got_payload {
+    // The Flow-1 send is spawned here, the instant the payload is ready, via
+    // AGENT_SEND_SCHEDULER.spawn — overlapping it with the function's remaining
+    // execution, regardless of send_tier. What differs by tier is only *when* it gets
+    // resolved: SendTier::Default resolves it at this invocation's own runtimeDone
+    // boundary below; SendTier::High resolves it at the start of the next invocation
+    // (see resolve_pending_agent_batch's call near the top of this function). Either
+    // way it's never detached past /next.
+    if has_run_id && got_payload {
         debug!(
             "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
             agent_payloads.len()
@@ -1356,20 +1468,21 @@ pub async fn process_apm_request(
 
         // Wrap each payload in an Arc once (moves the bytes, no copy). Cloning for the
         // spawned task is then a refcount bump — not a per-invocation byte copy of every
-        // payload (matters at ~28M invocations/day). The original Arc vec is retained for
-        // the runtimeDone-boundary timeout fallback.
+        // payload (matters at ~28M invocations/day). The original Arc vec is retained in
+        // AGENT_BATCH_META for the timeout fallback.
         let payloads: Vec<Arc<Vec<u8>>> = agent_payloads.into_iter().map(Arc::new).collect();
         let payloads_for_task = payloads.clone();
 
         // Progress cursor: incremented strictly AFTER each payload's send/buffer outcome
-        // is fully resolved. On a boundary timeout, only payloads[cursor..] (not yet
-        // started/finished) are re-buffered — payloads before the cursor were already
-        // sent successfully or individually buffered by the task itself, so re-buffering
-        // them would duplicate telemetry / FAILED_AGENT_PAYLOADS entries.
+        // is fully resolved. SendScheduler reports its value back on TimedOut/Failed, so
+        // only payloads[cursor..] (not yet started/finished) ever get re-buffered —
+        // payloads before the cursor were already sent successfully or individually
+        // buffered by the task itself, so re-buffering them would duplicate telemetry /
+        // FAILED_AGENT_PAYLOADS entries.
         let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cursor_clone = cursor.clone();
 
-        let handle = tokio::spawn(async move {
+        let send: crate::send::BoxedSend = Box::pin(async move {
             let mut all_sent = true;
             for payload_bytes in &payloads_for_task {
                 extract_and_coordinate_trace_id(
@@ -1398,9 +1511,36 @@ pub async fn process_apm_request(
                 // fetch_add — atomic; the aborted task can't be killed mid-increment).
                 cursor_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            all_sent
+            if all_sent {
+                crate::send::SendOutcome::Success
+            } else {
+                crate::send::SendOutcome::Failure
+            }
         });
-        Some((handle, payloads, cursor))
+
+        let meta = AgentBatchMeta {
+            payloads,
+            request_id: request_id.clone(),
+            invoked_function_arn: invoked_function_arn.clone(),
+        };
+        match AGENT_BATCH_META.lock() {
+            Ok(mut guard) => {
+                if guard.is_some() {
+                    // Defensive, should-not-happen: AGENT_SEND_SCHEDULER.spawn's own
+                    // orphan-abort below already logs/handles the handle side of this;
+                    // this just keeps the metadata side in lockstep with it.
+                    warn!(
+                        "APM mode: overwriting unresolved AGENT_BATCH_META — \
+                         resolve_pending_agent_batch should have run first"
+                    );
+                }
+                *guard = Some(meta);
+            }
+            Err(e) => error!("AGENT_BATCH_META lock poisoned, dropping new entry: {}", e),
+        }
+        AGENT_SEND_SCHEDULER
+            .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
+            .await;
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
@@ -1425,12 +1565,12 @@ pub async fn process_apm_request(
                 request_id
             );
         }
-        None
-    };
+    }
 
-    // The Flow-1 send keeps running in the background while the function finishes; it is
-    // resolved at the runtimeDone boundary below (see `send_agent_task` handling after
-    // `wait_for_runtime_done_with_grace`), not detached-and-forgotten.
+    // The Flow-1 send (if any was spawned above) keeps running in the background while
+    // the function finishes; it is resolved below — at this invocation's own boundary
+    // under SendTier::Default, or already resolved for the *previous* invocation at the
+    // top of this function under SendTier::High — never detached-and-forgotten.
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode).
     //
@@ -1486,26 +1626,12 @@ pub async fn process_apm_request(
     )
     .await;
 
-    // runtimeDone boundary: resolve this invocation's own Flow-1 agent send before
-    // returning to /next — or, under SendTier::High, defer it to the start of the
-    // next invocation instead. See resolve_previous_pending_agent_send's call at the
-    // top of this function for where High-tier's deferred entry gets resolved.
-    if let Some((handle, payloads, cursor)) = send_agent_task {
-        match config.extension.send_tier {
-            crate::send::SendTier::Default => {
-                resolve_agent_send_at_boundary(handle, payloads, cursor, &request_id, &invoked_function_arn)
-                    .await;
-            }
-            crate::send::SendTier::High => {
-                stash_pending_agent_send(
-                    handle,
-                    payloads,
-                    cursor,
-                    request_id.clone(),
-                    invoked_function_arn.clone(),
-                );
-            }
-        }
+    // runtimeDone boundary: SendTier::Default resolves this invocation's own Flow-1
+    // agent send (already spawned into AGENT_SEND_SCHEDULER above) right here, before
+    // returning to /next. SendTier::High leaves it pending — resolved instead at the
+    // top of the *next* invocation (see that call near this function's start).
+    if config.extension.send_tier == crate::send::SendTier::Default {
+        resolve_pending_agent_batch().await;
     }
 
     // Fully detached, no wait at all -- /next must never be blocked by this, not even
@@ -1568,165 +1694,6 @@ async fn send_to_apm_collector(
         return Err("APM connection not ready yet - payload buffered for retry".into());
     }
     Ok(())
-}
-
-/// A Flow-1 agent send deferred past its own invocation's `runtimeDone` boundary,
-/// waiting to be resolved at the start of the *next* invocation. Only populated when
-/// `config.extension.send_tier` is `SendTier::High` — `SendTier::Default` always
-/// resolves immediately via `resolve_agent_send_at_boundary` and never touches this.
-struct PendingAgentSend {
-    handle: tokio::task::JoinHandle<bool>,
-    payloads: Vec<Arc<Vec<u8>>>,
-    cursor: Arc<std::sync::atomic::AtomicUsize>,
-    request_id: String,
-    invoked_function_arn: String,
-}
-
-/// Holds at most one deferred Flow-1 send at a time. Normal-mode Lambda never runs
-/// concurrent invocations in one environment, so there is at most one producer
-/// (`stash_pending_agent_send`, called once per invocation under `SendTier::High`)
-/// and at most one consumer (`resolve_previous_pending_agent_send`, called once at the
-/// start of the next invocation) active at any moment — a plain `std::sync::Mutex` is
-/// sufficient, no async lock needed.
-static PENDING_AGENT_SEND: once_cell::sync::Lazy<Mutex<Option<PendingAgentSend>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(None));
-
-/// `SendTier::High` path: stash this invocation's Flow-1 send instead of waiting on it
-/// now. Resolved later by `resolve_previous_pending_agent_send`, at the start of the
-/// next invocation.
-///
-/// Defensive, should-not-happen case: if a previous entry is still here (meaning
-/// `resolve_previous_pending_agent_send` was not called before this), abort the
-/// orphaned handle rather than silently leaking it — mirrors
-/// `SendScheduler::spawn_deferred`'s identical defensive-abort behavior.
-fn stash_pending_agent_send(
-    handle: tokio::task::JoinHandle<bool>,
-    payloads: Vec<Arc<Vec<u8>>>,
-    cursor: Arc<std::sync::atomic::AtomicUsize>,
-    request_id: String,
-    invoked_function_arn: String,
-) {
-    let entry = PendingAgentSend {
-        handle,
-        payloads,
-        cursor,
-        request_id,
-        invoked_function_arn,
-    };
-    let orphaned = match PENDING_AGENT_SEND.lock() {
-        Ok(mut guard) => guard.replace(entry),
-        Err(e) => {
-            error!("PENDING_AGENT_SEND lock poisoned, dropping new entry: {}", e);
-            return;
-        }
-    };
-    if let Some(orphaned) = orphaned {
-        warn!(
-            "SendTier::High: overwriting an unresolved deferred agent send for {} — \
-             resolve_previous_pending_agent_send should have run first; aborting the orphan",
-            orphaned.request_id
-        );
-        orphaned.handle.abort();
-    }
-}
-
-/// `SendTier::High` path: resolve whatever the *previous* invocation deferred, before
-/// this invocation does any of its own Flow-1 work. No-op (returns immediately) if
-/// nothing is pending — which is also exactly what happens on the very first
-/// invocation, since the static starts empty. Reuses
-/// `resolve_agent_send_at_boundary` unchanged: the bounded-wait/abort/re-buffer logic
-/// is identical whether it runs at "this invocation's end" or "the next invocation's
-/// start" — only the timing of the call changed, not the logic.
-async fn resolve_previous_pending_agent_send() {
-    let pending = match PENDING_AGENT_SEND.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(e) => {
-            error!("PENDING_AGENT_SEND lock poisoned, cannot resolve: {}", e);
-            return;
-        }
-    };
-    let Some(pending) = pending else {
-        return;
-    };
-    resolve_agent_send_at_boundary(
-        pending.handle,
-        pending.payloads,
-        pending.cursor,
-        &pending.request_id,
-        &pending.invoked_function_arn,
-    )
-    .await;
-}
-
-/// Resolve this invocation's own Flow-1 agent send at the `runtimeDone` boundary before
-/// returning to `/next` (APM mode, Normal Lambda).
-///
-/// - Already finished (or finishes within `APM_SEND_RUNTIME_DONE_GRACE`) → return
-///   immediately; zero added latency in the common case.
-/// - Still in flight after the grace bound → abort it and hand the payloads to the
-///   existing durable `FAILED_AGENT_PAYLOADS` retry path, exactly as an HTTP failure
-///   would. The send is never detached past `/next` (the sandbox freezes once every
-///   extension has called `/next`, which would freeze the send mid-flight).
-///
-/// The spawned send already buffers individual payloads into `FAILED_AGENT_PAYLOADS` on
-/// its own HTTP failures. On a boundary timeout, only the payloads the task had NOT yet
-/// finished (`payloads[cursor..]`) are re-buffered: payloads before the cursor were
-/// already sent successfully or individually buffered by the task itself, so touching
-/// them again would duplicate telemetry / `FAILED_AGENT_PAYLOADS` entries.
-async fn resolve_agent_send_at_boundary(
-    mut handle: tokio::task::JoinHandle<bool>,
-    payloads: Vec<Arc<Vec<u8>>>,
-    cursor: Arc<std::sync::atomic::AtomicUsize>,
-    request_id: &str,
-    invoked_function_arn: &str,
-) {
-    // Fast path: already done — skip constructing/polling the grace sleep future entirely.
-    if handle.is_finished() {
-        log_agent_send_join_result((&mut handle).await, request_id);
-        return;
-    }
-
-    tokio::select! {
-        res = &mut handle => log_agent_send_join_result(res, request_id),
-        _ = tokio::time::sleep(APM_SEND_RUNTIME_DONE_GRACE) => {
-            handle.abort();
-            // Re-buffer only the payloads the task had not yet finished. The cursor is
-            // incremented after each payload's outcome is fully resolved, so indices
-            // below it are already sent or already buffered by the task.
-            let resolved = cursor.load(std::sync::atomic::Ordering::SeqCst);
-            let unresolved = payloads.get(resolved..).unwrap_or(&[]);
-            warn!(
-                "APM mode: agent send for {} exceeded {}ms grace at runtimeDone — buffering {} of {} payload(s) for retry (resolved {})",
-                request_id,
-                APM_SEND_RUNTIME_DONE_GRACE.as_millis(),
-                unresolved.len(),
-                payloads.len(),
-                resolved
-            );
-            for payload_bytes in unresolved {
-                buffer_failed_agent_payload(payload_bytes.as_slice(), request_id, invoked_function_arn);
-            }
-        }
-    }
-}
-
-/// Log the outcome of joining the Flow-1 agent-send task (no re-buffering: the task
-/// buffers its own per-payload HTTP failures).
-fn log_agent_send_join_result(
-    res: Result<bool, tokio::task::JoinError>,
-    request_id: &str,
-) {
-    match res {
-        Ok(all_sent) => {
-            if !all_sent {
-                debug!(
-                    "APM mode: agent send for {} had failures — unsent payload(s) already buffered for retry",
-                    request_id
-                );
-            }
-        }
-        Err(e) => error!("Agent send task failed for {}: {}", request_id, e),
-    }
 }
 
 /// Send one agent payload to the APM collector; on failure buffer it into
