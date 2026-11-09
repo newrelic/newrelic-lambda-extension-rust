@@ -13,17 +13,18 @@
 //! module implements.
 //!
 //!
-//! `SendScheduler` has a real caller (`event_loop.rs`'s `AGENT_SEND_SCHEDULER`)
-//! as of the agent-payload integration — this is no longer unused
-//! scaffolding. `BreakerState` and `DispatchOutcome` remain unused *by name*
-//! outside this module today (accessed via `.state()`/`.result`/`.cursor`
-//! rather than the type name) but are kept exported for Sashwat's real
-//! `CircuitBreaker` work and for callers who want to pattern-match on the
-//! outcome directly.
+//! `SendScheduler` has a real caller (`event_loop.rs`'s `SEND_SCHEDULER`,
+//! covering both `SendKind::ApmCollector` — agent payload — and
+//! `SendKind::Logs` — log flush) — this is no longer unused scaffolding.
+//! `BreakerState` and `DispatchOutcome` remain unused *by name* outside this
+//! module today (accessed via `.state()`/`.result`/`.cursor` rather than the
+//! type name) but are kept exported for Sashwat's real `CircuitBreaker` work
+//! and for callers who want to pattern-match on the outcome directly.
 //!
-//! `SendKind::Logs`/`MetricApi` are likewise only constructed by tests
-//! today — only `ApmCollector` has a real caller (the agent-payload send).
-//! Ready for logs/metric-API once those get wired through `SendScheduler`.
+//! `SendKind::MetricApi` is still only constructed by tests — ready for
+//! platform-report-metrics once that's wired through `SendScheduler` too
+//! (currently still unconditionally detached, same as logs were before this
+//! integration — see `event_loop.rs`'s platform-report-metrics block).
 
 #![allow(dead_code, unused_imports)]
 
