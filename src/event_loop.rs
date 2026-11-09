@@ -1835,17 +1835,12 @@ pub async fn process_apm_request(
     // are never tier-gated and never killed mid-flight.
     spawn_log_flush(&global_log_processor, &request_id).await;
 
-    // Platform flush: still fully detached, not yet routed through SEND_SCHEDULER
-    // (out of scope for this pass -- same reasoning as logs would apply if/when it
-    // is: see the platform-report-metrics block above for why occasional loss on
-    // environment reclaim is an acceptable tradeoff for never blocking /next here).
-    let platform_processor_clone = state.platform_processor.clone();
-    let request_id_clone = request_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = platform_processor_clone.flush().await {
-            error!("Failed to flush platform for request {}: {}", request_id_clone, e);
-        }
-    });
+    // PlatformProcessor::flush() is a no-op by design (platform/processor.rs) --
+    // platform.* lifecycle log lines are pushed directly into LogProcessor's own
+    // batch at process_record() time (platform_processor.process_invoke_event ->
+    // log_processor.add_log_to_batch), so they already go out via spawn_log_flush
+    // above. Spawning and awaiting flush() here did nothing except spawn a task
+    // that immediately returned Ok(()) -- removed.
 
     // Agent payloads arrive via the named pipe independently and are already sent above.
     // Late agent payloads will be caught by the warm-start pending-payload logic.
