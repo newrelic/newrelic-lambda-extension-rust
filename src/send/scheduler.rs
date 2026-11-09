@@ -3,7 +3,7 @@
 
 //! `SendScheduler`: the shared primitive both send tiers run through, and
 //! the real integration point for the agent-payload Flow-1 batch (wired in
-//! `event_loop.rs`'s `process_apm_request`/`PENDING_AGENT_SEND` call sites).
+//! `event_loop.rs`'s `process_apm_request`, via `AGENT_SEND_SCHEDULER`).
 //!
 //! - `SendMode::Sync` (`default` tier): spawn immediately, then
 //!   bounded-wait on it in the *current* invocation, before returning —
