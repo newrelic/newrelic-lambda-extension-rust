@@ -19,10 +19,12 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod circuit_breaker;
+pub mod scheduler;
 pub mod send_target;
 pub mod timeout_provider;
 
 pub use circuit_breaker::{AlwaysAllowBreaker, BreakerState, CircuitBreaker};
+pub use scheduler::{DispatchResult, SendMode, SendScheduler};
 pub use send_target::BoxedSend;
 pub use timeout_provider::{FixedTimeoutProvider, SendTimeoutProvider};
 
