@@ -83,6 +83,11 @@ pub enum DispatchResult {
     /// waited on right now. Resolution happens later via
     /// [`SendScheduler::resolve_pending`].
     Deferred,
+    /// [`SendScheduler::resolve_pending_no_abort`] only: still running, left
+    /// alone (not aborted). Nothing to buffer — nothing was lost, it's just
+    /// not done yet. The pending entry stays in place for a later call to
+    /// check again.
+    StillRunning,
 }
 
 /// A [`DispatchResult`] plus, for batch sends, the progress cursor's value
@@ -245,6 +250,46 @@ impl SendScheduler {
             }
         };
         Some(result)
+    }
+
+    /// Like [`SendScheduler::resolve_pending`], but **never aborts** an
+    /// unfinished send — some sends (e.g. the log flush, which holds its
+    /// chunk list in a purely local variable with no externally visible
+    /// progress cursor) aren't safe to abort-and-partially-recover the way
+    /// the agent-payload batch is; killing them mid-flight would silently
+    /// lose whatever wasn't yet sent, with nothing to buffer it. Use this
+    /// for kinds where "leave it running, check again later" is strictly
+    /// safer than "kill it and hope the caller can reconstruct what was
+    /// lost."
+    ///
+    /// If still running: the entry stays in the pending map (not removed),
+    /// and this returns `StillRunning`. Callers must not spawn a new send
+    /// for the same `kind` while that's the case — check
+    /// [`SendScheduler::has_pending`] first, or duplicate sends can overlap.
+    /// Returns `None` if nothing was pending at all (including the
+    /// first-invocation case).
+    pub async fn resolve_pending_no_abort(&self, kind: SendKind) -> Option<DispatchOutcome> {
+        let mut guard = self.pending.lock().await;
+        let entry = guard.get(&kind)?;
+        if !entry.handle.is_finished() {
+            return Some(DispatchOutcome {
+                result: DispatchResult::StillRunning,
+                cursor: entry.cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
+            });
+        }
+
+        // Finished: take it out of the map and join it for real.
+        let PendingEntry { handle, cursor } = guard.remove(&kind).expect("just checked present");
+        drop(guard);
+        Some(self.finish(kind, handle.await, cursor.as_deref()))
+    }
+
+    /// Whether `kind` currently has a pending send (spawned, not yet
+    /// resolved) — for callers using [`SendScheduler::resolve_pending_no_abort`]
+    /// to decide whether it's safe to spawn a new send for the same kind
+    /// without risking two overlapping in flight at once.
+    pub async fn has_pending(&self, kind: SendKind) -> bool {
+        self.pending.lock().await.contains_key(&kind)
     }
 
     /// Bounded drain of every still-pending kind — for `SHUTDOWN`, where
@@ -601,5 +646,86 @@ mod tests {
         let outcome = scheduler.dispatch(SendKind::ApmCollector, send, Some(cursor)).await;
         assert_eq!(outcome.result, DispatchResult::Sent);
         assert_eq!(outcome.cursor, Some(3));
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_no_abort_returns_none_when_nothing_spawned() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        assert_eq!(scheduler.resolve_pending_no_abort(SendKind::Logs).await, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_no_abort_resolves_an_already_finished_send() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::Logs, boxed(SendOutcome::Success), None).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let outcome = scheduler.resolve_pending_no_abort(SendKind::Logs).await;
+        assert_eq!(outcome.map(|o| o.result), Some(DispatchResult::Sent));
+        // And it's gone from the pending map now - a second call finds nothing.
+        assert!(!scheduler.has_pending(SendKind::Logs).await);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_no_abort_never_kills_a_still_running_send() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            // Deliberately tiny timeout - if this were resolve_pending (the
+            // aborting variant), it would time out and kill the task almost
+            // immediately. resolve_pending_no_abort must ignore the timeout
+            // provider entirely and just report StillRunning.
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(1))),
+        );
+
+        let still_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let still_running_for_task = still_running.clone();
+        let send: BoxedSend = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            still_running_for_task.store(false, Ordering::SeqCst);
+            SendOutcome::Success
+        });
+        scheduler.spawn(SendKind::Logs, send, None).await;
+
+        let outcome = scheduler.resolve_pending_no_abort(SendKind::Logs).await;
+        assert_eq!(outcome.map(|o| o.result), Some(DispatchResult::StillRunning));
+        // Proof it wasn't aborted: the task is still actually running.
+        assert!(
+            still_running.load(Ordering::SeqCst),
+            "the send must still be running - resolve_pending_no_abort must never abort it"
+        );
+        // And it's still tracked, so a later call can check it again.
+        assert!(scheduler.has_pending(SendKind::Logs).await);
+
+        // Let it actually finish and clean up, so the test doesn't leak a
+        // detached task past its own scope.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let final_outcome = scheduler.resolve_pending_no_abort(SendKind::Logs).await;
+        assert_eq!(final_outcome.map(|o| o.result), Some(DispatchResult::Sent));
+    }
+
+    #[tokio::test]
+    async fn has_pending_reflects_spawn_and_resolve() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        assert!(!scheduler.has_pending(SendKind::Logs).await);
+
+        scheduler.spawn(SendKind::Logs, boxed(SendOutcome::Success), None).await;
+        assert!(scheduler.has_pending(SendKind::Logs).await);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        scheduler.resolve_pending_no_abort(SendKind::Logs).await;
+        assert!(!scheduler.has_pending(SendKind::Logs).await);
     }
 }

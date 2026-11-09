@@ -253,10 +253,15 @@ async fn resolve_pending_agent_batch() {
                 &meta.invoked_function_arn,
             );
         }
-        crate::send::DispatchResult::Dropped | crate::send::DispatchResult::Deferred => {
-            // Unreachable in practice: resolve_pending never checks the
-            // breaker (Dropped is a dispatch()-only outcome) and never
-            // itself returns Deferred. Handled defensively, not assumed.
+        crate::send::DispatchResult::Dropped
+        | crate::send::DispatchResult::Deferred
+        | crate::send::DispatchResult::StillRunning => {
+            // Unreachable in practice: resolve_pending (used here, not
+            // resolve_pending_no_abort) never checks the breaker (Dropped is
+            // a dispatch()-only outcome), never itself returns Deferred, and
+            // StillRunning is only ever produced by resolve_pending_no_abort,
+            // which the agent-payload path doesn't use. Handled defensively,
+            // not assumed.
             warn!(
                 "APM mode: unexpected {:?} resolving agent batch for {}",
                 outcome.result, meta.request_id
