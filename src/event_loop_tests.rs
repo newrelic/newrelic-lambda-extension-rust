@@ -3743,3 +3743,67 @@ async fn spawn_log_flush_skips_when_a_flush_is_already_pending() {
     // Test cleanup only - fine to abort here, this task has no real data.
     let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::Logs).await;
 }
+
+// --- Platform-metrics flush tests (spawn_platform_metrics_flush / resolve_pending_platform_metrics) ---
+
+#[tokio::test]
+#[serial]
+async fn spawn_platform_metrics_flush_then_resolve_round_trip() {
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::MetricApi).await;
+
+    // No APM app connected - the spawned future hits its own "not ready"
+    // branch and returns quickly with SendOutcome::Failure. That's enough
+    // to prove the SEND_SCHEDULER wiring round-trips correctly without
+    // needing a real network client.
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    spawn_platform_metrics_flush(&apm_app, "REPORT line".to_string(), "req-metrics-roundtrip", "arn:aws:lambda:us-east-1:123:function:test").await;
+    assert!(
+        SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await,
+        "spawn_platform_metrics_flush must register the send with SEND_SCHEDULER"
+    );
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    resolve_pending_platform_metrics("req-metrics-roundtrip").await;
+    assert!(
+        !SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await,
+        "resolve_pending_platform_metrics must clear the entry once the send is finished"
+    );
+}
+
+// Proves the duplicate-send guard: if a metrics send is already pending
+// (StillRunning), spawn_platform_metrics_flush must skip entirely rather
+// than overwrite/abort it.
+#[tokio::test]
+#[serial]
+async fn spawn_platform_metrics_flush_skips_when_a_send_is_already_pending() {
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::MetricApi).await;
+
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct AbortFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for AbortFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag = AbortFlag(aborted.clone());
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        let _flag = flag;
+        std::future::pending::<()>().await;
+        crate::send::SendOutcome::Success
+    });
+    SEND_SCHEDULER.spawn(crate::send::SendKind::MetricApi, send, None).await;
+    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await);
+
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    spawn_platform_metrics_flush(&apm_app, "REPORT line".to_string(), "req-metrics-skip", "arn:aws:lambda:us-east-1:123:function:test").await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "spawn_platform_metrics_flush must not abort/overwrite an already-pending send"
+    );
+    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await);
+
+    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::MetricApi).await;
+}

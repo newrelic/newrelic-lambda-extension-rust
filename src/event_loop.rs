@@ -360,6 +360,116 @@ async fn resolve_pending_logs(request_id: &str) {
     }
 }
 
+/// Spawn this invocation's platform-report-metrics send into `SEND_SCHEDULER`,
+/// unconditionally — like logs, never tier-gated, and was already
+/// unconditionally detached before `SendTier` existed.
+///
+/// `send_platform_report_metrics` already self-buffers on transient failure
+/// (`metric_api_buffer::buffer_failed_metric_api`) and always returns `Ok`
+/// (parse-fail, disabled, permanent-drop, and buffered-for-retry are all
+/// `Ok` at that call site) — so, same as logs, there is nothing further for
+/// this module to buffer on `Failed`; `from_collector_result` mapping this
+/// to `SendOutcome::Success` is the realistic common case, with
+/// `SendOutcome::Failure` reserved for the theoretical panic/unexpected-error
+/// case.
+///
+/// Never aborted (see `resolve_pending_platform_metrics`): this call's
+/// report data lives only inside the spawned future (the caller already
+/// called `remove_pending_report` before spawning) — an abort would lose it
+/// with nothing to buffer, the same risk `resolve_pending_no_abort` exists
+/// to avoid for logs. Guarded by `has_pending` against ever running two
+/// concurrent metrics sends for the same kind.
+async fn spawn_platform_metrics_flush(
+    apm_app: &crate::apm::SharedApmApp,
+    report_line: String,
+    request_id: &str,
+    invoked_function_arn: &str,
+) {
+    if SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await {
+        debug!(
+            "APM mode: previous platform-metrics send still running — report for {} dropped \
+             (occasional loss here is an accepted tradeoff, same as before this send was tracked)",
+            request_id
+        );
+        return;
+    }
+
+    let apm_app_clone = apm_app.clone();
+    let request_id_clone = request_id.to_string();
+    let invoked_function_arn_clone = invoked_function_arn.to_string();
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        let apm_app_guard = apm_app_clone.read().await;
+        let Some(ref app) = *apm_app_guard else {
+            warn!(
+                "APM mode: APM app not ready - cannot send platform metrics for {}",
+                request_id_clone
+            );
+            return crate::send::SendOutcome::Failure;
+        };
+        let result = app
+            .send_platform_report_metrics(&report_line, &invoked_function_arn_clone)
+            .await;
+        match &result {
+            Ok(()) => info!(
+                "APM mode: Successfully sent platform report metrics for request {}",
+                request_id_clone
+            ),
+            Err(e) => error!(
+                "APM mode: Failed to send platform report metrics for {}: {}",
+                request_id_clone, e
+            ),
+        }
+        crate::send::from_collector_result(&result)
+    });
+    SEND_SCHEDULER
+        .spawn(crate::send::SendKind::MetricApi, send, None)
+        .await;
+}
+
+/// Resolve whatever platform-metrics send is pending from a previous
+/// invocation, if any — called unconditionally at the start of every
+/// invocation and at `SHUTDOWN`, regardless of `send_tier`. Never aborts
+/// (see `spawn_platform_metrics_flush`'s doc for why). Nothing to buffer on
+/// `Failed`: the send already buffered itself internally on any retryable
+/// failure before returning.
+async fn resolve_pending_platform_metrics(request_id: &str) {
+    let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending_no_abort(crate::send::SendKind::MetricApi)
+        .await
+    else {
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send completed successfully (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::Failed => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send failed, already handled internally (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::StillRunning => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send still running (checked at {})",
+                request_id
+            );
+        }
+        other => {
+            // TimedOut/Dropped/Deferred: unreachable in practice, same
+            // reasoning as resolve_pending_logs. Handled defensively.
+            warn!(
+                "APM mode: unexpected {:?} resolving pending platform-metrics send at {}",
+                other, request_id
+            );
+        }
+    }
+}
+
 /// Event loop: handles cold start (first invoke) and warm starts (subsequent invokes)
 pub async fn run_infinite_event_loop(
     mut extension_components: ExtensionComponents,
@@ -840,6 +950,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // actually guarantees the final drain either way, since LogProcessor::flush
                 // is safe to call concurrently/redundantly with itself.
                 resolve_pending_logs("shutdown").await;
+
+                // Platform-metrics: same no-op-if-already-resolved check. The shutdown
+                // handler below separately walks all_pending_reports for *other*
+                // requests' never-yet-spawned reports; this only resolves whatever the
+                // *last* invocation already spawned into SEND_SCHEDULER.
+                resolve_pending_platform_metrics("shutdown").await;
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
@@ -1466,9 +1582,12 @@ pub async fn process_apm_request(
         resolve_pending_agent_batch().await;
     }
 
-    // Logs are never tier-gated (see spawn_log_flush/resolve_pending_logs) — this
-    // always runs, for both SendTier::Default and SendTier::High.
+    // Logs and platform-metrics are never tier-gated (see spawn_log_flush/
+    // resolve_pending_logs and spawn_platform_metrics_flush/
+    // resolve_pending_platform_metrics) — both always run, for both
+    // SendTier::Default and SendTier::High.
     resolve_pending_logs(&request_id).await;
+    resolve_pending_platform_metrics(&request_id).await;
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -1680,47 +1799,16 @@ pub async fn process_apm_request(
     // top of this function under SendTier::High — never detached-and-forgotten.
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode).
-    //
-    // Fully detached, no grace/boundary check -- unlike the agent-payload send above,
-    // this is duration/memory stats, not customer transaction/error data, so losing an
-    // occasional one to environment reclaim is an acceptable tradeoff for never blocking
-    // /next on it. If the spawned task is still running when the environment freezes, it
-    // resumes and completes once the next invocation thaws the environment, and its
-    // success/failure log line lands in CloudWatch whenever that actually happens -- same
-    // as any other extension background work.
+    // Spawned via SEND_SCHEDULER now, tracked (not pure fire-and-forget) -- resolved
+    // at the start of the next invocation or at SHUTDOWN, same pattern as logs. See
+    // spawn_platform_metrics_flush's doc for why this is never aborted and why an
+    // occasional dropped report under the has_pending guard is an accepted tradeoff.
     if let Some(report_line) = get_pending_report(&request_id) {
         debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
-        let apm_app_clone = apm_app.clone();
-        let request_id_clone = request_id.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-        tokio::spawn(async move {
-            let apm_app_guard = apm_app_clone.read().await;
-            if let Some(ref app) = *apm_app_guard {
-                if let Err(e) = app
-                    .send_platform_report_metrics(&report_line, &invoked_function_arn_clone)
-                    .await
-                {
-                    error!(
-                        "APM mode: Failed to send platform report metrics for {}: {}",
-                        request_id_clone, e
-                    );
-                } else {
-                    info!(
-                        "APM mode: Successfully sent platform report metrics for request {}",
-                        request_id_clone
-                    );
-                }
-            } else {
-                warn!(
-                    "APM mode: APM app not ready - cannot send platform metrics for {}",
-                    request_id_clone
-                );
-            }
-        });
-
         // Remove pending report immediately -- the spawned task owns report_line now;
         // nothing left here depends on get_pending_report's entry for this request.
         remove_pending_report(&request_id);
+        spawn_platform_metrics_flush(&apm_app, report_line, &request_id, &invoked_function_arn).await;
     } else {
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }

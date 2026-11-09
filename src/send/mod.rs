@@ -14,17 +14,14 @@
 //!
 //!
 //! `SendScheduler` has a real caller (`event_loop.rs`'s `SEND_SCHEDULER`,
-//! covering both `SendKind::ApmCollector` — agent payload — and
-//! `SendKind::Logs` — log flush) — this is no longer unused scaffolding.
-//! `BreakerState` and `DispatchOutcome` remain unused *by name* outside this
-//! module today (accessed via `.state()`/`.result`/`.cursor` rather than the
-//! type name) but are kept exported for Sashwat's real `CircuitBreaker` work
-//! and for callers who want to pattern-match on the outcome directly.
-//!
-//! `SendKind::MetricApi` is still only constructed by tests — ready for
-//! platform-report-metrics once that's wired through `SendScheduler` too
-//! (currently still unconditionally detached, same as logs were before this
-//! integration — see `event_loop.rs`'s platform-report-metrics block).
+//! covering all three `SendKind`s now: `ApmCollector` — agent payload,
+//! `Logs` — log flush, `MetricApi` — platform-report-metrics) — this is no
+//! longer unused scaffolding, and every `SendKind` variant has a real
+//! caller. `BreakerState` and `DispatchOutcome` remain unused *by name*
+//! outside this module today (accessed via `.state()`/`.result`/`.cursor`
+//! rather than the type name) but are kept exported for Sashwat's real
+//! `CircuitBreaker` work and for callers who want to pattern-match on the
+//! outcome directly.
 
 #![allow(dead_code, unused_imports)]
 
@@ -38,7 +35,7 @@ pub mod timeout_provider;
 
 pub use circuit_breaker::{AlwaysAllowBreaker, BreakerState, CircuitBreaker};
 pub use scheduler::{DispatchOutcome, DispatchResult, SendMode, SendScheduler};
-pub use send_target::BoxedSend;
+pub use send_target::{from_collector_result, BoxedSend};
 pub use tier::SendTier;
 pub use timeout_provider::{FixedTimeoutProvider, SendTimeoutProvider};
 
