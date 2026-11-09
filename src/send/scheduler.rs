@@ -33,6 +33,14 @@
 //! `timeout_provider.current_timeout(kind)` against the remaining time to
 //! deadline before relying on it, the same way `wait_for_runtime_done_with_grace`
 //! already clamps its own wait against `deadlineMs` (`event_loop.rs`).
+//!
+//! **Not everything here has a production caller yet.** `AGENT_SEND_SCHEDULER`
+//! (`event_loop.rs`) uses `spawn`/`resolve_pending` directly — it never
+//! calls `dispatch`/`mode`/`send_now`/`drain_all`, since the agent-payload
+//! call site needs explicit two-phase control (spawn now, resolve at a
+//! caller-chosen point) rather than `dispatch`'s mode-coupled timing. Those
+//! stay exported, tested, and ready for the next send kind (logs, metric
+//! API) that wants the simpler single-call form instead.
 
 #![allow(dead_code)]
 

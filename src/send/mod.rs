@@ -12,9 +12,18 @@
 //! exist. See `TEAM_COLLAB_PLAN.md` for the collaboration contract this
 //! module implements.
 //!
-//! Unused until Phase B (`SendScheduler`) wires these in — `allow(dead_code)`
-//! on this module is intentional scaffolding, not a sign something's wrong,
-//! and should be removed once Phase B lands.
+//!
+//! `SendScheduler` has a real caller (`event_loop.rs`'s `AGENT_SEND_SCHEDULER`)
+//! as of the agent-payload integration — this is no longer unused
+//! scaffolding. `BreakerState` and `DispatchOutcome` remain unused *by name*
+//! outside this module today (accessed via `.state()`/`.result`/`.cursor`
+//! rather than the type name) but are kept exported for Sashwat's real
+//! `CircuitBreaker` work and for callers who want to pattern-match on the
+//! outcome directly.
+//!
+//! `SendKind::Logs`/`MetricApi` are likewise only constructed by tests
+//! today — only `ApmCollector` has a real caller (the agent-payload send).
+//! Ready for logs/metric-API once those get wired through `SendScheduler`.
 
 #![allow(dead_code, unused_imports)]
 

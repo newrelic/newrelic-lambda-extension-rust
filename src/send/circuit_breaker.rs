@@ -8,6 +8,12 @@
 //! file, implementing this trait. `AlwaysAllowBreaker` is the stub the
 //! scheduler is built and tested against until the real implementation is
 //! ready to be wired in — see `TEAM_COLLAB_PLAN.md` §1/§3.
+//!
+//! `BreakerState`/`state()` have no production caller yet — observability
+//! logging on breaker-state transitions (`REDESIGN_PLAN.md` §10.4) isn't
+//! wired up until a real breaker exists to transition in the first place.
+
+#![allow(dead_code)]
 
 use super::{SendKind, SendOutcome};
 

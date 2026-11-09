@@ -24,6 +24,14 @@
 //! stays where it already lives (`agent/batch.rs`, `apm/telemetry_buffer.rs`,
 //! `apm/metric_api_buffer.rs`); the scheduler calls back into the
 //! appropriate buffer function itself when a send fails or times out.
+//!
+//! **No production caller yet.** The real agent-payload call site
+//! (`event_loop.rs`) builds its `SendOutcome` inline (`if all_sent { ... }`)
+//! rather than through these mapping functions, since it doesn't go through
+//! `client.rs`/`collector.rs`'s `Result` types directly. These stay ready
+//! for whichever of logs/APM-telemetry/metric-API gets wired through
+//! `SendScheduler` next, at which point its call site is exactly what these
+//! were written for.
 
 #![allow(dead_code)]
 

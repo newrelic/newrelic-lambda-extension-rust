@@ -16,13 +16,22 @@
 //! with the real implementation at the construction site below — nothing
 //! else in this module or in `SendScheduler` needs to change either way.
 //!
-//! **Deliberately not added to `config/mod.rs` yet.** `config/mod.rs` is
-//! the file Sashwat's circuit-breaker/timeout-provider env vars will also
-//! land in (see `TEAM_COLLAB_PLAN.md` §2) — keeping this knob's parsing
-//! self-contained here avoids a merge collision while both of you are
-//! actively editing that file. Folding `NEW_RELIC_SEND_TIER` into
-//! `ExtensionConfig` proper (alongside the other `NEW_RELIC_*` knobs) is
-//! expected once this gets wired into `event_loop.rs`.
+//! **`ExtensionConfig.extension.send_tier`** (`config/mod.rs`) holds the
+//! parsed value for the rest of the codebase to read — `event_loop.rs`
+//! branches on it directly. This module's own `SendTier::from_env()` is
+//! still called a second time, independently, by `AGENT_SEND_SCHEDULER`'s
+//! `Lazy` initializer (`event_loop.rs`) — harmless, since it's a pure
+//! function of the same env var and the value can't change mid-process;
+//! kept that way so `event_loop.rs` doesn't need `config` threaded into
+//! static initialization. Sashwat's circuit-breaker/timeout-provider env
+//! vars (NR-643533/NR-643534) still land directly in `config/mod.rs`
+//! instead of here (see `TEAM_COLLAB_PLAN.md` §2) — no merge collision
+//! risk, since this knob's own parsing is already settled.
+//!
+//! **`blocking_connect` has no production caller yet.** Generalizing
+//! `NEW_RELIC_APM_BLOCKING_HANDSHAKE` to logs/metric-API connect warm-up
+//! (`REDESIGN_PLAN.md` §10.2) is separate, not-yet-started work — this
+//! method is ready for that, tested, not wired in.
 
 #![allow(dead_code)]
 
