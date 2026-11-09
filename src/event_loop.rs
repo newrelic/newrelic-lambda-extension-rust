@@ -615,11 +615,12 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // above and keeps running detached. /next must never wait on it: this
                 // path has no bound at all (a JoinSet draining an arbitrary number of
                 // previous requests' sends, plus their platform-report-metrics calls),
-                // unlike current_task's own send which is capped at
-                // APM_SEND_RUNTIME_DONE_GRACE. process_and_send_agent_payload already
-                // buffers into FAILED_AGENT_PAYLOADS on transient send failure
-                // internally, so this detach doesn't remove that existing safety net --
-                // it only removes the synchronous wait for the attempt itself.
+                // unlike current_task's own agent-payload send, which is resolved
+                // through AGENT_SEND_SCHEDULER and bounded by its configured timeout.
+                // process_and_send_agent_payload already buffers into
+                // FAILED_AGENT_PAYLOADS on transient send failure internally, so this
+                // detach doesn't remove that existing safety net -- it only removes the
+                // synchronous wait for the attempt itself.
 
                 // Post-invoke wait: only when NEW_RELIC_APM_BLOCKING_HANDSHAKE=true.
                 // Handshake establishes the APM connection (one-time cold-start cost);
