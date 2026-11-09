@@ -608,6 +608,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 }
 
+                // SendTier::High: there is no "next invocation" at shutdown to defer
+                // to, so drain whatever the last invocation stashed here first, with
+                // the same bounded wait resolve_agent_send_at_boundary already uses.
+                // Harmless no-op under SendTier::Default (nothing is ever stashed
+                // there) and on the common case where nothing is pending.
+                resolve_previous_pending_agent_send().await;
+
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
 
@@ -1224,6 +1231,13 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
+    // SendTier::High: resolve whatever the previous invocation deferred before this
+    // invocation does any of its own Flow-1 work. Gated on the tier so
+    // SendTier::Default (the default, unchanged-behavior path) never even touches
+    // PENDING_AGENT_SEND's lock. No-op on the first invocation (nothing pending yet).
+    if config.extension.send_tier == crate::send::SendTier::High {
+        resolve_previous_pending_agent_send().await;
+    }
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -1463,10 +1477,25 @@ pub async fn process_apm_request(
     .await;
 
     // runtimeDone boundary: resolve this invocation's own Flow-1 agent send before
-    // returning to /next.
+    // returning to /next — or, under SendTier::High, defer it to the start of the
+    // next invocation instead. See resolve_previous_pending_agent_send's call at the
+    // top of this function for where High-tier's deferred entry gets resolved.
     if let Some((handle, payloads, cursor)) = send_agent_task {
-        resolve_agent_send_at_boundary(handle, payloads, cursor, &request_id, &invoked_function_arn)
-            .await;
+        match config.extension.send_tier {
+            crate::send::SendTier::Default => {
+                resolve_agent_send_at_boundary(handle, payloads, cursor, &request_id, &invoked_function_arn)
+                    .await;
+            }
+            crate::send::SendTier::High => {
+                stash_pending_agent_send(
+                    handle,
+                    payloads,
+                    cursor,
+                    request_id.clone(),
+                    invoked_function_arn.clone(),
+                );
+            }
+        }
     }
 
     // Fully detached, no wait at all -- /next must never be blocked by this, not even
@@ -1529,6 +1558,94 @@ async fn send_to_apm_collector(
         return Err("APM connection not ready yet - payload buffered for retry".into());
     }
     Ok(())
+}
+
+/// A Flow-1 agent send deferred past its own invocation's `runtimeDone` boundary,
+/// waiting to be resolved at the start of the *next* invocation. Only populated when
+/// `config.extension.send_tier` is `SendTier::High` — `SendTier::Default` always
+/// resolves immediately via `resolve_agent_send_at_boundary` and never touches this.
+struct PendingAgentSend {
+    handle: tokio::task::JoinHandle<bool>,
+    payloads: Vec<Arc<Vec<u8>>>,
+    cursor: Arc<std::sync::atomic::AtomicUsize>,
+    request_id: String,
+    invoked_function_arn: String,
+}
+
+/// Holds at most one deferred Flow-1 send at a time. Normal-mode Lambda never runs
+/// concurrent invocations in one environment, so there is at most one producer
+/// (`stash_pending_agent_send`, called once per invocation under `SendTier::High`)
+/// and at most one consumer (`resolve_previous_pending_agent_send`, called once at the
+/// start of the next invocation) active at any moment — a plain `std::sync::Mutex` is
+/// sufficient, no async lock needed.
+static PENDING_AGENT_SEND: once_cell::sync::Lazy<Mutex<Option<PendingAgentSend>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// `SendTier::High` path: stash this invocation's Flow-1 send instead of waiting on it
+/// now. Resolved later by `resolve_previous_pending_agent_send`, at the start of the
+/// next invocation.
+///
+/// Defensive, should-not-happen case: if a previous entry is still here (meaning
+/// `resolve_previous_pending_agent_send` was not called before this), abort the
+/// orphaned handle rather than silently leaking it — mirrors
+/// `SendScheduler::spawn_deferred`'s identical defensive-abort behavior.
+fn stash_pending_agent_send(
+    handle: tokio::task::JoinHandle<bool>,
+    payloads: Vec<Arc<Vec<u8>>>,
+    cursor: Arc<std::sync::atomic::AtomicUsize>,
+    request_id: String,
+    invoked_function_arn: String,
+) {
+    let entry = PendingAgentSend {
+        handle,
+        payloads,
+        cursor,
+        request_id,
+        invoked_function_arn,
+    };
+    let orphaned = match PENDING_AGENT_SEND.lock() {
+        Ok(mut guard) => guard.replace(entry),
+        Err(e) => {
+            error!("PENDING_AGENT_SEND lock poisoned, dropping new entry: {}", e);
+            return;
+        }
+    };
+    if let Some(orphaned) = orphaned {
+        warn!(
+            "SendTier::High: overwriting an unresolved deferred agent send for {} — \
+             resolve_previous_pending_agent_send should have run first; aborting the orphan",
+            orphaned.request_id
+        );
+        orphaned.handle.abort();
+    }
+}
+
+/// `SendTier::High` path: resolve whatever the *previous* invocation deferred, before
+/// this invocation does any of its own Flow-1 work. No-op (returns immediately) if
+/// nothing is pending — which is also exactly what happens on the very first
+/// invocation, since the static starts empty. Reuses
+/// `resolve_agent_send_at_boundary` unchanged: the bounded-wait/abort/re-buffer logic
+/// is identical whether it runs at "this invocation's end" or "the next invocation's
+/// start" — only the timing of the call changed, not the logic.
+async fn resolve_previous_pending_agent_send() {
+    let pending = match PENDING_AGENT_SEND.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(e) => {
+            error!("PENDING_AGENT_SEND lock poisoned, cannot resolve: {}", e);
+            return;
+        }
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    resolve_agent_send_at_boundary(
+        pending.handle,
+        pending.payloads,
+        pending.cursor,
+        &pending.request_id,
+        &pending.invoked_function_arn,
+    )
+    .await;
 }
 
 /// Resolve this invocation's own Flow-1 agent send at the `runtimeDone` boundary before

@@ -3536,3 +3536,145 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
 
     assert_eq!(event_count, 1, "single SHUTDOWN must count as one event");
 }
+
+// --- SendTier::High deferred agent-send tests (PENDING_AGENT_SEND) ---
+//
+// These exercise stash_pending_agent_send / resolve_previous_pending_agent_send
+// directly, independent of the full process_apm_request flow, mirroring the
+// same split event_loop_tests.rs already uses for send_agent_payload_or_buffer
+// above. #[serial] because PENDING_AGENT_SEND and FAILED_AGENT_PAYLOADS are
+// process-global.
+
+fn clear_pending_agent_send() {
+    if let Ok(mut guard) = PENDING_AGENT_SEND.lock() {
+        *guard = None;
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn resolve_previous_pending_agent_send_is_a_noop_when_nothing_stashed() {
+    clear_pending_agent_send();
+    // Must return promptly and without panicking - this is also exactly the
+    // first-invocation case, where nothing has ever been stashed yet.
+    let start = tokio::time::Instant::now();
+    resolve_previous_pending_agent_send().await;
+    assert!(start.elapsed() < Duration::from_millis(50));
+}
+
+#[tokio::test]
+#[serial]
+async fn stash_then_resolve_recovers_an_already_finished_send() {
+    clear_pending_agent_send();
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let handle = tokio::spawn(async { true });
+    // Give the trivial task a moment to actually finish before resolving,
+    // simulating it completing well before the next invocation checks it.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    stash_pending_agent_send(
+        handle,
+        vec![Arc::new(vec![1, 2, 3])],
+        cursor,
+        "req-deferred-ok".to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+    );
+
+    let start = tokio::time::Instant::now();
+    resolve_previous_pending_agent_send().await;
+    assert!(
+        start.elapsed() < Duration::from_millis(20),
+        "an already-finished deferred send must resolve with ~zero added wait"
+    );
+
+    // Nothing left pending, and nothing should have landed in the durable
+    // buffer for a send that finished successfully.
+    clear_pending_agent_send();
+}
+
+#[tokio::test]
+#[serial]
+async fn stash_then_resolve_buffers_an_unfinished_straggler() {
+    clear_pending_agent_send();
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let handle: tokio::task::JoinHandle<bool> = tokio::spawn(async {
+        // Longer than APM_SEND_RUNTIME_DONE_GRACE - never actually finishes
+        // within the bound this test cares about.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        true
+    });
+
+    stash_pending_agent_send(
+        handle,
+        vec![Arc::new(vec![9, 9, 9])],
+        cursor,
+        "req-deferred-straggler".to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+    );
+
+    let start = tokio::time::Instant::now();
+    resolve_previous_pending_agent_send().await;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= APM_SEND_RUNTIME_DONE_GRACE && elapsed < APM_SEND_RUNTIME_DONE_GRACE + Duration::from_secs(1),
+        "resolving a straggler must be bounded to roughly the configured grace, got {elapsed:?}"
+    );
+
+    let buffered = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().any(|p| p.request_id == "req-deferred-straggler"))
+        .unwrap_or(false);
+    assert!(
+        buffered,
+        "an unresolved deferred send's payload must be buffered for retry, not dropped"
+    );
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+    clear_pending_agent_send();
+}
+
+#[tokio::test]
+#[serial]
+async fn stashing_a_second_time_without_resolving_aborts_the_orphan() {
+    clear_pending_agent_send();
+
+    let first_handle: tokio::task::JoinHandle<bool> = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        true
+    });
+    stash_pending_agent_send(
+        first_handle,
+        vec![Arc::new(vec![1])],
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        "req-orphan".to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+    );
+
+    // Second stash without an intervening resolve - the defensive path should
+    // abort the first handle rather than leaking it, and the second entry
+    // should be the one resolve_previous_pending_agent_send picks up.
+    let second_handle = tokio::spawn(async { true });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    stash_pending_agent_send(
+        second_handle,
+        vec![Arc::new(vec![2])],
+        Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+        "req-second".to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+    );
+
+    let start = tokio::time::Instant::now();
+    resolve_previous_pending_agent_send().await;
+    assert!(
+        start.elapsed() < Duration::from_millis(20),
+        "the second (already-finished) entry must resolve quickly, proving it - not the orphan - is what's stored"
+    );
+
+    clear_pending_agent_send();
+}
