@@ -360,6 +360,11 @@ async fn perform_one_time_initialization(
 
     let config = Arc::new(updated_config);
 
+    info!(
+        "NEW_RELIC_SEND_TIER active: {:?} (agent-payload send mode: {:?})",
+        config.extension.send_tier,
+        config.extension.send_tier.send_mode()
+    );
     info!("License key validated and extension registered - proceeding with full initialization");
     
     // Construct registration fallback ARN once from registration response
