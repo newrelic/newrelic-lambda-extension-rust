@@ -859,15 +859,34 @@ impl LogProcessor {
         // Compute message string ONCE, passed to to_log_message to avoid
         // double-serialization of non-String records.
         //
-        // An object record is re-serialized back into a string so every field the
-        // customer logged is preserved, instead of keeping only `message`. The
-        // String arm is untouched.
-        let message_owned: String = match &record.record {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Object(_) => {
-                serde_json::to_string(&record.record).unwrap_or_default()
+        // The #118 fix (always re-serialize an object record so every custom field
+        // the customer logged is preserved) only matters for "function" records --
+        // that's the only log source carrying customer/agent-attached fields worth
+        // preserving. "extension" and "platform" records are ours/AWS's own log
+        // lines; they never had custom fields to lose, so they keep the original,
+        // cheaper pre-#118 behavior: just pull `message` if present, no re-serialize.
+        let message_owned: String = if record.record_type == "function" {
+            match &record.record {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(obj) if obj.len() == 1 => match obj.get("message") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    _ => serde_json::to_string(&record.record).unwrap_or_default(),
+                },
+                serde_json::Value::Object(_) => {
+                    serde_json::to_string(&record.record).unwrap_or_default()
+                }
+                other => other.to_string(),
             }
-            other => other.to_string(),
+        } else {
+            match &record.record {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Object(obj) => match obj.get("message") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(other) => other.to_string(),
+                    None => serde_json::to_string(&record.record).unwrap_or_default(),
+                },
+                other => other.to_string(),
+            }
         };
 
         if let Some(mut log_message) = self.to_log_message_with_msg(&record, message_owned.clone()) {

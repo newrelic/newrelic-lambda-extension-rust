@@ -144,12 +144,6 @@ pub struct ExtensionSettings {
     /// `log_batch` still has data (i.e. `is_drained()` returns false). Default
     /// 25, clamped to `[0, 2000]`. Read once at startup by `init_config()`.
     pub runtime_done_grace_ms: u64,
-    /// NEW_RELIC_EXTENSION_PIPELINE_FLUSH — when true, the extension calls
-    /// GET /next immediately after runtimeDone and flushes telemetry in the
-    /// background during the freeze/thaw gap. Reduces billed duration but
-    /// may lose data on final shutdown if flush doesn't complete in time.
-    /// Default: false (safe mode — flush completes before GET /next).
-    pub pipeline_flush: bool,
     /// NEW_RELIC_LMI_FLUSH_INTERVAL_MS — heartbeat flush cadence (ms) for the
     /// Lambda Managed Instances (LMI) event loop. LMI runs continuously (no
     /// freeze between invokes), so buffered telemetry is drained on this
@@ -307,7 +301,6 @@ impl Default for ExtensionSettings {
             log_level: "info".to_string(),
             extension_logs_enabled: true,
             runtime_done_grace_ms: 25,
-            pipeline_flush: false,
             lmi_flush_interval_ms: 30_000,
             ignore_errors: HashSet::new(),
             expected_errors: HashSet::new(),
@@ -606,12 +599,6 @@ impl ExtensionConfig {
             .unwrap_or(25)
             .min(2000);
 
-        // NEW_RELIC_EXTENSION_PIPELINE_FLUSH: opt-in to pipeline GET /next pattern.
-        // When enabled, the extension calls GET /next immediately after runtimeDone
-        // and flushes telemetry in the background, reducing billed duration.
-        let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
-        config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
-
         // NEW_RELIC_LMI_FLUSH_INTERVAL_MS: heartbeat flush cadence for the LMI
         // event loop. Floored at 1000 ms to avoid pathological flush storms.
         // Default 30_000 ms.
@@ -636,20 +623,6 @@ impl ExtensionConfig {
         let synchronous_flush_str =
             env::var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH").unwrap_or_default();
         config.new_relic.synchronous_flush = parse_bool(&synchronous_flush_str);
-
-        // synchronous_flush takes precedence over pipeline_flush on any invocation
-        // where an immediate send is exercised (see event_loop.rs
-        // execute_standard_mode_event_loop) — the delivery guarantee the customer
-        // explicitly opted into must not be silently defeated by the deferred-send
-        // optimization. Surface that trade-off once at startup rather than leaving it silent.
-        if config.extension.pipeline_flush && config.new_relic.synchronous_flush {
-            warn!(
-                "NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH=true overrides NEW_RELIC_EXTENSION_PIPELINE_FLUSH's \
-                 deferred-send behavior on invocations where an immediate send is exercised — you \
-                 will not get pipeline_flush's billed-duration savings on those invocations. This is \
-                 intentional: the delivery guarantee takes precedence over the throughput optimization."
-            );
-        }
 
         config
     }

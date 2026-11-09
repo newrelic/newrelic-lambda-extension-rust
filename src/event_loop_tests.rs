@@ -615,25 +615,6 @@ fn test_bounded_wait_budget_ms_u64_max_configured_falls_back_to_deadline_budget(
     assert!(budget <= 100, "expected deadline-bounded budget <= 100ms, got {budget}");
 }
 
-// ── should_defer_via_pipeline_flush precedence (serverless-mode mirror of the ──
-// ── APM guard) ──────────────────────────────────────────────────────────────
-
-#[test]
-fn test_pipeline_flush_defers_when_synchronous_flush_disabled() {
-    assert!(should_defer_via_pipeline_flush(true, false));
-}
-
-#[test]
-fn test_pipeline_flush_does_not_defer_when_synchronous_flush_enabled() {
-    assert!(!should_defer_via_pipeline_flush(true, true));
-}
-
-#[test]
-fn test_no_defer_when_pipeline_flush_disabled_regardless_of_synchronous_flush() {
-    assert!(!should_defer_via_pipeline_flush(false, false));
-    assert!(!should_defer_via_pipeline_flush(false, true));
-}
-
 fn make_noop_log_processor_serverless(config: Arc<config::ExtensionConfig>) -> Arc<LogProcessor> {
     Arc::new(LogProcessor::new(
         Arc::new(crate::newrelic::client::NewRelicClient::new_noop()),
@@ -1589,6 +1570,121 @@ async fn tag_lambda_function_once_does_not_panic_and_guards_repeat_calls() {
     );
 }
 
+// ── resolve_agent_send_at_boundary (runtimeDone boundary — unified APM send) ─────────
+
+// Common case: the Flow-1 send already finished by the runtimeDone boundary. Resolving
+// it must add ~zero latency and must NOT buffer anything into FAILED_AGENT_PAYLOADS.
+#[tokio::test]
+#[serial]
+async fn resolve_agent_send_at_boundary_already_done_adds_no_wait_and_buffers_nothing() {
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    // A send task that completes immediately (all payloads sent), with the cursor
+    // advanced to payloads.len() to mirror the real task's end state.
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let handle = tokio::spawn(async { true });
+    let payloads = vec![Arc::new(vec![1u8, 2, 3])];
+
+    // Give the spawned task a moment to actually finish so is_finished() is true and the
+    // fast path (no sleep future constructed) is exercised.
+    tokio::task::yield_now().await;
+
+    let start = std::time::Instant::now();
+    resolve_agent_send_at_boundary(
+        handle,
+        payloads,
+        cursor,
+        "rtd-done-req",
+        "arn:aws:lambda:us-east-1:123:function:test",
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < APM_SEND_RUNTIME_DONE_GRACE,
+        "already-done send must resolve well under the grace bound, took {elapsed:?}"
+    );
+    let len = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(usize::MAX);
+    assert_eq!(len, 0, "already-done send must not buffer any failed payloads");
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+}
+
+// Worst case with partial completion: the Flow-1 send successfully resolves payload 0
+// (advancing the cursor), then hangs on payload 1 past the grace bound. Resolving must
+// time out at ~APM_SEND_RUNTIME_DONE_GRACE, abort the send, and buffer ONLY the unresolved
+// payload (payload 1) — NOT payload 0, which was already sent. Re-buffering payload 0
+// would duplicate telemetry / FAILED_AGENT_PAYLOADS entries (the fixed duplicate-send bug).
+#[tokio::test]
+#[serial]
+async fn resolve_agent_send_at_boundary_timeout_buffers_only_unresolved_payloads() {
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    // Shared cursor: the task advances it after "sending" payload 0, then hangs on
+    // payload 1 (mirroring a send stuck mid-flight at the runtimeDone boundary).
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cursor_task = cursor.clone();
+    let handle = tokio::spawn(async move {
+        // payload 0 "sent" successfully → resolved.
+        cursor_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // payload 1 hangs forever (never resolves, cursor stays at 1).
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        cursor_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        true
+    });
+
+    // payload 0 = [1,2,3] (already sent), payload 1 = [4,5,6] (stuck → must be buffered).
+    let payloads = vec![Arc::new(vec![1u8, 2, 3]), Arc::new(vec![4u8, 5, 6])];
+
+    // Let the task advance the cursor past payload 0 before the boundary check.
+    tokio::task::yield_now().await;
+
+    let start = std::time::Instant::now();
+    resolve_agent_send_at_boundary(
+        handle,
+        payloads,
+        cursor,
+        "rtd-timeout-req",
+        "arn:aws:lambda:us-east-1:123:function:test",
+    )
+    .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed >= APM_SEND_RUNTIME_DONE_GRACE,
+        "must wait at least the grace bound before timing out, took {elapsed:?}"
+    );
+    assert!(
+        elapsed < APM_SEND_RUNTIME_DONE_GRACE + Duration::from_secs(2),
+        "must not wait anywhere near the stuck send's full duration, took {elapsed:?}"
+    );
+
+    let buffered: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().map(|p| p.payload_bytes.clone()).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        buffered.len(),
+        1,
+        "only the unresolved payload (payload 1) must be buffered, not the already-sent payload 0"
+    );
+    assert_eq!(
+        buffered[0],
+        vec![4u8, 5, 6],
+        "the buffered payload must be payload 1 ([4,5,6]) — payload 0 ([1,2,3]) was already sent"
+    );
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+}
+
 // ── buffer_failed_agent_payload ─────────────────────────────────────────────────────
 
 #[test]
@@ -2461,50 +2557,6 @@ async fn execute_standard_mode_shutdown_unknown_reason_synthesizes_generic_error
     REQUEST_DATA.remove("req-std-unknown-1");
 }
 
-// ── execute_standard_mode_event_loop — pipeline_flush path ───────────────────────────
-
-#[tokio::test]
-#[serial]
-async fn execute_standard_mode_pipeline_flush_defers_processing_handle() {
-    let server = wiremock::MockServer::start().await;
-
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
-                "req-std-pf-1",
-                "arn:aws:lambda:us-east-1:123456789012:function:pipeline-flush-test",
-                deadline_ms_from_now(5_000),
-            )),
-        )
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
-        .mount(&server)
-        .await;
-
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.new_relic.extension_enabled = true;
-    cfg.new_relic.license_key = Some("fake-key".to_string());
-    cfg.extension.pipeline_flush = true;
-    cfg.new_relic.synchronous_flush = false; // pipeline_flush takes effect only when synchronous_flush is off
-    let config = Arc::new(cfg);
-    let client = Arc::new(Client::new());
-    let mut components = make_test_extension_components(config, client, false);
-
-    let event_count = with_runtime_api_el(&server, || async {
-        execute_standard_mode_event_loop(&mut components).await
-    })
-    .await;
-
-    assert_eq!(event_count, 2, "pipeline_flush path: INVOKE + SHUTDOWN = 2 events");
-    REQUEST_DATA.remove("req-std-pf-1");
-}
-
 // ── execute_standard_mode_event_loop — cleanup_counter >= 10 path ────────────────────
 
 #[tokio::test]
@@ -2605,49 +2657,6 @@ async fn execute_apm_mode_warm_start_covers_second_invoke_path() {
     assert_eq!(event_count, 3, "2 APM INVOKEs + 1 SHUTDOWN = 3 events");
     REQUEST_DATA.remove("req-apm-warm-1");
     REQUEST_DATA.remove("req-apm-warm-2");
-}
-
-// ── execute_apm_mode_event_loop — pipeline_flush defers combined task ─────────────────
-
-#[tokio::test]
-#[serial]
-async fn execute_apm_mode_pipeline_flush_defers_combined_task() {
-    let server = wiremock::MockServer::start().await;
-
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
-                "req-apm-pf-1",
-                "arn:aws:lambda:us-east-1:123456789012:function:apm-pf-test",
-                deadline_ms_from_now(5_000),
-            )),
-        )
-        .up_to_n_times(1)
-        .mount(&server)
-        .await;
-
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
-        .mount(&server)
-        .await;
-
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.new_relic.extension_enabled = true;
-    cfg.new_relic.license_key = Some("fake-key".to_string());
-    cfg.extension.pipeline_flush = true;
-    let config = Arc::new(cfg);
-    let client = Arc::new(Client::new());
-    let mut components = make_test_extension_components(config, client, true);
-
-    let event_count = with_runtime_api_el(&server, || async {
-        execute_apm_mode_event_loop(&mut components).await
-    })
-    .await;
-
-    assert_eq!(event_count, 2, "APM pipeline_flush: INVOKE + SHUTDOWN = 2 events");
-    REQUEST_DATA.remove("req-apm-pf-1");
 }
 
 // ── execute_apm_mode_event_loop — apm_blocking_handshake path ────────────────────────
@@ -2859,14 +2868,14 @@ async fn execute_apm_mode_shutdown_unknown_reason_with_last_request_context_set(
     REQUEST_DATA.remove("req-apm-unk-1");
 }
 
-// ── execute_standard_mode_event_loop — 403 pipeline_flush emergency path ─────────────
+// ── execute_standard_mode_event_loop — 403 emergency path ────────────────────────────
 
 #[tokio::test]
 #[serial]
-async fn execute_standard_mode_pipeline_flush_403_emergency_shutdown() {
+async fn execute_standard_mode_403_emergency_shutdown() {
     let server = wiremock::MockServer::start().await;
 
-    // First INVOKE pushes a handle into pending_flush_handles
+    // First INVOKE, then a 403 on the next poll triggers emergency shutdown cleanup.
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
         .respond_with(
@@ -2880,7 +2889,7 @@ async fn execute_standard_mode_pipeline_flush_403_emergency_shutdown() {
         .mount(&server)
         .await;
 
-    // 403 triggers emergency shutdown while pending_flush_handles is non-empty
+    // 403 triggers emergency shutdown cleanup.
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
         .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("forbidden"))
@@ -2890,8 +2899,6 @@ async fn execute_standard_mode_pipeline_flush_403_emergency_shutdown() {
     let mut cfg = config::ExtensionConfig::default();
     cfg.new_relic.extension_enabled = true;
     cfg.new_relic.license_key = Some("fake-key".to_string());
-    cfg.extension.pipeline_flush = true;
-    cfg.new_relic.synchronous_flush = false;
     let config = Arc::new(cfg);
     let client = Arc::new(Client::new());
     let mut components = make_test_extension_components(config, client, false);
@@ -2904,11 +2911,11 @@ async fn execute_standard_mode_pipeline_flush_403_emergency_shutdown() {
     REQUEST_DATA.remove("req-std-pf-403");
 }
 
-// ── execute_apm_mode_event_loop — 403 pipeline_flush emergency path ───────────────────
+// ── execute_apm_mode_event_loop — 403 emergency path ─────────────────────────────────
 
 #[tokio::test]
 #[serial]
-async fn execute_apm_mode_pipeline_flush_403_emergency_shutdown() {
+async fn execute_apm_mode_403_emergency_shutdown() {
     let server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -2924,7 +2931,7 @@ async fn execute_apm_mode_pipeline_flush_403_emergency_shutdown() {
         .mount(&server)
         .await;
 
-    // 403 while pending_flush_handles is non-empty (pipeline_flush=true means handle was pushed)
+    // 403 triggers emergency shutdown cleanup.
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
         .respond_with(wiremock::ResponseTemplate::new(403).set_body_string("forbidden"))
@@ -2934,7 +2941,6 @@ async fn execute_apm_mode_pipeline_flush_403_emergency_shutdown() {
     let mut cfg = config::ExtensionConfig::default();
     cfg.new_relic.extension_enabled = true;
     cfg.new_relic.license_key = Some("fake-key".to_string());
-    cfg.extension.pipeline_flush = true;
     let config = Arc::new(cfg);
     let client = Arc::new(Client::new());
     let mut components = make_test_extension_components(config, client, true);
@@ -3365,16 +3371,6 @@ fn bounded_wait_budget_ms_caps_result_to_configured_timeout() {
     assert_eq!(super::bounded_wait_budget_ms(far_future_ms, 1_000), 1_000);
 }
 
-// ── should_defer_via_pipeline_flush ──────────────────────────────────────────
-
-#[test]
-fn should_defer_via_pipeline_flush_all_cases() {
-    assert!( super::should_defer_via_pipeline_flush(true,  false));
-    assert!(!super::should_defer_via_pipeline_flush(false, false));
-    assert!(!super::should_defer_via_pipeline_flush(true,  true));
-    assert!(!super::should_defer_via_pipeline_flush(false, true));
-}
-
 // ── cleanup_old_failed_payloads ───────────────────────────────────────────────
 
 #[test]
@@ -3467,56 +3463,6 @@ async fn send_batched_payloads_with_reports_only_clears_paired_entries_leaves_un
     );
 
     crate::agent::batch::AGENT_BATCH_BUFFER.clear();
-}
-
-// ── pipeline flush handle cap — execute_standard_mode_event_loop:1025-1030 ───
-//
-// With pipeline_flush=true and 9 rapid INVOKE events the cap check fires:
-// when pending_flush_handles already holds 8 entries the oldest is awaited
-// synchronously before adding the next.  Uses multi-thread so spawned
-// process_request_concurrently tasks can actually run concurrently.
-#[tokio::test]
-#[serial]
-async fn execute_standard_mode_event_loop_awaits_oldest_handle_when_pipeline_flush_cap_reached() {
-    let server = wiremock::MockServer::start().await;
-
-    // 9 INVOKE events so the pipeline-flush Vec can fill past 8
-    for i in 0..9u32 {
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
-                &format!("req-cap-{i}"),
-                "arn:aws:lambda:us-east-1:123:function:cap-test",
-                deadline_ms_from_now(5_000),
-            )))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-    }
-    wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(shutdown_event_body("spindown")))
-        .mount(&server)
-        .await;
-
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.new_relic.extension_enabled = true;
-    cfg.new_relic.license_key = Some("fake-key".to_string());
-    cfg.extension.pipeline_flush = true; // enable pipeline flush to exercise the cap path
-    let config = Arc::new(cfg);
-    let client = Arc::new(reqwest::Client::new());
-    let mut components = make_test_extension_components(config, client, false);
-
-    let event_count = with_runtime_api_el(&server, || async {
-        execute_standard_mode_event_loop(&mut components).await
-    })
-    .await;
-
-    assert_eq!(event_count, 10, "must count all 9 INVOKEs + 1 SHUTDOWN");
-
-    for i in 0..9u32 {
-        REQUEST_DATA.remove(&format!("req-cap-{i}"));
-    }
 }
 
 // ── shutdown log-flush failure — execute_standard_mode_event_loop:1229-1233 ──

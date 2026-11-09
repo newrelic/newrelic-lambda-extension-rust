@@ -1542,7 +1542,6 @@ fn test_extension_settings_all_fields() {
         log_level: "debug".to_string(),
         extension_logs_enabled: false,
         runtime_done_grace_ms: 250,
-        pipeline_flush: false,
         lmi_flush_interval_ms: 30_000,
         ignore_errors: std::collections::HashSet::new(),
         expected_errors: std::collections::HashSet::new(),
@@ -2078,21 +2077,6 @@ fn test_synchronous_flush_truthy_variants() {
             );
         });
     }
-}
-
-#[test]
-#[serial]
-fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
-    // Both flags can legally be set simultaneously — precedence is enforced at the
-    // event-loop level (execute_standard_mode_event_loop), not by rejecting the config.
-    with_full_clean_env(|| {
-        env::set_var("NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH", "true");
-        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
-        let config = ExtensionConfig::from_env();
-        assert!(config.new_relic.synchronous_flush);
-        assert!(config.extension.pipeline_flush);
-        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
-    });
 }
 
 // ============================================================================
