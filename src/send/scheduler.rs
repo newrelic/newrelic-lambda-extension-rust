@@ -3,7 +3,7 @@
 
 //! `SendScheduler`: the shared primitive both send tiers run through, and
 //! the real integration point for the agent-payload Flow-1 batch (wired in
-//! `event_loop.rs`'s `process_apm_request`, via `AGENT_SEND_SCHEDULER`).
+//! `event_loop.rs`'s `process_apm_request`, via `SEND_SCHEDULER`).
 //!
 //! - `SendMode::Sync` (`default` tier): spawn immediately, then
 //!   bounded-wait on it in the *current* invocation, before returning —
@@ -34,7 +34,7 @@
 //! deadline before relying on it, the same way `wait_for_runtime_done_with_grace`
 //! already clamps its own wait against `deadlineMs` (`event_loop.rs`).
 //!
-//! **Not everything here has a production caller yet.** `AGENT_SEND_SCHEDULER`
+//! **Not everything here has a production caller yet.** `SEND_SCHEDULER`
 //! (`event_loop.rs`) uses `spawn`/`resolve_pending` directly — it never
 //! calls `dispatch`/`mode`/`send_now`/`drain_all`, since the agent-payload
 //! call site needs explicit two-phase control (spawn now, resolve at a

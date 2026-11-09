@@ -1570,7 +1570,7 @@ async fn tag_lambda_function_once_does_not_panic_and_guards_repeat_calls() {
     );
 }
 
-// ── resolve_pending_agent_batch (runtimeDone boundary — via AGENT_SEND_SCHEDULER) ────
+// ── resolve_pending_agent_batch (runtimeDone boundary — via SEND_SCHEDULER) ────
 
 fn set_agent_batch_meta(payloads: Vec<Arc<Vec<u8>>>, request_id: &str, arn: &str) {
     if let Ok(mut guard) = AGENT_BATCH_META.lock() {
@@ -1594,7 +1594,7 @@ async fn resolve_pending_agent_batch_already_done_adds_no_wait_and_buffers_nothi
     let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     set_agent_batch_meta(vec![Arc::new(vec![1u8, 2, 3])], "rtd-done-req", "arn:aws:lambda:us-east-1:123:function:test");
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
         .await;
 
@@ -1649,7 +1649,7 @@ async fn resolve_pending_agent_batch_timeout_buffers_only_unresolved_payloads() 
         "rtd-timeout-req",
         "arn:aws:lambda:us-east-1:123:function:test",
     );
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
         .await;
 
@@ -3537,12 +3537,12 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
     assert_eq!(event_count, 1, "single SHUTDOWN must count as one event");
 }
 
-// --- SendTier::High deferred agent-send tests (AGENT_SEND_SCHEDULER / AGENT_BATCH_META) ---
+// --- SendTier::High deferred agent-send tests (SEND_SCHEDULER / AGENT_BATCH_META) ---
 //
-// These exercise AGENT_SEND_SCHEDULER.spawn + resolve_pending_agent_batch directly,
+// These exercise SEND_SCHEDULER.spawn + resolve_pending_agent_batch directly,
 // independent of the full process_apm_request flow, mirroring the same split
 // event_loop_tests.rs already uses for send_agent_payload_or_buffer above. #[serial]
-// because AGENT_SEND_SCHEDULER, AGENT_BATCH_META, and FAILED_AGENT_PAYLOADS are
+// because SEND_SCHEDULER, AGENT_BATCH_META, and FAILED_AGENT_PAYLOADS are
 // process-global.
 
 fn clear_agent_batch_meta() {
@@ -3569,7 +3569,7 @@ async fn spawn_then_resolve_recovers_an_already_finished_send() {
     let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     set_agent_batch_meta(vec![Arc::new(vec![1, 2, 3])], "req-deferred-ok", "arn:aws:lambda:us-east-1:123:function:test");
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
         .await;
     // Give the trivial task a moment to actually finish before resolving,
@@ -3604,7 +3604,7 @@ async fn spawn_then_resolve_buffers_an_unfinished_straggler() {
         crate::send::SendOutcome::Success
     });
     set_agent_batch_meta(vec![Arc::new(vec![9, 9, 9])], "req-deferred-straggler", "arn:aws:lambda:us-east-1:123:function:test");
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
         .await;
 
@@ -3641,7 +3641,7 @@ async fn spawning_a_second_time_without_resolving_aborts_the_orphan() {
         crate::send::SendOutcome::Success
     });
     set_agent_batch_meta(vec![Arc::new(vec![1])], "req-orphan", "arn:aws:lambda:us-east-1:123:function:test");
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(
             crate::send::SendKind::ApmCollector,
             first_send,
@@ -3655,7 +3655,7 @@ async fn spawning_a_second_time_without_resolving_aborts_the_orphan() {
     let second_send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     tokio::time::sleep(Duration::from_millis(10)).await;
     set_agent_batch_meta(vec![Arc::new(vec![2])], "req-second", "arn:aws:lambda:us-east-1:123:function:test");
-    AGENT_SEND_SCHEDULER
+    SEND_SCHEDULER
         .spawn(
             crate::send::SendKind::ApmCollector,
             second_send,
@@ -3671,4 +3671,75 @@ async fn spawning_a_second_time_without_resolving_aborts_the_orphan() {
     );
 
     clear_agent_batch_meta();
+}
+
+// --- Log flush tests (spawn_log_flush / resolve_pending_logs via SEND_SCHEDULER) ---
+
+#[tokio::test]
+#[serial]
+async fn spawn_log_flush_then_resolve_round_trip_with_empty_batch() {
+    // Clean slate: a previous test (or a prior run of this one) must not
+    // leave SendKind::Logs occupied.
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
+
+    let config = Arc::new(config::ExtensionConfig::default());
+    let log_processor = make_noop_log_processor_serverless(config);
+
+    spawn_log_flush(&log_processor, "req-roundtrip").await;
+    assert!(
+        SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await,
+        "spawn_log_flush must register the flush with SEND_SCHEDULER"
+    );
+
+    // An empty batch hits LogProcessor::flush's own fast path and returns
+    // near-instantly - no real network call happens.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    resolve_pending_logs("req-roundtrip").await;
+    assert!(
+        !SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await,
+        "resolve_pending_logs must clear the entry once the flush is actually finished"
+    );
+}
+
+// Proves the duplicate-flush guard: if a flush is already pending (StillRunning),
+// spawn_log_flush must skip entirely - never touching, overwriting, or aborting it.
+#[tokio::test]
+#[serial]
+async fn spawn_log_flush_skips_when_a_flush_is_already_pending() {
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
+
+    // A never-finishing send with a drop-detector, standing in for "a flush
+    // from a previous invocation that's still running."
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct AbortFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for AbortFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flag = AbortFlag(aborted.clone());
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        let _flag = flag;
+        std::future::pending::<()>().await;
+        crate::send::SendOutcome::Success
+    });
+    SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, send, None).await;
+    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await);
+
+    let config = Arc::new(config::ExtensionConfig::default());
+    let log_processor = make_noop_log_processor_serverless(config);
+    spawn_log_flush(&log_processor, "req-skip-test").await;
+    tokio::task::yield_now().await;
+
+    assert!(
+        !aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "spawn_log_flush must not abort/overwrite an already-pending flush"
+    );
+    assert!(
+        SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await,
+        "the original pending entry must still be the one occupying the slot"
+    );
+
+    // Test cleanup only - fine to abort here, this task has no real data.
+    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::Logs).await;
 }

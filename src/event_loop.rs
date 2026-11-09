@@ -152,15 +152,15 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
 /// `high` tier: same spawn, but resolved at the *next* invocation's start
 /// instead. Either way, the bounded-wait/abort-on-timeout mechanics are
 /// `SendScheduler`'s, not duplicated here.
-static AGENT_SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
+static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendTier::from_env().build_scheduler());
 
 /// Metadata `SendScheduler` deliberately doesn't know about — the actual
 /// payload bytes and the request/ARN needed to buffer the unresolved tail
 /// into `FAILED_AGENT_PAYLOADS` on a timeout. Written alongside every
-/// `AGENT_SEND_SCHEDULER.spawn(...)` call, consumed by
+/// `SEND_SCHEDULER.spawn(...)` call, consumed by
 /// `resolve_pending_agent_batch`. At most one entry at a time, for the same
-/// reason `AGENT_SEND_SCHEDULER` only ever has at most one pending handle
+/// reason `SEND_SCHEDULER` only ever has at most one pending handle
 /// for `SendKind::ApmCollector`: Normal-mode Lambda never runs concurrent
 /// invocations in one environment.
 struct AgentBatchMeta {
@@ -203,7 +203,7 @@ fn buffer_unresolved_agent_payloads(
 }
 
 /// Resolve whatever agent-payload batch is currently pending in
-/// `AGENT_SEND_SCHEDULER` (if any) and buffer its unresolved tail. No-op if
+/// `SEND_SCHEDULER` (if any) and buffer its unresolved tail. No-op if
 /// nothing is pending — including the first-invocation case, where nothing
 /// has ever been spawned yet.
 ///
@@ -214,7 +214,7 @@ fn buffer_unresolved_agent_payloads(
 /// - `SHUTDOWN`: there's no next invocation to defer to, so this is the
 ///   final drain.
 async fn resolve_pending_agent_batch() {
-    let Some(outcome) = AGENT_SEND_SCHEDULER
+    let Some(outcome) = SEND_SCHEDULER
         .resolve_pending(crate::send::SendKind::ApmCollector)
         .await
     else {
@@ -229,10 +229,10 @@ async fn resolve_pending_agent_batch() {
         }
     };
     let Some(meta) = meta else {
-        // AGENT_SEND_SCHEDULER and AGENT_BATCH_META are always written
+        // SEND_SCHEDULER and AGENT_BATCH_META are always written
         // together at the spawn site below — this should be unreachable.
         error!(
-            "AGENT_SEND_SCHEDULER had a pending agent batch but AGENT_BATCH_META was empty \
+            "SEND_SCHEDULER had a pending agent batch but AGENT_BATCH_META was empty \
              — payload metadata lost, cannot buffer any unresolved tail"
         );
         return;
@@ -265,6 +265,96 @@ async fn resolve_pending_agent_batch() {
             warn!(
                 "APM mode: unexpected {:?} resolving agent batch for {}",
                 outcome.result, meta.request_id
+            );
+        }
+    }
+}
+
+/// Spawn this invocation's log flush into `SEND_SCHEDULER`, unconditionally —
+/// logs are never tier-gated (unlike agent payload): they were already
+/// unconditionally detached before `SendTier` existed, and stay that way
+/// regardless of `default`/`high`. What changes is *tracking*: instead of
+/// pure fire-and-forget (never checked again), the flush is now resolved —
+/// without ever being aborted — at the start of the next invocation (see
+/// `resolve_pending_logs`) or at `SHUTDOWN`.
+///
+/// Guards against ever running two log flushes concurrently: if
+/// `has_pending` says one is still running (`StillRunning` from a previous
+/// `resolve_pending_logs` call), this skips spawning a new one entirely —
+/// new logs simply stay in `LogProcessor`'s own batch to go out on the
+/// *next* flush, same as if the threshold-triggered auto-flush path were
+/// still in progress.
+async fn spawn_log_flush(log_processor: &Arc<LogProcessor>, request_id: &str) {
+    if SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await {
+        debug!(
+            "APM mode: previous log flush still running — new logs for {} stay batched for the next flush",
+            request_id
+        );
+        return;
+    }
+
+    let log_processor_clone = log_processor.clone();
+    let request_id_clone = request_id.to_string();
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        match log_processor_clone.flush().await {
+            Ok(()) => crate::send::SendOutcome::Success,
+            Err(e) => {
+                error!("Failed to flush logs for request {}: {}", request_id_clone, e);
+                crate::send::SendOutcome::Failure
+            }
+        }
+    });
+    SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, send, None).await;
+}
+
+/// Resolve whatever log flush is pending from a previous invocation, if any —
+/// called unconditionally at the start of every invocation and at `SHUTDOWN`,
+/// regardless of `send_tier` (logs are never tier-gated — see
+/// `spawn_log_flush`). Never aborts: a still-running flush is left exactly
+/// alone (see `SendScheduler::resolve_pending_no_abort`'s doc for why —
+/// `LogProcessor::flush`'s chunk list lives in a purely local variable with
+/// no externally visible progress, unlike the agent-payload batch, so
+/// killing it mid-flight would lose data with nothing to buffer).
+///
+/// No buffering happens here even on `Failed`: `LogProcessor::flush` already
+/// buffers its own per-chunk send failures into its internal
+/// `failed_logs_buffer` (see `send_and_clear_batch_simple`) — this function
+/// only needs to observe and log the outcome, not act on it.
+async fn resolve_pending_logs(request_id: &str) {
+    let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending_no_abort(crate::send::SendKind::Logs)
+        .await
+    else {
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: previous invocation's log flush completed successfully (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::Failed => {
+            debug!(
+                "APM mode: previous invocation's log flush had failures, already buffered internally (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::StillRunning => {
+            debug!(
+                "APM mode: previous invocation's log flush still running (checked at {})",
+                request_id
+            );
+        }
+        other => {
+            // TimedOut/Dropped/Deferred: unreachable in practice —
+            // resolve_pending_no_abort never aborts (no TimedOut), never
+            // checks the breaker (no Dropped), and never itself returns
+            // Deferred. Handled defensively, not assumed.
+            warn!(
+                "APM mode: unexpected {:?} resolving pending log flush at {}",
+                other, request_id
             );
         }
     }
@@ -600,16 +690,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // before this loop returns to /next — that part is unconditional.
                 // What happens *inside* it depends on config.extension.send_tier:
                 // - SendTier::Default: resolves this invocation's own agent-payload
-                //   send (spawned via AGENT_SEND_SCHEDULER) at its runtimeDone
+                //   send (spawned via SEND_SCHEDULER) at its runtimeDone
                 //   boundary, bounded, then FAILED_AGENT_PAYLOADS on timeout. Every
                 //   invocation closes out its own send before this await returns.
                 // - SendTier::High: leaves this invocation's send pending in
-                //   AGENT_SEND_SCHEDULER instead of waiting on it, and — at the very
+                //   SEND_SCHEDULER instead of waiting on it, and — at the very
                 //   top of the *next* call to process_apm_request — resolves whatever
                 //   the previous invocation left pending, with the same bound. The
                 //   await below still can't return until that resolution finishes;
                 //   what changed is *which* invocation's boundary pays for it, not
-                //   whether /next can be blocked at all. See AGENT_SEND_SCHEDULER's
+                //   whether /next can be blocked at all. See SEND_SCHEDULER's
                 //   doc comment for the full design and REDESIGN_PLAN.md for why.
                 if let Err(e) = current_task.await {
                     error!("Error in APM request processing: {}", e);
@@ -621,7 +711,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // path has no bound at all (a JoinSet draining an arbitrary number of
                 // previous requests' sends, plus their platform-report-metrics calls),
                 // unlike current_task's own agent-payload send, which is resolved
-                // through AGENT_SEND_SCHEDULER and bounded by its configured timeout.
+                // through SEND_SCHEDULER and bounded by its configured timeout.
                 // process_and_send_agent_payload already buffers into
                 // FAILED_AGENT_PAYLOADS on transient send failure internally, so this
                 // detach doesn't remove that existing safety net -- it only removes the
@@ -739,10 +829,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 // SendTier::High: there is no "next invocation" at shutdown to defer
                 // to, so drain whatever the last invocation left pending in
-                // AGENT_SEND_SCHEDULER first. Harmless no-op under SendTier::Default
+                // SEND_SCHEDULER first. Harmless no-op under SendTier::Default
                 // (already resolved at its own boundary) and on the common case
                 // where nothing is pending.
                 resolve_pending_agent_batch().await;
+
+                // Logs are never tier-gated — same no-op-if-already-resolved check,
+                // every tier, every shutdown. Never aborts a still-running flush (see
+                // resolve_pending_logs's doc); flush_on_shutdown below is still what
+                // actually guarantees the final drain either way, since LogProcessor::flush
+                // is safe to call concurrently/redundantly with itself.
+                resolve_pending_logs("shutdown").await;
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
@@ -1363,11 +1460,15 @@ pub async fn process_apm_request(
     // SendTier::High: resolve whatever the previous invocation deferred before this
     // invocation does any of its own Flow-1 work. Gated on the tier so
     // SendTier::Default (the default, unchanged-behavior path) never even touches
-    // AGENT_SEND_SCHEDULER's lock here (it resolves at its own boundary instead).
+    // SEND_SCHEDULER's lock here (it resolves at its own boundary instead).
     // No-op on the first invocation (nothing pending yet).
     if config.extension.send_tier == crate::send::SendTier::High {
         resolve_pending_agent_batch().await;
     }
+
+    // Logs are never tier-gated (see spawn_log_flush/resolve_pending_logs) — this
+    // always runs, for both SendTier::Default and SendTier::High.
+    resolve_pending_logs(&request_id).await;
 
     if !is_cold_start {
         // Atomically drain old request buffers in a single lock to avoid
@@ -1455,7 +1556,7 @@ pub async fn process_apm_request(
     // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
     //
     // The Flow-1 send is spawned here, the instant the payload is ready, via
-    // AGENT_SEND_SCHEDULER.spawn — overlapping it with the function's remaining
+    // SEND_SCHEDULER.spawn — overlapping it with the function's remaining
     // execution, regardless of send_tier. What differs by tier is only *when* it gets
     // resolved: SendTier::Default resolves it at this invocation's own runtimeDone
     // boundary below; SendTier::High resolves it at the start of the next invocation
@@ -1532,7 +1633,7 @@ pub async fn process_apm_request(
         match AGENT_BATCH_META.lock() {
             Ok(mut guard) => {
                 if guard.is_some() {
-                    // Defensive, should-not-happen: AGENT_SEND_SCHEDULER.spawn's own
+                    // Defensive, should-not-happen: SEND_SCHEDULER.spawn's own
                     // orphan-abort below already logs/handles the handle side of this;
                     // this just keeps the metadata side in lockstep with it.
                     warn!(
@@ -1544,7 +1645,7 @@ pub async fn process_apm_request(
             }
             Err(e) => error!("AGENT_BATCH_META lock poisoned, dropping new entry: {}", e),
         }
-        AGENT_SEND_SCHEDULER
+        SEND_SCHEDULER
             .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
             .await;
     } else {
@@ -1633,26 +1734,23 @@ pub async fn process_apm_request(
     .await;
 
     // runtimeDone boundary: SendTier::Default resolves this invocation's own Flow-1
-    // agent send (already spawned into AGENT_SEND_SCHEDULER above) right here, before
+    // agent send (already spawned into SEND_SCHEDULER above) right here, before
     // returning to /next. SendTier::High leaves it pending — resolved instead at the
     // top of the *next* invocation (see that call near this function's start).
     if config.extension.send_tier == crate::send::SendTier::Default {
         resolve_pending_agent_batch().await;
     }
 
-    // Fully detached, no wait at all -- /next must never be blocked by this, not even
-    // up to the 100ms grace the agent-payload send gets. Log/platform flush is a
-    // network send like the others above; same reasoning applies (see the
-    // platform-report-metrics block above for the full rationale on why occasional
-    // loss on environment reclaim is an acceptable tradeoff here).
-    let log_processor_clone = global_log_processor.clone();
-    let request_id_clone = request_id.clone();
-    tokio::spawn(async move {
-        if let Err(e) = log_processor_clone.flush().await {
-            error!("Failed to flush logs for request {}: {}", request_id_clone, e);
-        }
-    });
+    // Spawned now, never waited on here -- /next must never be blocked by this.
+    // Resolved (without ever being aborted) at the start of the next invocation by
+    // resolve_pending_logs, or at SHUTDOWN -- see spawn_log_flush's doc for why logs
+    // are never tier-gated and never killed mid-flight.
+    spawn_log_flush(&global_log_processor, &request_id).await;
 
+    // Platform flush: still fully detached, not yet routed through SEND_SCHEDULER
+    // (out of scope for this pass -- same reasoning as logs would apply if/when it
+    // is: see the platform-report-metrics block above for why occasional loss on
+    // environment reclaim is an acceptable tradeoff for never blocking /next here).
     let platform_processor_clone = state.platform_processor.clone();
     let request_id_clone = request_id.clone();
     tokio::spawn(async move {
