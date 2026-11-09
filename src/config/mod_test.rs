@@ -1545,6 +1545,7 @@ fn test_extension_settings_all_fields() {
         lmi_flush_interval_ms: 30_000,
         ignore_errors: std::collections::HashSet::new(),
         expected_errors: std::collections::HashSet::new(),
+        send_tier: crate::send::SendTier::Default,
     };
     
     assert!(settings.send_function_logs);
