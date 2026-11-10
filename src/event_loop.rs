@@ -1323,42 +1323,6 @@ pub async fn process_apm_request(
             })
             .collect();
 
-        // Opportunistically remove other requests' state that is already fully
-        // drained (empty buffer, no pending platform.report) instead of leaving it
-        // for the 5-invocation-old periodic sweep (cleanup_old_request_buffers) —
-        // now that Flow 1 (process_apm_request's same-invoke send) succeeds in the
-        // common case, a request's buffer is usually already empty by the time the
-        // next invocation runs, so it would otherwise sit unreferenced until the
-        // periodic sweep catches up. Excludes anything just captured above in
-        // pending_with_payloads — those still need their late-send to complete
-        // first; their own cleanup happens after that, in the loop below.
-        let late_payload_ids: std::collections::HashSet<&str> =
-            pending_with_payloads.iter().map(|(id, _)| id.as_str()).collect();
-        let exhausted_request_ids: Vec<String> = REQUEST_DATA
-            .iter()
-            .filter_map(|entry| {
-                let req_id = entry.key();
-                if req_id != &request_id
-                    && !late_payload_ids.contains(req_id.as_str())
-                    && entry.pending_report.is_none()
-                {
-                    if let Ok(buffer) = entry.agent_buffer.lock() {
-                        if buffer.is_empty() {
-                            return Some(req_id.clone());
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-        for old_request_id in exhausted_request_ids {
-            debug!(
-                "Removing fully-drained request state for {} (no payload, no pending report)",
-                old_request_id
-            );
-            cleanup_request_processing_state_internal(&old_request_id, false);
-        }
-
         if !pending_with_payloads.is_empty() {
             debug!(
                 "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
