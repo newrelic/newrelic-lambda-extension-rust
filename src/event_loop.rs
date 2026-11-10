@@ -1335,28 +1335,24 @@ pub async fn process_apm_request(
                 // multi-minute delay (idle-sandbox reclaim) is distinguishable from the
                 // routine ~tens-of-ms gap inherent to deferring to the next invocation.
                 let elapsed_ms = request::get_runtime_done_elapsed_ms(&old_request_id);
+                let chunk_count = late_payloads.len();
 
-                // Send all late payloads concurrently — each is an independent HTTP POST
-                // that only takes a read lock on apm_app (no write contention).
-                let mut set = tokio::task::JoinSet::new();
-                for payload_bytes in late_payloads {
-                    let rid = old_request_id.clone();
-                    let apm = apm_app.clone();
-                    set.spawn(async move {
-                        if let Err(e) = send_to_apm_collector(&payload_bytes, &rid, &apm).await {
-                            error!(
-                                "Failed to send late agent payload for {} (arrived {} after runtime.done): {}",
-                                rid, format_elapsed_for_log(elapsed_ms), e
-                            );
-                        } else {
-                            info!(
-                                "Successfully sent late agent payload for request: {} (arrived {} after runtime.done)",
-                                rid, format_elapsed_for_log(elapsed_ms)
-                            );
-                        }
-                    });
+                // Merge mergeable event-list types across all of this request's
+                // buffered chunks into one collector POST per type, rather than one
+                // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
+                if let Err(e) =
+                    send_merged_payloads_to_apm_collector(late_payloads, &old_request_id, &apm_app).await
+                {
+                    error!(
+                        "Failed to send {} late agent payload chunk(s) for {} (arrived {} after runtime.done): {}",
+                        chunk_count, old_request_id, format_elapsed_for_log(elapsed_ms), e
+                    );
+                } else {
+                    info!(
+                        "Successfully sent {} late agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
+                        chunk_count, old_request_id, format_elapsed_for_log(elapsed_ms)
+                    );
                 }
-                while set.join_next().await.is_some() {}
 
                 cleanup_request_processing_state_internal(&old_request_id, false);
             }
@@ -1583,6 +1579,32 @@ async fn send_to_apm_collector(
     Ok(())
 }
 
+/// Like `send_to_apm_collector`, but for multiple agent-payload chunks belonging to
+/// the same request — merges mergeable event-list types across chunks into one
+/// collector POST per type instead of one POST per chunk (see
+/// `ApmApp::process_merged_agent_payloads`).
+async fn send_merged_payloads_to_apm_collector(
+    payloads: Vec<Vec<u8>>,
+    request_id: &str,
+    apm_app: &crate::apm::SharedApmApp,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let apm_app_guard = apm_app.read().await;
+    if let Some(ref app) = *apm_app_guard {
+        app.process_merged_agent_payloads(payloads, request_id).await?;
+        info!(
+            "APM mode: Merged agent payload batch sent successfully for request: {}",
+            request_id
+        );
+    } else {
+        warn!(
+            "APM connection still in progress - merged payload batch for {} will be buffered and retried",
+            request_id
+        );
+        return Err("APM connection not ready yet - payload buffered for retry".into());
+    }
+    Ok(())
+}
+
 /// Send one agent payload to the APM collector; on failure buffer it into
 /// `FAILED_AGENT_PAYLOADS` so `retry_failed_agent_payloads` resends it on the
 /// next invoke / at shutdown. Returns `true` on success, `false` on a
@@ -1607,19 +1629,6 @@ async fn send_agent_payload_or_buffer(
     }
 }
 
-/// Wait for `platform.runtimeDone` for this request, then give a short grace for
-/// trailing telemetry, then return. Used by both serverless mode and APM mode before
-/// the end-of-invocation flush so late logs land in `log_batch` before it drains.
-///
-/// Bounds:
-/// - Upper bound on the runtime.done wait = function's own deadline (`deadlineMs`
-///   from the INVOKE event), clamped to Lambda's 15 min ceiling. Never outlives
-///   the function. Falls back to 5 s if `deadline_ms` is missing/stale.
-/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 25 ms,
-///   clamp `[0, 2000]`). Skipped entirely when `log_processor.is_drained()` is true.
-///
-/// Notify is pre-armable: if `runtime.done` fired before we reach this point,
-/// `notified()` returns immediately.
 /// Core wait, shared by every caller that needs to know when the handler has actually
 /// finished: blocks on `runtime_done_notify` (pre-armable — if `platform.runtimeDone`
 /// already fired, `notified()` returns immediately), bounded by the invocation's own

@@ -850,6 +850,127 @@ async fn process_agent_payload_v2_ruby_normalizes_all_six_data_types() {
     assert!(result.is_ok());
 }
 
+// ── process_merged_agent_payloads ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn process_merged_agent_payloads_empty_list_returns_ok() {
+    let result = test_apm_app().process_merged_agent_payloads(vec![], "req-merged-empty").await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+#[serial]
+async fn process_merged_agent_payloads_single_chunk_delegates_to_single_payload_path() {
+    // len() <= 1 must take the same code path as process_agent_payload — proven here
+    // by observing the same buffer-on-failure outcome for a single mergeable-type chunk.
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+    let payload = make_v1_payload(serde_json::json!({
+        "analytic_event_data": [null, {"reservoir_size": 100, "events_seen": 1}, [{"id": "only"}]]
+    }));
+    let result = test_apm_app()
+        .process_merged_agent_payloads(vec![payload], "req-merged-single")
+        .await;
+    assert!(result.is_ok());
+
+    let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
+    let entries: Vec<_> = buffered.iter().filter(|e| e.request_id == "req-merged-single").collect();
+    assert_eq!(entries.len(), 1, "a single chunk must buffer as exactly one entry");
+    assert_eq!(entries[0].data[2].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn process_merged_agent_payloads_merges_mergeable_event_list_types_across_chunks() {
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+
+    let chunk1 = make_v1_payload(serde_json::json!({
+        "analytic_event_data": [null, {"reservoir_size": 100, "events_seen": 2}, [{"id": "a1"}, {"id": "a2"}]]
+    }));
+    let chunk2 = make_v1_payload(serde_json::json!({
+        "analytic_event_data": [null, {"reservoir_size": 1200, "events_seen": 3}, [{"id": "b1"}, {"id": "b2"}, {"id": "b3"}]]
+    }));
+
+    let result = test_apm_app()
+        .process_merged_agent_payloads(vec![chunk1, chunk2], "req-merged-analytic")
+        .await;
+    assert!(result.is_ok());
+
+    let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
+    let entries: Vec<_> = buffered
+        .iter()
+        .filter(|e| e.request_id == "req-merged-analytic" && e.telemetry_type == "analytic_event_data")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "two chunks of a mergeable type must buffer as exactly one merged entry, not two"
+    );
+    let events = entries[0].data[2].as_array().unwrap();
+    assert_eq!(events.len(), 5, "merged entry must contain all 5 events from both chunks");
+    assert_eq!(entries[0].data[1]["events_seen"], serde_json::json!(5));
+    assert_eq!(entries[0].data[1]["reservoir_size"], serde_json::json!(1200));
+}
+
+#[tokio::test]
+#[serial]
+async fn process_merged_agent_payloads_keeps_non_mergeable_types_per_chunk() {
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+
+    let chunk1 = make_v1_payload(serde_json::json!({
+        "metric_data": [null, 0, 0, [["m1", [0,0,0,0,0,0]]]]
+    }));
+    let chunk2 = make_v1_payload(serde_json::json!({
+        "metric_data": [null, 0, 0, [["m2", [0,0,0,0,0,0]]]]
+    }));
+
+    let result = test_apm_app()
+        .process_merged_agent_payloads(vec![chunk1, chunk2], "req-merged-metric")
+        .await;
+    assert!(result.is_ok());
+
+    let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
+    let entries: Vec<_> = buffered
+        .iter()
+        .filter(|e| e.request_id == "req-merged-metric" && e.telemetry_type == "metric_data")
+        .collect();
+    assert_eq!(
+        entries.len(),
+        2,
+        "non-mergeable types must stay as separate per-chunk entries, not merged into one"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn process_merged_agent_payloads_skips_unparseable_chunk_but_sends_the_rest() {
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+
+    let good_chunk = make_v1_payload(serde_json::json!({
+        "analytic_event_data": [null, {"reservoir_size": 10, "events_seen": 1}, [{"id": "good"}]]
+    }));
+    let bad_chunk = vec![0xFF, 0xFE]; // invalid utf8 — parse_agent_payload errors
+
+    let result = test_apm_app()
+        .process_merged_agent_payloads(vec![bad_chunk, good_chunk], "req-merged-partial-fail")
+        .await;
+    assert!(result.is_ok(), "one bad chunk must not fail the whole batch");
+
+    let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
+    let entries: Vec<_> = buffered
+        .iter()
+        .filter(|e| e.request_id == "req-merged-partial-fail")
+        .collect();
+    assert_eq!(entries.len(), 1, "the good chunk must still be sent (and buffered on failure)");
+}
+
 // ── send_shutdown_error_event ─────────────────────────────────────────────────
 
 #[tokio::test]

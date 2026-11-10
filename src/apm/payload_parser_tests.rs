@@ -202,3 +202,69 @@ fn parse_v1_array_content_returns_parse_error() {
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("v1"));
 }
+
+// ── is_mergeable_event_list_type / merge_event_list_payloads ───────────────────────
+
+#[test]
+fn is_mergeable_event_list_type_is_true_for_the_four_documented_types() {
+    for t in ["analytic_event_data", "span_event_data", "error_event_data", "custom_event_data"] {
+        assert!(is_mergeable_event_list_type(t), "{t} must be mergeable");
+    }
+}
+
+#[test]
+fn is_mergeable_event_list_type_is_false_for_other_types() {
+    for t in ["metric_data", "error_data", "transaction_sample_data", "sql_trace_data", "log_event_data", "unknown_type"] {
+        assert!(!is_mergeable_event_list_type(t), "{t} must not be mergeable");
+    }
+}
+
+#[test]
+fn merge_event_list_payloads_concatenates_events_and_combines_reservoir_metadata() {
+    let chunk_a = vec![
+        Value::Null,
+        json!({"reservoir_size": 100, "events_seen": 3}),
+        json!([{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]),
+    ];
+    let chunk_b = vec![
+        Value::Null,
+        json!({"reservoir_size": 1200, "events_seen": 5}),
+        json!([{"id": "b1"}, {"id": "b2"}]),
+    ];
+
+    let merged = merge_event_list_payloads(vec![chunk_a, chunk_b]);
+
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged[1]["events_seen"], json!(8), "events_seen must sum across chunks");
+    assert_eq!(merged[1]["reservoir_size"], json!(1200), "reservoir_size must be the max across chunks");
+    let events = merged[2].as_array().expect("events must be an array");
+    assert_eq!(events.len(), 5, "events arrays must be concatenated, not deduped or truncated");
+    assert_eq!(events[0]["id"], json!("a1"));
+    assert_eq!(events[4]["id"], json!("b2"));
+}
+
+#[test]
+fn merge_event_list_payloads_skips_malformed_chunks_without_panicking() {
+    let malformed = vec![Value::Null, json!({"reservoir_size": 10, "events_seen": 1})]; // len 2, missing events element
+    let well_formed = vec![
+        Value::Null,
+        json!({"reservoir_size": 50, "events_seen": 2}),
+        json!([{"id": "x"}, {"id": "y"}]),
+    ];
+
+    let merged = merge_event_list_payloads(vec![malformed, well_formed]);
+
+    assert_eq!(merged[1]["events_seen"], json!(2), "malformed chunk's metadata must be skipped, not counted");
+    assert_eq!(merged[1]["reservoir_size"], json!(50));
+    let events = merged[2].as_array().unwrap();
+    assert_eq!(events.len(), 2, "only the well-formed chunk's events must survive");
+}
+
+#[test]
+fn merge_event_list_payloads_on_empty_input_returns_zeroed_shape() {
+    let merged = merge_event_list_payloads(vec![]);
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 0);
+}

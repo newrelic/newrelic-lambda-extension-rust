@@ -261,8 +261,37 @@ impl ApmApp {
     pub async fn process_agent_payload(&self, payload: Vec<u8>, request_id: &str) -> Result<()> {
         debug!("Processing agent payload ({} bytes) for request {}", payload.len(), request_id);
 
-        let (mut telemetry_map, protocol_version) =
-            parse_agent_payload(&payload).context("Failed to parse agent payload")?;
+        let telemetry_map = Self::parse_and_normalize_one_payload(&payload)
+            .context("Failed to parse agent payload")?;
+
+        let mut send_tasks = Vec::new();
+        for (telemetry_type, data) in telemetry_map {
+            if data.is_empty() {
+                continue;
+            }
+            if super::collector::is_telemetry_disabled(&telemetry_type) {
+                debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                continue;
+            }
+            debug!("Sending {} telemetry items as {}", data.len(), telemetry_type);
+            send_tasks.push(self.spawn_send_task(telemetry_type, data, request_id.to_string()));
+        }
+
+        for task in send_tasks {
+            let _ = task.await;
+        }
+
+        Ok(())
+    }
+
+    /// Parse one raw agent payload chunk and apply the same per-chunk normalization
+    /// `process_agent_payload` always has: custom tag injection, Ruby v2 transaction-name
+    /// fixups, and the Java-agent metric_data epoch-window ms→s correction. Factored out
+    /// so `process_merged_agent_payloads` can apply identical per-chunk normalization to
+    /// each chunk *before* merging — these corrections only make sense against one
+    /// agent's own single-harvest shape, not a post-merge combined one.
+    fn parse_and_normalize_one_payload(payload: &[u8]) -> Result<std::collections::HashMap<String, Vec<Value>>> {
+        let (mut telemetry_map, protocol_version) = parse_agent_payload(payload)?;
 
         debug!(
             "Parsed agent payload: protocol_v{}, {} telemetry types",
@@ -278,29 +307,24 @@ impl ApmApp {
             let runtime = crate::version::get_runtime_name();
             if runtime == "ruby" {
                 debug!("Ruby v2 payload detected - normalizing transaction names");
-                
+
                 if let Some(data) = telemetry_map.get_mut("analytic_event_data") {
                     normalize_analytic_event_data(data);
                 }
-                
                 if let Some(data) = telemetry_map.get_mut("span_event_data") {
                     normalize_span_event_data(data);
                 }
-                
                 if let Some(data) = telemetry_map.get_mut("metric_data") {
                     normalize_metric_data(data);
                 }
-                
                 // Normalize error events - they may contain transaction names
                 if let Some(data) = telemetry_map.get_mut("error_event_data") {
                     normalize_error_event_data(data);
                 }
-                
                 // Normalize custom events - they may contain transaction names
                 if let Some(data) = telemetry_map.get_mut("custom_event_data") {
                     normalize_custom_event_data(data);
                 }
-                
                 // Normalize transaction samples - they contain transaction names
                 if let Some(data) = telemetry_map.get_mut("transaction_sample_data") {
                     normalize_transaction_sample_data(data);
@@ -308,30 +332,18 @@ impl ApmApp {
             }
         }
 
-        let mut send_tasks = Vec::new();
-
-        for (telemetry_type, mut data) in telemetry_map {
-            if data.is_empty() {
-                continue;
-            }
-
-            // Customer opted out of this telemetry type — drop it (no send, no buffer).
-            if super::collector::is_telemetry_disabled(&telemetry_type) {
-                debug!("Telemetry type {} disabled - skipping", telemetry_type);
-                continue;
-            }
-
-            // metric_data[1] and [2] are the harvest epoch window (start, end).
-            // The Java agent serverless mode writes these in milliseconds; the APM
-            // collector protocol expects seconds. Values above this threshold are
-            // unambiguously milliseconds (the year ~33658 as seconds — no real epoch
-            // will exceed this in seconds for centuries).
-            const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
-            if telemetry_type == "metric_data" && data.len() >= 3 {
+        // metric_data[1] and [2] are the harvest epoch window (start, end).
+        // The Java agent serverless mode writes these in milliseconds; the APM
+        // collector protocol expects seconds. Values above this threshold are
+        // unambiguously milliseconds (the year ~33658 as seconds — no real epoch
+        // will exceed this in seconds for centuries).
+        const JAVA_AGENT_MS_EPOCH_THRESHOLD: f64 = 1_000_000_000_000.0;
+        if let Some(data) = telemetry_map.get_mut("metric_data") {
+            if data.len() >= 3 {
                 for i in 1..=2usize {
                     if let Some(ts) = data[i].as_f64() {
                         if ts > JAVA_AGENT_MS_EPOCH_THRESHOLD {
-                            data[i] = serde_json::Value::from((ts / 1000.0) as i64);
+                            data[i] = Value::from((ts / 1000.0) as i64);
                         }
                     }
                 }
@@ -340,60 +352,140 @@ impl ApmApp {
                     data[1], data[2]
                 );
             }
+        }
 
+        Ok(telemetry_map)
+    }
 
-            debug!(
-                "Sending {} telemetry items as {}",
-                data.len(),
-                telemetry_type
-            );
+    /// Spawn the send (+ on-failure buffer-for-retry) task for one `(telemetry_type,
+    /// data)` pair. Shared by `process_agent_payload` (single chunk) and
+    /// `process_merged_agent_payloads` (multiple chunks, some types merged first).
+    fn spawn_send_task(
+        &self,
+        telemetry_type: String,
+        data: Vec<Value>,
+        request_id: String,
+    ) -> tokio::task::JoinHandle<()> {
+        let client = self.client.clone();
+        let license_key = self.license_key.clone();
+        let collector_host = self.collector_host.clone();
+        let run_id = self.run_id.clone();
 
-            let client = self.client.clone();
-            let license_key = self.license_key.clone();
-            let collector_host = self.collector_host.clone();
-            let run_id = self.run_id.clone();
-            let request_id_owned = request_id.to_string();
-
-            let task = tokio::spawn(async move {
-                let request_id = request_id_owned;
-                let command = match telemetry_type.as_str() {
-                    "metric_data" => CMD_METRICS,
-                    "span_event_data" => CMD_SPAN_EVENTS,
-                    "error_data" => CMD_ERROR_DATA,
-                    "error_event_data" => CMD_ERROR_EVENTS,
-                    "analytic_event_data" => CMD_ANALYTIC_EVENTS,
-                    "custom_event_data" => CMD_CUSTOM_EVENTS,
-                    "log_event_data" => CMD_LOG_EVENTS,
-                    "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
-                    "sql_trace_data" => CMD_SLOW_SQLS,
-                    _ => {
-                        warn!("Unknown telemetry type: {}", telemetry_type);
-                        return;
-                    }
-                };
-                let send_result = send_apm_telemetry(
-                    &client,
-                    &license_key,
-                    &collector_host,
-                    &run_id,
-                    command,
-                    &data,
-                )
-                .await;
-
-                if let Err(e) = send_result {
-                    warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
-                    super::telemetry_buffer::buffer_failed_telemetry(
-                        telemetry_type.clone(),
-                        data,
-                        request_id,
-                        run_id,
-                        collector_host,
-                    );
+        tokio::spawn(async move {
+            let command = match telemetry_type.as_str() {
+                "metric_data" => CMD_METRICS,
+                "span_event_data" => CMD_SPAN_EVENTS,
+                "error_data" => CMD_ERROR_DATA,
+                "error_event_data" => CMD_ERROR_EVENTS,
+                "analytic_event_data" => CMD_ANALYTIC_EVENTS,
+                "custom_event_data" => CMD_CUSTOM_EVENTS,
+                "log_event_data" => CMD_LOG_EVENTS,
+                "transaction_sample_data" => CMD_TRANSACTION_SAMPLES,
+                "sql_trace_data" => CMD_SLOW_SQLS,
+                _ => {
+                    warn!("Unknown telemetry type: {}", telemetry_type);
+                    return;
                 }
-            });
+            };
+            let send_result = send_apm_telemetry(
+                &client,
+                &license_key,
+                &collector_host,
+                &run_id,
+                command,
+                &data,
+            )
+            .await;
 
-            send_tasks.push(task);
+            if let Err(e) = send_result {
+                warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
+                super::telemetry_buffer::buffer_failed_telemetry(
+                    telemetry_type.clone(),
+                    data,
+                    request_id,
+                    run_id,
+                    collector_host,
+                );
+            }
+        })
+    }
+
+    /// Like `process_agent_payload`, but for multiple agent-payload chunks that
+    /// belong to the same request (e.g. several buffered invocations' worth, drained
+    /// together) — merges the event-list types (`analytic_event_data`,
+    /// `span_event_data`, `error_event_data`, `custom_event_data`) across all chunks
+    /// into a single collector POST per type, instead of one POST per chunk per type.
+    ///
+    /// Per `Transaction-Events-PORTED.md`: the collector does no server-side
+    /// re-aggregation of these event-list types, so concatenating multiple chunks'
+    /// events into one POST (with combined `events_seen`/`reservoir_size` metadata) is
+    /// spec-safe. Other types (`metric_data`'s epoch-window tuple, `error_data`/
+    /// `transaction_sample_data`/`sql_trace_data`'s different shapes) have no such
+    /// documented merge rule, so they're sent per-chunk, unmerged — exactly as before.
+    pub async fn process_merged_agent_payloads(
+        &self,
+        payloads: Vec<Vec<u8>>,
+        request_id: &str,
+    ) -> Result<()> {
+        if payloads.len() <= 1 {
+            // No batching benefit for 0 or 1 chunk — reuse the single-payload path
+            // verbatim rather than duplicating its empty/trivial-case handling.
+            if let Some(payload) = payloads.into_iter().next() {
+                return self.process_agent_payload(payload, request_id).await;
+            }
+            return Ok(());
+        }
+
+        debug!(
+            "Processing {} agent payload chunks together for request {}",
+            payloads.len(),
+            request_id
+        );
+
+        let mut mergeable: std::collections::HashMap<String, Vec<Vec<Value>>> = std::collections::HashMap::new();
+        let mut per_chunk: Vec<(String, Vec<Value>)> = Vec::new();
+
+        for payload in payloads {
+            let telemetry_map = match Self::parse_and_normalize_one_payload(&payload) {
+                Ok(map) => map,
+                Err(e) => {
+                    warn!(
+                        "Failed to parse one agent payload chunk in merged batch for request {}: {} - skipping this chunk only",
+                        request_id, e
+                    );
+                    continue;
+                }
+            };
+
+            for (telemetry_type, data) in telemetry_map {
+                if data.is_empty() {
+                    continue;
+                }
+                if super::collector::is_telemetry_disabled(&telemetry_type) {
+                    debug!("Telemetry type {} disabled - skipping", telemetry_type);
+                    continue;
+                }
+                if super::payload_parser::is_mergeable_event_list_type(&telemetry_type) {
+                    mergeable.entry(telemetry_type).or_default().push(data);
+                } else {
+                    per_chunk.push((telemetry_type, data));
+                }
+            }
+        }
+
+        let mut send_tasks = Vec::new();
+
+        for (telemetry_type, chunks) in mergeable {
+            let chunk_count = chunks.len();
+            let merged = super::payload_parser::merge_event_list_payloads(chunks);
+            debug!(
+                "Merged {} chunk(s) of {} into one batch for request {}",
+                chunk_count, telemetry_type, request_id
+            );
+            send_tasks.push(self.spawn_send_task(telemetry_type, merged, request_id.to_string()));
+        }
+        for (telemetry_type, data) in per_chunk {
+            send_tasks.push(self.spawn_send_task(telemetry_type, data, request_id.to_string()));
         }
 
         for task in send_tasks {

@@ -152,6 +152,68 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     map
 }
 
+/// Telemetry types whose wire shape is `[placeholder, {reservoir_size, events_seen},
+/// [events]]` — safe to merge across multiple agent-payload chunks for the same
+/// request by concatenating the events array and combining the reservoir metadata
+/// (events_seen summed, reservoir_size passed through as the max seen). Per
+/// `Transaction-Events-PORTED.md`, the collector does no server-side re-aggregation of
+/// these, so sending N chunks' events as one POST is equivalent to N separate POSTs
+/// from the collector's point of view.
+///
+/// Other types (`metric_data`'s epoch-window tuple, `error_data`/
+/// `transaction_sample_data`/`sql_trace_data`'s different shapes, `log_event_data`)
+/// have no documented cross-chunk merge rule and are intentionally excluded — they're
+/// sent per-chunk, unmerged.
+const MERGEABLE_EVENT_LIST_TYPES: &[&str] = &[
+    "analytic_event_data",
+    "span_event_data",
+    "error_event_data",
+    "custom_event_data",
+];
+
+/// Whether `telemetry_type` is safe to merge across chunks via
+/// [`merge_event_list_payloads`]. See [`MERGEABLE_EVENT_LIST_TYPES`].
+pub fn is_mergeable_event_list_type(telemetry_type: &str) -> bool {
+    MERGEABLE_EVENT_LIST_TYPES.contains(&telemetry_type)
+}
+
+/// Merge multiple chunks of the *same* event-list telemetry type (see
+/// [`is_mergeable_event_list_type`]) into one combined `[placeholder, {reservoir_size,
+/// events_seen}, [events]]` payload. Chunks shorter than 3 elements (malformed/
+/// unexpected shape) are skipped rather than panicking — a defensively-dropped chunk
+/// is better than a corrupted merge.
+pub fn merge_event_list_payloads(chunks: Vec<Vec<Value>>) -> Vec<Value> {
+    let mut total_events_seen: i64 = 0;
+    let mut max_reservoir_size: i64 = 0;
+    let mut merged_events: Vec<Value> = Vec::new();
+
+    for chunk in chunks {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if let Some(meta) = chunk[1].as_object() {
+            if let Some(events_seen) = meta.get("events_seen").and_then(Value::as_i64) {
+                total_events_seen += events_seen;
+            }
+            if let Some(reservoir_size) = meta.get("reservoir_size").and_then(Value::as_i64) {
+                max_reservoir_size = max_reservoir_size.max(reservoir_size);
+            }
+        }
+        if let Some(events) = chunk[2].as_array() {
+            merged_events.extend(events.iter().cloned());
+        }
+    }
+
+    vec![
+        Value::Null,
+        serde_json::json!({
+            "reservoir_size": max_reservoir_size,
+            "events_seen": total_events_seen,
+        }),
+        Value::Array(merged_events),
+    ]
+}
+
 /// Extract the Lambda invocation request id (`aws.requestId`) the agent embedded in the
 /// transaction analytic event of an agent payload.
 ///
