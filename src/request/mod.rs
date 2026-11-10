@@ -608,6 +608,30 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
         .ok()
         .and_then(|guard| guard.clone());
 
+    // Guard against misattribution: a payload that physically lands on the named
+    // pipe right at an invocation boundary — after the agent flushed for the
+    // PREVIOUS invocation, but after CURRENT_ACTIVE_REQUEST_ID has already been
+    // updated to the NEXT one — gets silently routed to the wrong buffer: one
+    // invocation's telemetry duplicates under a different (often already-completed)
+    // invocation's identity, while the correct invocation records none. Confirmed
+    // live against Extension_Python_APM_X86. Cross-check against the aws.requestId
+    // the agent embedded in the payload itself (the same self-describing id LMI
+    // already routes by — see route_payload_by_embedded_request_id) and correct the
+    // target when it disagrees with the global AND names a request we actually have
+    // a buffer for (a disagreement against an unknown/not-yet-created request is not
+    // actionable — fall back to the global in that case, same as before).
+    let embedded_request_id = crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes);
+    let current_request_id = match (&current_request_id, &embedded_request_id) {
+        (Some(active), Some(embedded)) if active != embedded && REQUEST_DATA.contains_key(embedded) => {
+            warn!(
+                "Agent payload's embedded request_id ({}) disagrees with the active request ({}) — routing to the embedded id to avoid misattributing it",
+                embedded, active
+            );
+            Some(embedded.clone())
+        }
+        _ => current_request_id,
+    };
+
     // Read once; used below both for the immediate-send decision and for trace
     // extraction. None only in the brief startup window before main.rs populates it.
     let send_context = crate::event_loop::SERVERLESS_SEND_CONTEXT.get();

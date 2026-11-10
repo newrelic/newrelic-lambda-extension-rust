@@ -362,10 +362,12 @@ mod tests {
         clear_request_state();
     }
 
-    /// Normal-Lambda regression: the embedded id is IGNORED; routing uses the active global.
+    /// Normal-Lambda: when the embedded id names a request we have NO buffer for
+    /// (unknown/not-yet-created), there's nothing actionable to redirect to — falls
+    /// back to the active global exactly as before the misattribution-guard was added.
     #[tokio::test(flavor = "current_thread")]
     #[serial]
-    async fn test_normal_ignores_embedded_id_uses_active_global() {
+    async fn test_normal_falls_back_to_active_global_when_embedded_id_is_unknown() {
         clear_request_state();
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
@@ -384,14 +386,104 @@ mod tests {
             *active = Some("req-B".to_string());
         }
 
-        // Payload embeds req-A, but NORMAL routes by the active global (req-B).
+        // Payload embeds req-A, which has no buffer — nothing to redirect to, falls
+        // back to the active global (req-B).
         route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
 
-        assert_eq!(buffer.lock().unwrap().len(), 1, "Normal routes to active req-B");
+        assert_eq!(buffer.lock().unwrap().len(), 1, "Normal falls back to active req-B");
         assert!(
             REQUEST_DATA.get("req-A").is_none(),
-            "Normal must not parse or route by the embedded id"
+            "Normal must not auto-create a buffer for an unknown embedded id"
         );
+
+        clear_request_state();
+    }
+
+    /// Normal-Lambda misattribution guard: when the global points at a DIFFERENT,
+    /// already-completed invocation (e.g. it raced ahead to the next invocation
+    /// before this late-arriving payload landed), but the embedded id names a
+    /// request we DO have a buffer for, route to the embedded id instead of
+    /// silently duplicating the global's invocation's telemetry. Confirmed live
+    /// against Extension_Python_APM_X86 (payload #6 landed in the PREVIOUS
+    /// invocation's buffer instead of the one it actually belonged to).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_corrects_to_embedded_id_when_it_disagrees_with_a_known_active_global() {
+        clear_request_state();
+
+        let buffer_a = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-A".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer_a.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        let buffer_b = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-B".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer_b.clone(),
+            pending_report: None,
+            creation_invocation: 1,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        // The global has already moved on to req-B (the NEXT invocation)...
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-B".to_string());
+        }
+
+        // ...but this payload self-identifies as belonging to req-A, and req-A has a
+        // real buffer we know about — must be corrected to land there, not in req-B.
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
+
+        assert_eq!(
+            buffer_a.lock().unwrap().len(),
+            1,
+            "payload must be corrected to its own request req-A, not the stale/racing global"
+        );
+        assert_eq!(
+            buffer_b.lock().unwrap().len(),
+            0,
+            "req-B must NOT receive a payload that doesn't belong to it"
+        );
+
+        clear_request_state();
+    }
+
+    /// Sanity check: when the global and the embedded id already agree, nothing
+    /// changes — no spurious correction, no duplicate routing.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_normal_routes_normally_when_embedded_id_matches_active_global() {
+        clear_request_state();
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        REQUEST_DATA.insert("req-A".to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: buffer.clone(),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+        {
+            let mut active = CURRENT_ACTIVE_REQUEST_ID.lock().unwrap();
+            *active = Some("req-A".to_string());
+        }
+
+        route_payload_to_request_buffer(lmi_wire_payload(Some("req-A")), NORMAL).await;
+
+        assert_eq!(buffer.lock().unwrap().len(), 1);
 
         clear_request_state();
     }
