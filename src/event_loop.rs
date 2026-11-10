@@ -1281,6 +1281,18 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
     }
 }
 
+/// Render an elapsed-ms-since-runtime.done value for a log line. `None` means
+/// `platform.runtimeDone` was never observed for that request (e.g. it fired before
+/// `RequestData` existed and the pre-fire timestamp was somehow lost, or this is being
+/// called defensively on a request with no recorded runtime.done at all) — render that
+/// as "unknown" rather than a misleading "0ms".
+fn format_elapsed_for_log(elapsed_ms: Option<i64>) -> String {
+    match elapsed_ms {
+        Some(ms) => format!("{}ms", ms),
+        None => "an unknown time".to_string(),
+    }
+}
+
 pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
@@ -1318,6 +1330,12 @@ pub async fn process_apm_request(
             );
 
             for (old_request_id, late_payloads) in pending_with_payloads {
+                // Captured before cleanup removes the REQUEST_DATA entry below — this
+                // is how late, not just that it's late, so a genuine multi-second/
+                // multi-minute delay (idle-sandbox reclaim) is distinguishable from the
+                // routine ~tens-of-ms gap inherent to deferring to the next invocation.
+                let elapsed_ms = request::get_runtime_done_elapsed_ms(&old_request_id);
+
                 // Send all late payloads concurrently — each is an independent HTTP POST
                 // that only takes a read lock on apm_app (no write contention).
                 let mut set = tokio::task::JoinSet::new();
@@ -1326,9 +1344,15 @@ pub async fn process_apm_request(
                     let apm = apm_app.clone();
                     set.spawn(async move {
                         if let Err(e) = send_to_apm_collector(&payload_bytes, &rid, &apm).await {
-                            error!("Failed to send late agent payload for {}: {}", rid, e);
+                            error!(
+                                "Failed to send late agent payload for {} (arrived {} after runtime.done): {}",
+                                rid, format_elapsed_for_log(elapsed_ms), e
+                            );
                         } else {
-                            info!("Successfully sent late agent payload for request: {}", rid);
+                            info!(
+                                "Successfully sent late agent payload for request: {} (arrived {} after runtime.done)",
+                                rid, format_elapsed_for_log(elapsed_ms)
+                            );
                         }
                     });
                 }

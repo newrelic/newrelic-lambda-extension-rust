@@ -201,6 +201,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -234,6 +235,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -373,6 +375,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -415,6 +418,7 @@ mod tests {
             pending_report: Some("report".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -438,6 +442,7 @@ mod tests {
             pending_report: Some("r".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -581,6 +586,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -611,6 +617,7 @@ mod tests {
             pending_report: Some("REPORT old".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -650,6 +657,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -689,6 +697,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -728,6 +737,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: "arn:test".to_string(),
         });
@@ -777,6 +787,7 @@ mod tests {
             pending_report: None,
             creation_invocation: current_invocation_count(),
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -787,6 +798,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -843,6 +855,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -993,6 +1006,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -1002,6 +1016,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -1042,6 +1057,7 @@ mod tests {
             pending_report: Some("REPORT for X".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -1051,6 +1067,7 @@ mod tests {
             pending_report: Some("REPORT for Y".to_string()),
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
         });
@@ -1359,6 +1376,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
         });
@@ -1406,6 +1424,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: arn.clone(),
         });
@@ -1465,6 +1484,7 @@ mod tests {
                 pending_report: None,
                 creation_invocation: 0,
                 runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+                runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 pending_send_handles: Arc::new(Mutex::new(Vec::new())),
                 invoked_function_arn: String::new(),
             });
@@ -1525,6 +1545,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -1561,6 +1582,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -1580,7 +1602,7 @@ mod tests {
         clear_request_state();
         PREFIRED_RUNTIME_DONE.clear();
 
-        record_prefired_runtime_done("req-prefired-1");
+        record_runtime_done("req-prefired-1");
 
         assert!(PREFIRED_RUNTIME_DONE.contains_key("req-prefired-1"));
 
@@ -1600,6 +1622,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -1619,7 +1642,7 @@ mod tests {
         clear_request_state();
         PREFIRED_RUNTIME_DONE.clear();
 
-        record_prefired_runtime_done("req-lmi-prefired");
+        record_runtime_done("req-lmi-prefired");
         assert!(PREFIRED_RUNTIME_DONE.contains_key("req-lmi-prefired"));
 
         ensure_lmi_request_slot("req-lmi-prefired");
@@ -1671,7 +1694,7 @@ mod tests {
         clear_request_state();
         PREFIRED_RUNTIME_DONE.clear();
 
-        record_prefired_runtime_done("req-create-prefired");
+        record_runtime_done("req-create-prefired");
 
         let config = Arc::new(crate::config::ExtensionConfig::default());
         let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
@@ -1758,6 +1781,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -1815,6 +1839,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: String::new(),
         });
@@ -1875,6 +1900,7 @@ mod tests {
             pending_report: None,
             creation_invocation: 0,
             runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pending_send_handles: Arc::new(Mutex::new(Vec::new())),
             invoked_function_arn: arn,
         });
@@ -1902,5 +1928,110 @@ mod tests {
         clear_request_state();
         reset_invocation_counter();
         crate::agent::batch::AGENT_BATCH_BUFFER.clear();
+    }
+
+    // ── record_runtime_done / get_runtime_done_elapsed_ms ───────────────────────────
+
+    #[test]
+    #[serial]
+    fn get_runtime_done_elapsed_ms_is_none_before_runtime_done_fires() {
+        clear_request_state();
+        let request_id = "rtd-elapsed-not-fired";
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        assert!(
+            get_runtime_done_elapsed_ms(request_id).is_none(),
+            "sentinel 0 (never fired) must report as None, not Some(huge_number)"
+        );
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn get_runtime_done_elapsed_ms_is_none_for_unregistered_request() {
+        clear_request_state();
+        assert!(get_runtime_done_elapsed_ms("rtd-elapsed-unregistered").is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn record_runtime_done_sets_timestamp_and_notifies_existing_request() {
+        clear_request_state();
+        let request_id = "rtd-record-existing";
+        REQUEST_DATA.insert(request_id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(Vec::new())),
+            pending_report: None,
+            creation_invocation: current_invocation_count(),
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: String::new(),
+        });
+
+        record_runtime_done(request_id);
+
+        let elapsed = get_runtime_done_elapsed_ms(request_id);
+        assert!(
+            elapsed.is_some() && elapsed.unwrap() < 1_000,
+            "elapsed must be recorded and small immediately after recording (got {:?})",
+            elapsed
+        );
+
+        // The notify must also have fired (consistent with the pre-existing contract).
+        let notify = get_runtime_done_notify(request_id).expect("notify must exist");
+        // notify_one() stores exactly one permit; this must not block.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        assert!(
+            notified.as_mut().enable(),
+            "a pending permit from record_runtime_done's notify_one() must already be available"
+        );
+
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn record_runtime_done_prefires_for_unregistered_request_and_is_consumed_on_creation() {
+        clear_request_state();
+        let request_id = "rtd-record-prefired";
+
+        record_runtime_done(request_id); // no RequestData yet — must land in PREFIRED_RUNTIME_DONE
+
+        assert!(
+            PREFIRED_RUNTIME_DONE.get(request_id).is_some(),
+            "prefired timestamp must be recorded when the request isn't registered yet"
+        );
+
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
+
+        create_request_processing_state(request_id, "arn:test", &factory);
+
+        assert!(
+            PREFIRED_RUNTIME_DONE.get(request_id).is_none(),
+            "the prefired entry must be consumed once the request is created"
+        );
+        let elapsed = get_runtime_done_elapsed_ms(request_id);
+        assert!(
+            elapsed.is_some() && elapsed.unwrap() < 1_000,
+            "the prefired timestamp must carry forward onto runtime_done_at_ms (got {:?})",
+            elapsed
+        );
+
+        clear_request_state();
     }
 }
