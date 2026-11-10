@@ -1718,6 +1718,17 @@ async fn process_pending_agent_payloads_buffers_late_payload_when_apm_not_connec
     REQUEST_DATA.remove(prev_id);
 }
 
+// Note: the merge behavior itself (ApmApp::process_merged_agent_payloads correctly
+// merging multiple chunks into one POST per mergeable type) is already covered by
+// apm::app::tests::process_merged_agent_payloads_merges_mergeable_event_list_types_across_chunks
+// and three sibling tests. An equivalent test at this integration layer (going
+// through process_pending_agent_payloads with a real ApmApp wrapped in
+// SharedApmApp) was attempted but hit an unresolved test-harness/runtime-teardown
+// hang unrelated to the merge logic itself (the function body completes and all
+// assertions pass in ~1ms; the hang occurs after the test's own code finishes,
+// before the harness reports completion) — removed rather than leave a flaky/
+// hanging test in the suite.
+
 // ── retry_failed_agent_payloads (APM) ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1784,7 +1795,6 @@ async fn process_apm_request_completes_cold_start_with_no_payload_and_no_run_id(
     process_apm_request(
         request_id.to_string(),
         "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        true,
         config,
         log_processor,
         apm_app,
@@ -1809,43 +1819,12 @@ async fn process_apm_request_returns_early_when_no_state_registered() {
     process_apm_request(
         "par-missing-state-req".to_string(),
         "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        true,
         config,
         log_processor,
         apm_app,
         deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
-}
-
-#[tokio::test]
-#[serial]
-async fn process_apm_request_warm_start_drains_previous_request_late_payload() {
-    let prev_id = "par-warm-prev-req";
-    let current_id = "par-warm-current-req";
-    let config = make_config_for_serverless(false);
-    register_request_for_serverless(prev_id, config.clone());
-    if let Some(buf) = request::get_agent_buffer(prev_id) {
-        buf.lock().unwrap().push(vec![5, 5, 5]);
-    }
-    register_request_for_serverless(current_id, config.clone());
-
-    let log_processor = make_noop_log_processor_serverless(config.clone());
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-
-    process_apm_request(
-        current_id.to_string(),
-        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        false,
-        config,
-        log_processor,
-        apm_app,
-        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
-    )
-    .await;
-
-    assert!(REQUEST_PROCESSORS.get(current_id).is_none());
-    REQUEST_DATA.remove(prev_id);
 }
 
 // ── execute_apm_mode_event_loop (APM) — driven end-to-end against a wiremock Extensions API ──
@@ -3055,7 +3034,6 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
     process_apm_request(
         req_id.to_string(),
         "arn:test".to_string(),
-        true, // is_cold_start=true → skip warm-start drain; keeps test deterministic
         config,
         log_processor,
         apm_app,
@@ -3250,7 +3228,6 @@ async fn process_apm_request_pending_report_warns_when_apm_app_not_ready() {
     process_apm_request(
         req_id.to_string(),
         "arn:test".to_string(),
-        true, // is_cold_start — skips warm-start drain; keeps test deterministic
         config,
         log_processor,
         apm_app,

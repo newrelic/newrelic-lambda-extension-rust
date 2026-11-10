@@ -479,7 +479,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     process_apm_request(
                         request_id_clone,
                         invoked_function_arn_clone,
-                        is_cold_start,
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
@@ -1296,7 +1295,6 @@ fn format_elapsed_for_log(elapsed_ms: Option<i64>) -> String {
 pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
-    is_cold_start: bool,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
@@ -1304,60 +1302,13 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-
-    if !is_cold_start {
-        // Atomically drain old request buffers in a single lock to avoid
-        // TOCTOU race between emptiness check and mem::take.
-        let pending_with_payloads: Vec<(String, Vec<Vec<u8>>)> = REQUEST_DATA
-            .iter()
-            .filter_map(|entry| {
-                let req_id = entry.key();
-                if req_id != &request_id {
-                    if let Ok(mut buffer) = entry.agent_buffer.lock() {
-                        if !buffer.is_empty() {
-                            return Some((req_id.clone(), std::mem::take(&mut *buffer)));
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-
-        if !pending_with_payloads.is_empty() {
-            debug!(
-                "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
-                pending_with_payloads.len()
-            );
-
-            for (old_request_id, late_payloads) in pending_with_payloads {
-                // Captured before cleanup removes the REQUEST_DATA entry below — this
-                // is how late, not just that it's late, so a genuine multi-second/
-                // multi-minute delay (idle-sandbox reclaim) is distinguishable from the
-                // routine ~tens-of-ms gap inherent to deferring to the next invocation.
-                let elapsed_ms = request::get_runtime_done_elapsed_ms(&old_request_id);
-                let chunk_count = late_payloads.len();
-
-                // Merge mergeable event-list types across all of this request's
-                // buffered chunks into one collector POST per type, rather than one
-                // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
-                if let Err(e) =
-                    send_merged_payloads_to_apm_collector(late_payloads, &old_request_id, &apm_app).await
-                {
-                    error!(
-                        "Failed to send {} late agent payload chunk(s) for {} (arrived {} after runtime.done): {}",
-                        chunk_count, old_request_id, format_elapsed_for_log(elapsed_ms), e
-                    );
-                } else {
-                    info!(
-                        "Successfully sent {} late agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
-                        chunk_count, old_request_id, format_elapsed_for_log(elapsed_ms)
-                    );
-                }
-
-                cleanup_request_processing_state_internal(&old_request_id, false);
-            }
-        }
-    }
+    // Draining other (previous-invocation) requests' leftover buffers/pending
+    // reports is NOT this function's job — it's handled by
+    // process_pending_agent_payloads, spawned concurrently alongside this one
+    // (see execute_apm_mode_event_loop's `pending_task`). The two used to
+    // independently duplicate that responsibility, racing each other on the same
+    // REQUEST_DATA entries. This function owns exactly one thing: this request's
+    // own Flow 1/2/3 decision below.
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
@@ -1572,32 +1523,6 @@ async fn send_to_apm_collector(
         // APM connection still in progress - buffer will be kept for retry
         warn!(
             "APM connection still in progress - payload for {} will be buffered and retried",
-            request_id
-        );
-        return Err("APM connection not ready yet - payload buffered for retry".into());
-    }
-    Ok(())
-}
-
-/// Like `send_to_apm_collector`, but for multiple agent-payload chunks belonging to
-/// the same request — merges mergeable event-list types across chunks into one
-/// collector POST per type instead of one POST per chunk (see
-/// `ApmApp::process_merged_agent_payloads`).
-async fn send_merged_payloads_to_apm_collector(
-    payloads: Vec<Vec<u8>>,
-    request_id: &str,
-    apm_app: &crate::apm::SharedApmApp,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let apm_app_guard = apm_app.read().await;
-    if let Some(ref app) = *apm_app_guard {
-        app.process_merged_agent_payloads(payloads, request_id).await?;
-        info!(
-            "APM mode: Merged agent payload batch sent successfully for request: {}",
-            request_id
-        );
-    } else {
-        warn!(
-            "APM connection still in progress - merged payload batch for {} will be buffered and retried",
             request_id
         );
         return Err("APM connection not ready yet - payload buffered for retry".into());
@@ -2394,6 +2319,10 @@ pub(crate) async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
+        // Captured before cleanup removes the REQUEST_DATA entry below — how late,
+        // not just that it's late (see format_elapsed_for_log).
+        let elapsed_ms = request::get_runtime_done_elapsed_ms(&request_id);
+
         let context = get_request_context(&request_id);
 
         let invoked_function_arn = if let Some(ctx) = context {
@@ -2419,29 +2348,58 @@ pub(crate) async fn process_pending_agent_payloads(
         };
 
         if !payloads.is_empty() {
+            let chunk_count = payloads.len();
             debug!(
                 "Found {} pending agent payload(s) for previous request: {}",
-                payloads.len(),
-                request_id
+                chunk_count, request_id
             );
 
-            // Send all payloads for this request concurrently
-            let mut set = tokio::task::JoinSet::new();
-            for payload_bytes in payloads {
-                let rid = request_id.clone();
-                let arn = invoked_function_arn.clone();
-                let lp = global_log_processor.clone();
-                let cfg = config.clone();
-                let apm = apm_app.clone();
-                set.spawn(async move {
-                    if let Err(e) = process_and_send_agent_payload(
-                        &payload_bytes, &rid, &arn, &lp, &cfg, &apm,
-                    ).await {
-                        error!("Failed to process pending agent payload: {}", e);
+            // Trace-id extraction is per-chunk (independent of telemetry-map
+            // merging) — preserved here before chunks are merged/sent together.
+            if config.new_relic.collect_trace_id {
+                for payload_bytes in &payloads {
+                    if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
+                        if let Err(e) = global_log_processor.on_trace_id_extracted(&request_id, &trace_id).await {
+                            error!("Failed to coordinate logs with trace ID: {}", e);
+                        }
                     }
-                });
+                }
             }
-            while set.join_next().await.is_some() {}
+
+            // Merge mergeable event-list types across all of this request's
+            // buffered chunks into one collector POST per type, rather than one
+            // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
+            let apm_app_guard = apm_app.read().await;
+            if let Some(ref app) = *apm_app_guard {
+                let send_result = app.process_merged_agent_payloads(payloads.clone(), &request_id).await;
+                drop(apm_app_guard);
+                match send_result {
+                    Ok(()) => {
+                        info!(
+                            "Successfully sent {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
+                            chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to send {} pending agent payload chunk(s) for {} (arrived {} after runtime.done): {} - buffering for retry",
+                            chunk_count, request_id, format_elapsed_for_log(elapsed_ms), e
+                        );
+                        for payload_bytes in &payloads {
+                            buffer_failed_agent_payload(payload_bytes, &request_id, &invoked_function_arn);
+                        }
+                    }
+                }
+            } else {
+                drop(apm_app_guard);
+                warn!(
+                    "APM connection not established - buffering {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
+                    chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                );
+                for payload_bytes in &payloads {
+                    buffer_failed_agent_payload(payload_bytes, &request_id, &invoked_function_arn);
+                }
+            }
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)
