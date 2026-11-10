@@ -139,6 +139,341 @@ fn push_failed_payload_capped(buf: &mut Vec<FailedAgentPayload>, payload: Failed
 pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String, String)>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
+
+/// The scheduler driving every `high`-tier send (agent payload, logs,
+/// platform-metrics) — see `DUAL_PATH_PLAN.md`. `default` tier never
+/// touches this: `process_apm_request_default` is the exact pre-existing
+/// `main` code, untouched, and has no dependency on `SendScheduler` at all.
+/// Only `process_apm_request_high` (and its SHUTDOWN-drain counterpart)
+/// calls into this.
+///
+/// Mode is always `Deferred` here by construction — `high` tier's whole
+/// point is: spawn the send the instant data is ready, overlapping the
+/// function's remaining execution, and resolve it at the start of the
+/// *next* invocation (bounded, abort-on-timeout for agent payload;
+/// never-abort for logs/metrics — see each `resolve_pending_*` below).
+static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
+    once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
+        crate::send::SendMode::Deferred,
+        std::sync::Arc::new(crate::send::AlwaysAllowBreaker),
+        std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
+    ));
+
+/// Metadata `SendScheduler` deliberately doesn't know about — the actual
+/// payload bytes and the request/ARN needed to buffer the unresolved tail
+/// into `FAILED_AGENT_PAYLOADS` on a timeout. Written alongside every
+/// `SEND_SCHEDULER.spawn(...)` call, consumed by
+/// `resolve_pending_agent_batch`. At most one entry at a time, for the same
+/// reason `SEND_SCHEDULER` only ever has at most one pending handle
+/// for `SendKind::ApmCollector`: Normal-mode Lambda never runs concurrent
+/// invocations in one environment.
+struct AgentBatchMeta {
+    payloads: Vec<Arc<Vec<u8>>>,
+    request_id: String,
+    invoked_function_arn: String,
+}
+
+static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<AgentBatchMeta>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// Buffer `payloads[resolved_cursor..]` into `FAILED_AGENT_PAYLOADS` — the
+/// re-buffering half of what the old `resolve_agent_send_at_boundary` did
+/// end-to-end; the scheduling/bounded-wait/abort half now lives entirely in
+/// `SendScheduler`. A no-op when `resolved_cursor >= payloads.len()` (the
+/// `Failed` case: the task ran to completion and every payload already
+/// buffered its own HTTP failure via `send_agent_payload_or_buffer` — only
+/// `TimedOut`, where the task was aborted mid-batch, ever has a genuinely
+/// unresolved tail here).
+fn buffer_unresolved_agent_payloads(
+    payloads: &[Arc<Vec<u8>>],
+    resolved_cursor: usize,
+    request_id: &str,
+    invoked_function_arn: &str,
+) {
+    let unresolved = payloads.get(resolved_cursor..).unwrap_or(&[]);
+    if unresolved.is_empty() {
+        return;
+    }
+    warn!(
+        "APM mode: agent send for {} did not finish in time — buffering {} of {} payload(s) for retry (resolved {})",
+        request_id,
+        unresolved.len(),
+        payloads.len(),
+        resolved_cursor
+    );
+    for payload_bytes in unresolved {
+        buffer_failed_agent_payload(payload_bytes.as_slice(), request_id, invoked_function_arn);
+    }
+}
+
+/// Resolve whatever agent-payload batch is currently pending in
+/// `SEND_SCHEDULER` (if any) and buffer its unresolved tail. No-op if
+/// nothing is pending — including the first-invocation case, where nothing
+/// has ever been spawned yet.
+///
+/// Called from `process_apm_request_high` only (never from the `default`
+/// path, which doesn't use `SEND_SCHEDULER` at all):
+/// - At the start of the *next* `high`-tier invocation, resolving what the
+///   previous one deferred.
+/// - At `SHUTDOWN`: there's no next invocation to defer to, so this is the
+///   final drain.
+async fn resolve_pending_agent_batch() {
+    let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending(crate::send::SendKind::ApmCollector)
+        .await
+    else {
+        return;
+    };
+
+    let meta = match AGENT_BATCH_META.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(e) => {
+            error!("AGENT_BATCH_META lock poisoned, cannot resolve: {}", e);
+            return;
+        }
+    };
+    let Some(meta) = meta else {
+        // SEND_SCHEDULER and AGENT_BATCH_META are always written
+        // together at the spawn site below — this should be unreachable.
+        error!(
+            "SEND_SCHEDULER had a pending agent batch but AGENT_BATCH_META was empty \
+             — payload metadata lost, cannot buffer any unresolved tail"
+        );
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: agent send for {} completed successfully",
+                meta.request_id
+            );
+        }
+        crate::send::DispatchResult::Failed | crate::send::DispatchResult::TimedOut => {
+            buffer_unresolved_agent_payloads(
+                &meta.payloads,
+                outcome.cursor.unwrap_or(0),
+                &meta.request_id,
+                &meta.invoked_function_arn,
+            );
+        }
+        crate::send::DispatchResult::Dropped
+        | crate::send::DispatchResult::Deferred
+        | crate::send::DispatchResult::StillRunning => {
+            // Unreachable in practice: resolve_pending (used here, not
+            // resolve_pending_no_abort) never checks the breaker (Dropped is
+            // a dispatch()-only outcome), never itself returns Deferred, and
+            // StillRunning is only ever produced by resolve_pending_no_abort,
+            // which the agent-payload path doesn't use. Handled defensively,
+            // not assumed.
+            warn!(
+                "APM mode: unexpected {:?} resolving agent batch for {}",
+                outcome.result, meta.request_id
+            );
+        }
+    }
+}
+
+/// Spawn this invocation's log flush into `SEND_SCHEDULER`, unconditionally —
+/// logs are never tier-gated (unlike agent payload): they were already
+/// unconditionally detached before `SendTier` existed, and stay that way
+/// regardless of `default`/`high`. What changes is *tracking*: instead of
+/// pure fire-and-forget (never checked again), the flush is now resolved —
+/// without ever being aborted — at the start of the next invocation (see
+/// `resolve_pending_logs`) or at `SHUTDOWN`.
+///
+/// Guards against ever running two log flushes concurrently: if
+/// `has_pending` says one is still running (`StillRunning` from a previous
+/// `resolve_pending_logs` call), this skips spawning a new one entirely —
+/// new logs simply stay in `LogProcessor`'s own batch to go out on the
+/// *next* flush, same as if the threshold-triggered auto-flush path were
+/// still in progress.
+async fn spawn_log_flush(log_processor: &Arc<LogProcessor>, request_id: &str) {
+    if SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await {
+        debug!(
+            "APM mode: previous log flush still running — new logs for {} stay batched for the next flush",
+            request_id
+        );
+        return;
+    }
+
+    let log_processor_clone = log_processor.clone();
+    let request_id_clone = request_id.to_string();
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        match log_processor_clone.flush().await {
+            Ok(()) => crate::send::SendOutcome::Success,
+            Err(e) => {
+                error!("Failed to flush logs for request {}: {}", request_id_clone, e);
+                crate::send::SendOutcome::Failure
+            }
+        }
+    });
+    SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, send, None).await;
+}
+
+/// Resolve whatever log flush is pending from a previous invocation, if any —
+/// called unconditionally at the start of every invocation and at `SHUTDOWN`,
+/// regardless of `send_tier` (logs are never tier-gated — see
+/// `spawn_log_flush`). Never aborts: a still-running flush is left exactly
+/// alone (see `SendScheduler::resolve_pending_no_abort`'s doc for why —
+/// `LogProcessor::flush`'s chunk list lives in a purely local variable with
+/// no externally visible progress, unlike the agent-payload batch, so
+/// killing it mid-flight would lose data with nothing to buffer).
+///
+/// No buffering happens here even on `Failed`: `LogProcessor::flush` already
+/// buffers its own per-chunk send failures into its internal
+/// `failed_logs_buffer` (see `send_and_clear_batch_simple`) — this function
+/// only needs to observe and log the outcome, not act on it.
+async fn resolve_pending_logs(request_id: &str) {
+    let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending_no_abort(crate::send::SendKind::Logs)
+        .await
+    else {
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: previous invocation's log flush completed successfully (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::Failed => {
+            debug!(
+                "APM mode: previous invocation's log flush had failures, already buffered internally (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::StillRunning => {
+            debug!(
+                "APM mode: previous invocation's log flush still running (checked at {})",
+                request_id
+            );
+        }
+        other => {
+            // TimedOut/Dropped/Deferred: unreachable in practice —
+            // resolve_pending_no_abort never aborts (no TimedOut), never
+            // checks the breaker (no Dropped), and never itself returns
+            // Deferred. Handled defensively, not assumed.
+            warn!(
+                "APM mode: unexpected {:?} resolving pending log flush at {}",
+                other, request_id
+            );
+        }
+    }
+}
+
+/// Spawn this invocation's platform-report-metrics send into `SEND_SCHEDULER`,
+/// unconditionally — like logs, never tier-gated, and was already
+/// unconditionally detached before `SendTier` existed.
+///
+/// `send_platform_report_metrics` already self-buffers on transient failure
+/// (`metric_api_buffer::buffer_failed_metric_api`) and always returns `Ok`
+/// (parse-fail, disabled, permanent-drop, and buffered-for-retry are all
+/// `Ok` at that call site) — so, same as logs, there is nothing further for
+/// this module to buffer on `Failed`; `from_collector_result` mapping this
+/// to `SendOutcome::Success` is the realistic common case, with
+/// `SendOutcome::Failure` reserved for the theoretical panic/unexpected-error
+/// case.
+///
+/// Never aborted (see `resolve_pending_platform_metrics`): this call's
+/// report data lives only inside the spawned future (the caller already
+/// called `remove_pending_report` before spawning) — an abort would lose it
+/// with nothing to buffer, the same risk `resolve_pending_no_abort` exists
+/// to avoid for logs. Guarded by `has_pending` against ever running two
+/// concurrent metrics sends for the same kind.
+async fn spawn_platform_metrics_flush(
+    apm_app: &crate::apm::SharedApmApp,
+    report_line: String,
+    request_id: &str,
+    invoked_function_arn: &str,
+) {
+    if SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await {
+        debug!(
+            "APM mode: previous platform-metrics send still running — report for {} dropped \
+             (occasional loss here is an accepted tradeoff, same as before this send was tracked)",
+            request_id
+        );
+        return;
+    }
+
+    let apm_app_clone = apm_app.clone();
+    let request_id_clone = request_id.to_string();
+    let invoked_function_arn_clone = invoked_function_arn.to_string();
+    let send: crate::send::BoxedSend = Box::pin(async move {
+        let apm_app_guard = apm_app_clone.read().await;
+        let Some(ref app) = *apm_app_guard else {
+            warn!(
+                "APM mode: APM app not ready - cannot send platform metrics for {}",
+                request_id_clone
+            );
+            return crate::send::SendOutcome::Failure;
+        };
+        let result = app
+            .send_platform_report_metrics(&report_line, &invoked_function_arn_clone)
+            .await;
+        match &result {
+            Ok(()) => info!(
+                "APM mode: Successfully sent platform report metrics for request {}",
+                request_id_clone
+            ),
+            Err(e) => error!(
+                "APM mode: Failed to send platform report metrics for {}: {}",
+                request_id_clone, e
+            ),
+        }
+        crate::send::from_collector_result(&result)
+    });
+    SEND_SCHEDULER
+        .spawn(crate::send::SendKind::MetricApi, send, None)
+        .await;
+}
+
+/// Resolve whatever platform-metrics send is pending from a previous
+/// invocation, if any — called unconditionally at the start of every
+/// invocation and at `SHUTDOWN`, regardless of `send_tier`. Never aborts
+/// (see `spawn_platform_metrics_flush`'s doc for why). Nothing to buffer on
+/// `Failed`: the send already buffered itself internally on any retryable
+/// failure before returning.
+async fn resolve_pending_platform_metrics(request_id: &str) {
+    let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending_no_abort(crate::send::SendKind::MetricApi)
+        .await
+    else {
+        return;
+    };
+
+    match outcome.result {
+        crate::send::DispatchResult::Sent => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send completed successfully (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::Failed => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send failed, already handled internally (checked at {})",
+                request_id
+            );
+        }
+        crate::send::DispatchResult::StillRunning => {
+            debug!(
+                "APM mode: previous invocation's platform-metrics send still running (checked at {})",
+                request_id
+            );
+        }
+        other => {
+            // TimedOut/Dropped/Deferred: unreachable in practice, same
+            // reasoning as resolve_pending_logs. Handled defensively.
+            warn!(
+                "APM mode: unexpected {:?} resolving pending platform-metrics send at {}",
+                other, request_id
+            );
+        }
+    }
+}
+
 /// Event loop: handles cold start (first invoke) and warm starts (subsequent invokes)
 pub async fn run_infinite_event_loop(
     mut extension_components: ExtensionComponents,
@@ -1357,6 +1692,62 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
+    match config.extension.send_tier {
+        crate::send::SendTier::Default => {
+            process_apm_request_default(
+                &request_id,
+                &invoked_function_arn,
+                &config,
+                &global_log_processor,
+                &apm_app,
+                deadline_ms,
+                &state,
+            ).await;
+        }
+        crate::send::SendTier::High => {
+            process_apm_request_high(
+                &request_id,
+                &invoked_function_arn,
+                &config,
+                &global_log_processor,
+                &apm_app,
+                deadline_ms,
+                &state,
+            ).await;
+        }
+    }
+    // Agent payloads arrive via the named pipe independently and are already sent above.
+    // Late agent payloads will be caught by the warm-start pending-payload logic.
+
+    cleanup_request_processing_state_internal(&request_id, true);
+
+
+    debug!(
+        "APM mode: Completed processing for request: {}",
+        request_id
+    );
+}
+
+/// `SendTier::Default` — the exact pre-existing `main` code (pipeline_flush-based,
+/// pre-`SendScheduler`), moved here verbatim, not edited, per `DUAL_PATH_PLAN.md`.
+/// Zero behavior change versus `main` -- this is the whole point of the dual-path
+/// design: `default` tier's testing surface/regression risk stays exactly what it
+/// already was.
+///
+/// `#[allow(clippy::too_many_lines)]`: a function-boundary artifact of
+/// extracting this logic out of the original combined `process_apm_request`
+/// (which didn't trip this lint at its old boundary) -- the code itself is
+/// unchanged, not newly complex.
+#[allow(clippy::too_many_lines)]
+async fn process_apm_request_default(
+    request_id: &String,
+    invoked_function_arn: &String,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+    apm_app: &crate::apm::SharedApmApp,
+    deadline_ms: i64,
+    state: &request::RequestProcessingState,
+) {
     // APM mode: Check if run_id is available
     let has_run_id = {
         let apm_app_guard = apm_app.read().await;
@@ -1424,7 +1815,7 @@ pub async fn process_apm_request(
                 agent_payloads.len()
             );
             // Put payloads back in buffer to send when run_id arrives
-            if let Some(buffer_ref) = get_agent_buffer(&request_id) {
+            if let Some(buffer_ref) = get_agent_buffer(request_id) {
                 if let Ok(mut buffer) = buffer_ref.lock() {
                     buffer.extend(agent_payloads);
                 }
@@ -1461,12 +1852,12 @@ pub async fn process_apm_request(
     }
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode)
-    if let Some(report_line) = get_pending_report(&request_id) {
+    if let Some(report_line) = get_pending_report(request_id) {
         debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
         let apm_app_guard = apm_app.read().await;
         if let Some(ref app) = *apm_app_guard {
-            if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
+            if let Err(e) = app.send_platform_report_metrics(&report_line, invoked_function_arn).await {
                 error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
             } else {
                 info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
@@ -1477,16 +1868,16 @@ pub async fn process_apm_request(
         drop(apm_app_guard);
 
         // Remove pending report after sending
-        remove_pending_report(&request_id);
+        remove_pending_report(request_id);
     } else {
         debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
     }
 
     wait_for_runtime_done_with_grace(
-        &request_id,
+        request_id,
         deadline_ms,
-        &config,
-        &global_log_processor,
+        config,
+        global_log_processor,
     )
     .await;
 
@@ -1505,17 +1896,187 @@ pub async fn process_apm_request(
     if let Err(e) = platform_result {
         error!("Failed to flush platform for request {}: {}", request_id, e);
     }
+}
 
-    // Agent payloads arrive via the named pipe independently and are already sent above.
-    // Late agent payloads will be caught by the warm-start pending-payload logic.
+/// `SendTier::High` — routes agent payload, logs, and platform-metrics
+/// through `SEND_SCHEDULER` (helpers defined above `run_infinite_event_loop`):
+/// spawn the instant data is ready, never wait on it here. Resolve whatever
+/// the *previous* `high`-tier invocation deferred at the very top, before
+/// this invocation does any of its own work. Entirely separate from
+/// `process_apm_request_default` — no shared internals, per
+/// `DUAL_PATH_PLAN.md`.
+///
+/// `#[allow(clippy::too_many_lines)]`: one cohesive Flow-1/metrics/logs
+/// sequence, mirroring the shape already proven on `apm-unified-telemetry-flush`
+/// — kept as a single function for direct comparison against that branch's
+/// version rather than splitting it differently here.
+#[allow(clippy::too_many_lines)]
+async fn process_apm_request_high(
+    request_id: &String,
+    invoked_function_arn: &str,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+    apm_app: &crate::apm::SharedApmApp,
+    deadline_ms: i64,
+    state: &request::RequestProcessingState,
+) {
+    // Resolve whatever the previous high-tier invocation deferred, before
+    // this invocation does any of its own Flow-1/log/metrics work.
+    resolve_pending_agent_batch().await;
+    resolve_pending_logs(request_id).await;
+    resolve_pending_platform_metrics(request_id).await;
 
-    cleanup_request_processing_state_internal(&request_id, true);
+    // APM mode: Check if run_id is available
+    let has_run_id = {
+        let apm_app_guard = apm_app.read().await;
+        apm_app_guard.is_some()
+    };
 
+    // Check if we have agent payload
+    let agent_payloads = {
+        if let Ok(mut buffer) = state.agent_buffer.lock() {
+            std::mem::take(&mut *buffer)
+        } else {
+            Vec::new()
+        }
+    };
 
-    debug!(
-        "APM mode: Completed processing for request: {}",
-        request_id
-    );
+    let got_payload = !agent_payloads.is_empty();
+
+    // Flow 1: If run_id exists and payload arrived, spawn it now — resolved
+    // at the *next* invocation's start (see the top of this function), never
+    // waited on here.
+    if has_run_id && got_payload {
+        debug!(
+            "APM mode (high): run_id available + agent payload arrived ({} payload(s)) - spawning",
+            agent_payloads.len()
+        );
+        let request_id_clone = request_id.clone();
+        let config_clone = config.clone();
+        let global_log_processor_clone = global_log_processor.clone();
+        let apm_app_clone = apm_app.clone();
+        let invoked_function_arn_clone = invoked_function_arn.to_string();
+
+        // Wrap each payload in an Arc once (moves the bytes, no copy); cloning for
+        // the spawned task is then a refcount bump. The original Arc vec is
+        // retained in AGENT_BATCH_META for the timeout fallback.
+        let payloads: Vec<Arc<Vec<u8>>> = agent_payloads.into_iter().map(Arc::new).collect();
+        let payloads_for_task = payloads.clone();
+
+        // Progress cursor: incremented strictly after each payload's send/buffer
+        // outcome is fully resolved — see buffer_unresolved_agent_payloads.
+        let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cursor_clone = cursor.clone();
+
+        let send: crate::send::BoxedSend = Box::pin(async move {
+            let mut all_sent = true;
+            for payload_bytes in &payloads_for_task {
+                extract_and_coordinate_trace_id(
+                    payload_bytes.as_slice(),
+                    &request_id_clone,
+                    &config_clone,
+                    &global_log_processor_clone,
+                )
+                .await;
+
+                // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
+                // (never silently dropped); the global retry loop resends it on a
+                // later invoke / at shutdown.
+                if !send_agent_payload_or_buffer(
+                    payload_bytes.as_slice(),
+                    &request_id_clone,
+                    &invoked_function_arn_clone,
+                    &apm_app_clone,
+                )
+                .await
+                {
+                    all_sent = false;
+                }
+
+                cursor_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            if all_sent {
+                crate::send::SendOutcome::Success
+            } else {
+                crate::send::SendOutcome::Failure
+            }
+        });
+
+        let meta = AgentBatchMeta {
+            payloads,
+            request_id: request_id.clone(),
+            invoked_function_arn: invoked_function_arn.to_string(),
+        };
+        match AGENT_BATCH_META.lock() {
+            Ok(mut guard) => {
+                if guard.is_some() {
+                    // Defensive, should-not-happen: SEND_SCHEDULER.spawn's own
+                    // orphan-abort below already handles the handle side of this;
+                    // this just keeps the metadata side in lockstep with it.
+                    warn!(
+                        "APM mode (high): overwriting unresolved AGENT_BATCH_META — \
+                         resolve_pending_agent_batch should have run first"
+                    );
+                }
+                *guard = Some(meta);
+            }
+            Err(e) => error!("AGENT_BATCH_META lock poisoned, dropping new entry: {}", e),
+        }
+        SEND_SCHEDULER
+            .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
+            .await;
+    } else if !has_run_id && got_payload {
+        debug!(
+            "APM mode (high): No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
+            agent_payloads.len()
+        );
+        if let Some(buffer_ref) = get_agent_buffer(request_id) {
+            if let Ok(mut buffer) = buffer_ref.lock() {
+                buffer.extend(agent_payloads);
+            }
+        }
+    } else if has_run_id && !got_payload {
+        debug!(
+            "APM mode (high): run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
+            request_id
+        );
+    } else {
+        debug!(
+            "APM mode (high): No run_id and no agent payload for request: {} - normal flow",
+            request_id
+        );
+    }
+
+    // Check for pending platform.report and spawn as metrics — resolved at
+    // the next invocation's start (see the top of this function).
+    if let Some(report_line) = get_pending_report(request_id) {
+        debug!(
+            "APM mode (high): Found platform.report for request {} - converting to metrics",
+            request_id
+        );
+        // Remove pending report immediately -- the spawned task owns report_line
+        // now; nothing left here depends on get_pending_report's entry.
+        remove_pending_report(request_id);
+        spawn_platform_metrics_flush(apm_app, report_line, request_id, invoked_function_arn).await;
+    } else {
+        debug!(
+            "APM mode (high): No platform.report found for request {} (may arrive in next invocation)",
+            request_id
+        );
+    }
+
+    wait_for_runtime_done_with_grace(
+        request_id,
+        deadline_ms,
+        config,
+        global_log_processor,
+    )
+    .await;
+
+    // Logs: spawned, tracked via SEND_SCHEDULER, never waited on here.
+    // PlatformProcessor::flush() is a hardcoded no-op (platform.* lines already
+    // live in LogProcessor's own batch, flushed above) -- nothing to call for it.
+    spawn_log_flush(global_log_processor, request_id).await;
 }
 
 /// Send agent payload to APM collector (parses and sends 5 telemetry types)
