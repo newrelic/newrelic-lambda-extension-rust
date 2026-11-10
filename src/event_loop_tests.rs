@@ -1367,11 +1367,70 @@ async fn drain_late_paired_payloads_returns_zero_when_no_candidates_exist() {
     assert_eq!(paired, 0);
 }
 
-// ── wait_for_runtime_done_with_grace ───────────────────────────────────────────────
+// ── wait_for_runtime_done (core wait, ungated) ──────────────────────────────────────
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_returns_immediately_when_function_logs_disabled() {
+async fn wait_for_runtime_done_returns_false_immediately_when_request_has_no_notify() {
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done("wfrd-unregistered-request", deadline_ms_from_now(5_000)).await;
+    assert!(
+        !signaled,
+        "an unregistered request has no notify handle, so this must return false"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "must return immediately, not sleep"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_true_when_pre_fired() {
+    let request_id = "wfrd-core-signalled";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+
+    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
+    notify.notify_one(); // pre-fire: notified() below resolves immediately
+
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(5_000)).await;
+    assert!(signaled, "a pre-fired notify must be observed");
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "a pre-fired notify must resolve immediately, not wait out the deadline"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_false_when_deadline_expires_before_signal() {
+    let request_id = "wfrd-core-deadline-expires";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    // Notify is never fired — the wait must fall through on the deadline instead.
+
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(60)).await;
+    let elapsed = start.elapsed();
+    assert!(!signaled, "an unfired notify must fall through as false, not true");
+    assert!(
+        elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(1_000),
+        "must wait roughly until the deadline budget, then return (elapsed: {:?})",
+        elapsed
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// ── wait_for_runtime_done_with_grace (log-flush grace layered on an already-observed signal) ──
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_with_grace_returns_immediately_when_function_logs_disabled() {
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = false;
     let config = Arc::new(cfg);
@@ -1379,51 +1438,25 @@ async fn wait_for_runtime_done_returns_immediately_when_function_logs_disabled()
 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
-        "wfrd-no-such-request",
-        deadline_ms_from_now(5_000),
+        "wfrd-grace-no-such-request",
+        true,
         &config,
         &log_processor,
     )
     .await;
     assert!(
         start.elapsed() < Duration::from_millis(200),
-        "must short-circuit before touching request state or sleeping"
+        "must short-circuit before touching the log processor at all"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_returns_immediately_when_request_has_no_notify() {
+async fn wait_for_runtime_done_with_grace_skips_grace_when_signalled_and_already_drained() {
+    let request_id = "wfrd-grace-signalled-drained";
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = true;
     let config = Arc::new(cfg);
-    let log_processor = make_noop_log_processor_serverless(config.clone());
-
-    let start = std::time::Instant::now();
-    wait_for_runtime_done_with_grace(
-        "wfrd-unregistered-request",
-        deadline_ms_from_now(5_000),
-        &config,
-        &log_processor,
-    )
-    .await;
-    assert!(
-        start.elapsed() < Duration::from_millis(200),
-        "an unregistered request has no notify handle, so this must return immediately"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() {
-    let request_id = "wfrd-signalled-drained";
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.extension.send_function_logs = true;
-    let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
-    notify.notify_one(); // pre-fire: notified() below resolves immediately
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
     assert!(log_processor.is_drained(), "a fresh noop log processor starts drained");
@@ -1431,7 +1464,7 @@ async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -1440,38 +1473,29 @@ async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() 
         start.elapsed() < Duration::from_millis(200),
         "already-drained batch must skip the grace-period wait entirely"
     );
-
-    REQUEST_DATA.remove(request_id);
 }
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_falls_through_when_deadline_expires_before_signal() {
-    let request_id = "wfrd-deadline-expires";
+async fn wait_for_runtime_done_with_grace_is_a_no_op_when_signaled_is_false() {
+    let request_id = "wfrd-grace-not-signalled";
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = true;
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-    // Notify is never fired — the wait must fall through on the deadline instead.
-
     let log_processor = make_noop_log_processor_serverless(config.clone());
 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(60), // short but not-yet-expired deadline
+        false,
         &config,
         &log_processor,
     )
     .await;
-    let elapsed = start.elapsed();
     assert!(
-        elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(1_000),
-        "must wait roughly until the deadline budget, then return (elapsed: {:?})",
-        elapsed
+        start.elapsed() < Duration::from_millis(200),
+        "signaled=false (deadline already expired upstream) must not wait again"
     );
-
-    REQUEST_DATA.remove(request_id);
 }
 
 // ── batch_all_payloads / spawn_immediate_agent_payload_sends / maybe_spawn_batch_send ──
@@ -1764,7 +1788,7 @@ async fn process_apm_request_completes_cold_start_with_no_payload_and_no_run_id(
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 
@@ -1789,7 +1813,7 @@ async fn process_apm_request_returns_early_when_no_state_registered() {
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 }
@@ -1816,7 +1840,7 @@ async fn process_apm_request_warm_start_drains_previous_request_late_payload() {
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 
@@ -1837,7 +1861,12 @@ async fn execute_apm_mode_event_loop_processes_invoke_then_shutdown() {
             wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
                 "req-apm-loop-1",
                 "arn:aws:lambda:us-east-1:123456789012:function:apm-loop-test",
-                deadline_ms_from_now(5_000),
+                // This mock never emits platform.runtimeDone, so
+                // process_apm_request's wait_for_runtime_done falls through on the
+                // deadline — 2s comfortably survives the wiremock round trip without
+                // the deadline going stale (which would trip the 5s fallback branch
+                // instead), while still being far faster than the real 5s fallback.
+                deadline_ms_from_now(2_000),
             )),
         )
         .up_to_n_times(1)
@@ -2163,10 +2192,6 @@ async fn wait_for_runtime_done_waits_grace_when_signalled_and_batch_not_drained(
     cfg.extension.send_function_logs = true;
     cfg.extension.runtime_done_grace_ms = 150;
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist");
-    notify.notify_one(); // pre-fire so notified() resolves immediately
 
     // Push a log into the batch so is_drained() returns false.
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -2179,7 +2204,7 @@ async fn wait_for_runtime_done_waits_grace_when_signalled_and_batch_not_drained(
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -2206,10 +2231,6 @@ async fn wait_for_runtime_done_with_grace_skips_grace_when_grace_ms_is_zero() {
     cfg.extension.send_function_logs = true;
     cfg.extension.runtime_done_grace_ms = 0; // grace disabled
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist");
-    notify.notify_one(); // pre-fire so the select picks up the signal immediately
 
     // Undrained batch — if grace_ms were > 0 this would cause a wait
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -2222,7 +2243,7 @@ async fn wait_for_runtime_done_with_grace_skips_grace_when_grace_ms_is_zero() {
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -3038,7 +3059,7 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 
@@ -3061,24 +3082,16 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
 #[serial]
 async fn wait_for_runtime_done_uses_fallback_when_deadline_is_past() {
     let request_id = "wfrd-past-deadline-fallback";
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.extension.send_function_logs = true;
-    let config = Arc::new(cfg);
+    let config = make_config_for_serverless(false);
     register_request_for_serverless(request_id, config.clone());
 
     // Pre-fire the notify so notified() resolves instantly even via the fallback path.
     let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
     notify.notify_one();
 
-    let log_processor = make_noop_log_processor_serverless(config.clone());
     let start = std::time::Instant::now();
-    wait_for_runtime_done_with_grace(
-        request_id,
-        deadline_ms_from_now(-1_000), // already expired → triggers lines 1607-1611
-        &config,
-        &log_processor,
-    )
-    .await;
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(-1_000)).await; // already expired → stale-deadline fallback branch
+    assert!(signaled, "pre-fired notify must still be observed on the expired-deadline fallback path");
     assert!(
         start.elapsed() < Duration::from_millis(500),
         "pre-fired notify must resolve fast even on the expired-deadline fallback path"
@@ -3178,7 +3191,12 @@ async fn execute_apm_mode_event_loop_tags_function_on_cold_start_with_version_ta
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
             "req-apm-vtags-1",
             "arn:aws:lambda:us-east-1:123:function:apm-vtags",
-            deadline_ms_from_now(5_000),
+            // This mock never emits platform.runtimeDone, so
+            // process_apm_request's wait_for_runtime_done falls through on the
+            // deadline — 2s comfortably survives the wiremock round trip without
+            // the deadline going stale (which would trip the 5s fallback branch
+            // instead), while still being far faster than the real 5s fallback.
+            deadline_ms_from_now(2_000),
         )))
         .up_to_n_times(1)
         .mount(&server)
@@ -3236,7 +3254,7 @@ async fn process_apm_request_pending_report_warns_when_apm_app_not_ready() {
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(1_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 

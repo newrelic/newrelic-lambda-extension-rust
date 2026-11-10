@@ -1357,13 +1357,24 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
+    // Wait for the handler to actually finish (platform.runtimeDone) BEFORE deciding
+    // whether the agent payload / platform.report have arrived. Checking any earlier
+    // (as this used to, right here at INVOKE time) makes Flow 1 below structurally
+    // unreachable: the customer's handler — and the agent's own payload flush — can't
+    // have produced anything yet. Bounded by the invocation's own remaining deadline,
+    // so this can never outlive the function. Always runs regardless of
+    // NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS (unlike wait_for_runtime_done_with_grace
+    // below, which is purely about log-flush grace and is allowed to skip waiting).
+    let runtime_done_signaled = wait_for_runtime_done(&request_id, deadline_ms).await;
+
     // APM mode: Check if run_id is available
     let has_run_id = {
         let apm_app_guard = apm_app.read().await;
         apm_app_guard.is_some()
     };
 
-    // Check if we have agent payload
+    // Check if we have agent payload — now checked AFTER runtime.done, so Flow 1 can
+    // actually see a payload that arrived during the handler's execution.
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -1431,8 +1442,8 @@ pub async fn process_apm_request(
             }
         } else if has_run_id && !got_payload {
             debug!(
-                "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
-                request_id
+                "APM mode: run_id available but no agent payload for request: {} even after waiting for runtime.done (signaled: {}) - will catch in next invocation if it arrives late",
+                request_id, runtime_done_signaled
             );
         } else {
             debug!(
@@ -1443,21 +1454,20 @@ pub async fn process_apm_request(
         None
     };
 
-    // Spawn agent send in background - don't wait for it to complete
-    // This ensures we return to /next quickly without blocking on agent sends
+    // Await the agent send inline (rather than fire-and-forget) so a same-invoke send
+    // genuinely completes — with its own result observed — before this invocation
+    // returns to /next, instead of racing the sandbox freeze in the background.
     if let Some(handle) = send_agent_task {
-        tokio::spawn(async move {
-            match handle.await {
-                Ok((success, payloads)) => {
-                    if !success && !payloads.is_empty() {
-                        debug!("APM mode: agent send had failures — unsent payloads buffered for retry (next invoke / shutdown)");
-                    }
-                }
-                Err(e) => {
-                    error!("Agent send task failed: {}", e);
+        match handle.await {
+            Ok((success, payloads)) => {
+                if !success && !payloads.is_empty() {
+                    debug!("APM mode: agent send had failures — unsent payloads buffered for retry (next invoke / shutdown)");
                 }
             }
-        });
+            Err(e) => {
+                error!("Agent send task failed: {}", e);
+            }
+        }
     }
 
     // Check for pending platform.report and send as metrics to Metric API (APM mode)
@@ -1479,12 +1489,15 @@ pub async fn process_apm_request(
         // Remove pending report after sending
         remove_pending_report(&request_id);
     } else {
-        debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
+        debug!(
+            "APM mode: No platform.report found for request {} even after waiting for runtime.done (signaled: {}) (may arrive in next invocation)",
+            request_id, runtime_done_signaled
+        );
     }
 
     wait_for_runtime_done_with_grace(
         &request_id,
-        deadline_ms,
+        runtime_done_signaled,
         &config,
         &global_log_processor,
     )
@@ -1510,7 +1523,6 @@ pub async fn process_apm_request(
     // Late agent payloads will be caught by the warm-start pending-payload logic.
 
     cleanup_request_processing_state_internal(&request_id, true);
-
 
     debug!(
         "APM mode: Completed processing for request: {}",
@@ -1584,17 +1596,21 @@ async fn send_agent_payload_or_buffer(
 ///
 /// Notify is pre-armable: if `runtime.done` fired before we reach this point,
 /// `notified()` returns immediately.
-async fn wait_for_runtime_done_with_grace(
-    request_id: &str,
-    deadline_ms: i64,
-    config: &ExtensionConfig,
-    log_processor: &Arc<LogProcessor>,
-) {
-    if !config.extension.send_function_logs {
-        return;
-    }
+/// Core wait, shared by every caller that needs to know when the handler has actually
+/// finished: blocks on `runtime_done_notify` (pre-armable — if `platform.runtimeDone`
+/// already fired, `notified()` returns immediately), bounded by the invocation's own
+/// remaining deadline so it can never outlive the function. Returns `true` if the
+/// signal arrived, `false` if the deadline was hit first.
+///
+/// Deliberately has no config gate: callers that only care about this for log-flushing
+/// purposes (`wait_for_runtime_done_with_grace`) may skip calling it entirely when log
+/// forwarding is off, but callers that need it for correctness (e.g. the agent-payload
+/// Flow-1 check in `process_apm_request`) must always call it regardless of any
+/// unrelated logging config — `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=false` must not
+/// silently disable the agent-payload same-invoke-send fix.
+async fn wait_for_runtime_done(request_id: &str, deadline_ms: i64) -> bool {
     let Some(notify) = request::get_runtime_done_notify(request_id) else {
-        return;
+        return false;
     };
 
     const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
@@ -1622,6 +1638,33 @@ async fn wait_for_runtime_done_with_grace(
             request_id,
             chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
         );
+    } else {
+        debug!(
+            "runtime.done wait reached function deadline ({}ms) for request: {} - proceeding anyway",
+            remaining_ms, request_id
+        );
+    }
+
+    signal
+}
+
+/// Log-flush-specific grace period, layered on top of an *already-observed*
+/// `runtime.done` signal. Takes `signaled` rather than calling `wait_for_runtime_done`
+/// itself: `Notify::notify_one` hands out a single wake-up permit, so calling the core
+/// wait twice for the same request would consume it once and then block the second
+/// caller out to the full deadline/fallback timeout every time — callers must wait
+/// exactly once (see `process_apm_request`) and share the resulting bool.
+async fn wait_for_runtime_done_with_grace(
+    request_id: &str,
+    signaled: bool,
+    config: &ExtensionConfig,
+    log_processor: &Arc<LogProcessor>,
+) {
+    if !config.extension.send_function_logs {
+        return;
+    }
+
+    if signaled {
         if !log_processor.is_drained() {
             let grace_ms = config.extension.runtime_done_grace_ms;
             if grace_ms > 0 {
@@ -1660,12 +1703,8 @@ async fn wait_for_runtime_done_with_grace(
                 request_id
             );
         }
-    } else {
-        debug!(
-            "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
-            remaining_ms, request_id
-        );
     }
+    // else: wait_for_runtime_done already logged the deadline-reached case.
 }
 
 /// Sends the appropriate APM error event for a given shutdown reason.
@@ -2028,9 +2067,19 @@ pub async fn process_request_concurrently(
         None
     };
 
+    // This caller only ever needed the wait for log-flush purposes (unlike
+    // process_apm_request, which now needs it unconditionally for agent-payload
+    // correctness) — so preserve the original behavior of skipping the wait
+    // entirely when function-log forwarding is off, rather than always paying for
+    // the core wait and only gating the grace period.
+    let runtime_done_signaled = if config.extension.send_function_logs {
+        wait_for_runtime_done(&request_id, deadline_ms).await
+    } else {
+        false
+    };
     wait_for_runtime_done_with_grace(
         &request_id,
-        deadline_ms,
+        runtime_done_signaled,
         &config,
         &global_log_processor,
     )
