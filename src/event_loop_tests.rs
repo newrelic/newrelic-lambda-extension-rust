@@ -936,6 +936,46 @@ async fn process_request_concurrently_rebuffers_payload_when_no_report_sync_flus
     REQUEST_DATA.remove(request_id);
 }
 
+/// When send_function_logs IS on, process_request_concurrently must actually engage
+/// wait_for_runtime_done (not just skip straight to the grace-only check) — the
+/// regression this guards: an earlier version of the fix for NR-??? (same-invoke
+/// agent-payload delivery) made this call unconditional here too, which broke this
+/// exact "flag off: must return near-instantly" contract for the flag-off case above.
+/// With no notify fired, a short deadline, and the flag on, the call must still wait
+/// out (a bounded slice of) the deadline rather than returning instantly.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_waits_for_runtime_done_when_flag_on() {
+    let request_id = "prc-send-logs-flag-on-test";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_function_logs = true;
+    let config = Arc::new(cfg);
+    register_request_for_serverless(request_id, config.clone());
+    // Notify is never fired — the wait must fall through on the deadline instead.
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    let t0 = std::time::Instant::now();
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(60),
+    )
+    .await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed >= 50,
+        "flag on: must actually wait for runtime.done (deadline fallback), not skip it (got {elapsed}ms)"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
 // process_request_concurrently must await any pending_send_handles registered for its
 // request (e.g. by route_payload_to_request_buffer's immediate-send path) before
 // returning, bounded by the invocation's remaining deadline — proven here via a side
@@ -1367,6 +1407,19 @@ async fn drain_late_paired_payloads_returns_zero_when_no_candidates_exist() {
     assert_eq!(paired, 0);
 }
 
+// ── format_elapsed_for_log ───────────────────────────────────────────────────────────
+
+#[test]
+fn format_elapsed_for_log_renders_some_as_milliseconds() {
+    assert_eq!(format_elapsed_for_log(Some(42)), "42ms");
+    assert_eq!(format_elapsed_for_log(Some(0)), "0ms");
+}
+
+#[test]
+fn format_elapsed_for_log_renders_none_as_unknown() {
+    assert_eq!(format_elapsed_for_log(None), "an unknown time");
+}
+
 // ── wait_for_runtime_done (core wait, ungated) ──────────────────────────────────────
 
 #[tokio::test]
@@ -1721,13 +1774,16 @@ async fn process_pending_agent_payloads_buffers_late_payload_when_apm_not_connec
 // Note: the merge behavior itself (ApmApp::process_merged_agent_payloads correctly
 // merging multiple chunks into one POST per mergeable type) is already covered by
 // apm::app::tests::process_merged_agent_payloads_merges_mergeable_event_list_types_across_chunks
-// and three sibling tests. An equivalent test at this integration layer (going
-// through process_pending_agent_payloads with a real ApmApp wrapped in
-// SharedApmApp) was attempted but hit an unresolved test-harness/runtime-teardown
-// hang unrelated to the merge logic itself (the function body completes and all
-// assertions pass in ~1ms; the hang occurs after the test's own code finishes,
-// before the harness reports completion) — removed rather than leave a flaky/
-// hanging test in the suite.
+// and three sibling tests. An equivalent test at this integration layer — going
+// through process_pending_agent_payloads with a real ApmApp wrapped in SharedApmApp —
+// was attempted twice (current_thread and multi_thread runtime flavors) and hit an
+// unresolved test-harness/runtime-teardown hang both times, unrelated to the merge
+// logic itself (manual instrumentation confirmed the function body completes and all
+// assertions pass in ~1ms; the hang occurs after the test's own code finishes, before
+// the harness reports completion — attaching a debugger to inspect it was blocked by
+// sandbox permissions). Removed rather than leave a flaky/hanging test in the suite;
+// the "apm_app is Some" branch in process_pending_agent_payloads (event_loop.rs
+// ~2372-2392) is consequently uncovered by this specific integration path.
 
 // ── retry_failed_agent_payloads (APM) ────────────────────────────────────────────────
 
@@ -1825,6 +1881,33 @@ async fn process_apm_request_returns_early_when_no_state_registered() {
         deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn process_apm_request_flow1_sends_immediately_when_run_id_and_payload_present() {
+    let request_id = "par-flow1-send-test";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(vec![0xAB, 0xCD, 0xEF]); // got_payload=true
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true
+
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
+    )
+    .await;
+
+    assert!(REQUEST_PROCESSORS.get(request_id).is_none());
+    REQUEST_DATA.remove(request_id);
 }
 
 // ── execute_apm_mode_event_loop (APM) — driven end-to-end against a wiremock Extensions API ──

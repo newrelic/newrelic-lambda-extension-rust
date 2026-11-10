@@ -268,3 +268,35 @@ fn merge_event_list_payloads_on_empty_input_returns_zeroed_shape() {
     assert_eq!(merged[1]["reservoir_size"], json!(0));
     assert_eq!(merged[2].as_array().unwrap().len(), 0);
 }
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_with_no_reservoir_metadata_fields() {
+    // chunk[1] is a valid object but has neither events_seen nor reservoir_size —
+    // both .get(...).and_then(...) calls must resolve to None without panicking.
+    let chunk = vec![Value::Null, json!({}), json!([{"id": "x"}])];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_whose_third_element_is_not_an_array() {
+    // chunk[2] present but not an array — .as_array() must resolve to None, skipping
+    // this chunk's events rather than panicking.
+    let chunk = vec![Value::Null, json!({"reservoir_size": 10, "events_seen": 1}), json!("not-an-array")];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(1));
+    assert_eq!(merged[1]["reservoir_size"], json!(10));
+    assert_eq!(merged[2].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_whose_second_element_is_not_an_object() {
+    // chunk[1] present but not an object — .as_object() must resolve to None.
+    let chunk = vec![Value::Null, json!("not-an-object"), json!([{"id": "x"}])];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 1);
+}
