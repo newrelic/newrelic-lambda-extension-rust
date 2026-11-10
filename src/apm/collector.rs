@@ -228,11 +228,9 @@ pub async fn send_error_events(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
-        debug!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
         info!(
-            "Successfully sent {} error events for request {} (status: {})",
-            error_events.len(), request_id, status
+            "Successfully sent {} error events for request {} (status: {}, duration: {}ms)",
+            error_events.len(), request_id, status, duration.as_millis()
         );
         Ok(())
     } else {
@@ -330,11 +328,9 @@ pub async fn send_apm_telemetry(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for {} telemetry: {}", command, status_code);
-        debug!("Send {} duration: {}ms", command, duration.as_millis());
         info!(
-            "Successfully sent {} for request {} (status: {})",
-            command, request_id, status
+            "Successfully sent {} for request {} (status: {}, duration: {}ms)",
+            command, request_id, status, duration.as_millis()
         );
         Ok(())
     } else {
@@ -429,9 +425,10 @@ pub async fn send_platform_metrics(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for platform_metrics telemetry: {}", status_code);
-        debug!("Send platform_metrics duration: {}ms", duration.as_millis());
-        info!("Successfully sent {} platform metrics", metrics.len());
+        info!(
+            "Successfully sent {} platform metrics (status: {}, duration: {}ms)",
+            metrics.len(), status, duration.as_millis()
+        );
         Ok(())
     } else if is_retryable_status(status_code) {
         let retry_after = parse_retry_after(response.headers());
