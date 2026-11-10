@@ -167,6 +167,13 @@ pub struct ExtensionSettings {
     /// `error.expected: true` on the `TransactionError` event, excluding them from
     /// error rate/Apdex while keeping them visible in Errors Inbox. APM mode only.
     pub expected_errors: HashSet<String>,
+    /// `NEW_RELIC_SEND_TIER` — `default` (existing `pipeline_flush`-based behavior,
+    /// completely unmodified) or `high` (the new `SendScheduler`-based path for
+    /// agent payload, logs, and platform-metrics). Dual-path by design: `default`
+    /// routes through the exact pre-existing code, `high` through new code — not a
+    /// single pipeline configured by tier. See `DUAL_PATH_PLAN.md`. Read once at
+    /// startup.
+    pub send_tier: crate::send::SendTier,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -311,6 +318,7 @@ impl Default for ExtensionSettings {
             lmi_flush_interval_ms: 30_000,
             ignore_errors: HashSet::new(),
             expected_errors: HashSet::new(),
+            send_tier: crate::send::SendTier::Default,
         }
     }
 }
@@ -597,6 +605,10 @@ impl ExtensionConfig {
 
         let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
+
+        // NEW_RELIC_SEND_TIER: default|high. Unknown/missing values fall back to
+        // Default inside SendTier::from_env itself (warns, never panics).
+        config.extension.send_tier = crate::send::SendTier::from_env();
 
         // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
         // Default 25 ms — matches the Telemetry API buffer flush window.

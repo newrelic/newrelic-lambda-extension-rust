@@ -21,6 +21,7 @@ mod runtime;
 mod request;
 mod event_loop;
 mod event_loop_lmi;
+mod send;
 mod error_synthesis;
 #[cfg(test)]
 mod error_synthesis_tests;
