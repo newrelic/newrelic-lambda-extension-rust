@@ -394,6 +394,7 @@ impl ApmApp {
                 &run_id,
                 command,
                 &data,
+                &request_id,
             )
             .await;
 
@@ -581,6 +582,7 @@ impl ApmApp {
             &self.collector_host,
             &self.run_id,
             &error_events,
+            request_id,
         )
         .await;
 
