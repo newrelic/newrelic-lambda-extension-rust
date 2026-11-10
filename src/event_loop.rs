@@ -964,6 +964,17 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 }
 
+                // SendTier::High only: there's no "next invocation" at shutdown to defer
+                // to, so drain whatever the last high-tier invocation left pending in
+                // SEND_SCHEDULER first. No-op under SendTier::Default (process_apm_request_default
+                // never touches SEND_SCHEDULER, so nothing is ever pending there) and on the
+                // common case where nothing is pending.
+                if components.config.extension.send_tier == crate::send::SendTier::High {
+                    resolve_pending_agent_batch().await;
+                    resolve_pending_logs("shutdown").await;
+                    resolve_pending_platform_metrics("shutdown").await;
+                }
+
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
 
