@@ -14,12 +14,17 @@
 //!
 //! ## Design, in one paragraph per concern
 //!
-//! - **Agent payload + platform-metrics**: spawned the instant their data
-//!   is ready, then resolved at *this* invocation's own `runtimeDone`
-//!   boundary against **one shared** budget (not one budget each) — see
-//!   [`RUNTIME_DONE_BUDGET_MS`]. Whatever's still running when the budget
-//!   elapses is aborted and buffered for a background retry on a later
-//!   invocation, attributed to the request that actually produced it.
+//! - **Agent payload + platform-metrics**: checked for and spawned *after*
+//!   `runtimeDone` (not at the top of the invocation) — the agent delivers
+//!   its payload over a named pipe, asynchronously, and checking too early
+//!   can miss a payload that arrives a few/tens of ms into the same
+//!   invocation, pushing it needlessly into the next invocation's
+//!   late-payload sweep instead of this invocation's own bounded
+//!   spawn+resolve. Resolved against **one shared** budget (not one budget
+//!   each) — see [`RUNTIME_DONE_BUDGET_MS`]. Whatever's still running when
+//!   the budget elapses is aborted and buffered for a background retry on
+//!   a later invocation, attributed to the request that actually produced
+//!   it.
 //! - **Logs**: deliberately excluded from that budget. Lambda freezes the
 //!   execution environment almost immediately after the extension calls
 //!   `/next`, so starting a log-flush network call right at `runtimeDone`
@@ -142,6 +147,17 @@ pub async fn process_invocation(
     global_log_processor.set_invocation_start_time(chrono::Utc::now());
     state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
 
+    event_loop_wait_for_runtime_done(&request_id, deadline_ms, &config, &global_log_processor).await;
+
+    // Checked here, right before the bounded resolve below -- not at the
+    // top of the invocation. The agent sends its payload over a named
+    // pipe, asynchronously; checking early can miss a payload that arrives
+    // a few/tens of ms into the same invocation (confirmed in practice --
+    // it would otherwise fall through to the next invocation's late-payload
+    // sweep entirely, skipping the bounded-wait/retry path below for no
+    // reason). Checking after runtimeDone instead gives the payload the
+    // rest of the invocation's own real time to arrive, maximizing the
+    // chance it's actually here to spawn+resolve this cycle.
     let has_run_id = apm_app.read().await.is_some();
 
     agent_payload::spawn_if_ready(
@@ -157,8 +173,6 @@ pub async fn process_invocation(
     .await;
 
     platform_metrics::spawn_if_ready(&SCHEDULER, &apm_app, &request_id, &invoked_function_arn).await;
-
-    event_loop_wait_for_runtime_done(&request_id, deadline_ms, &config, &global_log_processor).await;
 
     // Single shared bound covering agent payload + platform-metrics
     // together -- never `2 * RUNTIME_DONE_BUDGET_MS`. Whatever's still

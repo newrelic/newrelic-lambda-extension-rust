@@ -37,10 +37,37 @@ struct BatchMeta {
 static BATCH_META: once_cell::sync::Lazy<Mutex<Option<BatchMeta>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
+/// Bound on [`wait_briefly_for_arrival`] — the agent delivers its payload
+/// over a named pipe, asynchronously; this invocation's own runtime
+/// already returned by the time we check, so a payload that's merely
+/// milliseconds away from landing would otherwise be missed entirely and
+/// fall through to the next invocation's late-payload sweep for no reason.
+/// Short and bounded: this is extra latency charged to every invocation
+/// that ever has a payload arrive just slightly late, so it stays well
+/// under the shared send budget, not comparable to it.
+const PAYLOAD_ARRIVAL_POLL_MS: u64 = 25;
+const PAYLOAD_ARRIVAL_POLL_TICK_MS: u64 = 1;
+
+/// Poll `state.agent_buffer` for up to [`PAYLOAD_ARRIVAL_POLL_MS`],
+/// returning as soon as it's non-empty rather than always waiting out the
+/// full bound — a payload that's already there (the common case) costs
+/// nothing extra.
+async fn wait_briefly_for_arrival(state: &RequestProcessingState) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(PAYLOAD_ARRIVAL_POLL_MS);
+    loop {
+        let has_payload = state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false);
+        if has_payload || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(PAYLOAD_ARRIVAL_POLL_TICK_MS)).await;
+    }
+}
+
 /// If `run_id` is available and a payload arrived this invocation, spawn
 /// the send (resolved later, at this invocation's own `runtimeDone`, by
 /// [`super::process_invocation`]). If `run_id` isn't ready yet, buffer the
-/// payload back for when it is. If nothing arrived, no-op.
+/// payload back for when it is. If nothing arrived even after a brief
+/// bounded wait (see [`wait_briefly_for_arrival`]), no-op.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn spawn_if_ready(
     scheduler: &Scheduler,
@@ -52,6 +79,8 @@ pub(super) async fn spawn_if_ready(
     state: &RequestProcessingState,
     has_run_id: bool,
 ) {
+    wait_briefly_for_arrival(state).await;
+
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -234,5 +263,78 @@ fn buffer_unresolved_tail(payloads: &[Arc<Vec<u8>>], resolved_cursor: usize, req
     );
     for payload_bytes in unresolved {
         crate::event_loop::buffer_failed_agent_payload(payload_bytes.as_slice(), request_id, invoked_function_arn);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ExtensionConfig;
+    use crate::request::{create_request_processing_state, ProcessorFactory};
+
+    fn make_state(request_id: &str) -> RequestProcessingState {
+        let config = Arc::new(ExtensionConfig::default());
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let apm_app: SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+        let factory = Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app));
+        create_request_processing_state(request_id, "arn:aws:lambda:us-east-1:123:function:test-fn", &factory)
+    }
+
+    #[tokio::test]
+    async fn wait_briefly_for_arrival_returns_immediately_when_already_present() {
+        let state = make_state("req-already-there");
+        state.agent_buffer.lock().unwrap().push(vec![1, 2, 3]);
+
+        let start = tokio::time::Instant::now();
+        wait_briefly_for_arrival(&state).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(5),
+            "an already-present payload must not pay any poll delay, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_briefly_for_arrival_catches_a_payload_that_lands_mid_poll() {
+        let state = make_state("req-lands-mid-poll");
+        let buffer = state.agent_buffer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(8)).await;
+            buffer.lock().unwrap().push(vec![9, 9, 9]);
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_briefly_for_arrival(&state).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            state.agent_buffer.lock().unwrap().len() == 1,
+            "the payload that landed mid-poll must be visible once the wait returns"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "must return as soon as the payload lands, not wait out the full {}ms bound, took {:?}",
+            PAYLOAD_ARRIVAL_POLL_MS,
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_briefly_for_arrival_gives_up_after_bound_when_nothing_arrives() {
+        let state = make_state("req-never-arrives");
+
+        let start = tokio::time::Instant::now();
+        wait_briefly_for_arrival(&state).await;
+        let elapsed = start.elapsed();
+
+        assert!(state.agent_buffer.lock().unwrap().is_empty());
+        assert!(
+            elapsed >= std::time::Duration::from_millis(PAYLOAD_ARRIVAL_POLL_MS)
+                && elapsed < std::time::Duration::from_millis(PAYLOAD_ARRIVAL_POLL_MS + 15),
+            "must wait out the full bound (no false-positive early exit) but not overshoot it, took {:?}",
+            elapsed
+        );
     }
 }
