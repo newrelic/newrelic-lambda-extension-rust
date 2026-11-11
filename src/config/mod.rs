@@ -167,6 +167,13 @@ pub struct ExtensionSettings {
     /// `error.expected: true` on the `TransactionError` event, excluding them from
     /// error rate/Apdex while keeping them visible in Errors Inbox. APM mode only.
     pub expected_errors: HashSet<String>,
+    /// `NEW_RELIC_SEND_TIER` — `default` (today's behavior, completely
+    /// unmodified) or `high` (routes APM-mode agent-payload/platform-metrics/
+    /// log sends through `high_tier`'s own bounded, never-blocking-`/next`
+    /// implementation — see `high_tier` module docs). Inert for `default`:
+    /// nothing branches on it except the one fork point in
+    /// `execute_apm_mode_event_loop`. Read once at startup.
+    pub send_tier: crate::high_tier::SendTier,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -311,6 +318,7 @@ impl Default for ExtensionSettings {
             lmi_flush_interval_ms: 30_000,
             ignore_errors: HashSet::new(),
             expected_errors: HashSet::new(),
+            send_tier: crate::high_tier::SendTier::default(),
         }
     }
 }
@@ -611,6 +619,11 @@ impl ExtensionConfig {
         // and flushes telemetry in the background, reducing billed duration.
         let pipeline_flush_str = env::var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH").unwrap_or_default();
         config.extension.pipeline_flush = parse_bool(&pipeline_flush_str);
+
+        // NEW_RELIC_SEND_TIER: default|high, see high_tier::SendTier docs.
+        // Unknown/missing values fall back to Default inside SendTier::from_env
+        // itself (warns on an unrecognized-but-present value, never panics).
+        config.extension.send_tier = crate::high_tier::SendTier::from_env();
 
         // NEW_RELIC_LMI_FLUSH_INTERVAL_MS: heartbeat flush cadence for the LMI
         // event loop. Floored at 1000 ms to avoid pathological flush storms.

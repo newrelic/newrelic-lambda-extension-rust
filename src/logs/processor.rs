@@ -1775,6 +1775,30 @@ impl LogProcessor {
     }
 
     pub async fn send_and_clear_batch_simple(&self) -> std::io::Result<()> {
+        self.send_and_clear_batch_simple_with_request_id(None).await
+    }
+
+    /// Like [`LogProcessor::send_and_clear_batch_simple`], but lets the
+    /// caller pin the `request_id` used for ARN-fallback logging and
+    /// `FailedLogEntry::original_request_id` attribution to a specific
+    /// value, instead of reading `self.invocation_context` live at send
+    /// time. Needed by `high_tier::logs` (`SendTier::High`): that module
+    /// deliberately sends a *previous* invocation's leftover batch at the
+    /// start of the *next* invocation, by which point `invocation_context`
+    /// has already been updated to the new invocation's own request_id —
+    /// using it unpinned would misattribute a failed chunk's retry entry to
+    /// the wrong request. The actual log data sent to New Relic is
+    /// unaffected either way — every `LogMessage` already carries its own
+    /// stamped `aws.lambda_request_id` — this override only matters for
+    /// the bookkeeping/retry-attribution fields below.
+    ///
+    /// `None` (via [`LogProcessor::send_and_clear_batch_simple`], the
+    /// `Flush` trait impl, and every other existing caller) preserves the
+    /// exact existing behavior.
+    async fn send_and_clear_batch_simple_with_request_id(
+        &self,
+        request_id_override: Option<&str>,
+    ) -> std::io::Result<()> {
         // FIRST: Try to stamp any remaining pre-invoke logs before final flush
         // This catches logs that arrived early (before context was ready)
         debug!("Final flush: Attempting to process pre-invoke logs one last time");
@@ -1893,6 +1917,12 @@ impl LogProcessor {
                 return Ok(());
             }
         };
+        // The request_id used for bookkeeping/attribution below -- the
+        // caller's pinned value if given, else whatever's live in
+        // self.invocation_context right now (unchanged default behavior).
+        let effective_request_id: String = request_id_override
+            .map(str::to_string)
+            .unwrap_or_else(|| context.request_id.clone());
 
         // GUARD: Never send logs without ARN - use fallback chain if context ARN is empty
         let effective_arn = if !context.invoked_function_arn.is_empty() {
@@ -1904,7 +1934,7 @@ impl LogProcessor {
                     "BLOCKED: Refusing to flush {} logs without ARN (request_id: '{}'). \
                      Neither invocation context nor fallback ARN available.",
                     deduplicated_batch.len(),
-                    context.request_id
+                    effective_request_id
                 );
                 // Put logs back in batch so they can be sent later when ARN is available
                 if let Ok(mut batch) = self.log_batch.lock() {
@@ -1914,7 +1944,7 @@ impl LogProcessor {
             }
             // In LMI heartbeat flushes there is no active invocation, so request_id is
             // legitimately empty. Only include it in the message when it carries a value.
-            if context.request_id.is_empty() {
+            if effective_request_id.is_empty() {
                 warn!(
                     "Log flush: Using fallback ARN '{}' (heartbeat flush — no active invocation context)",
                     fallback
@@ -1922,7 +1952,7 @@ impl LogProcessor {
             } else {
                 warn!(
                     "Log flush: Using fallback ARN '{}' (invocation context ARN was empty, request_id: '{}')",
-                    fallback, context.request_id
+                    fallback, effective_request_id
                 );
             }
             fallback
@@ -1958,7 +1988,7 @@ impl LogProcessor {
 
         for chunk in chunks {
             let chunk_len = chunk.len();
-            let request_id = context.request_id.clone();
+            let request_id = effective_request_id.clone();
             match self.try_send_chunk(&client, &config, chunk, &effective_arn).await {
                 Ok(()) => {
                     successful_chunks += 1;
@@ -2105,6 +2135,40 @@ impl LogProcessor {
                 error!("Failed to send log chunk on shutdown — {} logs permanently dropped: {}", dropped, e);
             }
         }
+    }
+
+    /// Like the `Flush` trait's `flush()`, but pins the `request_id` used
+    /// for retry-attribution bookkeeping to `request_id` rather than
+    /// whatever's live in `self.invocation_context` at send time -- see
+    /// `send_and_clear_batch_simple_with_request_id`'s doc for why.
+    /// `high_tier::logs` (`SendTier::High`) is the only caller; every other
+    /// caller uses the unmodified `flush()` trait method.
+    pub async fn flush_with_request_id(&self, request_id: &str) -> std::io::Result<()> {
+        // Fast-path: nothing to do — same check as flush().
+        {
+            let no_retry = self.invocation_retry_handle.lock().unwrap().is_none();
+            let batch_empty = self.log_batch.lock().unwrap().is_empty();
+            let not_flushing = !self.is_auto_flushing.load(Ordering::Acquire);
+            let no_handles = self.pending_flush_handles.lock().unwrap()
+                .as_ref().map_or(true, |h| h.is_finished());
+            if no_retry && batch_empty && not_flushing && no_handles {
+                return Ok(());
+            }
+        }
+
+        let retry_handle = self.invocation_retry_handle.lock().unwrap().take();
+
+        let (send_result, _) = tokio::join!(
+            self.send_and_clear_batch_simple_with_request_id(Some(request_id)),
+            async move {
+                if let Some(h) = retry_handle {
+                    if let Err(e) = h.await {
+                        warn!("Invocation retry task panicked or was cancelled: {}", e);
+                    }
+                }
+            }
+        );
+        send_result
     }
 
 }

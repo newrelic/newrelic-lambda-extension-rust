@@ -452,56 +452,74 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     );
                 }
 
-                let pending_task = tokio::spawn({
-                    let config = components.config.clone();
-                    let global_log_processor = components.global_log_processor.clone();
-                    let apm_app = components.apm_app.clone();
-                    let current_request_id = request_id.clone();
-
-                    async move {
-                        process_pending_agent_payloads(
-                            &config,
-                            &global_log_processor,
-                            &apm_app,
-                            &current_request_id,
-                        )
-                        .await;
-                    }
-                });
-
-                let request_id_clone = request_id.clone();
-                let invoked_function_arn_clone = invoked_function_arn.clone();
-                let config_clone = components.config.clone();
-                let global_log_processor_clone = components.global_log_processor.clone();
-                let apm_app_clone = components.apm_app.clone();
-
-                let current_task = tokio::spawn(async move {
-                    process_apm_request(
-                        request_id_clone,
-                        invoked_function_arn_clone,
-                        is_cold_start,
-                        config_clone,
-                        global_log_processor_clone,
-                        apm_app_clone,
+                // The one fork point: SendTier::High routes to a completely
+                // separate, from-scratch module (see `high_tier`'s own doc)
+                // that never blocks /next by more than one small explicit
+                // budget. SendTier::Default below is the exact pre-existing
+                // code, untouched -- same pending_task/current_task/join
+                // shape as it always was.
+                if components.config.extension.send_tier == crate::high_tier::SendTier::High {
+                    crate::high_tier::process_invocation(
+                        request_id.clone(),
+                        invoked_function_arn.clone(),
+                        components.config.clone(),
+                        components.global_log_processor.clone(),
+                        components.apm_app.clone(),
                         deadline_ms,
                     )
                     .await;
-                });
-
-                if components.config.extension.pipeline_flush {
-                    let combined = tokio::spawn(async move {
-                        let (r1, r2) = tokio::join!(current_task, pending_task);
-                        if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
-                        if let Err(e) = r2 { error!("Error in pending payload processing: {}", e); }
-                    });
-                    pending_flush_handles.push(combined);
                 } else {
-                    let (current_result, pending_result) = tokio::join!(current_task, pending_task);
-                    if let Err(e) = current_result {
-                        error!("Error in APM request processing: {}", e);
-                    }
-                    if let Err(e) = pending_result {
-                        error!("Error in pending payload processing: {}", e);
+                    let pending_task = tokio::spawn({
+                        let config = components.config.clone();
+                        let global_log_processor = components.global_log_processor.clone();
+                        let apm_app = components.apm_app.clone();
+                        let current_request_id = request_id.clone();
+
+                        async move {
+                            process_pending_agent_payloads(
+                                &config,
+                                &global_log_processor,
+                                &apm_app,
+                                &current_request_id,
+                            )
+                            .await;
+                        }
+                    });
+
+                    let request_id_clone = request_id.clone();
+                    let invoked_function_arn_clone = invoked_function_arn.clone();
+                    let config_clone = components.config.clone();
+                    let global_log_processor_clone = components.global_log_processor.clone();
+                    let apm_app_clone = components.apm_app.clone();
+
+                    let current_task = tokio::spawn(async move {
+                        process_apm_request(
+                            request_id_clone,
+                            invoked_function_arn_clone,
+                            is_cold_start,
+                            config_clone,
+                            global_log_processor_clone,
+                            apm_app_clone,
+                            deadline_ms,
+                        )
+                        .await;
+                    });
+
+                    if components.config.extension.pipeline_flush {
+                        let combined = tokio::spawn(async move {
+                            let (r1, r2) = tokio::join!(current_task, pending_task);
+                            if let Err(e) = r1 { error!("Error in APM request processing: {}", e); }
+                            if let Err(e) = r2 { error!("Error in pending payload processing: {}", e); }
+                        });
+                        pending_flush_handles.push(combined);
+                    } else {
+                        let (current_result, pending_result) = tokio::join!(current_task, pending_task);
+                        if let Err(e) = current_result {
+                            error!("Error in APM request processing: {}", e);
+                        }
+                        if let Err(e) = pending_result {
+                            error!("Error in pending payload processing: {}", e);
+                        }
                     }
                 }
 
@@ -1519,7 +1537,7 @@ pub async fn process_apm_request(
 }
 
 /// Send agent payload to APM collector (parses and sends 5 telemetry types)
-async fn send_to_apm_collector(
+pub(crate) async fn send_to_apm_collector(
     payload_bytes: &[u8],
     request_id: &str,
     apm_app: &crate::apm::SharedApmApp,
@@ -1552,7 +1570,7 @@ async fn send_to_apm_collector(
 /// next invoke / at shutdown. Returns `true` on success, `false` on a
 /// (now-buffered) failure. Mirrors `process_and_send_agent_payload` so the
 /// Flow-1 immediate-send path can never silently drop a payload.
-async fn send_agent_payload_or_buffer(
+pub(crate) async fn send_agent_payload_or_buffer(
     payload_bytes: &[u8],
     request_id: &str,
     invoked_function_arn: &str,
@@ -1584,7 +1602,7 @@ async fn send_agent_payload_or_buffer(
 ///
 /// Notify is pre-armable: if `runtime.done` fired before we reach this point,
 /// `notified()` returns immediately.
-async fn wait_for_runtime_done_with_grace(
+pub(crate) async fn wait_for_runtime_done_with_grace(
     request_id: &str,
     deadline_ms: i64,
     config: &ExtensionConfig,
@@ -2578,7 +2596,7 @@ pub(crate) fn buffer_failed_agent_payload(
 /// telemetry endpoint — so APM-mode telemetry can't leak into the serverless pipeline.
 /// Payloads that still can't be sent (APM not connected) stay buffered for the next
 /// invoke / shutdown. Mirrors the Err→re-buffer convention of the initial send path.
-async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
+pub(crate) async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
     let mut retry_successful_count = 0;
     let mut retry_failed_count = 0;
 
