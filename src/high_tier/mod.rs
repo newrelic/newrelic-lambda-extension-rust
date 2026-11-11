@@ -180,6 +180,45 @@ pub async fn process_invocation(
     debug!("APM mode (high): completed processing for request: {}", request_id);
 }
 
+/// Bound on the SHUTDOWN-only drain below. There's no "next invocation" to
+/// defer to at SHUTDOWN, so this is deliberately more generous than
+/// [`RUNTIME_DONE_BUDGET_MS`] — the caller runs this inside its own overall
+/// SHUTDOWN timeout anyway (`event_loop::SHUTDOWN_TIMEOUT_MS`), so this is
+/// just an inner bound to guarantee forward progress, not a tight latency
+/// target like the per-invocation one is.
+const SHUTDOWN_DRAIN_BUDGET_MS: u64 = 500;
+
+/// Final drain at SHUTDOWN. Call sites: `event_loop`'s own SHUTDOWN handling
+/// is completely tier-agnostic and has no idea this module's statics exist
+/// ([`SCHEDULER`]'s in-flight entries, `logs`'s in-flight send,
+/// `platform_metrics`'s failure buffer) — without this, anything caught
+/// mid-flight or buffered in them at the moment a container shuts down
+/// would be silently lost. `event_loop`'s own sweep of raw `REQUEST_DATA`
+/// agent buffers and `LogProcessor`'s `log_batch`/`failed_logs_buffer` is
+/// unaffected by this and still runs regardless of tier — this only covers
+/// what's specific to `high_tier`.
+pub async fn drain_at_shutdown(apm_app: SharedApmApp) {
+    debug!("APM mode (high): draining at shutdown");
+
+    let (agent_outcome, metrics_outcome) = SCHEDULER
+        .resolve_both_within(Duration::from_millis(SHUTDOWN_DRAIN_BUDGET_MS))
+        .await;
+    agent_payload::handle_outcome(&agent_outcome);
+    platform_metrics::handle_outcome(&metrics_outcome);
+
+    // No "next invocation" to send this in parallel with -- just wait for
+    // it, bounded by the budget above (via the resolve already having spent
+    // some of the caller's overall SHUTDOWN timeout; logs::await_in_flight
+    // itself is unbounded, but the caller's own outer SHUTDOWN_TIMEOUT_MS
+    // timeout wraps this whole function).
+    logs::await_in_flight().await;
+
+    // One last attempt at whatever platform-metrics reports are still
+    // buffered — mirrors event_loop's own "process ALL remaining pending
+    // agent payloads before shutdown" for the agent-payload buffer.
+    platform_metrics::retry_failed(apm_app).await;
+}
+
 /// Thin re-export so `high_tier`'s submodules don't reach across to
 /// `event_loop` directly for this one tier-agnostic helper (identical
 /// behavior/bound for both tiers: wait for `platform.runtimeDone`, then a

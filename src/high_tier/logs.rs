@@ -85,3 +85,17 @@ pub(super) fn send_previous_invocation_batch(log_processor: &Arc<LogProcessor>, 
         Err(e) => error!("logs IN_FLIGHT lock poisoned: {}", e),
     }
 }
+
+/// SHUTDOWN only: there's no "next invocation" to defer an in-flight log
+/// send to, so wait for it here instead — bounded by the caller's own
+/// SHUTDOWN timeout budget, not by anything in this module. A no-op if
+/// nothing is in flight (the common case: either nothing was pending, or
+/// it already finished).
+pub(super) async fn await_in_flight() {
+    let handle = IN_FLIGHT.lock().unwrap().take();
+    if let Some(handle) = handle {
+        if let Err(e) = handle.await {
+            error!("APM mode (high) shutdown: log-flush task panicked or was cancelled: {}", e);
+        }
+    }
+}

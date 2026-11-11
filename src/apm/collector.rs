@@ -25,6 +25,10 @@ pub const CMD_SLOW_SQLS: &str = "sql_trace_data";
 
 const PROTOCOL_VERSION: u8 = 17;
 
+/// Per-request timeout for APM collector sends (telemetry/error/platform-metrics).
+/// Temporarily lowered from 20s for testing.
+const COLLECTOR_SEND_TIMEOUT_SECS: u64 = 5;
+
 fn get_user_agent() -> String {
     // Single source of truth (tracks Cargo.toml); shared with the handshake path.
     crate::version::user_agent()
@@ -211,7 +215,7 @@ pub async fn send_error_events(
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(COLLECTOR_SEND_TIMEOUT_SECS))
         .send()
         .await
         // Strip the request URL (carries `license_key`) from any error before it
@@ -320,7 +324,7 @@ pub async fn send_apm_telemetry(
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
         .body(compressed)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(COLLECTOR_SEND_TIMEOUT_SECS))
         .send()
         .await
         // Strip the request URL (carries `license_key`) from any error before it
@@ -411,7 +415,7 @@ pub async fn send_platform_metrics(
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
         .body(payload_json)
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(COLLECTOR_SEND_TIMEOUT_SECS))
         .send()
         .await
     {

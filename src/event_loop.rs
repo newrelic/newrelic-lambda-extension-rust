@@ -211,6 +211,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             }
                         }
 
+                        if components.config.extension.send_tier == crate::high_tier::SendTier::High {
+                            crate::high_tier::drain_at_shutdown(components.apm_app.clone()).await;
+                        }
+
                         process_pending_agent_payloads(
                             &components.config,
                             &components.global_log_processor,
@@ -588,6 +592,14 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             error!("Pipeline flush task panicked during APM shutdown: {}", e);
                         }
                     }
+                }
+
+                // SendTier::High only: drain high_tier's own statics (SCHEDULER's
+                // in-flight entries, logs's in-flight send, platform_metrics's
+                // failure buffer) -- this SHUTDOWN handler otherwise has no idea
+                // they exist. No-op under SendTier::Default.
+                if components.config.extension.send_tier == crate::high_tier::SendTier::High {
+                    crate::high_tier::drain_at_shutdown(components.apm_app.clone()).await;
                 }
 
                 // Synthesize and send error based on shutdown reason (to APM collector)
