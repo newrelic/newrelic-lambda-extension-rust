@@ -1111,6 +1111,45 @@ impl LogProcessor {
         }
     }
 
+    /// Snapshot (clone, don't drain) the current `log_batch` — for a caller
+    /// that needs a write-ahead record of "what's about to be sent" *before*
+    /// handing the real send off to something that might be aborted
+    /// mid-flight (e.g. `SendScheduler`'s shared-budget bound in
+    /// `SendTier::High` — see `event_loop::spawn_log_flush`). `flush()`
+    /// itself still does the real drain (`mem::take`) at send time; this is
+    /// purely a recovery copy, not a second source of truth.
+    pub fn snapshot_batch_for_write_ahead(&self) -> Vec<payload::LogMessage> {
+        self.log_batch.lock().map(|b| b.clone()).unwrap_or_default()
+    }
+
+    /// Re-queue a batch that a caller's send was aborted before finishing —
+    /// routes through the exact same `failed_logs_buffer`/`start_invocation_retry`
+    /// path used for a real per-chunk send failure, so the next invocation's
+    /// already-existing retry pass (`start_invocation_retry`, called
+    /// unconditionally every invocation) picks it up with proper
+    /// `retry_count`/`MAX_RETRIES` handling and `original_request_id`
+    /// attribution — no new retry machinery needed.
+    pub fn requeue_aborted_batch(&self, batch: Vec<payload::LogMessage>, request_id: &str) {
+        if batch.is_empty() {
+            return;
+        }
+        warn!(
+            "APM mode (high): log flush for {} aborted at the shared runtimeDone budget — \
+             re-queuing {} log(s) for retry on the next invocation",
+            request_id,
+            batch.len()
+        );
+        for log_message in batch {
+            let entry = FailedLogEntry {
+                log_type: Self::log_type_from_message(&log_message),
+                log_message,
+                original_request_id: request_id.to_string(),
+                retry_count: 0,
+            };
+            self.push_to_failed_buffer(entry);
+        }
+    }
+
     /// Drain the failed-log buffer and spawn a tracked retry task.
     /// The task runs concurrently with the Lambda function; flush() awaits it before GET /next.
     ///

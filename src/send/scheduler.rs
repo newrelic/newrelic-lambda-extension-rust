@@ -108,6 +108,11 @@ struct PendingEntry {
     cursor: Option<Arc<AtomicUsize>>,
 }
 
+/// Cooperative poll interval used by `SendScheduler::resolve_pending_shared_budget`
+/// to check whether any still-running send has finished early, without
+/// pulling in an external crate for a proper select-over-a-dynamic-set.
+const SHARED_BUDGET_POLL_TICK: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// The shared scheduler. One instance covers all three [`SendKind`]s via
 /// the `pending` map — this is "one per send kind" at the data level
 /// without needing three separate struct instances.
@@ -309,6 +314,81 @@ impl SendScheduler {
                 results.push((kind, result));
             }
         }
+        results
+    }
+
+    /// Resolve every kind in `kinds` against **one shared** `budget`, not
+    /// `budget` per kind. Used at a single invocation's own `runtimeDone`
+    /// boundary, where the requirement is "never block the next `/next` by
+    /// more than `budget` total," regardless of how many send kinds are
+    /// in flight.
+    ///
+    /// Kinds already finished are resolved immediately at zero cost. Kinds
+    /// still running are polled cooperatively (short internal tick, no
+    /// extra dependency) until either all finish or `budget` elapses,
+    /// whichever comes first — so a fast send doesn't force everyone else
+    /// to wait out the full budget. Anything still unfinished when `budget`
+    /// elapses is aborted and reported as [`DispatchResult::TimedOut`];
+    /// the caller buffers it exactly like [`SendScheduler::resolve_pending`]'s
+    /// `TimedOut` case.
+    ///
+    /// Kinds with nothing pending are simply absent from the returned map
+    /// (including the first-invocation case).
+    pub async fn resolve_pending_shared_budget(
+        &self,
+        kinds: &[SendKind],
+        budget: std::time::Duration,
+    ) -> HashMap<SendKind, DispatchOutcome> {
+        let mut entries: HashMap<SendKind, PendingEntry> = HashMap::new();
+        {
+            let mut guard = self.pending.lock().await;
+            for &kind in kinds {
+                if let Some(entry) = guard.remove(&kind) {
+                    entries.insert(kind, entry);
+                }
+            }
+        }
+
+        let mut results = HashMap::new();
+        let mut running: Vec<(SendKind, JoinHandle<SendOutcome>, Option<Arc<AtomicUsize>>)> = Vec::new();
+        for (kind, PendingEntry { handle, cursor }) in entries {
+            if handle.is_finished() {
+                results.insert(kind, self.finish(kind, handle.await, cursor.as_deref()));
+            } else {
+                running.push((kind, handle, cursor));
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + budget;
+        while !running.is_empty() && tokio::time::Instant::now() < deadline {
+            let mut i = 0;
+            while i < running.len() {
+                if running[i].1.is_finished() {
+                    let (kind, handle, cursor) = running.remove(i);
+                    results.insert(kind, self.finish(kind, handle.await, cursor.as_deref()));
+                } else {
+                    i += 1;
+                }
+            }
+            if running.is_empty() {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            tokio::time::sleep(remaining.min(SHARED_BUDGET_POLL_TICK)).await;
+        }
+
+        for (kind, handle, cursor) in running {
+            handle.abort();
+            self.breaker.record_result(kind, SendOutcome::Failure);
+            results.insert(
+                kind,
+                DispatchOutcome {
+                    result: DispatchResult::TimedOut,
+                    cursor: cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
+                },
+            );
+        }
+
         results
     }
 
@@ -727,5 +807,127 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         scheduler.resolve_pending_no_abort(SendKind::Logs).await;
         assert!(!scheduler.has_pending(SendKind::Logs).await);
+    }
+
+    #[tokio::test]
+    async fn shared_budget_resolves_all_fast_kinds_without_waiting_out_the_full_budget() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::ApmCollector, boxed(SendOutcome::Success), None).await;
+        scheduler.spawn(SendKind::Logs, boxed(SendOutcome::Success), None).await;
+        scheduler.spawn(SendKind::MetricApi, boxed(SendOutcome::Failure), None).await;
+
+        let start = tokio::time::Instant::now();
+        let outcomes = scheduler
+            .resolve_pending_shared_budget(
+                &[SendKind::ApmCollector, SendKind::Logs, SendKind::MetricApi],
+                Duration::from_millis(100),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcomes.len(), 3);
+        assert_eq!(outcomes[&SendKind::ApmCollector].result, DispatchResult::Sent);
+        assert_eq!(outcomes[&SendKind::Logs].result, DispatchResult::Sent);
+        assert_eq!(outcomes[&SendKind::MetricApi].result, DispatchResult::Failed);
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "already-finished/fast sends must not pay the full shared budget, took {:?}",
+            elapsed
+        );
+        assert!(!scheduler.has_pending(SendKind::ApmCollector).await);
+        assert!(!scheduler.has_pending(SendKind::Logs).await);
+        assert!(!scheduler.has_pending(SendKind::MetricApi).await);
+    }
+
+    #[tokio::test]
+    async fn shared_budget_is_combined_not_per_kind() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        // All three never finish on their own -- forces every kind to ride
+        // out to the shared deadline together.
+        scheduler.spawn(SendKind::ApmCollector, boxed_never(), None).await;
+        scheduler.spawn(SendKind::Logs, boxed_never(), None).await;
+        scheduler.spawn(SendKind::MetricApi, boxed_never(), None).await;
+
+        let start = tokio::time::Instant::now();
+        let outcomes = scheduler
+            .resolve_pending_shared_budget(
+                &[SendKind::ApmCollector, SendKind::Logs, SendKind::MetricApi],
+                Duration::from_millis(60),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcomes.len(), 3);
+        for kind in [SendKind::ApmCollector, SendKind::Logs, SendKind::MetricApi] {
+            assert_eq!(outcomes[&kind].result, DispatchResult::TimedOut);
+        }
+        // The combined wait must land near ONE budget (~60ms), not
+        // kinds.len() budgets (~180ms) -- the whole point of this method.
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "three still-pending kinds must share one budget, not pay it per kind, took {:?}",
+            elapsed
+        );
+        assert!(!scheduler.has_pending(SendKind::ApmCollector).await);
+        assert!(!scheduler.has_pending(SendKind::Logs).await);
+        assert!(!scheduler.has_pending(SendKind::MetricApi).await);
+    }
+
+    #[tokio::test]
+    async fn shared_budget_mix_of_fast_and_slow_waits_only_for_the_slow_one() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::ApmCollector, boxed(SendOutcome::Success), None).await;
+        scheduler
+            .spawn(
+                SendKind::Logs,
+                boxed_delayed(SendOutcome::Success, Duration::from_millis(20)),
+                None,
+            )
+            .await;
+
+        let start = tokio::time::Instant::now();
+        let outcomes = scheduler
+            .resolve_pending_shared_budget(
+                &[SendKind::ApmCollector, SendKind::Logs],
+                Duration::from_millis(100),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcomes[&SendKind::ApmCollector].result, DispatchResult::Sent);
+        assert_eq!(outcomes[&SendKind::Logs].result, DispatchResult::Sent);
+        assert!(
+            elapsed < Duration::from_millis(80),
+            "must return once the slower (but still-under-budget) send finishes, not wait out the full budget, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_budget_returns_empty_map_when_nothing_pending() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        let outcomes = scheduler
+            .resolve_pending_shared_budget(
+                &[SendKind::ApmCollector, SendKind::Logs, SendKind::MetricApi],
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(outcomes.is_empty());
     }
 }
