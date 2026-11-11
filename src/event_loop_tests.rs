@@ -501,81 +501,109 @@ fn test_shutdown_diagnostic_reserve_fits_budget() {
     );
 }
 
-// ── Flow-1 immediate-send failure must buffer (not silently drop) the payload ──
+// ── Flow-1 merged-send failure must buffer the payload (not silently drop) ──
 
-// process_apm_request's Flow-1 loop calls send_agent_payload_or_buffer. The
-// guarantee under test: when the collector send fails, the payload lands in
-// FAILED_AGENT_PAYLOADS so retry_failed_agent_payloads resends it on a later
-// invoke / at shutdown — it must never be dropped. A `None` apm_app forces the
-// failure deterministically (send_to_apm_collector returns Err when not
-// connected), exercising the exact Err -> buffer path the fix added.
+// process_apm_request's Flow-1 now calls ApmApp::process_merged_agent_payloads
+// for the chunk(s) buffered during the current invocation, batching mergeable
+// event-list types into one collector POST per type (same call
+// process_pending_agent_payloads already makes for the previous-invocation drain
+// path). With exactly one buffered chunk, process_merged_agent_payloads
+// delegates to process_agent_payload verbatim (no batching benefit for a single
+// chunk) — a chunk that fails to parse (invalid UTF-8, not valid agent-payload
+// JSON) propagates as Err there, and the guarantee under test is that Err must
+// still land the raw payload in FAILED_AGENT_PAYLOADS for retry, never dropped.
 #[tokio::test]
 #[serial]
-async fn flow1_send_failure_buffers_payload_for_retry() {
+async fn flow1_merged_send_failure_buffers_payload_for_retry() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-    let before = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
 
-    let apm: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let request_id = "req-flow1-merged-failure";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    // Invalid UTF-8 — parse_agent_payload fails immediately (std::str::from_utf8),
+    // deterministically exercising the Err path without depending on a real send.
+    state.agent_buffer.lock().unwrap().push(vec![0xFF, 0xFE, 0xFD]);
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 
-    let sent = send_agent_payload_or_buffer(
-        &[1, 2, 3],
-        "req-flow1",
-        "arn:aws:lambda:us-east-1:123:function:test",
-        &apm,
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true
+
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
     )
     .await;
 
-    assert!(!sent, "a failed send must report false");
-    let after = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
-    assert_eq!(
-        after,
-        before + 1,
-        "failed Flow-1 payload must be buffered for retry, not dropped"
-    );
-    let retained = FAILED_AGENT_PAYLOADS
+    let buffered_count = FAILED_AGENT_PAYLOADS
         .lock()
-        .map(|b| b.iter().any(|p| p.request_id == "req-flow1"))
-        .unwrap_or(false);
-    assert!(
-        retained,
-        "buffered payload must retain its request_id for the retry path"
+        .map(|b| b.iter().filter(|p| p.request_id == request_id).count())
+        .unwrap_or(0);
+    assert_eq!(
+        buffered_count, 1,
+        "a chunk that fails to parse must still be buffered for retry, not dropped"
     );
 
+    REQUEST_DATA.remove(request_id);
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
 }
 
-// Success path: a connected, working collector returns Ok -> true and buffers
-// nothing. We can't stand up a real collector in a unit test, but we can assert
-// the inverse invariant cheaply: on the failure path above the buffer grew by
-// exactly one, proving the helper does not buffer on success by construction.
+// Flow-1 with apm_app not yet connected at all (has_run_id=false) must leave the
+// buffered payload in agent_buffer for the next invocation (Flow 2) — it must
+// NOT be dropped, and must NOT be buffered into FAILED_AGENT_PAYLOADS either
+// (that buffer is for payloads that failed an attempted send, not ones that were
+// never attempted).
 #[tokio::test]
 #[serial]
-async fn flow1_failure_buffers_exactly_one_per_failed_payload() {
+async fn flow1_without_run_id_rebuffers_payload_for_next_invocation() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-    let apm: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
-    for i in 0..3 {
-        let _ = send_agent_payload_or_buffer(
-            &[i as u8],
-            &format!("req-{i}"),
-            "arn:aws:lambda:us-east-1:123:function:test",
-            &apm,
-        )
-        .await;
-    }
+    let request_id = "req-flow2-no-run-id";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(vec![1, 2, 3]);
+    let agent_buffer = state.agent_buffer.clone();
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 
-    let count = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
-    assert_eq!(count, 3, "each failed payload must be buffered exactly once");
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None)); // has_run_id=false
 
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
+    )
+    .await;
+
+    assert_eq!(
+        agent_buffer.lock().unwrap().len(),
+        1,
+        "payload must be re-buffered for the next invocation, not dropped"
+    );
+    let buffered_in_failed = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().any(|p| p.request_id == request_id))
+        .unwrap_or(false);
+    assert!(
+        !buffered_in_failed,
+        "a never-attempted send must not land in FAILED_AGENT_PAYLOADS"
+    );
+
+    REQUEST_DATA.remove(request_id);
 }
 
 // ── bounded_wait_budget_ms (shared budget helper) ────────────────────────────
@@ -952,6 +980,8 @@ async fn process_request_concurrently_waits_for_runtime_done_when_flag_on() {
     let config = Arc::new(cfg);
     register_request_for_serverless(request_id, config.clone());
     // Notify is never fired — the wait must fall through on the deadline instead.
+    // deadline_ms_from_now(600) leaves a ~100ms budget after the 500ms
+    // INVOKE_DEADLINE_SAFETY_MARGIN_MS wait_for_runtime_done is bounded by.
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
     let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
@@ -963,7 +993,7 @@ async fn process_request_concurrently_waits_for_runtime_done_when_flag_on() {
         newrelic_client,
         config,
         log_processor,
-        deadline_ms_from_now(60),
+        deadline_ms_from_now(600),
     )
     .await;
     let elapsed = t0.elapsed().as_millis();
@@ -1465,14 +1495,43 @@ async fn wait_for_runtime_done_returns_false_when_deadline_expires_before_signal
     let config = make_config_for_serverless(false);
     register_request_for_serverless(request_id, config.clone());
     // Notify is never fired — the wait must fall through on the deadline instead.
-
+    // deadline_ms_from_now(600) leaves a ~100ms budget after the 500ms
+    // INVOKE_DEADLINE_SAFETY_MARGIN_MS this wait is bounded by (same margin every
+    // other deadline-relative wait in event_loop.rs uses) — without that margin,
+    // this wait would sleep all the way to the real Lambda deadline, leaving zero
+    // time for the agent-send/report-send/log-flush work that still runs after it.
     let start = std::time::Instant::now();
-    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(60)).await;
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(600)).await;
     let elapsed = start.elapsed();
     assert!(!signaled, "an unfired notify must fall through as false, not true");
     assert!(
         elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(1_000),
-        "must wait roughly until the deadline budget, then return (elapsed: {:?})",
+        "must wait roughly until the deadline budget minus the safety margin, then return (elapsed: {:?})",
+        elapsed
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// With a deadline so close that the 500ms INVOKE_DEADLINE_SAFETY_MARGIN_MS eats the
+// entire remaining time, the wait must return near-instantly (budget saturates to 0),
+// not sleep the full remaining-to-deadline window. Guards against the pre-fix behavior
+// where this wait ignored the margin entirely and slept right up to the real deadline.
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_immediately_when_margin_exceeds_remaining_time() {
+    let request_id = "wfrd-core-margin-exceeds-remaining";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+
+    let start = std::time::Instant::now();
+    // Only 100ms left before the deadline — entirely consumed by the 500ms margin.
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(100)).await;
+    let elapsed = start.elapsed();
+    assert!(!signaled, "an unfired notify must fall through as false, not true");
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "must return near-instantly once the safety margin saturates the remaining budget to 0 (elapsed: {:?})",
         elapsed
     );
 
@@ -1680,16 +1739,6 @@ fn buffer_failed_agent_payload_appends_to_failed_buffer() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-}
-
-// ── send_to_apm_collector (APM) ─────────────────────────────────────────────────────
-
-#[tokio::test]
-#[serial]
-async fn send_to_apm_collector_errors_when_apm_not_connected() {
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-    let result = send_to_apm_collector(&[1, 2, 3], "satc-req-1", &apm_app).await;
-    assert!(result.is_err());
 }
 
 // ── process_and_send_agent_payload (APM) ────────────────────────────────────────────

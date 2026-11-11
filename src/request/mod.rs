@@ -660,11 +660,8 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
         }
 
         // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH (serverless mode only — gated on
-        // !apm_lambda_mode because this function is the *shared* storage step for
-        // agent payloads in both modes: process_apm_request's Flow-1/Flow-2 reads from
-        // this same agent_buffer, so diverting payloads away from it here would
-        // silently break APM-mode delivery): send immediately instead of buffering to
-        // pair with platform.report.
+        // !apm_lambda_mode): send immediately instead of buffering to pair with
+        // platform.report.
         if let Some((newrelic_client, config, _)) = send_context {
             if config.new_relic.synchronous_flush && !config.new_relic.apm_lambda_mode {
                 spawn_immediate_agent_payload_send(
@@ -682,8 +679,13 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
             match entry.agent_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
-                    debug!(
-                        "Stored agent payload in request buffer for {} (buffer size: {})",
+                    // The one visible (info-level, default log level) signal that an
+                    // agent payload actually arrived for this invocation — previously
+                    // debug-only, so a production deployment at the default log level
+                    // had no CloudWatch evidence a payload showed up at all until (if)
+                    // it was later sent.
+                    info!(
+                        "Agent payload received for request {} (buffer size: {})",
                         request_id, buffer.len()
                     );
                 }
@@ -751,7 +753,7 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
 /// (metrics-only / log-only harvest — nothing to mis-attribute) are parked in the
 /// orphaned buffer and drained into the next slot; the global is never consulted.
 fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
-    use tracing::{debug, error, warn};
+    use tracing::{debug, error, info, warn};
 
     match crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes) {
         Some(request_id) => {
@@ -760,8 +762,10 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
                 match entry.agent_buffer.lock() {
                     Ok(mut buffer) => {
                         buffer.push(payload_bytes);
-                        debug!(
-                            "LMI: routed agent payload to its own request {} (buffer size: {})",
+                        // Visible (info-level) signal the payload arrived — same fix as
+                        // the Normal-mode routing path above.
+                        info!(
+                            "LMI: agent payload received for request {} (buffer size: {})",
                             request_id,
                             buffer.len()
                         );

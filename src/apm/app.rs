@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug)]
 pub struct ApmApp {
@@ -544,7 +544,19 @@ impl ApmApp {
         )
         .await
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The single accurate success log for this send — callers must not
+                // add their own "Successfully sent" on top. This function always
+                // returns Ok (permanent-drop and buffered-for-retry are Ok too, by
+                // design — see the tests below), so a caller branching on Err to
+                // decide whether to log success would log it unconditionally, even
+                // when the metrics were actually dropped or buffered.
+                info!(
+                    "APM mode: Successfully sent platform report metrics for request {}",
+                    metrics_data.request_id
+                );
+                Ok(())
+            }
             // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
             Err(e) if e.is_permanent() => {
                 error!("Platform metrics dropped (permanent): {}", e);
