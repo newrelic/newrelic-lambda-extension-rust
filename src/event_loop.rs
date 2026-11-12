@@ -1424,9 +1424,12 @@ pub async fn process_apm_request(
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
-            debug!(
-                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
-                agent_payloads.len()
+            // Visible (info-level) — otherwise a trace shows the payload arriving
+            // but no evidence at all of what happened to it until (if) it's sent on
+            // a later invocation.
+            info!(
+                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) for request {} - buffering until run_id becomes available",
+                agent_payloads.len(), request_id
             );
             // Put payloads back in buffer to send when run_id arrives
             if let Some(buffer_ref) = get_agent_buffer(&request_id) {
@@ -1627,8 +1630,16 @@ async fn wait_for_runtime_done_with_grace(
                 notified.as_mut().enable();
 
                 if !log_processor.is_drained() {
+                    // "Drained" here means the pending log batch was handed off to a
+                    // background auto-flush send task — NOT that the send itself has
+                    // completed. This grace window is just an early best-effort nudge
+                    // so a batch sitting just under the auto-flush threshold gets
+                    // handed off sooner; it does not wait for (or guarantee) actual
+                    // delivery. The real guarantee that logs are delivered before this
+                    // invocation ends comes from the unbounded "Waiting for N pending
+                    // auto-flush tasks" step right after this function returns.
                     debug!(
-                        "runtime.done: batch not drained - awaiting drain notify (up to {}ms grace, request: {})",
+                        "runtime.done: log batch not yet handed off for sending - waiting up to {}ms for the hand-off (not the send itself; request: {})",
                         grace_ms, request_id
                     );
                     let grace_start = tokio::time::Instant::now();
@@ -1638,7 +1649,7 @@ async fn wait_for_runtime_done_with_grace(
                     )
                     .await;
                     debug!(
-                        "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
+                        "runtime.done: hand-off wait ended after {}ms / {}ms max (request: {}) - actual send completion is awaited separately below",
                         grace_start.elapsed().as_millis(),
                         grace_ms,
                         request_id
