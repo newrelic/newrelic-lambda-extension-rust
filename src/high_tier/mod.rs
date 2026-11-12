@@ -41,9 +41,10 @@
 //!   processing — see [`pending_sweep`].
 //!
 //! Reuses `event_loop`'s tier-agnostic helpers where they're genuinely
-//! tier-agnostic (sending one payload, waiting for `runtimeDone`, the
-//! agent-payload failure buffer + its retry loop) rather than duplicating
-//! them — see each submodule's own doc for exactly what it reuses.
+//! tier-agnostic (sending one payload, the agent-payload failure buffer +
+//! its retry loop) rather than duplicating them — see each submodule's own
+//! doc for exactly what it reuses. **Not** reused: `wait_for_runtime_done_with_grace`
+//! — see [`wait_for_runtime_done_signal_only`]'s doc for why.
 
 mod agent_payload;
 mod logs;
@@ -110,6 +111,14 @@ impl SendTier {
 /// Logs are not part of this budget — see this module's own doc for why.
 pub const RUNTIME_DONE_BUDGET_MS: u64 = 100;
 
+/// Upper bound on [`wait_for_runtime_done_signal_only`]'s wait, mirroring
+/// `event_loop::wait_for_runtime_done_with_grace`'s own ceiling: never
+/// wait past the function's own deadline, clamped to Lambda's hard max.
+const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
+/// Fallback when `deadlineMs` is missing/stale — same value as the shared
+/// function uses.
+const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
+
 /// The scheduler driving agent-payload + platform-metrics resolution.
 /// One instance for the process's lifetime — see `scheduler` module doc
 /// for why a single shared budget needs one shared instance rather than
@@ -147,7 +156,7 @@ pub async fn process_invocation(
     global_log_processor.set_invocation_start_time(chrono::Utc::now());
     state.platform_processor.process_invoke_event(&request_id, &invoked_function_arn);
 
-    event_loop_wait_for_runtime_done(&request_id, deadline_ms, &config, &global_log_processor).await;
+    wait_for_runtime_done_signal_only(&request_id, deadline_ms).await;
 
     // Checked here, right before the bounded resolve below -- not at the
     // top of the invocation. The agent sends its payload over a named
@@ -233,15 +242,51 @@ pub async fn drain_at_shutdown(apm_app: SharedApmApp) {
     platform_metrics::retry_failed(apm_app).await;
 }
 
-/// Thin re-export so `high_tier`'s submodules don't reach across to
-/// `event_loop` directly for this one tier-agnostic helper (identical
-/// behavior/bound for both tiers: wait for `platform.runtimeDone`, then a
-/// short grace for trailing telemetry).
-async fn event_loop_wait_for_runtime_done(
-    request_id: &str,
-    deadline_ms: i64,
-    config: &ExtensionConfig,
-    log_processor: &Arc<LogProcessor>,
-) {
-    crate::event_loop::wait_for_runtime_done_with_grace(request_id, deadline_ms, config, log_processor).await;
+/// Wait for the `platform.runtimeDone` signal itself — **and nothing
+/// more**. Deliberately not `event_loop::wait_for_runtime_done_with_grace`:
+/// that shared function, after the signal, checks
+/// `log_processor.is_drained()` and — if not drained — waits up to
+/// `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 25ms) for a drain
+/// notification. That's real log-flush waiting happening right at
+/// `runtimeDone`, which is exactly what this tier's design (see this
+/// module's own doc, and `logs`'s) exists to avoid — logs are never sent
+/// or waited on here, full stop, not even indirectly via a shared
+/// helper's side effect. So `high` tier gets its own copy of just the
+/// signal-wait half, skipping the grace/drain-wait half entirely.
+///
+/// Mirrors `event_loop::wait_for_runtime_done_with_grace`'s signal-wait
+/// logic exactly (same deadline clamping, same fallback) — logic
+/// duplicated, not behavior changed; `default` tier's own call to the
+/// full function is untouched.
+async fn wait_for_runtime_done_signal_only(request_id: &str, deadline_ms: i64) {
+    let Some(notify) = request::get_runtime_done_notify(request_id) else {
+        return;
+    };
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let remaining_ms: u64 = if deadline_ms > now_ms {
+        (deadline_ms - now_ms).cast_unsigned().min(MAX_RUNTIME_DONE_WAIT_MS)
+    } else {
+        tracing::warn!(
+            "APM mode (high): INVOKE for request {} missing/stale deadlineMs ({}); using {}ms fallback for runtime.done wait",
+            request_id, deadline_ms, FALLBACK_RUNTIME_DONE_WAIT_MS
+        );
+        FALLBACK_RUNTIME_DONE_WAIT_MS
+    };
+
+    tokio::select! {
+        () = notify.notified() => {
+            debug!(
+                "APM mode (high): runtime.done signal received for request: {} (after {}ms)",
+                request_id,
+                chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
+            );
+        }
+        () = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {
+            debug!(
+                "APM mode (high): runtime.done wait reached function deadline ({}ms) for request: {}",
+                remaining_ms, request_id
+            );
+        }
+    }
 }
