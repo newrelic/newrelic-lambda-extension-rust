@@ -8,7 +8,7 @@
 //! Each request gets isolated processors with their own InvocationContext.
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use once_cell::sync::Lazy;
 use dashmap::DashMap;
 use tokio::sync::Notify;
@@ -97,6 +97,13 @@ pub struct RequestData {
     /// Awaited in event_loop::process_request_concurrently before the end-of-invocation flush
     /// so logs emitted late in the invocation are captured.
     pub runtime_done_notify: Arc<Notify>,
+    /// Wall-clock timestamp (epoch ms) of this request's `platform.runtimeDone`, or `0`
+    /// (sentinel) if it hasn't fired yet. Set alongside `runtime_done_notify.notify_one()`
+    /// by `record_runtime_done` — unlike the `Notify`, this persists after the original
+    /// waiter (if any) has already resolved, so a *later* invocation picking this
+    /// request's payload up as "late" can compute exactly how late, not just that it
+    /// was late.
+    pub runtime_done_at_ms: Arc<AtomicI64>,
     /// Immediate-send task handles spawned for this request under
     /// `NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH` — one per agent payload chunk, sent
     /// independently the instant it's received by
@@ -205,12 +212,6 @@ pub async fn drain_and_await_all_pending_send_handles() {
     }
 }
 
-/// Record that platform.runtimeDone fired before the request state existed.
-/// Called by the telemetry listener when get_runtime_done_notify returns None.
-pub fn record_prefired_runtime_done(request_id: &str) {
-    PREFIRED_RUNTIME_DONE.insert(request_id.to_string(), ());
-}
-
 /// Get the number of entries in REQUEST_DATA (used for debug logging).
 pub fn request_data_len() -> usize {
     REQUEST_DATA.len()
@@ -261,7 +262,8 @@ pub static TELEMETRY_CURRENT_REQUEST_ID: Lazy<Arc<std::sync::Mutex<Option<String
 pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
     Lazy::new(|| Arc::new(std::sync::Mutex::new(Vec::new())));
 
-/// Request IDs for which platform.runtimeDone fired before their RequestData existed.
+/// Request IDs for which platform.runtimeDone fired before their RequestData existed,
+/// mapped to the epoch-ms timestamp it fired at.
 ///
 /// Race: on very fast functions (< 50 ms), runtimeDone can arrive at the telemetry
 /// listener while the event loop is still constructing the per-request state.
@@ -269,10 +271,39 @@ pub static ORPHANED_PAYLOADS: Lazy<Arc<std::sync::Mutex<Vec<Vec<u8>>>>> =
 /// created later by create_request_processing_state() is never signalled → the
 /// wait_for_runtime_done_with_grace call sleeps until the full Lambda deadline.
 ///
-/// Fix: record the pre-fired request_id here; create_request_processing_state()
-/// checks this set and calls notify_one() immediately on the fresh Notify.
-pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, ()>> =
+/// Fix: record the pre-fired request_id (+ timestamp) here; create_request_processing_state()
+/// checks this map and calls notify_one() immediately on the fresh Notify, carrying the
+/// timestamp forward onto runtime_done_at_ms rather than losing it.
+pub static PREFIRED_RUNTIME_DONE: Lazy<DashMap<String, i64>> =
     Lazy::new(DashMap::new);
+
+/// Record that `platform.runtimeDone` fired for `request_id`, whether or not its
+/// `RequestData` exists yet. The single call site for both: the telemetry listener
+/// calls this instead of separately checking `get_runtime_done_notify` +
+/// `record_prefired_runtime_done`, so the timestamp is never recorded in one path but
+/// not the other.
+pub fn record_runtime_done(request_id: &str) {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Some(entry) = REQUEST_DATA.get(request_id) {
+        entry.runtime_done_at_ms.store(now_ms, Ordering::Relaxed);
+        entry.runtime_done_notify.notify_one();
+    } else {
+        PREFIRED_RUNTIME_DONE.insert(request_id.to_string(), now_ms);
+    }
+}
+
+/// Epoch-ms elapsed since `request_id`'s `platform.runtimeDone`, or `None` if it hasn't
+/// fired yet (or the request is unregistered). Used to log exactly how late a deferred
+/// agent payload is, instead of just that it was late.
+pub fn get_runtime_done_elapsed_ms(request_id: &str) -> Option<i64> {
+    let fired_at = REQUEST_DATA
+        .get(request_id)
+        .map(|entry| entry.runtime_done_at_ms.load(Ordering::Relaxed))?;
+    if fired_at == 0 {
+        return None;
+    }
+    Some((chrono::Utc::now().timestamp_millis() - fired_at).max(0))
+}
 
 /// Extract the per-record request id from a telemetry record body.
 ///
@@ -301,19 +332,24 @@ pub fn ensure_lmi_request_slot(request_id: &str) {
         invoked_function_arn: arn.clone(),
         trace_id: None,
     }));
-    let runtime_done_notify = Arc::new(Notify::new());
-    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
-        runtime_done_notify.notify_one();
-    }
+    // Insert before checking PREFIRED_RUNTIME_DONE — same ordering fix as
+    // create_request_processing_state (see there for why).
     let entry = REQUEST_DATA.entry(request_id.to_string()).or_insert_with(|| RequestData {
         context,
         agent_buffer: Arc::new(Mutex::new(Vec::new())),
         pending_report: None,
         creation_invocation: current_invocation_count(),
-        runtime_done_notify,
+        runtime_done_notify: Arc::new(Notify::new()),
+        runtime_done_at_ms: Arc::new(AtomicI64::new(0)),
         invoked_function_arn: arn,
         pending_send_handles: Arc::new(Mutex::new(Vec::new())),
     });
+    // Read back from `entry`, not a local variable, in case another concurrent
+    // call already won the insert race.
+    if let Some((_, ts)) = PREFIRED_RUNTIME_DONE.remove(request_id) {
+        entry.runtime_done_at_ms.store(ts, Ordering::Relaxed);
+        entry.runtime_done_notify.notify_one();
+    }
 
     // Drain payloads that beat platform.start to the pipe (cold-start race).
     if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
@@ -366,28 +402,36 @@ pub fn create_request_processing_state(
     }
 
     let runtime_done_notify = Arc::new(Notify::new());
+    let runtime_done_at_ms = Arc::new(AtomicI64::new(0));
 
-    // If platform.runtimeDone already fired for this request before we were created
-    // (fast functions where runtimeDone races the event loop setup), fire the notify
-    // now so wait_for_runtime_done_with_grace doesn't sleep until the deadline.
-    if PREFIRED_RUNTIME_DONE.remove(request_id).is_some() {
-        tracing::debug!(
-            "runtime.done pre-fire detected for {} — signalling notify immediately",
-            request_id
-        );
-        runtime_done_notify.notify_one();
-    }
-
-    // Insert consolidated request data (replaces 5 separate DashMap inserts)
+    // Insert into REQUEST_DATA BEFORE checking PREFIRED_RUNTIME_DONE below, not
+    // after — otherwise a runtimeDone arriving in between would be missed by both
+    // and never signalled.
     REQUEST_DATA.insert(request_id.to_string(), RequestData {
         context: context.clone(),
         agent_buffer: agent_buffer.clone(),
         pending_report: None,
         creation_invocation: current_invocation_count(),
-        runtime_done_notify,
+        runtime_done_notify: runtime_done_notify.clone(),
+        runtime_done_at_ms: runtime_done_at_ms.clone(),
         pending_send_handles: Arc::new(Mutex::new(Vec::new())),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
+
+    // If platform.runtimeDone already fired for this request before the insert
+    // above (fast functions where runtimeDone races the event loop setup), fire
+    // the notify now so wait_for_runtime_done_with_grace doesn't sleep until the
+    // deadline — and carry the timestamp it fired at forward onto
+    // runtime_done_at_ms rather than losing it (the Notify permit alone doesn't
+    // tell a later "how late" check when it actually happened).
+    if let Some((_, ts)) = PREFIRED_RUNTIME_DONE.remove(request_id) {
+        tracing::debug!(
+            "runtime.done pre-fire detected for {} (fired at {}) — signalling notify immediately",
+            request_id, ts
+        );
+        runtime_done_at_ms.store(ts, Ordering::Relaxed);
+        runtime_done_notify.notify_one();
+    }
 
     let state = RequestProcessingState {
         context: context.clone(),
@@ -570,6 +614,30 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
         .ok()
         .and_then(|guard| guard.clone());
 
+    // Guard against misattribution: a payload that physically lands on the named
+    // pipe right at an invocation boundary — after the agent flushed for the
+    // PREVIOUS invocation, but after CURRENT_ACTIVE_REQUEST_ID has already been
+    // updated to the NEXT one — gets silently routed to the wrong buffer: one
+    // invocation's telemetry duplicates under a different (often already-completed)
+    // invocation's identity, while the correct invocation records none. Confirmed
+    // live against Extension_Python_APM_X86. Cross-check against the aws.requestId
+    // the agent embedded in the payload itself (the same self-describing id LMI
+    // already routes by — see route_payload_by_embedded_request_id) and correct the
+    // target when it disagrees with the global AND names a request we actually have
+    // a buffer for (a disagreement against an unknown/not-yet-created request is not
+    // actionable — fall back to the global in that case, same as before).
+    let embedded_request_id = crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes);
+    let current_request_id = match (&current_request_id, &embedded_request_id) {
+        (Some(active), Some(embedded)) if active != embedded && REQUEST_DATA.contains_key(embedded) => {
+            warn!(
+                "Agent payload's embedded request_id ({}) disagrees with the active request ({}) — routing to the embedded id to avoid misattributing it",
+                embedded, active
+            );
+            Some(embedded.clone())
+        }
+        _ => current_request_id,
+    };
+
     // Read once; used below both for the immediate-send decision and for trace
     // extraction. None only in the brief startup window before main.rs populates it.
     let send_context = crate::event_loop::SERVERLESS_SEND_CONTEXT.get();
@@ -598,11 +666,8 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
         }
 
         // NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH (serverless mode only — gated on
-        // !apm_lambda_mode because this function is the *shared* storage step for
-        // agent payloads in both modes: process_apm_request's Flow-1/Flow-2 reads from
-        // this same agent_buffer, so diverting payloads away from it here would
-        // silently break APM-mode delivery): send immediately instead of buffering to
-        // pair with platform.report.
+        // !apm_lambda_mode): send immediately instead of buffering to pair with
+        // platform.report.
         if let Some((newrelic_client, config, _)) = send_context {
             if config.new_relic.synchronous_flush && !config.new_relic.apm_lambda_mode {
                 spawn_immediate_agent_payload_send(
@@ -620,8 +685,8 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
             match entry.agent_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
-                    debug!(
-                        "Stored agent payload in request buffer for {} (buffer size: {})",
+                    info!(
+                        "Agent payload received for request {} (buffer size: {})",
                         request_id, buffer.len()
                     );
                 }
@@ -689,7 +754,7 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
 /// (metrics-only / log-only harvest — nothing to mis-attribute) are parked in the
 /// orphaned buffer and drained into the next slot; the global is never consulted.
 fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
-    use tracing::{debug, error, warn};
+    use tracing::{debug, error, info, warn};
 
     match crate::apm::payload_parser::extract_request_id_from_payload_bytes(&payload_bytes) {
         Some(request_id) => {
@@ -698,8 +763,8 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
                 match entry.agent_buffer.lock() {
                     Ok(mut buffer) => {
                         buffer.push(payload_bytes);
-                        debug!(
-                            "LMI: routed agent payload to its own request {} (buffer size: {})",
+                        info!(
+                            "LMI: agent payload received for request {} (buffer size: {})",
                             request_id,
                             buffer.len()
                         );

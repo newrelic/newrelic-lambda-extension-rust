@@ -501,81 +501,109 @@ fn test_shutdown_diagnostic_reserve_fits_budget() {
     );
 }
 
-// ── Flow-1 immediate-send failure must buffer (not silently drop) the payload ──
+// ── Flow-1 merged-send failure must buffer the payload (not silently drop) ──
 
-// process_apm_request's Flow-1 loop calls send_agent_payload_or_buffer. The
-// guarantee under test: when the collector send fails, the payload lands in
-// FAILED_AGENT_PAYLOADS so retry_failed_agent_payloads resends it on a later
-// invoke / at shutdown — it must never be dropped. A `None` apm_app forces the
-// failure deterministically (send_to_apm_collector returns Err when not
-// connected), exercising the exact Err -> buffer path the fix added.
+// process_apm_request's Flow-1 now calls ApmApp::process_merged_agent_payloads
+// for the chunk(s) buffered during the current invocation, batching mergeable
+// event-list types into one collector POST per type (same call
+// process_pending_agent_payloads already makes for the previous-invocation drain
+// path). With exactly one buffered chunk, process_merged_agent_payloads
+// delegates to process_agent_payload verbatim (no batching benefit for a single
+// chunk) — a chunk that fails to parse (invalid UTF-8, not valid agent-payload
+// JSON) propagates as Err there, and the guarantee under test is that Err must
+// still land the raw payload in FAILED_AGENT_PAYLOADS for retry, never dropped.
 #[tokio::test]
 #[serial]
-async fn flow1_send_failure_buffers_payload_for_retry() {
+async fn flow1_merged_send_failure_buffers_payload_for_retry() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-    let before = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
 
-    let apm: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let request_id = "req-flow1-merged-failure";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    // Invalid UTF-8 — parse_agent_payload fails immediately (std::str::from_utf8),
+    // deterministically exercising the Err path without depending on a real send.
+    state.agent_buffer.lock().unwrap().push(vec![0xFF, 0xFE, 0xFD]);
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 
-    let sent = send_agent_payload_or_buffer(
-        &[1, 2, 3],
-        "req-flow1",
-        "arn:aws:lambda:us-east-1:123:function:test",
-        &apm,
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true
+
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
     )
     .await;
 
-    assert!(!sent, "a failed send must report false");
-    let after = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
-    assert_eq!(
-        after,
-        before + 1,
-        "failed Flow-1 payload must be buffered for retry, not dropped"
-    );
-    let retained = FAILED_AGENT_PAYLOADS
+    let buffered_count = FAILED_AGENT_PAYLOADS
         .lock()
-        .map(|b| b.iter().any(|p| p.request_id == "req-flow1"))
-        .unwrap_or(false);
-    assert!(
-        retained,
-        "buffered payload must retain its request_id for the retry path"
+        .map(|b| b.iter().filter(|p| p.request_id == request_id).count())
+        .unwrap_or(0);
+    assert_eq!(
+        buffered_count, 1,
+        "a chunk that fails to parse must still be buffered for retry, not dropped"
     );
 
+    REQUEST_DATA.remove(request_id);
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
 }
 
-// Success path: a connected, working collector returns Ok -> true and buffers
-// nothing. We can't stand up a real collector in a unit test, but we can assert
-// the inverse invariant cheaply: on the failure path above the buffer grew by
-// exactly one, proving the helper does not buffer on success by construction.
+// Flow-1 with apm_app not yet connected at all (has_run_id=false) must leave the
+// buffered payload in agent_buffer for the next invocation (Flow 2) — it must
+// NOT be dropped, and must NOT be buffered into FAILED_AGENT_PAYLOADS either
+// (that buffer is for payloads that failed an attempted send, not ones that were
+// never attempted).
 #[tokio::test]
 #[serial]
-async fn flow1_failure_buffers_exactly_one_per_failed_payload() {
+async fn flow1_without_run_id_rebuffers_payload_for_next_invocation() {
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-    let apm: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
-    for i in 0..3 {
-        let _ = send_agent_payload_or_buffer(
-            &[i as u8],
-            &format!("req-{i}"),
-            "arn:aws:lambda:us-east-1:123:function:test",
-            &apm,
-        )
-        .await;
-    }
+    let request_id = "req-flow2-no-run-id";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(vec![1, 2, 3]);
+    let agent_buffer = state.agent_buffer.clone();
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 
-    let count = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
-    assert_eq!(count, 3, "each failed payload must be buffered exactly once");
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None)); // has_run_id=false
 
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
+    )
+    .await;
+
+    assert_eq!(
+        agent_buffer.lock().unwrap().len(),
+        1,
+        "payload must be re-buffered for the next invocation, not dropped"
+    );
+    let buffered_in_failed = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().any(|p| p.request_id == request_id))
+        .unwrap_or(false);
+    assert!(
+        !buffered_in_failed,
+        "a never-attempted send must not land in FAILED_AGENT_PAYLOADS"
+    );
+
+    REQUEST_DATA.remove(request_id);
 }
 
 // ── bounded_wait_budget_ms (shared budget helper) ────────────────────────────
@@ -932,6 +960,48 @@ async fn process_request_concurrently_rebuffers_payload_when_no_report_sync_flus
     // The payload must have been put back into the buffer for the next invocation.
     let remaining = get_agent_buffer(request_id).and_then(|b| b.lock().ok().map(|g| g.len()));
     assert_eq!(remaining, Some(1), "payload must be re-buffered, not dropped, when the flag is off");
+
+    REQUEST_DATA.remove(request_id);
+}
+
+/// When send_function_logs IS on, process_request_concurrently must actually engage
+/// wait_for_runtime_done (not just skip straight to the grace-only check) — the
+/// regression this guards: an earlier version of the fix for NR-??? (same-invoke
+/// agent-payload delivery) made this call unconditional here too, which broke this
+/// exact "flag off: must return near-instantly" contract for the flag-off case above.
+/// With no notify fired, a short deadline, and the flag on, the call must still wait
+/// out (a bounded slice of) the deadline rather than returning instantly.
+#[tokio::test]
+#[serial]
+async fn process_request_concurrently_waits_for_runtime_done_when_flag_on() {
+    let request_id = "prc-send-logs-flag-on-test";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_function_logs = true;
+    let config = Arc::new(cfg);
+    register_request_for_serverless(request_id, config.clone());
+    // Notify is never fired — the wait must fall through on the deadline instead.
+    // deadline_ms_from_now(600) leaves a ~100ms budget after the 500ms
+    // INVOKE_DEADLINE_SAFETY_MARGIN_MS wait_for_runtime_done is bounded by.
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+    let t0 = std::time::Instant::now();
+    process_request_concurrently(
+        request_id.to_string(),
+        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
+        newrelic_client,
+        config,
+        log_processor,
+        deadline_ms_from_now(600),
+    )
+    .await;
+    let elapsed = t0.elapsed().as_millis();
+
+    assert!(
+        elapsed >= 50,
+        "flag on: must actually wait for runtime.done (deadline fallback), not skip it (got {elapsed}ms)"
+    );
 
     REQUEST_DATA.remove(request_id);
 }
@@ -1367,11 +1437,112 @@ async fn drain_late_paired_payloads_returns_zero_when_no_candidates_exist() {
     assert_eq!(paired, 0);
 }
 
-// ── wait_for_runtime_done_with_grace ───────────────────────────────────────────────
+// ── format_elapsed_for_log ───────────────────────────────────────────────────────────
+
+#[test]
+fn format_elapsed_for_log_renders_some_as_milliseconds() {
+    assert_eq!(format_elapsed_for_log(Some(42)), "42ms");
+    assert_eq!(format_elapsed_for_log(Some(0)), "0ms");
+}
+
+#[test]
+fn format_elapsed_for_log_renders_none_as_unknown() {
+    assert_eq!(format_elapsed_for_log(None), "an unknown time");
+}
+
+// ── wait_for_runtime_done (core wait, ungated) ──────────────────────────────────────
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_returns_immediately_when_function_logs_disabled() {
+async fn wait_for_runtime_done_returns_false_immediately_when_request_has_no_notify() {
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done("wfrd-unregistered-request", deadline_ms_from_now(5_000)).await;
+    assert!(
+        !signaled,
+        "an unregistered request has no notify handle, so this must return false"
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "must return immediately, not sleep"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_true_when_pre_fired() {
+    let request_id = "wfrd-core-signalled";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+
+    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
+    notify.notify_one(); // pre-fire: notified() below resolves immediately
+
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(5_000)).await;
+    assert!(signaled, "a pre-fired notify must be observed");
+    assert!(
+        start.elapsed() < Duration::from_millis(200),
+        "a pre-fired notify must resolve immediately, not wait out the deadline"
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_false_when_deadline_expires_before_signal() {
+    let request_id = "wfrd-core-deadline-expires";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    // Notify is never fired — the wait must fall through on the deadline instead.
+    // deadline_ms_from_now(600) leaves a ~100ms budget after the 500ms
+    // INVOKE_DEADLINE_SAFETY_MARGIN_MS this wait is bounded by (same margin every
+    // other deadline-relative wait in event_loop.rs uses) — without that margin,
+    // this wait would sleep all the way to the real Lambda deadline, leaving zero
+    // time for the agent-send/report-send/log-flush work that still runs after it.
+    let start = std::time::Instant::now();
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(600)).await;
+    let elapsed = start.elapsed();
+    assert!(!signaled, "an unfired notify must fall through as false, not true");
+    assert!(
+        elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(1_000),
+        "must wait roughly until the deadline budget minus the safety margin, then return (elapsed: {:?})",
+        elapsed
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// With a deadline so close that the 500ms INVOKE_DEADLINE_SAFETY_MARGIN_MS eats the
+// entire remaining time, the wait must return near-instantly (budget saturates to 0),
+// not sleep the full remaining-to-deadline window. Guards against the pre-fix behavior
+// where this wait ignored the margin entirely and slept right up to the real deadline.
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_returns_immediately_when_margin_exceeds_remaining_time() {
+    let request_id = "wfrd-core-margin-exceeds-remaining";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+
+    let start = std::time::Instant::now();
+    // Only 100ms left before the deadline — entirely consumed by the 500ms margin.
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(100)).await;
+    let elapsed = start.elapsed();
+    assert!(!signaled, "an unfired notify must fall through as false, not true");
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "must return near-instantly once the safety margin saturates the remaining budget to 0 (elapsed: {:?})",
+        elapsed
+    );
+
+    REQUEST_DATA.remove(request_id);
+}
+
+// ── wait_for_runtime_done_with_grace (log-flush grace layered on an already-observed signal) ──
+
+#[tokio::test]
+#[serial]
+async fn wait_for_runtime_done_with_grace_returns_immediately_when_function_logs_disabled() {
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = false;
     let config = Arc::new(cfg);
@@ -1379,51 +1550,25 @@ async fn wait_for_runtime_done_returns_immediately_when_function_logs_disabled()
 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
-        "wfrd-no-such-request",
-        deadline_ms_from_now(5_000),
+        "wfrd-grace-no-such-request",
+        true,
         &config,
         &log_processor,
     )
     .await;
     assert!(
         start.elapsed() < Duration::from_millis(200),
-        "must short-circuit before touching request state or sleeping"
+        "must short-circuit before touching the log processor at all"
     );
 }
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_returns_immediately_when_request_has_no_notify() {
+async fn wait_for_runtime_done_with_grace_skips_grace_when_signalled_and_already_drained() {
+    let request_id = "wfrd-grace-signalled-drained";
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = true;
     let config = Arc::new(cfg);
-    let log_processor = make_noop_log_processor_serverless(config.clone());
-
-    let start = std::time::Instant::now();
-    wait_for_runtime_done_with_grace(
-        "wfrd-unregistered-request",
-        deadline_ms_from_now(5_000),
-        &config,
-        &log_processor,
-    )
-    .await;
-    assert!(
-        start.elapsed() < Duration::from_millis(200),
-        "an unregistered request has no notify handle, so this must return immediately"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() {
-    let request_id = "wfrd-signalled-drained";
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.extension.send_function_logs = true;
-    let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
-    notify.notify_one(); // pre-fire: notified() below resolves immediately
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
     assert!(log_processor.is_drained(), "a fresh noop log processor starts drained");
@@ -1431,7 +1576,7 @@ async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -1440,38 +1585,29 @@ async fn wait_for_runtime_done_skips_grace_when_signalled_and_already_drained() 
         start.elapsed() < Duration::from_millis(200),
         "already-drained batch must skip the grace-period wait entirely"
     );
-
-    REQUEST_DATA.remove(request_id);
 }
 
 #[tokio::test]
 #[serial]
-async fn wait_for_runtime_done_falls_through_when_deadline_expires_before_signal() {
-    let request_id = "wfrd-deadline-expires";
+async fn wait_for_runtime_done_with_grace_is_a_no_op_when_signaled_is_false() {
+    let request_id = "wfrd-grace-not-signalled";
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_function_logs = true;
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-    // Notify is never fired — the wait must fall through on the deadline instead.
-
     let log_processor = make_noop_log_processor_serverless(config.clone());
 
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(60), // short but not-yet-expired deadline
+        false,
         &config,
         &log_processor,
     )
     .await;
-    let elapsed = start.elapsed();
     assert!(
-        elapsed >= Duration::from_millis(50) && elapsed < Duration::from_millis(1_000),
-        "must wait roughly until the deadline budget, then return (elapsed: {:?})",
-        elapsed
+        start.elapsed() < Duration::from_millis(200),
+        "signaled=false (deadline already expired upstream) must not wait again"
     );
-
-    REQUEST_DATA.remove(request_id);
 }
 
 // ── batch_all_payloads / spawn_immediate_agent_payload_sends / maybe_spawn_batch_send ──
@@ -1605,16 +1741,6 @@ fn buffer_failed_agent_payload_appends_to_failed_buffer() {
     }
 }
 
-// ── send_to_apm_collector (APM) ─────────────────────────────────────────────────────
-
-#[tokio::test]
-#[serial]
-async fn send_to_apm_collector_errors_when_apm_not_connected() {
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-    let result = send_to_apm_collector(&[1, 2, 3], "satc-req-1", &apm_app).await;
-    assert!(result.is_err());
-}
-
 // ── process_and_send_agent_payload (APM) ────────────────────────────────────────────
 
 #[tokio::test]
@@ -1694,6 +1820,20 @@ async fn process_pending_agent_payloads_buffers_late_payload_when_apm_not_connec
     REQUEST_DATA.remove(prev_id);
 }
 
+// Note: the merge behavior itself (ApmApp::process_merged_agent_payloads correctly
+// merging multiple chunks into one POST per mergeable type) is already covered by
+// apm::app::tests::process_merged_agent_payloads_merges_mergeable_event_list_types_across_chunks
+// and three sibling tests. An equivalent test at this integration layer — going
+// through process_pending_agent_payloads with a real ApmApp wrapped in SharedApmApp —
+// was attempted twice (current_thread and multi_thread runtime flavors) and hit an
+// unresolved test-harness/runtime-teardown hang both times, unrelated to the merge
+// logic itself (manual instrumentation confirmed the function body completes and all
+// assertions pass in ~1ms; the hang occurs after the test's own code finishes, before
+// the harness reports completion — attaching a debugger to inspect it was blocked by
+// sandbox permissions). Removed rather than leave a flaky/hanging test in the suite;
+// the "apm_app is Some" branch in process_pending_agent_payloads (event_loop.rs
+// ~2372-2392) is consequently uncovered by this specific integration path.
+
 // ── retry_failed_agent_payloads (APM) ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1760,11 +1900,10 @@ async fn process_apm_request_completes_cold_start_with_no_payload_and_no_run_id(
     process_apm_request(
         request_id.to_string(),
         "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        true,
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 
@@ -1785,43 +1924,114 @@ async fn process_apm_request_returns_early_when_no_state_registered() {
     process_apm_request(
         "par-missing-state-req".to_string(),
         "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        true,
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 }
 
 #[tokio::test]
 #[serial]
-async fn process_apm_request_warm_start_drains_previous_request_late_payload() {
-    let prev_id = "par-warm-prev-req";
-    let current_id = "par-warm-current-req";
+async fn process_apm_request_flow1_sends_immediately_when_run_id_and_payload_present() {
+    let request_id = "par-flow1-send-test";
     let config = make_config_for_serverless(false);
-    register_request_for_serverless(prev_id, config.clone());
-    if let Some(buf) = request::get_agent_buffer(prev_id) {
-        buf.lock().unwrap().push(vec![5, 5, 5]);
-    }
-    register_request_for_serverless(current_id, config.clone());
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(vec![0xAB, 0xCD, 0xEF]); // got_payload=true
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
 
     let log_processor = make_noop_log_processor_serverless(config.clone());
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true
 
     process_apm_request(
-        current_id.to_string(),
-        "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-        false,
+        request_id.to_string(),
+        "arn:test".to_string(),
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500),
     )
     .await;
 
-    assert!(REQUEST_PROCESSORS.get(current_id).is_none());
-    REQUEST_DATA.remove(prev_id);
+    assert!(REQUEST_PROCESSORS.get(request_id).is_none());
+    REQUEST_DATA.remove(request_id);
+}
+
+// Unlike the test above (which pre-seeds the buffer before runtime.done fires),
+// this test proves the real ordering: buffer starts empty, process_apm_request
+// must block in wait_for_runtime_done, and only then does the payload arrive and
+// runtime.done fire. Fast completion proves the notify woke it up; a 2s wait
+// would mean it just fell through on the deadline instead.
+#[tokio::test]
+#[serial]
+async fn process_apm_request_catches_payload_that_arrives_after_runtime_done_wait_begins() {
+    let request_id = "par-real-ordering-test";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    // Empty buffer and runtime.done NOT fired — process_apm_request must block on
+    // wait_for_runtime_done, not see got_payload=true immediately.
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true from the start
+
+    // Run process_apm_request and the late arrival concurrently via join! (not
+    // tokio::spawn — spawning a task that owns a real ApmApp hung this test
+    // harness; join! avoids the task boundary while still interleaving both
+    // futures). process_apm_request must actually be blocked in
+    // wait_for_runtime_done when the payload/notify arrive 50ms later — if it
+    // isn't (e.g. this ordering regressed), it'd either fail to pick up the
+    // payload at all, or only catch it on the 2s deadline fallback.
+    let start = std::time::Instant::now();
+    let process_fut = process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(2_000),
+    );
+    let late_arrival_fut = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(buffer) = get_agent_buffer(request_id) {
+            buffer.lock().unwrap().push(vec![0xAB, 0xCD, 0xEF]);
+        }
+        crate::request::record_runtime_done(request_id);
+    };
+    tokio::join!(process_fut, late_arrival_fut);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "must return shortly after the notify (~50ms), not anywhere near the 2s deadline fallback (elapsed: {:?})",
+        elapsed
+    );
+
+    // These bytes aren't parseable, so Flow 1 buffers them into FAILED_AGENT_PAYLOADS
+    // — proof the payload was picked up and acted on.
+    {
+        let buffered = FAILED_AGENT_PAYLOADS.lock().unwrap();
+        assert!(
+            buffered.iter().any(|p| p.request_id == request_id),
+            "the late-arriving payload must have been picked up and acted on, not left stuck in the buffer"
+        );
+    } // drop the guard before FAILED_AGENT_PAYLOADS.lock() is called again below
+    let agent_buffer_now_empty = get_agent_buffer(request_id)
+        .map(|b| b.lock().unwrap().is_empty())
+        .unwrap_or(true);
+    assert!(agent_buffer_now_empty, "the payload must have been taken out of agent_buffer by Flow 1");
+
+    REQUEST_DATA.remove(request_id);
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
 }
 
 // ── execute_apm_mode_event_loop (APM) — driven end-to-end against a wiremock Extensions API ──
@@ -1837,7 +2047,12 @@ async fn execute_apm_mode_event_loop_processes_invoke_then_shutdown() {
             wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
                 "req-apm-loop-1",
                 "arn:aws:lambda:us-east-1:123456789012:function:apm-loop-test",
-                deadline_ms_from_now(5_000),
+                // This mock never emits platform.runtimeDone, so
+                // process_apm_request's wait_for_runtime_done falls through on the
+                // deadline — 2s comfortably survives the wiremock round trip without
+                // the deadline going stale (which would trip the 5s fallback branch
+                // instead), while still being far faster than the real 5s fallback.
+                deadline_ms_from_now(2_000),
             )),
         )
         .up_to_n_times(1)
@@ -2163,10 +2378,6 @@ async fn wait_for_runtime_done_waits_grace_when_signalled_and_batch_not_drained(
     cfg.extension.send_function_logs = true;
     cfg.extension.runtime_done_grace_ms = 150;
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist");
-    notify.notify_one(); // pre-fire so notified() resolves immediately
 
     // Push a log into the batch so is_drained() returns false.
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -2179,7 +2390,7 @@ async fn wait_for_runtime_done_waits_grace_when_signalled_and_batch_not_drained(
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -2206,10 +2417,6 @@ async fn wait_for_runtime_done_with_grace_skips_grace_when_grace_ms_is_zero() {
     cfg.extension.send_function_logs = true;
     cfg.extension.runtime_done_grace_ms = 0; // grace disabled
     let config = Arc::new(cfg);
-    register_request_for_serverless(request_id, config.clone());
-
-    let notify = request::get_runtime_done_notify(request_id).expect("notify must exist");
-    notify.notify_one(); // pre-fire so the select picks up the signal immediately
 
     // Undrained batch — if grace_ms were > 0 this would cause a wait
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -2222,7 +2429,7 @@ async fn wait_for_runtime_done_with_grace_skips_grace_when_grace_ms_is_zero() {
     let start = std::time::Instant::now();
     wait_for_runtime_done_with_grace(
         request_id,
-        deadline_ms_from_now(5_000),
+        true,
         &config,
         &log_processor,
     )
@@ -3034,11 +3241,10 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
     process_apm_request(
         req_id.to_string(),
         "arn:test".to_string(),
-        true, // is_cold_start=true → skip warm-start drain; keeps test deterministic
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(5_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 
@@ -3061,24 +3267,16 @@ async fn process_apm_request_flow2_rebuffers_payload_when_no_run_id() {
 #[serial]
 async fn wait_for_runtime_done_uses_fallback_when_deadline_is_past() {
     let request_id = "wfrd-past-deadline-fallback";
-    let mut cfg = config::ExtensionConfig::default();
-    cfg.extension.send_function_logs = true;
-    let config = Arc::new(cfg);
+    let config = make_config_for_serverless(false);
     register_request_for_serverless(request_id, config.clone());
 
     // Pre-fire the notify so notified() resolves instantly even via the fallback path.
     let notify = request::get_runtime_done_notify(request_id).expect("notify must exist after registration");
     notify.notify_one();
 
-    let log_processor = make_noop_log_processor_serverless(config.clone());
     let start = std::time::Instant::now();
-    wait_for_runtime_done_with_grace(
-        request_id,
-        deadline_ms_from_now(-1_000), // already expired → triggers lines 1607-1611
-        &config,
-        &log_processor,
-    )
-    .await;
+    let signaled = wait_for_runtime_done(request_id, deadline_ms_from_now(-1_000)).await; // already expired → stale-deadline fallback branch
+    assert!(signaled, "pre-fired notify must still be observed on the expired-deadline fallback path");
     assert!(
         start.elapsed() < Duration::from_millis(500),
         "pre-fired notify must resolve fast even on the expired-deadline fallback path"
@@ -3178,7 +3376,12 @@ async fn execute_apm_mode_event_loop_tags_function_on_cold_start_with_version_ta
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(invoke_event_body(
             "req-apm-vtags-1",
             "arn:aws:lambda:us-east-1:123:function:apm-vtags",
-            deadline_ms_from_now(5_000),
+            // This mock never emits platform.runtimeDone, so
+            // process_apm_request's wait_for_runtime_done falls through on the
+            // deadline — 2s comfortably survives the wiremock round trip without
+            // the deadline going stale (which would trip the 5s fallback branch
+            // instead), while still being far faster than the real 5s fallback.
+            deadline_ms_from_now(2_000),
         )))
         .up_to_n_times(1)
         .mount(&server)
@@ -3232,11 +3435,10 @@ async fn process_apm_request_pending_report_warns_when_apm_app_not_ready() {
     process_apm_request(
         req_id.to_string(),
         "arn:test".to_string(),
-        true, // is_cold_start — skips warm-start drain; keeps test deterministic
         config,
         log_processor,
         apm_app,
-        deadline_ms_from_now(1_000),
+        deadline_ms_from_now(500), // short: no notify fired in this test, let the deadline fallback resolve fast
     )
     .await;
 

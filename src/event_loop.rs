@@ -479,7 +479,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     process_apm_request(
                         request_id_clone,
                         invoked_function_arn_clone,
-                        is_cold_start,
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
@@ -629,6 +628,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     }
                 }
 
+                // Yield to let the IPC pipe collector task route any last in-flight
+                // payloads before we collect from REQUEST_DATA below. The collector
+                // runs in a separate tokio task; two yields ensure items already in
+                // the mpsc channel are routed before the shutdown collect.
+                tokio::task::yield_now().await;
+                tokio::task::yield_now().await;
+
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
                 debug!("APM mode shutdown: Processing all remaining agent payloads");
 
@@ -669,7 +675,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     .unwrap_or_else(crate::get_global_fallback_arn);
                                 
                                 for payload_bytes in payloads {
-                                    if let Err(e) = process_and_send_agent_payload(
+                                    // process_and_send_agent_payload always returns Ok and
+                                    // logs its own outcome, so we don't branch on Err here.
+                                    //
+                                    // Also deliberately not adding to dropped_request_ids here:
+                                    // the retry below might still redeliver this payload, and
+                                    // dropped_request_ids is never pruned, so an early insert
+                                    // could wrongly mark a later-delivered request as dropped.
+                                    // The accounting happens once, after retries run, from the
+                                    // actual buffer contents (see buffered_agent_payload_request_ids below).
+                                    let _ = process_and_send_agent_payload(
                                         &payload_bytes,
                                         &request_id,
                                         &invoked_function_arn,
@@ -677,13 +692,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                         &components.config,
                                         &components.apm_app,
                                     )
-                                    .await
-                                    {
-                                        warn!("APM mode shutdown: Failed to send payload for {}: {}", request_id, e);
-                                        dropped_request_ids.insert(request_id.clone());
-                                    } else {
-                                        info!("APM mode shutdown: Successfully sent payload for request: {}", request_id);
-                                    }
+                                    .await;
                                 }
                             }
                         }
@@ -815,11 +824,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                             let shutdown_arn = LAST_REQUEST_CONTEXT.lock().ok()
                                 .and_then(|g| g.clone().map(|(_, arn)| arn))
                                 .unwrap_or_default();
-                            if let Err(e) = app.send_platform_report_metrics(&report_line, &shutdown_arn).await {
-                                error!("APM mode shutdown: Failed to send platform report metrics for {}: {}", request_id, e);
-                            } else {
-                                info!("APM mode shutdown: Successfully sent platform report metrics for request: {}", request_id);
-                            }
+                            // send_platform_report_metrics always returns Ok (permanent-drop
+                            // and buffered-for-retry are Ok too, by design) and already logs
+                            // its own accurate outcome internally — don't re-log here.
+                            let _ = app.send_platform_report_metrics(&report_line, &shutdown_arn).await;
 
                             // Remove pending report after sending
                             remove_pending_report(&request_id);
@@ -1281,10 +1289,21 @@ pub async fn execute_noop_event_loop(client: &Arc<Client>, extension_id: &str) {
     }
 }
 
+/// Render an elapsed-ms-since-runtime.done value for a log line. `None` means
+/// `platform.runtimeDone` was never observed for that request (e.g. it fired before
+/// `RequestData` existed and the pre-fire timestamp was somehow lost, or this is being
+/// called defensively on a request with no recorded runtime.done at all) — render that
+/// as "unknown" rather than a misleading "0ms".
+fn format_elapsed_for_log(elapsed_ms: Option<i64>) -> String {
+    match elapsed_ms {
+        Some(ms) => format!("{}ms", ms),
+        None => "an unknown time".to_string(),
+    }
+}
+
 pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
-    is_cold_start: bool,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
@@ -1292,52 +1311,13 @@ pub async fn process_apm_request(
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
-
-    if !is_cold_start {
-        // Atomically drain old request buffers in a single lock to avoid
-        // TOCTOU race between emptiness check and mem::take.
-        let pending_with_payloads: Vec<(String, Vec<Vec<u8>>)> = REQUEST_DATA
-            .iter()
-            .filter_map(|entry| {
-                let req_id = entry.key();
-                if req_id != &request_id {
-                    if let Ok(mut buffer) = entry.agent_buffer.lock() {
-                        if !buffer.is_empty() {
-                            return Some((req_id.clone(), std::mem::take(&mut *buffer)));
-                        }
-                    }
-                }
-                None
-            })
-            .collect();
-
-        if !pending_with_payloads.is_empty() {
-            debug!(
-                "APM warm start: Found {} pending late agent payload(s) from previous invocations - processing now",
-                pending_with_payloads.len()
-            );
-
-            for (old_request_id, late_payloads) in pending_with_payloads {
-                // Send all late payloads concurrently — each is an independent HTTP POST
-                // that only takes a read lock on apm_app (no write contention).
-                let mut set = tokio::task::JoinSet::new();
-                for payload_bytes in late_payloads {
-                    let rid = old_request_id.clone();
-                    let apm = apm_app.clone();
-                    set.spawn(async move {
-                        if let Err(e) = send_to_apm_collector(&payload_bytes, &rid, &apm).await {
-                            error!("Failed to send late agent payload for {}: {}", rid, e);
-                        } else {
-                            info!("Successfully sent late agent payload for request: {}", rid);
-                        }
-                    });
-                }
-                while set.join_next().await.is_some() {}
-
-                cleanup_request_processing_state_internal(&old_request_id, false);
-            }
-        }
-    }
+    // Draining other (previous-invocation) requests' leftover buffers/pending
+    // reports is NOT this function's job — it's handled by
+    // process_pending_agent_payloads, spawned concurrently alongside this one
+    // (see execute_apm_mode_event_loop's `pending_task`). The two used to
+    // independently duplicate that responsibility, racing each other on the same
+    // REQUEST_DATA entries. This function owns exactly one thing: this request's
+    // own Flow 1/2/3 decision below.
 
     let state = REQUEST_PROCESSORS.remove(&request_id).map(|(_k, v)| v);
 
@@ -1357,13 +1337,22 @@ pub async fn process_apm_request(
         .platform_processor
         .process_invoke_event(&request_id, &invoked_function_arn);
 
+    // Wait for the handler to actually finish (platform.runtimeDone) BEFORE deciding
+    // whether the agent payload / platform.report have arrived. Checking any earlier
+    // (as this used to, right here at INVOKE time) makes Flow 1 below structurally
+    // unreachable: the customer's handler — and the agent's own payload flush — can't
+    // have produced anything yet. Bounded by the invocation's own remaining deadline,
+    // so this can never outlive the function. Always runs regardless of
+    // NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS (unlike wait_for_runtime_done_with_grace
+    // below, which is purely about log-flush grace and is allowed to skip waiting).
+    let runtime_done_signaled = wait_for_runtime_done(&request_id, deadline_ms).await;
+
     // APM mode: Check if run_id is available
     let has_run_id = {
         let apm_app_guard = apm_app.read().await;
         apm_app_guard.is_some()
     };
 
-    // Check if we have agent payload
     let agent_payloads = {
         if let Ok(mut buffer) = state.agent_buffer.lock() {
             std::mem::take(&mut *buffer)
@@ -1374,9 +1363,9 @@ pub async fn process_apm_request(
 
     let got_payload = !agent_payloads.is_empty();
 
-    // Flow 1: If run_id exists and payload arrived, send it immediately
-    // Flow 2: If run_id exists but no payload, buffer will be kept for next invocation
-    // Flow 3: If no run_id, buffer the payload for when run_id arrives (or shutdown)
+    // Flow 1: run_id and agent payload both available — send now.
+    // Flow 2: run_id not available yet — re-buffer for the next invocation.
+    // Flow 3: nothing buffered yet.
     let send_agent_task = if has_run_id && got_payload {
         debug!(
             "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
@@ -1390,7 +1379,8 @@ pub async fn process_apm_request(
         let invoked_function_arn_clone = invoked_function_arn.clone();
 
         Some(tokio::spawn(async move {
-            let mut all_sent = true;
+            // Trace-id extraction is per-chunk (independent of telemetry-map
+            // merging) — same as process_pending_agent_payloads's identical step.
             for payload_bytes in &agent_payloads_clone {
                 extract_and_coordinate_trace_id(
                     payload_bytes,
@@ -1399,19 +1389,31 @@ pub async fn process_apm_request(
                     &global_log_processor_clone,
                 )
                 .await;
+            }
 
-                // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
-                // (never silently dropped); the global retry loop resends it on a
-                // later invoke / at shutdown. Mirrors process_and_send_agent_payload.
-                if !send_agent_payload_or_buffer(
-                    payload_bytes,
-                    &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &apm_app_clone,
-                )
-                .await
-                {
-                    all_sent = false;
+            // Merge mergeable event-list types across all of this request's
+            // buffered chunks into one collector POST per type, rather than one
+            // POST per chunk per type — mirrors process_pending_agent_payloads's
+            // identical call for the previous-invocation drain path. Before this,
+            // only that drain path got the batching win; this same-invoke path
+            // (the common case) still sent one POST per chunk per type.
+            // Clone out of the lock and drop it right away — don't hold a read
+            // lock across the send below, or it blocks a reconnect from writing.
+            let app_owned = apm_app_clone.read().await.clone();
+            let all_sent = if let Some(app) = app_owned {
+                let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
+                send_result.is_ok()
+            } else {
+                false
+            };
+
+            if !all_sent {
+                // On failure the payloads are buffered into FAILED_AGENT_PAYLOADS
+                // (never silently dropped); the global retry loop resends them on a
+                // later invoke / at shutdown. Mirrors process_pending_agent_payloads's
+                // identical fallback when apm_app isn't ready or the merged send errors.
+                for payload_bytes in &agent_payloads_clone {
+                    buffer_failed_agent_payload(payload_bytes, &request_id_clone, &invoked_function_arn_clone);
                 }
             }
             (all_sent, agent_payloads_clone)
@@ -1419,9 +1421,9 @@ pub async fn process_apm_request(
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
-            debug!(
-                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
-                agent_payloads.len()
+            info!(
+                "APM mode: No run_id yet but agent payload arrived ({} payload(s)) for request {} - buffering until run_id becomes available",
+                agent_payloads.len(), request_id
             );
             // Put payloads back in buffer to send when run_id arrives
             if let Some(buffer_ref) = get_agent_buffer(&request_id) {
@@ -1431,8 +1433,8 @@ pub async fn process_apm_request(
             }
         } else if has_run_id && !got_payload {
             debug!(
-                "APM mode: run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
-                request_id
+                "APM mode: run_id available but no agent payload for request: {} even after waiting for runtime.done (signaled: {}) - will catch in next invocation if it arrives late",
+                request_id, runtime_done_signaled
             );
         } else {
             debug!(
@@ -1443,10 +1445,18 @@ pub async fn process_apm_request(
         None
     };
 
-    // Spawn agent send in background - don't wait for it to complete
-    // This ensures we return to /next quickly without blocking on agent sends
-    if let Some(handle) = send_agent_task {
-        tokio::spawn(async move {
+    // The Flow-1 agent-payload send, the platform.report send, and the log/platform
+    // flush are mutually independent — none needs another's result — but used to
+    // run strictly sequentially here, adding up their individual durations into
+    // billed duration on every invocation that has more than one of them. Run all
+    // three concurrently instead: total tail latency becomes roughly the slowest of
+    // them, not their sum.
+    let agent_send_fut = async {
+        // Awaited inline (rather than fire-and-forget) so a same-invoke send
+        // genuinely completes — with its own result observed — before this
+        // invocation returns to /next, instead of racing the sandbox freeze in
+        // the background.
+        if let Some(handle) = send_agent_task {
             match handle.await {
                 Ok((success, payloads)) => {
                     if !success && !payloads.is_empty() {
@@ -1457,60 +1467,69 @@ pub async fn process_apm_request(
                     error!("Agent send task failed: {}", e);
                 }
             }
-        });
-    }
-
-    // Check for pending platform.report and send as metrics to Metric API (APM mode)
-    if let Some(report_line) = get_pending_report(&request_id) {
-        debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
-
-        let apm_app_guard = apm_app.read().await;
-        if let Some(ref app) = *apm_app_guard {
-            if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
-                error!("APM mode: Failed to send platform report metrics for {}: {}", request_id, e);
-            } else {
-                info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
-            }
-        } else {
-            warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
         }
-        drop(apm_app_guard);
+    };
 
-        // Remove pending report after sending
-        remove_pending_report(&request_id);
-    } else {
-        debug!("APM mode: No platform.report found for request {} (may arrive in next invocation)", request_id);
-    }
+    let report_send_fut = async {
+        // Check for pending platform.report and send as metrics to Metric API (APM mode)
+        if let Some(report_line) = get_pending_report(&request_id) {
+            debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
-    wait_for_runtime_done_with_grace(
-        &request_id,
-        deadline_ms,
-        &config,
-        &global_log_processor,
-    )
-    .await;
+            // Clone out and drop the guard before the send — same reasoning as
+            // process_apm_request's agent-payload send fix: don't hold a read lock
+            // across an HTTP POST and risk blocking a reconnect's write lock.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
+                // send_platform_report_metrics always returns Ok (permanent-drop and
+                // buffered-for-retry are Ok too, by design) and already logs its own
+                // accurate outcome internally — don't re-log here.
+                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+            } else {
+                warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
+            }
 
-    // Wait for logs and platform to complete before returning
-    let log_flushing = global_log_processor.flush();
-    let platform_flushing = state.platform_processor.flush();
+            // Remove pending report after sending
+            remove_pending_report(&request_id);
+        } else {
+            debug!(
+                "APM mode: No platform.report found for request {} even after waiting for runtime.done (signaled: {}) (may arrive in next invocation)",
+                request_id, runtime_done_signaled
+            );
+        }
+    };
 
-    let (log_result, platform_result) = tokio::join!(
-        log_flushing,
-        platform_flushing,
-    );
+    let log_flush_fut = async {
+        wait_for_runtime_done_with_grace(
+            &request_id,
+            runtime_done_signaled,
+            &config,
+            &global_log_processor,
+        )
+        .await;
 
-    if let Err(e) = log_result {
-        error!("Failed to flush logs for request {}: {}", request_id, e);
-    }
-    if let Err(e) = platform_result {
-        error!("Failed to flush platform for request {}: {}", request_id, e);
-    }
+        // Wait for logs and platform to complete before returning
+        let log_flushing = global_log_processor.flush();
+        let platform_flushing = state.platform_processor.flush();
+
+        let (log_result, platform_result) = tokio::join!(
+            log_flushing,
+            platform_flushing,
+        );
+
+        if let Err(e) = log_result {
+            error!("Failed to flush logs for request {}: {}", request_id, e);
+        }
+        if let Err(e) = platform_result {
+            error!("Failed to flush platform for request {}: {}", request_id, e);
+        }
+    };
+
+    tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
 
     // Agent payloads arrive via the named pipe independently and are already sent above.
     // Late agent payloads will be caught by the warm-start pending-payload logic.
 
     cleanup_request_processing_state_internal(&request_id, true);
-
 
     debug!(
         "APM mode: Completed processing for request: {}",
@@ -1518,91 +1537,30 @@ pub async fn process_apm_request(
     );
 }
 
-/// Send agent payload to APM collector (parses and sends 5 telemetry types)
-async fn send_to_apm_collector(
-    payload_bytes: &[u8],
-    request_id: &str,
-    apm_app: &crate::apm::SharedApmApp,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let apm_app_guard = apm_app.read().await;
-    if let Some(ref app) = *apm_app_guard {
-        debug!(
-            "APM mode: Processing agent payload for request: {} (size: {} bytes)",
-            request_id,
-            payload_bytes.len()
-        );
-        app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
-        info!(
-            "APM mode: Agent payload sent successfully for request: {}",
-            request_id
-        );
-    } else {
-        // APM connection still in progress - buffer will be kept for retry
-        warn!(
-            "APM connection still in progress - payload for {} will be buffered and retried",
-            request_id
-        );
-        return Err("APM connection not ready yet - payload buffered for retry".into());
-    }
-    Ok(())
-}
-
-/// Send one agent payload to the APM collector; on failure buffer it into
-/// `FAILED_AGENT_PAYLOADS` so `retry_failed_agent_payloads` resends it on the
-/// next invoke / at shutdown. Returns `true` on success, `false` on a
-/// (now-buffered) failure. Mirrors `process_and_send_agent_payload` so the
-/// Flow-1 immediate-send path can never silently drop a payload.
-async fn send_agent_payload_or_buffer(
-    payload_bytes: &[u8],
-    request_id: &str,
-    invoked_function_arn: &str,
-    apm_app: &crate::apm::SharedApmApp,
-) -> bool {
-    match send_to_apm_collector(payload_bytes, request_id, apm_app).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(
-                "APM mode: Agent payload send failed for {}, buffering for retry: {}",
-                request_id, e
-            );
-            buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
-            false
-        }
-    }
-}
-
-/// Wait for `platform.runtimeDone` for this request, then give a short grace for
-/// trailing telemetry, then return. Used by both serverless mode and APM mode before
-/// the end-of-invocation flush so late logs land in `log_batch` before it drains.
+/// Core wait, shared by every caller that needs to know when the handler has actually
+/// finished: blocks on `runtime_done_notify` (pre-armable — if `platform.runtimeDone`
+/// already fired, `notified()` returns immediately), bounded by the invocation's own
+/// remaining deadline so it can never outlive the function. Returns `true` if the
+/// signal arrived, `false` if the deadline was hit first.
 ///
-/// Bounds:
-/// - Upper bound on the runtime.done wait = function's own deadline (`deadlineMs`
-///   from the INVOKE event), clamped to Lambda's 15 min ceiling. Never outlives
-///   the function. Falls back to 5 s if `deadline_ms` is missing/stale.
-/// - Grace after runtime.done = `NEW_RELIC_RUNTIME_DONE_GRACE_MS` (default 25 ms,
-///   clamp `[0, 2000]`). Skipped entirely when `log_processor.is_drained()` is true.
-///
-/// Notify is pre-armable: if `runtime.done` fired before we reach this point,
-/// `notified()` returns immediately.
-async fn wait_for_runtime_done_with_grace(
-    request_id: &str,
-    deadline_ms: i64,
-    config: &ExtensionConfig,
-    log_processor: &Arc<LogProcessor>,
-) {
-    if !config.extension.send_function_logs {
-        return;
-    }
+/// Deliberately has no config gate: callers that only care about this for log-flushing
+/// purposes (`wait_for_runtime_done_with_grace`) may skip calling it entirely when log
+/// forwarding is off, but callers that need it for correctness (e.g. the agent-payload
+/// Flow-1 check in `process_apm_request`) must always call it regardless of any
+/// unrelated logging config — `NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS=false` must not
+/// silently disable the agent-payload same-invoke-send fix.
+async fn wait_for_runtime_done(request_id: &str, deadline_ms: i64) -> bool {
     let Some(notify) = request::get_runtime_done_notify(request_id) else {
-        return;
+        return false;
     };
 
     const MAX_RUNTIME_DONE_WAIT_MS: u64 = 15 * 60 * 1_000;
     const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // Leave the safety margin so we don't wait all the way to the real deadline.
     let remaining_ms: u64 = if deadline_ms > now_ms {
-        ((deadline_ms - now_ms) as u64).min(MAX_RUNTIME_DONE_WAIT_MS)
+        bounded_wait_budget_ms(deadline_ms, MAX_RUNTIME_DONE_WAIT_MS)
     } else {
         warn!(
             "INVOKE for request {} missing/stale deadlineMs ({}); using {}ms fallback for runtime.done wait",
@@ -1622,6 +1580,33 @@ async fn wait_for_runtime_done_with_grace(
             request_id,
             chrono::Utc::now().timestamp_millis().saturating_sub(now_ms)
         );
+    } else {
+        debug!(
+            "runtime.done wait reached function deadline ({}ms) for request: {} - proceeding anyway",
+            remaining_ms, request_id
+        );
+    }
+
+    signal
+}
+
+/// Log-flush-specific grace period, layered on top of an *already-observed*
+/// `runtime.done` signal. Takes `signaled` rather than calling `wait_for_runtime_done`
+/// itself: `Notify::notify_one` hands out a single wake-up permit, so calling the core
+/// wait twice for the same request would consume it once and then block the second
+/// caller out to the full deadline/fallback timeout every time — callers must wait
+/// exactly once (see `process_apm_request`) and share the resulting bool.
+async fn wait_for_runtime_done_with_grace(
+    request_id: &str,
+    signaled: bool,
+    config: &ExtensionConfig,
+    log_processor: &Arc<LogProcessor>,
+) {
+    if !config.extension.send_function_logs {
+        return;
+    }
+
+    if signaled {
         if !log_processor.is_drained() {
             let grace_ms = config.extension.runtime_done_grace_ms;
             if grace_ms > 0 {
@@ -1636,8 +1621,11 @@ async fn wait_for_runtime_done_with_grace(
                 notified.as_mut().enable();
 
                 if !log_processor.is_drained() {
+                    // "Drained" just means the batch was handed off to a background
+                    // send task, not that the send finished. The real wait for the
+                    // send to finish happens later, unconditionally.
                     debug!(
-                        "runtime.done: batch not drained - awaiting drain notify (up to {}ms grace, request: {})",
+                        "runtime.done: log batch not yet handed off for sending - waiting up to {}ms for the hand-off (not the send itself; request: {})",
                         grace_ms, request_id
                     );
                     let grace_start = tokio::time::Instant::now();
@@ -1647,7 +1635,7 @@ async fn wait_for_runtime_done_with_grace(
                     )
                     .await;
                     debug!(
-                        "runtime.done: grace period ended after {}ms / {}ms max (request: {})",
+                        "runtime.done: hand-off wait ended after {}ms / {}ms max (request: {}) - actual send completion is awaited separately below",
                         grace_start.elapsed().as_millis(),
                         grace_ms,
                         request_id
@@ -1660,12 +1648,8 @@ async fn wait_for_runtime_done_with_grace(
                 request_id
             );
         }
-    } else {
-        debug!(
-            "runtime.done wait reached function deadline ({}ms) for request: {} - flushing anyway",
-            remaining_ms, request_id
-        );
     }
+    // else: wait_for_runtime_done already logged the deadline-reached case.
 }
 
 /// Sends the appropriate APM error event for a given shutdown reason.
@@ -2028,9 +2012,19 @@ pub async fn process_request_concurrently(
         None
     };
 
+    // This caller only ever needed the wait for log-flush purposes (unlike
+    // process_apm_request, which now needs it unconditionally for agent-payload
+    // correctness) — so preserve the original behavior of skipping the wait
+    // entirely when function-log forwarding is off, rather than always paying for
+    // the core wait and only gating the grace period.
+    let runtime_done_signaled = if config.extension.send_function_logs {
+        wait_for_runtime_done(&request_id, deadline_ms).await
+    } else {
+        false
+    };
     wait_for_runtime_done_with_grace(
         &request_id,
-        deadline_ms,
+        runtime_done_signaled,
         &config,
         &global_log_processor,
     )
@@ -2312,6 +2306,10 @@ pub(crate) async fn process_pending_agent_payloads(
     );
 
     for (request_id, buffer) in pending_requests {
+        // Captured before cleanup removes the REQUEST_DATA entry below — how late,
+        // not just that it's late (see format_elapsed_for_log).
+        let elapsed_ms = request::get_runtime_done_elapsed_ms(&request_id);
+
         let context = get_request_context(&request_id);
 
         let invoked_function_arn = if let Some(ctx) = context {
@@ -2337,44 +2335,88 @@ pub(crate) async fn process_pending_agent_payloads(
         };
 
         if !payloads.is_empty() {
+            let chunk_count = payloads.len();
             debug!(
                 "Found {} pending agent payload(s) for previous request: {}",
-                payloads.len(),
-                request_id
+                chunk_count, request_id
             );
 
-            // Send all payloads for this request concurrently
-            let mut set = tokio::task::JoinSet::new();
-            for payload_bytes in payloads {
-                let rid = request_id.clone();
-                let arn = invoked_function_arn.clone();
-                let lp = global_log_processor.clone();
-                let cfg = config.clone();
-                let apm = apm_app.clone();
-                set.spawn(async move {
-                    if let Err(e) = process_and_send_agent_payload(
-                        &payload_bytes, &rid, &arn, &lp, &cfg, &apm,
-                    ).await {
-                        error!("Failed to process pending agent payload: {}", e);
+            // Trace-id extraction is per-chunk (independent of telemetry-map
+            // merging) — preserved here before chunks are merged/sent together.
+            if config.new_relic.collect_trace_id {
+                for payload_bytes in &payloads {
+                    if let Ok(Some(trace_id)) = trace::extract_trace_id_from_payload(payload_bytes) {
+                        if let Err(e) = global_log_processor.on_trace_id_extracted(&request_id, &trace_id).await {
+                            error!("Failed to coordinate logs with trace ID: {}", e);
+                        }
                     }
-                });
+                }
             }
-            while set.join_next().await.is_some() {}
+
+            // Merge mergeable event-list types across all of this request's
+            // buffered chunks into one collector POST per type, rather than one
+            // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
+            // Clone out and drop the guard before the send — see process_apm_request's
+            // identical fix for why a read lock must not span the HTTP POSTs below.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
+                let send_result = app.process_merged_agent_payloads(payloads.clone(), &request_id, &invoked_function_arn).await;
+                match send_result {
+                    // `sent_count` is how many chunks were actually parsed and
+                    // attempted — a chunk that failed to parse is buffered
+                    // internally by process_merged_agent_payloads and does NOT
+                    // count here, so this can legitimately be 0 of chunk_count
+                    // even though the call returned Ok (that function's contract:
+                    // buffered-for-retry is a handled outcome, not a propagated
+                    // error). Logging "Successfully sent" unconditionally on Ok
+                    // would claim success even when every chunk failed to parse
+                    // and was buffered instead — distinguish the two.
+                    Ok(sent_count) if sent_count == chunk_count => {
+                        info!(
+                            "Successfully sent {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
+                            chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                        );
+                    }
+                    Ok(sent_count) => {
+                        warn!(
+                            "Sent {} of {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done) — the rest failed to parse and were buffered for retry",
+                            sent_count, chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to send {} pending agent payload chunk(s) for {} (arrived {} after runtime.done): {} - buffering for retry",
+                            chunk_count, request_id, format_elapsed_for_log(elapsed_ms), e
+                        );
+                        for payload_bytes in &payloads {
+                            buffer_failed_agent_payload(payload_bytes, &request_id, &invoked_function_arn);
+                        }
+                    }
+                }
+            } else {
+                warn!(
+                    "APM connection not established - buffering {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
+                    chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                );
+                for payload_bytes in &payloads {
+                    buffer_failed_agent_payload(payload_bytes, &request_id, &invoked_function_arn);
+                }
+            }
         }
 
         // Check for pending platform.report for this old request and send as metrics (APM mode)
         if let Some(report_line) = get_pending_report(&request_id) {
             debug!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
 
-            let apm_app_guard = apm_app.read().await;
-            if let Some(ref app) = *apm_app_guard {
-                if let Err(e) = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await {
-                    error!("APM mode: Failed to send platform report metrics for previous request {}: {}", request_id, e);
-                } else {
-                    info!("APM mode: Successfully sent platform report metrics for previous request {}", request_id);
-                }
+            // Clone out and drop the guard before the send — same reasoning as
+            // process_apm_request's agent-payload send fix.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
+                // send_platform_report_metrics always returns Ok (permanent-drop and
+                // buffered-for-retry are Ok too, by design) and already logs its own
+                // accurate outcome internally — don't re-log here.
+                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
             }
-            drop(apm_app_guard);
 
             // Remove pending report after sending
             remove_pending_report(&request_id);
