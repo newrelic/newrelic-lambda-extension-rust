@@ -102,27 +102,14 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
     Ok((data_map, version))
 }
 
-/// Bounded cache of `parse_agent_payload` results, keyed by a fast content hash of
-/// the raw payload bytes. Every agent payload is fully parsed (base64 decode + gzip
-/// inflate + JSON deserialize) at least twice on the Normal Lambda path today: once
-/// by `extract_request_id_from_payload_bytes` (the misattribution guard, at arrival)
-/// and once again by `ApmApp::parse_and_normalize_one_payload` (at actual send time)
-/// — both calls parse the exact same bytes from scratch. `parse_agent_payload_cached`
-/// lets the second call reuse the first call's result instead of redoing the
-/// decompression/parse. A cache miss just falls through to a normal parse — this is
-/// purely an optimization, never a correctness dependency. Keying by content hash
-/// (not identity) is safe: identical bytes always parse to an identical result, so
-/// a hash collision between two genuinely different payloads can't happen in
-/// practice, and even a (cryptographically implausible) collision would only cause a
-/// cache miss's-worth of extra work, never wrong data, because callers never trust
-/// the hash itself — only the `Arc`'s contents, which came from a real parse.
-static PARSE_CACHE: once_cell::sync::Lazy<dashmap::DashMap<u64, Arc<(HashMap<String, Vec<Value>>, u8)>>> =
+/// Caches a parsed payload by content hash, so the same bytes don't get fully
+/// re-parsed (base64 + gzip + JSON) by multiple call sites. Stores the original
+/// bytes too, so a hash collision is detected and treated as a miss (safe) rather
+/// than returning the wrong payload's data.
+static PARSE_CACHE: once_cell::sync::Lazy<dashmap::DashMap<u64, (Vec<u8>, Arc<(HashMap<String, Vec<Value>>, u8)>)>> =
     once_cell::sync::Lazy::new(dashmap::DashMap::new);
 
-/// Caps how many not-yet-reused parses can accumulate — e.g. a payload that gets
-/// parsed for the misattribution check but is never actually sent (buffered for a
-/// long time, or dropped on an error path upstream of the send). Each entry holds a
-/// full telemetry map, so this is bounded memory, not a leak — just not infinite.
+/// Max cached entries before we just clear the whole cache. Keeps memory bounded.
 const MAX_PARSE_CACHE_ENTRIES: usize = 256;
 
 fn hash_payload_bytes(payload_bytes: &[u8]) -> u64 {
@@ -131,29 +118,22 @@ fn hash_payload_bytes(payload_bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Same contract as `parse_agent_payload`, but checks (and populates) `PARSE_CACHE`
-/// first. Entries are read non-destructively (shared via `Arc::clone`, never
-/// removed on hit) because this payload's bytes can legitimately be parsed from
-/// more than one call site before being consumed — the misattribution/routing
-/// check, trace-id extraction (possibly twice: at arrival and again in a later
-/// buffered-drain pass), and the actual send all run on the same bytes. Any one of
-/// them may be the first to seed the cache; every other reader of identical
-/// content reuses that one real parse. Bounded by `MAX_PARSE_CACHE_ENTRIES`/
-/// clear-on-overflow below, not by removal, so this works regardless of call order.
-///
-/// Also tolerates a payload whose bytes are the *whole* envelope array
-/// (`[version,"NR_LAMBDA_MONITORING",...]`) base64-encoded once more on top —
-/// some callers/agent payloads arrive in that double-encoded shape (see
-/// `trace::extract_trace_id_from_payload`'s matching fallback, which this
-/// supersedes). `parse_agent_payload` itself only accepts bytes that already
-/// start with `[`; this wrapper unwraps the extra encoding first when needed, so
-/// every caller gets the same leniency regardless of which one happens to run
-/// first for a given payload.
+/// Same as `parse_agent_payload`, but checks `PARSE_CACHE` first and reuses a
+/// previous parse of the same bytes if one exists. Also unwraps payloads that
+/// arrive base64-encoded one extra time (some payloads have the whole envelope
+/// array wrapped in base64, not just the compressed data inside it).
 pub fn parse_agent_payload_cached(payload_bytes: &[u8]) -> Result<Arc<(HashMap<String, Vec<Value>>, u8)>> {
     let key = hash_payload_bytes(payload_bytes);
-    if let Some(cached) = PARSE_CACHE.get(&key) {
-        trace!("Reusing cached parse for agent payload ({} bytes)", payload_bytes.len());
-        return Ok(Arc::clone(&cached));
+    if let Some(entry) = PARSE_CACHE.get(&key) {
+        let (cached_bytes, cached_parse) = &*entry;
+        if cached_bytes.as_slice() == payload_bytes {
+            trace!("Reusing cached parse for agent payload ({} bytes)", payload_bytes.len());
+            return Ok(Arc::clone(cached_parse));
+        }
+        // Same hash, different bytes — a genuine (vanishingly rare) collision.
+        // Fall through and parse fresh; the insert below overwrites the stale
+        // entry for this key with the correct one.
+        trace!("Parse cache key collision detected for different payload content — re-parsing");
     }
 
     let looks_like_raw_array = std::str::from_utf8(payload_bytes)
@@ -178,7 +158,7 @@ pub fn parse_agent_payload_cached(payload_bytes: &[u8]) -> Result<Arc<(HashMap<S
     if PARSE_CACHE.len() >= MAX_PARSE_CACHE_ENTRIES {
         PARSE_CACHE.clear();
     }
-    PARSE_CACHE.insert(key, Arc::clone(&parsed));
+    PARSE_CACHE.insert(key, (payload_bytes.to_vec(), Arc::clone(&parsed)));
     Ok(parsed)
 }
 
@@ -236,17 +216,12 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
 }
 
 /// Telemetry types whose wire shape is `[placeholder, {reservoir_size, events_seen},
-/// [events]]` — safe to merge across multiple agent-payload chunks for the same
-/// request by concatenating the events array and combining the reservoir metadata
-/// (events_seen summed, reservoir_size passed through as the max seen). Per
-/// `Transaction-Events-PORTED.md`, the collector does no server-side re-aggregation of
-/// these, so sending N chunks' events as one POST is equivalent to N separate POSTs
-/// from the collector's point of view.
-///
-/// Other types (`metric_data`'s epoch-window tuple, `error_data`/
-/// `transaction_sample_data`/`sql_trace_data`'s different shapes, `log_event_data`)
-/// have no documented cross-chunk merge rule and are intentionally excluded — they're
-/// sent per-chunk, unmerged.
+/// [events]]` — safe to merge across chunks for the same request by concatenating
+/// the events and combining the metadata: `events_seen` is a count, so it's
+/// summed; `reservoir_size` is a fixed capacity, not a count, so we take the max
+/// instead of summing it. Other types (`metric_data`, `error_data`,
+/// `transaction_sample_data`, `sql_trace_data`, `log_event_data`) have no such
+/// metadata to combine, so they're sent per-chunk, unmerged.
 const MERGEABLE_EVENT_LIST_TYPES: &[&str] = &[
     "analytic_event_data",
     "span_event_data",

@@ -855,7 +855,7 @@ async fn process_agent_payload_v2_ruby_normalizes_all_six_data_types() {
 #[tokio::test]
 async fn process_merged_agent_payloads_empty_list_returns_ok() {
     let result = test_apm_app().process_merged_agent_payloads(vec![], "req-merged-empty", "arn:test").await;
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 0, "no chunks given, none sent");
 }
 
 #[tokio::test]
@@ -872,7 +872,7 @@ async fn process_merged_agent_payloads_single_chunk_delegates_to_single_payload_
     let result = test_apm_app()
         .process_merged_agent_payloads(vec![payload], "req-merged-single", "arn:test")
         .await;
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 1, "one chunk parsed and attempted");
 
     let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
     let entries: Vec<_> = buffered.iter().filter(|e| e.request_id == "req-merged-single").collect();
@@ -897,7 +897,7 @@ async fn process_merged_agent_payloads_merges_mergeable_event_list_types_across_
     let result = test_apm_app()
         .process_merged_agent_payloads(vec![chunk1, chunk2], "req-merged-analytic", "arn:test")
         .await;
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 2, "both chunks parsed and attempted");
 
     let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
     let entries: Vec<_> = buffered
@@ -932,7 +932,7 @@ async fn process_merged_agent_payloads_keeps_non_mergeable_types_per_chunk() {
     let result = test_apm_app()
         .process_merged_agent_payloads(vec![chunk1, chunk2], "req-merged-metric", "arn:test")
         .await;
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 2, "both chunks parsed and attempted");
 
     let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
     let entries: Vec<_> = buffered
@@ -964,7 +964,9 @@ async fn process_merged_agent_payloads_skips_unparseable_chunk_but_sends_the_res
     let result = test_apm_app()
         .process_merged_agent_payloads(vec![bad_chunk.clone(), good_chunk], "req-merged-partial-fail", "arn:test")
         .await;
-    assert!(result.is_ok(), "one bad chunk must not fail the whole batch");
+    // The count, not just Ok/Err, is what a caller must check to avoid logging
+    // "Successfully sent 2" when only 1 of 2 actually was.
+    assert_eq!(result.unwrap(), 1, "only the good chunk was actually sent; the bad one was buffered, not sent");
 
     let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock().unwrap();
     let entries: Vec<_> = buffered
@@ -973,10 +975,7 @@ async fn process_merged_agent_payloads_skips_unparseable_chunk_but_sends_the_res
         .collect();
     assert_eq!(entries.len(), 1, "the good chunk must still be sent (and buffered on failure)");
 
-    // The bad chunk's raw bytes must not simply vanish — this is the actual
-    // regression: process_merged_agent_payloads always returns Ok, so a chunk
-    // that fails to parse here must buffer itself into FAILED_AGENT_PAYLOADS
-    // directly (nothing else will ever retry it otherwise).
+    // The bad chunk's raw bytes must be buffered for retry, not dropped.
     let failed_agent_payloads = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap();
     let dropped: Vec<_> = failed_agent_payloads
         .iter()
@@ -996,9 +995,7 @@ async fn process_merged_agent_payloads_all_chunks_unparseable_buffers_all_and_se
         b.clear();
     }
 
-    // Every chunk fails to parse — mergeable/per_chunk end up empty, so without the
-    // fix this returns Ok(()) having sent nothing and buffered nothing, silently
-    // losing both chunks (the degenerate case the review flagged as untested).
+    // Every chunk fails to parse — both must still be buffered, not dropped.
     let bad_chunk_1 = vec![0xFF, 0xFE];
     let bad_chunk_2 = vec![0xFD, 0xFC];
 
@@ -1009,7 +1006,9 @@ async fn process_merged_agent_payloads_all_chunks_unparseable_buffers_all_and_se
             "arn:test",
         )
         .await;
-    assert!(result.is_ok(), "parse failures must not propagate as Err — buffering is the retry path");
+    // Parse failures buffer instead of propagating as Err, but the count must
+    // still show 0 sent.
+    assert_eq!(result.unwrap(), 0, "every chunk failed to parse — zero were actually sent");
 
     let failed_agent_payloads = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap();
     let dropped: Vec<_> = failed_agent_payloads

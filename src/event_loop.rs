@@ -675,14 +675,15 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                     .unwrap_or_else(crate::get_global_fallback_arn);
                                 
                                 for payload_bytes in payloads {
-                                    // process_and_send_agent_payload always returns Ok(()) —
-                                    // a buffered-for-retry outcome is Ok too, not Err (see its
-                                    // own doc comment) — and already logs its own accurate
-                                    // success/buffered outcome internally. Branching on Err
-                                    // here was dead code that logged a misleading "Successfully
-                                    // sent" even when the payload had just been buffered.
-                                    // Detect the real outcome from FAILED_AGENT_PAYLOADS instead.
-                                    let buffered_before = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
+                                    // process_and_send_agent_payload always returns Ok and
+                                    // logs its own outcome, so we don't branch on Err here.
+                                    //
+                                    // Also deliberately not adding to dropped_request_ids here:
+                                    // the retry below might still redeliver this payload, and
+                                    // dropped_request_ids is never pruned, so an early insert
+                                    // could wrongly mark a later-delivered request as dropped.
+                                    // The accounting happens once, after retries run, from the
+                                    // actual buffer contents (see buffered_agent_payload_request_ids below).
                                     let _ = process_and_send_agent_payload(
                                         &payload_bytes,
                                         &request_id,
@@ -692,10 +693,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                                         &components.apm_app,
                                     )
                                     .await;
-                                    let buffered_after = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
-                                    if buffered_after > buffered_before {
-                                        dropped_request_ids.insert(request_id.clone());
-                                    }
                                 }
                             }
                         }
@@ -1400,13 +1397,13 @@ pub async fn process_apm_request(
             // identical call for the previous-invocation drain path. Before this,
             // only that drain path got the batching win; this same-invoke path
             // (the common case) still sent one POST per chunk per type.
-            let apm_app_guard = apm_app_clone.read().await;
-            let all_sent = if let Some(ref app) = *apm_app_guard {
+            // Clone out of the lock and drop it right away — don't hold a read
+            // lock across the send below, or it blocks a reconnect from writing.
+            let app_owned = apm_app_clone.read().await.clone();
+            let all_sent = if let Some(app) = app_owned {
                 let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
-                drop(apm_app_guard);
                 send_result.is_ok()
             } else {
-                drop(apm_app_guard);
                 false
             };
 
@@ -1424,9 +1421,6 @@ pub async fn process_apm_request(
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
-            // Visible (info-level) — otherwise a trace shows the payload arriving
-            // but no evidence at all of what happened to it until (if) it's sent on
-            // a later invocation.
             info!(
                 "APM mode: No run_id yet but agent payload arrived ({} payload(s)) for request {} - buffering until run_id becomes available",
                 agent_payloads.len(), request_id
@@ -1481,8 +1475,11 @@ pub async fn process_apm_request(
         if let Some(report_line) = get_pending_report(&request_id) {
             debug!("APM mode: Found platform.report for request {} - converting to metrics", request_id);
 
-            let apm_app_guard = apm_app.read().await;
-            if let Some(ref app) = *apm_app_guard {
+            // Clone out and drop the guard before the send — same reasoning as
+            // process_apm_request's agent-payload send fix: don't hold a read lock
+            // across an HTTP POST and risk blocking a reconnect's write lock.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
                 // send_platform_report_metrics always returns Ok (permanent-drop and
                 // buffered-for-retry are Ok too, by design) and already logs its own
                 // accurate outcome internally — don't re-log here.
@@ -1490,7 +1487,6 @@ pub async fn process_apm_request(
             } else {
                 warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
             }
-            drop(apm_app_guard);
 
             // Remove pending report after sending
             remove_pending_report(&request_id);
@@ -1562,12 +1558,7 @@ async fn wait_for_runtime_done(request_id: &str, deadline_ms: i64) -> bool {
     const FALLBACK_RUNTIME_DONE_WAIT_MS: u64 = 5_000;
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    // Bounded by INVOKE_DEADLINE_SAFETY_MARGIN_MS (via bounded_wait_budget_ms), same
-    // as every other deadline-relative wait in this file. Without the margin, a
-    // runtimeDone that never arrives would sleep this select! all the way to the
-    // real Lambda deadline, leaving zero time for the agent-send/report-send/
-    // log-flush work that still has to run after this wait returns — risking the
-    // sandbox being killed mid-POST/mid-flush instead of returning cleanly.
+    // Leave the safety margin so we don't wait all the way to the real deadline.
     let remaining_ms: u64 = if deadline_ms > now_ms {
         bounded_wait_budget_ms(deadline_ms, MAX_RUNTIME_DONE_WAIT_MS)
     } else {
@@ -1630,14 +1621,9 @@ async fn wait_for_runtime_done_with_grace(
                 notified.as_mut().enable();
 
                 if !log_processor.is_drained() {
-                    // "Drained" here means the pending log batch was handed off to a
-                    // background auto-flush send task — NOT that the send itself has
-                    // completed. This grace window is just an early best-effort nudge
-                    // so a batch sitting just under the auto-flush threshold gets
-                    // handed off sooner; it does not wait for (or guarantee) actual
-                    // delivery. The real guarantee that logs are delivered before this
-                    // invocation ends comes from the unbounded "Waiting for N pending
-                    // auto-flush tasks" step right after this function returns.
+                    // "Drained" just means the batch was handed off to a background
+                    // send task, not that the send finished. The real wait for the
+                    // send to finish happens later, unconditionally.
                     debug!(
                         "runtime.done: log batch not yet handed off for sending - waiting up to {}ms for the hand-off (not the send itself; request: {})",
                         grace_ms, request_id
@@ -2370,15 +2356,31 @@ pub(crate) async fn process_pending_agent_payloads(
             // Merge mergeable event-list types across all of this request's
             // buffered chunks into one collector POST per type, rather than one
             // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
-            let apm_app_guard = apm_app.read().await;
-            if let Some(ref app) = *apm_app_guard {
+            // Clone out and drop the guard before the send — see process_apm_request's
+            // identical fix for why a read lock must not span the HTTP POSTs below.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
                 let send_result = app.process_merged_agent_payloads(payloads.clone(), &request_id, &invoked_function_arn).await;
-                drop(apm_app_guard);
                 match send_result {
-                    Ok(()) => {
+                    // `sent_count` is how many chunks were actually parsed and
+                    // attempted — a chunk that failed to parse is buffered
+                    // internally by process_merged_agent_payloads and does NOT
+                    // count here, so this can legitimately be 0 of chunk_count
+                    // even though the call returned Ok (that function's contract:
+                    // buffered-for-retry is a handled outcome, not a propagated
+                    // error). Logging "Successfully sent" unconditionally on Ok
+                    // would claim success even when every chunk failed to parse
+                    // and was buffered instead — distinguish the two.
+                    Ok(sent_count) if sent_count == chunk_count => {
                         info!(
                             "Successfully sent {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
                             chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
+                        );
+                    }
+                    Ok(sent_count) => {
+                        warn!(
+                            "Sent {} of {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done) — the rest failed to parse and were buffered for retry",
+                            sent_count, chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
                         );
                     }
                     Err(e) => {
@@ -2392,7 +2394,6 @@ pub(crate) async fn process_pending_agent_payloads(
                     }
                 }
             } else {
-                drop(apm_app_guard);
                 warn!(
                     "APM connection not established - buffering {} pending agent payload chunk(s) for request: {} (arrived {} after runtime.done)",
                     chunk_count, request_id, format_elapsed_for_log(elapsed_ms)
@@ -2407,14 +2408,15 @@ pub(crate) async fn process_pending_agent_payloads(
         if let Some(report_line) = get_pending_report(&request_id) {
             debug!("APM mode: Found pending platform.report for previous request {} - converting to metrics", request_id);
 
-            let apm_app_guard = apm_app.read().await;
-            if let Some(ref app) = *apm_app_guard {
+            // Clone out and drop the guard before the send — same reasoning as
+            // process_apm_request's agent-payload send fix.
+            let app_owned = apm_app.read().await.clone();
+            if let Some(app) = app_owned {
                 // send_platform_report_metrics always returns Ok (permanent-drop and
                 // buffered-for-retry are Ok too, by design) and already logs its own
                 // accurate outcome internally — don't re-log here.
                 let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
             }
-            drop(apm_app_guard);
 
             // Remove pending report after sending
             remove_pending_report(&request_id);

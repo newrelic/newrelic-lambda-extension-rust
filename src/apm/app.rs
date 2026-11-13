@@ -24,7 +24,7 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ApmApp {
     pub run_id: String,
     pub entity_guid: String,
@@ -274,11 +274,16 @@ impl ApmApp {
                 continue;
             }
             debug!("Sending {} telemetry items as {}", data.len(), telemetry_type);
-            send_tasks.push(self.spawn_send_task(telemetry_type, data, request_id.to_string()));
+            let handle = self.spawn_send_task(telemetry_type.clone(), data, request_id.to_string());
+            send_tasks.push((telemetry_type, handle));
         }
 
-        for task in send_tasks {
-            let _ = task.await;
+        for (telemetry_type, task) in send_tasks {
+            // A panic here means the data is lost (not buffered) — log it so it's
+            // not silently mistaken for a successful send.
+            if let Err(e) = task.await {
+                error!("Agent-payload send task panicked for {} (request {}): {}", telemetry_type, request_id, e);
+            }
         }
 
         Ok(())
@@ -422,31 +427,29 @@ impl ApmApp {
         })
     }
 
-    /// Like `process_agent_payload`, but for multiple agent-payload chunks that
-    /// belong to the same request (e.g. several buffered invocations' worth, drained
-    /// together) — merges the event-list types (`analytic_event_data`,
-    /// `span_event_data`, `error_event_data`, `custom_event_data`) across all chunks
-    /// into a single collector POST per type, instead of one POST per chunk per type.
+    /// Like `process_agent_payload`, but for multiple chunks from the same request —
+    /// merges the mergeable event-list types into one POST per type instead of one
+    /// POST per chunk per type. See `payload_parser::merge_event_list_payloads` for
+    /// the merge rules.
     ///
-    /// Per `Transaction-Events-PORTED.md`: the collector does no server-side
-    /// re-aggregation of these event-list types, so concatenating multiple chunks'
-    /// events into one POST (with combined `events_seen`/`reservoir_size` metadata) is
-    /// spec-safe. Other types (`metric_data`'s epoch-window tuple, `error_data`/
-    /// `transaction_sample_data`/`sql_trace_data`'s different shapes) have no such
-    /// documented merge rule, so they're sent per-chunk, unmerged — exactly as before.
+    /// Returns how many chunks were actually attempted (a chunk that fails to parse
+    /// is buffered for retry instead, and doesn't count). Always returns `Ok` —
+    /// buffered-for-retry is a handled outcome, not an error — so callers should
+    /// check the count, not just `Ok`/`Err`, to tell "sent everything" apart from
+    /// "every chunk failed to parse."
     pub async fn process_merged_agent_payloads(
         &self,
         payloads: Vec<Vec<u8>>,
         request_id: &str,
         invoked_function_arn: &str,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         if payloads.len() <= 1 {
             // No batching benefit for 0 or 1 chunk — reuse the single-payload path
             // verbatim rather than duplicating its empty/trivial-case handling.
             if let Some(payload) = payloads.into_iter().next() {
-                return self.process_agent_payload(payload, request_id).await;
+                return self.process_agent_payload(payload, request_id).await.map(|()| 1);
             }
-            return Ok(());
+            return Ok(0);
         }
 
         debug!(
@@ -455,6 +458,8 @@ impl ApmApp {
             request_id
         );
 
+        let total_chunks = payloads.len();
+        let mut parse_failures = 0usize;
         let mut mergeable: std::collections::HashMap<String, Vec<Vec<Value>>> = std::collections::HashMap::new();
         let mut per_chunk: Vec<(String, Vec<Value>)> = Vec::new();
 
@@ -462,15 +467,14 @@ impl ApmApp {
             let telemetry_map = match Self::parse_and_normalize_one_payload(&payload) {
                 Ok(map) => map,
                 Err(e) => {
-                    // Unlike a single-chunk call (whose parse failure propagates as
-                    // Err, letting the caller buffer the raw bytes for retry), this
-                    // merged path always returns Ok — so a chunk skipped here would
-                    // otherwise be lost with no retry path at all. Buffer it directly.
+                    // This function always returns Ok, so a bad chunk must be
+                    // buffered here directly or it would be lost with no retry.
                     warn!(
                         "Failed to parse one agent payload chunk in merged batch for request {}: {} - buffering this chunk for retry",
                         request_id, e
                     );
                     crate::event_loop::buffer_failed_agent_payload(&payload, request_id, invoked_function_arn);
+                    parse_failures += 1;
                     continue;
                 }
             };
@@ -500,17 +504,22 @@ impl ApmApp {
                 "Merged {} chunk(s) of {} into one batch for request {}",
                 chunk_count, telemetry_type, request_id
             );
-            send_tasks.push(self.spawn_send_task(telemetry_type, merged, request_id.to_string()));
+            let handle = self.spawn_send_task(telemetry_type.clone(), merged, request_id.to_string());
+            send_tasks.push((telemetry_type, handle));
         }
         for (telemetry_type, data) in per_chunk {
-            send_tasks.push(self.spawn_send_task(telemetry_type, data, request_id.to_string()));
+            let handle = self.spawn_send_task(telemetry_type.clone(), data, request_id.to_string());
+            send_tasks.push((telemetry_type, handle));
         }
 
-        for task in send_tasks {
-            let _ = task.await;
+        for (telemetry_type, task) in send_tasks {
+            // Same as process_agent_payload: a panic here means lost data, so log it.
+            if let Err(e) = task.await {
+                error!("Agent-payload send task panicked for {} (request {}): {}", telemetry_type, request_id, e);
+            }
         }
 
-        Ok(())
+        Ok(total_chunks - parse_failures)
     }
 
     /// Convert and send platform REPORT log metrics
@@ -562,12 +571,8 @@ impl ApmApp {
         .await
         {
             Ok(()) => {
-                // The single accurate success log for this send — callers must not
-                // add their own "Successfully sent" on top. This function always
-                // returns Ok (permanent-drop and buffered-for-retry are Ok too, by
-                // design — see the tests below), so a caller branching on Err to
-                // decide whether to log success would log it unconditionally, even
-                // when the metrics were actually dropped or buffered.
+                // Only log success here — callers must not add their own, since
+                // this function always returns Ok even on a buffered/dropped send.
                 info!(
                     "APM mode: Successfully sent platform report metrics for request {}",
                     metrics_data.request_id
@@ -581,6 +586,12 @@ impl ApmApp {
             }
             // Transient/network failures: buffer for retry on a later invoke / at shutdown.
             Err(e) => {
+                // Callers discard the Err (this function always returns Ok), so
+                // this warn! is the only visibility a transient failure gets.
+                warn!(
+                    "Platform metrics buffered for retry for request {}: {}",
+                    metrics_data.request_id, e
+                );
                 let retry_after = e.retry_after();
                 super::metric_api_buffer::buffer_failed_metric_api(
                     metrics,

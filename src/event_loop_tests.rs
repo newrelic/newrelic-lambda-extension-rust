@@ -1959,6 +1959,81 @@ async fn process_apm_request_flow1_sends_immediately_when_run_id_and_payload_pre
     REQUEST_DATA.remove(request_id);
 }
 
+// Unlike the test above (which pre-seeds the buffer before runtime.done fires),
+// this test proves the real ordering: buffer starts empty, process_apm_request
+// must block in wait_for_runtime_done, and only then does the payload arrive and
+// runtime.done fire. Fast completion proves the notify woke it up; a 2s wait
+// would mean it just fell through on the deadline instead.
+#[tokio::test]
+#[serial]
+async fn process_apm_request_catches_payload_that_arrives_after_runtime_done_wait_begins() {
+    let request_id = "par-real-ordering-test";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    // Empty buffer and runtime.done NOT fired — process_apm_request must block on
+    // wait_for_runtime_done, not see got_payload=true immediately.
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(make_test_apm_app()))); // has_run_id=true from the start
+
+    // Run process_apm_request and the late arrival concurrently via join! (not
+    // tokio::spawn — spawning a task that owns a real ApmApp hung this test
+    // harness; join! avoids the task boundary while still interleaving both
+    // futures). process_apm_request must actually be blocked in
+    // wait_for_runtime_done when the payload/notify arrive 50ms later — if it
+    // isn't (e.g. this ordering regressed), it'd either fail to pick up the
+    // payload at all, or only catch it on the 2s deadline fallback.
+    let start = std::time::Instant::now();
+    let process_fut = process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(2_000),
+    );
+    let late_arrival_fut = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(buffer) = get_agent_buffer(request_id) {
+            buffer.lock().unwrap().push(vec![0xAB, 0xCD, 0xEF]);
+        }
+        crate::request::record_runtime_done(request_id);
+    };
+    tokio::join!(process_fut, late_arrival_fut);
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "must return shortly after the notify (~50ms), not anywhere near the 2s deadline fallback (elapsed: {:?})",
+        elapsed
+    );
+
+    // These bytes aren't parseable, so Flow 1 buffers them into FAILED_AGENT_PAYLOADS
+    // — proof the payload was picked up and acted on.
+    {
+        let buffered = FAILED_AGENT_PAYLOADS.lock().unwrap();
+        assert!(
+            buffered.iter().any(|p| p.request_id == request_id),
+            "the late-arriving payload must have been picked up and acted on, not left stuck in the buffer"
+        );
+    } // drop the guard before FAILED_AGENT_PAYLOADS.lock() is called again below
+    let agent_buffer_now_empty = get_agent_buffer(request_id)
+        .map(|b| b.lock().unwrap().is_empty())
+        .unwrap_or(true);
+    assert!(agent_buffer_now_empty, "the payload must have been taken out of agent_buffer by Flow 1");
+
+    REQUEST_DATA.remove(request_id);
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+}
+
 // ── execute_apm_mode_event_loop (APM) — driven end-to-end against a wiremock Extensions API ──
 
 #[tokio::test]

@@ -367,3 +367,26 @@ fn parse_agent_payload_cached_tolerates_a_whole_payload_double_base64_encoded() 
     assert_eq!(result.1, 1, "protocol version must be recovered after unwrapping the extra encoding");
     assert!(result.0.contains_key("metric_data"), "telemetry data must be recovered, not an empty map");
 }
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_detects_hash_collision_and_reparses_correctly() {
+    // Simulate a hash collision: plant payload_b's data under payload_a's key.
+    // The byte check on hit must reject it and re-parse instead of trusting the hash.
+    PARSE_CACHE.clear();
+
+    let payload_a = create_test_payload("1");
+    let payload_b = create_test_payload("2");
+    let key = hash_payload_bytes(&payload_a);
+
+    // Plant a wrong entry: payload_b's bytes/parse result stored under payload_a's key.
+    let wrong_parse = Arc::new(parse_agent_payload(&payload_b).unwrap());
+    PARSE_CACHE.insert(key, (payload_b.clone(), wrong_parse));
+
+    let result = parse_agent_payload_cached(&payload_a).expect("must re-parse despite the planted collision");
+    assert_eq!(result.1, 1, "must return payload_a's own protocol version (1), not payload_b's (2)");
+
+    // The cache must now hold the CORRECT entry for this key, not the stale wrong one.
+    let fixed = PARSE_CACHE.get(&key).expect("entry must exist after re-parse");
+    assert_eq!(fixed.0, payload_a, "cache must be corrected to payload_a's own bytes");
+}

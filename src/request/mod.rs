@@ -332,21 +332,24 @@ pub fn ensure_lmi_request_slot(request_id: &str) {
         invoked_function_arn: arn.clone(),
         trace_id: None,
     }));
-    let runtime_done_notify = Arc::new(Notify::new());
-    let prefired_at_ms = PREFIRED_RUNTIME_DONE.remove(request_id).map(|(_, ts)| ts);
-    if prefired_at_ms.is_some() {
-        runtime_done_notify.notify_one();
-    }
+    // Insert before checking PREFIRED_RUNTIME_DONE — same ordering fix as
+    // create_request_processing_state (see there for why).
     let entry = REQUEST_DATA.entry(request_id.to_string()).or_insert_with(|| RequestData {
         context,
         agent_buffer: Arc::new(Mutex::new(Vec::new())),
         pending_report: None,
         creation_invocation: current_invocation_count(),
-        runtime_done_notify,
-        runtime_done_at_ms: Arc::new(AtomicI64::new(prefired_at_ms.unwrap_or(0))),
+        runtime_done_notify: Arc::new(Notify::new()),
+        runtime_done_at_ms: Arc::new(AtomicI64::new(0)),
         invoked_function_arn: arn,
         pending_send_handles: Arc::new(Mutex::new(Vec::new())),
     });
+    // Read back from `entry`, not a local variable, in case another concurrent
+    // call already won the insert race.
+    if let Some((_, ts)) = PREFIRED_RUNTIME_DONE.remove(request_id) {
+        entry.runtime_done_at_ms.store(ts, Ordering::Relaxed);
+        entry.runtime_done_notify.notify_one();
+    }
 
     // Drain payloads that beat platform.start to the pipe (cold-start race).
     if let Ok(mut orphaned) = ORPHANED_PAYLOADS.lock() {
@@ -399,33 +402,36 @@ pub fn create_request_processing_state(
     }
 
     let runtime_done_notify = Arc::new(Notify::new());
+    let runtime_done_at_ms = Arc::new(AtomicI64::new(0));
 
-    // If platform.runtimeDone already fired for this request before we were created
-    // (fast functions where runtimeDone races the event loop setup), fire the notify
-    // now so wait_for_runtime_done_with_grace doesn't sleep until the deadline — and
-    // carry the timestamp it fired at forward onto runtime_done_at_ms rather than
-    // losing it (the Notify permit alone doesn't tell a later "how late" check when
-    // it actually happened).
-    let prefired_at_ms = PREFIRED_RUNTIME_DONE.remove(request_id).map(|(_, ts)| ts);
-    if let Some(ts) = prefired_at_ms {
-        tracing::debug!(
-            "runtime.done pre-fire detected for {} (fired at {}) — signalling notify immediately",
-            request_id, ts
-        );
-        runtime_done_notify.notify_one();
-    }
-
-    // Insert consolidated request data (replaces 5 separate DashMap inserts)
+    // Insert into REQUEST_DATA BEFORE checking PREFIRED_RUNTIME_DONE below, not
+    // after — otherwise a runtimeDone arriving in between would be missed by both
+    // and never signalled.
     REQUEST_DATA.insert(request_id.to_string(), RequestData {
         context: context.clone(),
         agent_buffer: agent_buffer.clone(),
         pending_report: None,
         creation_invocation: current_invocation_count(),
-        runtime_done_notify,
-        runtime_done_at_ms: Arc::new(AtomicI64::new(prefired_at_ms.unwrap_or(0))),
+        runtime_done_notify: runtime_done_notify.clone(),
+        runtime_done_at_ms: runtime_done_at_ms.clone(),
         pending_send_handles: Arc::new(Mutex::new(Vec::new())),
         invoked_function_arn: invoked_function_arn.to_string(),
     });
+
+    // If platform.runtimeDone already fired for this request before the insert
+    // above (fast functions where runtimeDone races the event loop setup), fire
+    // the notify now so wait_for_runtime_done_with_grace doesn't sleep until the
+    // deadline — and carry the timestamp it fired at forward onto
+    // runtime_done_at_ms rather than losing it (the Notify permit alone doesn't
+    // tell a later "how late" check when it actually happened).
+    if let Some((_, ts)) = PREFIRED_RUNTIME_DONE.remove(request_id) {
+        tracing::debug!(
+            "runtime.done pre-fire detected for {} (fired at {}) — signalling notify immediately",
+            request_id, ts
+        );
+        runtime_done_at_ms.store(ts, Ordering::Relaxed);
+        runtime_done_notify.notify_one();
+    }
 
     let state = RequestProcessingState {
         context: context.clone(),
@@ -679,11 +685,6 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
             match entry.agent_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
-                    // The one visible (info-level, default log level) signal that an
-                    // agent payload actually arrived for this invocation — previously
-                    // debug-only, so a production deployment at the default log level
-                    // had no CloudWatch evidence a payload showed up at all until (if)
-                    // it was later sent.
                     info!(
                         "Agent payload received for request {} (buffer size: {})",
                         request_id, buffer.len()
@@ -762,8 +763,6 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
                 match entry.agent_buffer.lock() {
                     Ok(mut buffer) => {
                         buffer.push(payload_bytes);
-                        // Visible (info-level) signal the payload arrived — same fix as
-                        // the Normal-mode routing path above.
                         info!(
                             "LMI: agent payload received for request {} (buffer size: {})",
                             request_id,

@@ -12,15 +12,8 @@ use std::collections::HashMap;
 use tracing::{debug, trace};
 
 /// Extract trace ID from agent payload, if present and collection is enabled.
-///
-/// Delegates to `apm::payload_parser::parse_agent_payload_cached` instead of
-/// maintaining a second, independent base64/gzip/JSON decoder — this function
-/// used to fully re-parse the payload from scratch even when the exact same
-/// bytes had already been (or were about to be) parsed elsewhere for routing or
-/// sending. Reusing the shared cache means a payload parsed once, anywhere,
-/// never pays for a second full decode just to find a trace.id. The shared
-/// parser already tolerates the double-base64-encoded envelope shape this
-/// function used to handle itself (see its doc comment).
+/// Uses the shared cached parser instead of its own decoder, so this reuses a
+/// parse already done elsewhere instead of decoding the same bytes again.
 pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<String>> {
     trace!("Starting trace ID extraction from payload ({} bytes)", payload_bytes.len());
 
@@ -47,20 +40,13 @@ pub fn extract_trace_id_from_payload(payload_bytes: &[u8]) -> Result<Option<Stri
     Ok(None)
 }
 
-/// Shape of each mergeable event-list type after `payload_parser::parse_agent_payload`
-/// has already unwrapped the outer array: `[run_id_or_placeholder, metadata, events]`.
+/// Each entry is `[run_id_or_placeholder, metadata, events]`.
 type TelemetryMap = HashMap<String, Vec<Value>>;
 
-/// Extract trace ID from analytic event data. `events[2]` is already a plain
-/// `Vec<Value>` (unwrapped by `parse_agent_payload`) — no second
-/// `serde_json::from_value` round-trip needed to get there, unlike the
-/// now-removed standalone decoder this replaced.
 fn extract_trace_id_from_analytics(data: &TelemetryMap) -> Option<String> {
     extract_trace_id_from_event_list(data, "analytic_event_data")
 }
 
-/// Extract trace ID from span event data. Same shape/logic as
-/// `extract_trace_id_from_analytics`, different telemetry type.
 fn extract_trace_id_from_spans(data: &TelemetryMap) -> Option<String> {
     extract_trace_id_from_event_list(data, "span_event_data")
 }
