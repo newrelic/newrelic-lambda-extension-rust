@@ -15,7 +15,7 @@ use super::connection::{
     record_connect_attempt, record_connect_cycle, reset_connect_stats, signal_handshake_fatal,
 };
 use super::metric_converter::{convert_to_apm_metrics, parse_lambda_report_log};
-use super::payload_parser::parse_agent_payload;
+use super::payload_parser::parse_agent_payload_cached;
 use crate::config::deployment::DeploymentContext;
 use crate::newrelic::tls_fallback::DualTlsClient;
 use anyhow::{Context, Result};
@@ -291,7 +291,18 @@ impl ApmApp {
     /// each chunk *before* merging — these corrections only make sense against one
     /// agent's own single-harvest shape, not a post-merge combined one.
     fn parse_and_normalize_one_payload(payload: &[u8]) -> Result<std::collections::HashMap<String, Vec<Value>>> {
-        let (mut telemetry_map, protocol_version) = parse_agent_payload(payload)?;
+        // Reuses the arrival-time parse (seeded by
+        // payload_parser::extract_request_id_from_payload_bytes, the Normal-Lambda
+        // misattribution guard / LMI routing check) when available, instead of
+        // redoing the full base64/gzip/JSON decode on these same bytes again. Falls
+        // back to a fresh parse on a cache miss — e.g. a retried FAILED_AGENT_PAYLOADS
+        // entry, whose arrival-time cache slot (if any) is long gone by retry time.
+        let cached = parse_agent_payload_cached(payload)?;
+        // Clone out of the Arc — the normalization below mutates in place, and the
+        // Arc may be shared if this exact content hash is still pending reuse
+        // elsewhere (vanishingly rare, but cloning a HashMap is far cheaper than
+        // redoing the decode it would otherwise force).
+        let (mut telemetry_map, protocol_version) = (*cached).clone();
 
         debug!(
             "Parsed agent payload: protocol_v{}, {} telemetry types",
@@ -427,6 +438,7 @@ impl ApmApp {
         &self,
         payloads: Vec<Vec<u8>>,
         request_id: &str,
+        invoked_function_arn: &str,
     ) -> Result<()> {
         if payloads.len() <= 1 {
             // No batching benefit for 0 or 1 chunk — reuse the single-payload path
@@ -450,10 +462,15 @@ impl ApmApp {
             let telemetry_map = match Self::parse_and_normalize_one_payload(&payload) {
                 Ok(map) => map,
                 Err(e) => {
+                    // Unlike a single-chunk call (whose parse failure propagates as
+                    // Err, letting the caller buffer the raw bytes for retry), this
+                    // merged path always returns Ok — so a chunk skipped here would
+                    // otherwise be lost with no retry path at all. Buffer it directly.
                     warn!(
-                        "Failed to parse one agent payload chunk in merged batch for request {}: {} - skipping this chunk only",
+                        "Failed to parse one agent payload chunk in merged batch for request {}: {} - buffering this chunk for retry",
                         request_id, e
                     );
+                    crate::event_loop::buffer_failed_agent_payload(&payload, request_id, invoked_function_arn);
                     continue;
                 }
             };

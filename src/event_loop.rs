@@ -1402,7 +1402,7 @@ pub async fn process_apm_request(
             // (the common case) still sent one POST per chunk per type.
             let apm_app_guard = apm_app_clone.read().await;
             let all_sent = if let Some(ref app) = *apm_app_guard {
-                let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone).await;
+                let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
                 drop(apm_app_guard);
                 send_result.is_ok()
             } else {
@@ -2372,7 +2372,7 @@ pub(crate) async fn process_pending_agent_payloads(
             // POST per chunk per type (see ApmApp::process_merged_agent_payloads).
             let apm_app_guard = apm_app.read().await;
             if let Some(ref app) = *apm_app_guard {
-                let send_result = app.process_merged_agent_payloads(payloads.clone(), &request_id).await;
+                let send_result = app.process_merged_agent_payloads(payloads.clone(), &request_id, &invoked_function_arn).await;
                 drop(apm_app_guard);
                 match send_result {
                     Ok(()) => {

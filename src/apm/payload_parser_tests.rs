@@ -5,6 +5,7 @@ use super::*;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::json;
+use serial_test::serial;
 use std::io::Write;
 
 fn create_test_payload(version: &str) -> Vec<u8> {
@@ -299,4 +300,70 @@ fn merge_event_list_payloads_tolerates_a_chunk_whose_second_element_is_not_an_ob
     assert_eq!(merged[1]["events_seen"], json!(0));
     assert_eq!(merged[1]["reservoir_size"], json!(0));
     assert_eq!(merged[2].as_array().unwrap().len(), 1);
+}
+
+// ── parse_agent_payload_cached ───────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_seeds_and_is_shared_by_a_later_call() {
+    // Clear any leftover state from other tests sharing PARSE_CACHE.
+    PARSE_CACHE.clear();
+
+    let payload = create_test_payload("1");
+    let key = hash_payload_bytes(&payload);
+
+    // First call (e.g. the arrival-time misattribution-guard/routing check): a
+    // genuine parse, seeding the cache for this exact byte content.
+    let first = parse_agent_payload_cached(&payload).expect("first parse must succeed");
+    assert!(
+        PARSE_CACHE.contains_key(&key),
+        "the first call must seed the cache for later reuse"
+    );
+
+    // Second call on the IDENTICAL bytes (e.g. trace-id extraction or the actual
+    // send): must be a cache hit, sharing the same Arc — and the entry must still
+    // be there afterward, since a third reader (e.g. the send, if trace extraction
+    // ran first) may still need it too.
+    let second = parse_agent_payload_cached(&payload).expect("second parse must succeed");
+    assert!(
+        PARSE_CACHE.contains_key(&key),
+        "a cache hit must NOT remove its entry — other readers of the same content may still need it"
+    );
+    assert!(Arc::ptr_eq(&first, &second), "a cache hit must share the exact same Arc, not clone the underlying data");
+}
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_distinguishes_different_payloads() {
+    PARSE_CACHE.clear();
+
+    let payload_a = create_test_payload("1");
+    let payload_b = create_test_payload("2");
+
+    let a = parse_agent_payload_cached(&payload_a).expect("payload a must parse");
+    let b = parse_agent_payload_cached(&payload_b).expect("payload b must parse");
+
+    // Different content must never be confused with each other via the cache —
+    // protocol version differs between the v1 and v2 fixtures used here.
+    assert_eq!(a.1, 1);
+    assert_eq!(b.1, 2);
+}
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_tolerates_a_whole_payload_double_base64_encoded() {
+    // Some payloads arrive with the entire envelope array base64-encoded once more
+    // on top (same shape trace::extract_trace_id_from_payload's own fallback
+    // handled, and that this cached parser now supersedes). Must not just return
+    // an empty map (parse_agent_payload's behavior for bytes that don't start with
+    // '[') — must unwrap the extra layer and parse through to the real data.
+    PARSE_CACHE.clear();
+
+    let inner = create_test_payload("1"); // raw array text, e.g. [1,"NR_LAMBDA_MONITORING","..."]
+    let double_encoded = general_purpose::STANDARD.encode(&inner).into_bytes();
+
+    let result = parse_agent_payload_cached(&double_encoded).expect("double-encoded payload must still parse");
+    assert_eq!(result.1, 1, "protocol version must be recovered after unwrapping the extra encoding");
+    assert!(result.0.contains_key("metric_data"), "telemetry data must be recovered, not an empty map");
 }
