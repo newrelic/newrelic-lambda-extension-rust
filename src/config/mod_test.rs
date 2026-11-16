@@ -1547,6 +1547,7 @@ fn test_extension_settings_all_fields() {
         ignore_errors: std::collections::HashSet::new(),
         expected_errors: std::collections::HashSet::new(),
         send_tier: crate::send::SendTier::Default,
+        short_invoke_threshold_ms: 20,
     };
     
     assert!(settings.send_function_logs);
@@ -2276,3 +2277,8 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
     });
 }
 
+
+#[test]
+fn test_short_invoke_threshold_defaults_to_20ms() {
+    assert_eq!(ExtensionSettings::default().short_invoke_threshold_ms, 20);
+}

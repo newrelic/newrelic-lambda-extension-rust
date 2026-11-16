@@ -174,6 +174,12 @@ pub struct ExtensionSettings {
     /// single pipeline configured by tier. See `DUAL_PATH_PLAN.md`. Read once at
     /// startup.
     pub send_tier: crate::send::SendTier,
+    /// `NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS` — `high` tier only.
+    /// A handler that finishes faster than this gets no post-`runtimeDone` hold at
+    /// all: a trivial function should never pay for telemetry delivery, which just
+    /// goes out with the next invocation instead. `0` disables the short path.
+    /// Default 20, clamped to `[0, 1000]`.
+    pub short_invoke_threshold_ms: u64,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -319,6 +325,7 @@ impl Default for ExtensionSettings {
             ignore_errors: HashSet::new(),
             expected_errors: HashSet::new(),
             send_tier: crate::send::SendTier::Default,
+            short_invoke_threshold_ms: 20,
         }
     }
 }
@@ -609,6 +616,13 @@ impl ExtensionConfig {
         // NEW_RELIC_SEND_TIER: default|high. Unknown/missing values fall back to
         // Default inside SendTier::from_env itself (warns, never panics).
         config.extension.send_tier = crate::send::SendTier::from_env();
+
+        config.extension.short_invoke_threshold_ms =
+            env::var("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(20)
+                .min(1000);
 
         // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
         // Default 25 ms — matches the Telemetry API buffer flush window.

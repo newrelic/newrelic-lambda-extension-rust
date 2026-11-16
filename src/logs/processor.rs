@@ -302,6 +302,10 @@ impl RequestLogBuffer {
         self.by_request.drain().flat_map(|(_, v)| v).collect()
     }
 
+    fn has(&self, request_id: &str) -> bool {
+        self.by_request.contains_key(request_id)
+    }
+
     #[cfg(test)]
     fn len_for(&self, request_id: &str) -> usize {
         self.by_request.get(request_id).map_or(0, Vec::len)
@@ -1588,6 +1592,15 @@ impl LogProcessor {
                 );
             }
         }
+    }
+
+    /// Whether logs for `request_id` are still held waiting for a trace.id. The
+    /// `high` tier only waits for the agent payload when this is true.
+    pub fn has_held_logs_for(&self, request_id: &str) -> bool {
+        self.pending_logs
+            .as_ref()
+            .and_then(|p| p.lock().ok())
+            .is_some_and(|p| p.has(request_id))
     }
 
     /// Test-only: number of logs still held (not yet stamped + routed) for `request_id`.

@@ -304,22 +304,23 @@ static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
         std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
     ));
 
-/// Metadata `SendScheduler` deliberately doesn't know about — the actual
-/// payload bytes and the request/ARN needed to buffer the unresolved tail
-/// into `FAILED_AGENT_PAYLOADS` on a timeout. Written alongside every
-/// `SEND_SCHEDULER.spawn(...)` call, consumed by
-/// `resolve_pending_agent_batch`. At most one entry at a time, for the same
-/// reason `SEND_SCHEDULER` only ever has at most one pending handle
-/// for `SendKind::ApmCollector`: Normal-mode Lambda never runs concurrent
-/// invocations in one environment.
-struct AgentBatchMeta {
-    payloads: Vec<Arc<Vec<u8>>>,
+/// One earlier request's un-sent data, taken out of `REQUEST_DATA` at INVOKE.
+struct PendingGroup {
     request_id: String,
     invoked_function_arn: String,
+    payloads: Vec<Vec<u8>>,
+    report: Option<String>,
 }
 
-static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<AgentBatchMeta>>> =
+/// What the in-flight batch send is working on. `SendScheduler` knows nothing
+/// about payloads, so this is what lets an abort re-buffer the unfinished tail.
+/// At most one at a time: it is resolved before the next batch is spawned.
+static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<Arc<Vec<PendingGroup>>>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// Set once the agent has delivered a payload in this sandbox. An
+/// uninstrumented function never sends one, so waiting for it would be wasted.
+static AGENT_PAYLOAD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Write-ahead copy of the log batch about to be flushed — mirrors
 /// `AgentBatchMeta`'s role for agent payload. `LogProcessor::flush()` drains
@@ -338,119 +339,190 @@ struct LogBatchWriteAhead {
 static LOG_BATCH_WRITE_AHEAD: once_cell::sync::Lazy<Mutex<Option<LogBatchWriteAhead>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
-/// Write-ahead copy of the platform-metrics report line about to be sent —
-/// same role as `LogBatchWriteAhead`, for `spawn_platform_metrics_flush`'s
-/// send. `report_line`'s only other home is inside the spawned future
-/// itself, so an abort with nothing recorded here loses it entirely.
-struct PlatformMetricsWriteAhead {
-    report_line: String,
-    request_id: String,
-    invoked_function_arn: String,
+/// Re-buffer groups the aborted send never got to. Groups before the cursor
+/// are done; a group cut off mid-flight is re-buffered whole, so a retry may
+/// repeat part of it. We prefer a duplicate over a loss.
+fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
+    for group in groups.get(resolved_cursor..).unwrap_or(&[]) {
+        warn!("APM mode: send for {} cut off - buffering for retry", group.request_id);
+        buffer_group(group);
+    }
 }
 
-static PLATFORM_METRICS_WRITE_AHEAD: once_cell::sync::Lazy<Mutex<Option<PlatformMetricsWriteAhead>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(None));
+fn buffer_group(group: &PendingGroup) {
+    for payload in &group.payloads {
+        buffer_failed_agent_payload(payload, &group.request_id, &group.invoked_function_arn);
+    }
+    if let Some(report) = &group.report {
+        buffer_failed_platform_report(report.clone(), &group.request_id, &group.invoked_function_arn);
+    }
+}
 
-/// Buffer `payloads[resolved_cursor..]` into `FAILED_AGENT_PAYLOADS` — the
-/// re-buffering half of what the old `resolve_agent_send_at_boundary` did
-/// end-to-end; the scheduling/bounded-wait/abort half now lives entirely in
-/// `SendScheduler`. A no-op when `resolved_cursor >= payloads.len()` (the
-/// `Failed` case: the task ran to completion and every payload already
-/// buffered its own HTTP failure via `send_agent_payload_or_buffer` — only
-/// `TimedOut`, where the task was aborted mid-batch, ever has a genuinely
-/// unresolved tail here).
-fn buffer_unresolved_agent_payloads(
-    payloads: &[Arc<Vec<u8>>],
-    resolved_cursor: usize,
-    request_id: &str,
-    invoked_function_arn: &str,
+/// Take every other request's payloads and report. The current request is
+/// excluded: its handler is still producing its own payload.
+fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
+    let ids: Vec<String> = REQUEST_DATA
+        .iter()
+        .filter(|entry| entry.key() != current_request_id)
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    let mut groups = Vec::new();
+    for request_id in ids {
+        let payloads = get_agent_buffer(&request_id)
+            .and_then(|buf| buf.lock().ok().map(|mut b| std::mem::take(&mut *b)))
+            .unwrap_or_default();
+        let report = remove_pending_report(&request_id);
+        let invoked_function_arn = get_request_context(&request_id)
+            .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()))
+            .filter(|arn| !arn.is_empty())
+            .unwrap_or_else(crate::get_global_fallback_arn);
+        cleanup_request_processing_state_internal(&request_id, false);
+
+        if !payloads.is_empty() || report.is_some() {
+            groups.push(PendingGroup { request_id, invoked_function_arn, payloads, report });
+        }
+    }
+    groups
+}
+
+/// Sends one group at a time and buffers its own failures, so the task never
+/// loses data by itself. `cursor` counts finished groups: that is all an abort
+/// needs to know to re-buffer the rest.
+async fn send_pending_groups(
+    groups: Arc<Vec<PendingGroup>>,
+    cursor: Arc<std::sync::atomic::AtomicUsize>,
+    config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+    apm_app: crate::apm::SharedApmApp,
+) -> crate::send::SendOutcome {
+    let mut all_sent = true;
+    for group in groups.iter() {
+        for payload in &group.payloads {
+            extract_and_coordinate_trace_id(payload, &group.request_id, &config, &global_log_processor).await;
+        }
+
+        // Clone out: a read lock held across the POSTs would block a reconnect.
+        let app = apm_app.read().await.clone();
+        let sent = if let Some(app) = app {
+            send_group(&app, group).await
+        } else {
+            buffer_group(group);
+            false
+        };
+        all_sent &= sent;
+        cursor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    if all_sent {
+        crate::send::SendOutcome::Success
+    } else {
+        crate::send::SendOutcome::Failure
+    }
+}
+
+/// `false` if anything failed (and was buffered).
+async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
+    let mut sent = true;
+    if !group.payloads.is_empty() {
+        // One POST per telemetry type, not per chunk.
+        let result = app
+            .process_merged_agent_payloads(group.payloads.clone(), &group.request_id, &group.invoked_function_arn)
+            .await;
+        if let Err(e) = result {
+            warn!("Agent payload send failed for {}: {} - buffering", group.request_id, e);
+            for payload in &group.payloads {
+                buffer_failed_agent_payload(payload, &group.request_id, &group.invoked_function_arn);
+            }
+            sent = false;
+        }
+    }
+    if let Some(report) = &group.report {
+        if let Err(e) = app.send_platform_report_metrics(report, &group.invoked_function_arn).await {
+            warn!("Report metrics send failed for {}: {} - buffering", group.request_id, e);
+            buffer_failed_platform_report(report.clone(), &group.request_id, &group.invoked_function_arn);
+            sent = false;
+        }
+    }
+    sent
+}
+
+/// `high` tier, at INVOKE: start sending what earlier invocations left behind,
+/// so the round-trips overlap this invocation's handler instead of following it.
+async fn spawn_pending_batch(
+    current_request_id: &str,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+    apm_app: &crate::apm::SharedApmApp,
 ) {
-    let unresolved = payloads.get(resolved_cursor..).unwrap_or(&[]);
-    if unresolved.is_empty() {
-        return;
-    }
-    warn!(
-        "APM mode: agent send for {} did not finish in time — buffering {} of {} payload(s) for retry (resolved {})",
-        request_id,
-        unresolved.len(),
-        payloads.len(),
-        resolved_cursor
-    );
-    for payload_bytes in unresolved {
-        buffer_failed_agent_payload(payload_bytes.as_slice(), request_id, invoked_function_arn);
-    }
-}
-
-/// Resolve whatever agent-payload batch is currently pending in
-/// `SEND_SCHEDULER` (if any) and buffer its unresolved tail. No-op if
-/// nothing is pending — including the first-invocation case, where nothing
-/// has ever been spawned yet.
-///
-/// Called from `process_apm_request_high` only (never from the `default`
-/// path, which doesn't use `SEND_SCHEDULER` at all):
-/// - At the start of the *next* `high`-tier invocation, resolving what the
-///   previous one deferred.
-/// - At `SHUTDOWN`: there's no next invocation to defer to, so this is the
-///   final drain.
-async fn resolve_pending_agent_batch() {
-    let Some(outcome) = SEND_SCHEDULER
-        .resolve_pending(crate::send::SendKind::ApmCollector)
+    // A previous send still running (short invokes leave it so) must not be
+    // aborted or orphaned: skip this round, the data stays buffered for the next.
+    if let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending_no_abort(crate::send::SendKind::ApmCollector)
         .await
-    else {
-        return;
-    };
-    handle_agent_batch_outcome(&outcome);
-}
-
-/// Shared by `resolve_pending_agent_batch` (SHUTDOWN's drain-whatever's-left
-/// safety net) and `process_apm_request_high`'s own shared-budget resolve
-/// (the common case now — see `HIGH_TIER_RUNTIME_DONE_BUDGET_MS`).
-fn handle_agent_batch_outcome(outcome: &crate::send::DispatchOutcome) {
-    let meta = match AGENT_BATCH_META.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(e) => {
-            error!("AGENT_BATCH_META lock poisoned, cannot resolve: {}", e);
+    {
+        handle_agent_batch_outcome(&outcome);
+        if outcome.result == crate::send::DispatchResult::StillRunning {
             return;
         }
-    };
-    let Some(meta) = meta else {
-        // SEND_SCHEDULER and AGENT_BATCH_META are always written
-        // together at the spawn site below — this should be unreachable.
-        error!(
-            "SEND_SCHEDULER had a pending agent batch but AGENT_BATCH_META was empty \
-             — payload metadata lost, cannot buffer any unresolved tail"
-        );
+    }
+
+    let groups = Arc::new(take_pending_groups(current_request_id));
+    if groups.is_empty() {
+        return;
+    }
+    if groups.iter().any(|g| !g.payloads.is_empty()) {
+        AGENT_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if let Ok(mut guard) = AGENT_BATCH_META.lock() {
+        *guard = Some(groups.clone());
+    } else {
+        // Without the meta an abort could not re-buffer, so don't send.
+        error!("AGENT_BATCH_META poisoned, buffering instead of sending");
+        groups.iter().for_each(buffer_group);
+        return;
+    }
+
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let send: crate::send::BoxedSend = Box::pin(send_pending_groups(
+        groups,
+        cursor.clone(),
+        config.clone(),
+        global_log_processor.clone(),
+        apm_app.clone(),
+    ));
+    SEND_SCHEDULER
+        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
+        .await;
+}
+
+/// Final drain at SHUTDOWN: no next invocation to defer to.
+async fn resolve_pending_agent_batch() {
+    if let Some(outcome) = SEND_SCHEDULER
+        .resolve_pending(crate::send::SendKind::ApmCollector)
+        .await
+    {
+        handle_agent_batch_outcome(&outcome);
+    }
+}
+
+fn handle_agent_batch_outcome(outcome: &crate::send::DispatchOutcome) {
+    use crate::send::DispatchResult::{Failed, Sent, StillRunning, TimedOut};
+    // Still running: the meta must survive for whoever resolves it for real.
+    if outcome.result == StillRunning {
+        return;
+    }
+    let Some(groups) = AGENT_BATCH_META.lock().ok().and_then(|mut g| g.take()) else {
+        error!("batch send resolved but AGENT_BATCH_META was empty - nothing to re-buffer");
         return;
     };
-
     match outcome.result {
-        crate::send::DispatchResult::Sent => {
-            debug!(
-                "APM mode: agent send for {} completed successfully",
-                meta.request_id
-            );
-        }
-        crate::send::DispatchResult::Failed | crate::send::DispatchResult::TimedOut => {
-            buffer_unresolved_agent_payloads(
-                &meta.payloads,
-                outcome.cursor.unwrap_or(0),
-                &meta.request_id,
-                &meta.invoked_function_arn,
-            );
-        }
-        crate::send::DispatchResult::Dropped
-        | crate::send::DispatchResult::Deferred
-        | crate::send::DispatchResult::StillRunning => {
-            // Unreachable in practice: resolve_pending (used here, not
-            // resolve_pending_no_abort) never checks the breaker (Dropped is
-            // a dispatch()-only outcome), never itself returns Deferred, and
-            // StillRunning is only ever produced by resolve_pending_no_abort,
-            // which the agent-payload path doesn't use. Handled defensively,
-            // not assumed.
-            warn!(
-                "APM mode: unexpected {:?} resolving agent batch for {}",
-                outcome.result, meta.request_id
-            );
+        // Failed: the task already buffered its own failures.
+        Sent | Failed => {}
+        TimedOut => buffer_unresolved_groups(&groups, outcome.cursor.unwrap_or(0)),
+        other => {
+            warn!("unexpected {:?} resolving batch send - buffering everything", other);
+            buffer_unresolved_groups(&groups, 0);
         }
     }
 }
@@ -548,6 +620,10 @@ fn handle_logs_outcome(
     log_processor: &Arc<LogProcessor>,
     request_id: &str,
 ) {
+    // Still running: the write-ahead must survive until the flush really resolves.
+    if outcome.result == crate::send::DispatchResult::StillRunning {
+        return;
+    }
     let write_ahead = match LOG_BATCH_WRITE_AHEAD.lock() {
         Ok(mut guard) => guard.take(),
         Err(e) => {
@@ -566,12 +642,6 @@ fn handle_logs_outcome(
         crate::send::DispatchResult::Failed => {
             debug!(
                 "APM mode: log flush for {} had failures, already buffered internally",
-                request_id
-            );
-        }
-        crate::send::DispatchResult::StillRunning => {
-            debug!(
-                "APM mode: log flush for {} still running (checked again later)",
                 request_id
             );
         }
@@ -598,177 +668,6 @@ fn handle_logs_outcome(
             // caller for Logs checks the breaker or produces Deferred.
             warn!(
                 "APM mode: unexpected {:?} resolving log flush for {}",
-                other, request_id
-            );
-        }
-    }
-}
-
-/// Spawn this invocation's platform-report-metrics send into `SEND_SCHEDULER`,
-/// unconditionally — like logs, never tier-gated, and was already
-/// unconditionally detached before `SendTier` existed.
-///
-/// `send_platform_report_metrics` already self-buffers on transient failure
-/// (`metric_api_buffer::buffer_failed_metric_api`) and always returns `Ok`
-/// (parse-fail, disabled, permanent-drop, and buffered-for-retry are all
-/// `Ok` at that call site) — so, same as logs, there is nothing further for
-/// this module to buffer on `Failed`; `from_collector_result` mapping this
-/// to `SendOutcome::Success` is the realistic common case, with
-/// `SendOutcome::Failure` reserved for the theoretical panic/unexpected-error
-/// case.
-///
-/// Never aborted (see `resolve_pending_platform_metrics`): this call's
-/// report data lives only inside the spawned future (the caller already
-/// called `remove_pending_report` before spawning) — an abort would lose it
-/// with nothing to buffer, the same risk `resolve_pending_no_abort` exists
-/// to avoid for logs. Guarded by `has_pending` against ever running two
-/// concurrent metrics sends for the same kind.
-async fn spawn_platform_metrics_flush(
-    apm_app: &crate::apm::SharedApmApp,
-    report_line: String,
-    request_id: &str,
-    invoked_function_arn: &str,
-) {
-    if SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await {
-        debug!(
-            "APM mode: previous platform-metrics send still running — report for {} dropped \
-             (occasional loss here is an accepted tradeoff, same as before this send was tracked)",
-            request_id
-        );
-        return;
-    }
-
-    // Write-ahead copy, taken before the send is spawned — see
-    // `PlatformMetricsWriteAhead`'s doc for why this (not the moved-in
-    // `report_line` inside the closure below) is what survives an abort.
-    match PLATFORM_METRICS_WRITE_AHEAD.lock() {
-        Ok(mut guard) => {
-            if guard.is_some() {
-                warn!(
-                    "APM mode (high): overwriting unresolved PLATFORM_METRICS_WRITE_AHEAD for {} — \
-                     the shared-budget resolve should have cleared it first",
-                    request_id
-                );
-            }
-            *guard = Some(PlatformMetricsWriteAhead {
-                report_line: report_line.clone(),
-                request_id: request_id.to_string(),
-                invoked_function_arn: invoked_function_arn.to_string(),
-            });
-        }
-        Err(e) => error!(
-            "PLATFORM_METRICS_WRITE_AHEAD lock poisoned, dropping write-ahead snapshot: {}",
-            e
-        ),
-    }
-
-    let apm_app_clone = apm_app.clone();
-    let request_id_clone = request_id.to_string();
-    let invoked_function_arn_clone = invoked_function_arn.to_string();
-    let send: crate::send::BoxedSend = Box::pin(async move {
-        let apm_app_guard = apm_app_clone.read().await;
-        let Some(ref app) = *apm_app_guard else {
-            warn!(
-                "APM mode: APM app not ready - cannot send platform metrics for {}",
-                request_id_clone
-            );
-            return crate::send::SendOutcome::Failure;
-        };
-        let result = app
-            .send_platform_report_metrics(&report_line, &invoked_function_arn_clone)
-            .await;
-        match &result {
-            Ok(()) => info!(
-                "APM mode: Successfully sent platform report metrics for request {}",
-                request_id_clone
-            ),
-            Err(e) => error!(
-                "APM mode: Failed to send platform report metrics for {}: {}",
-                request_id_clone, e
-            ),
-        }
-        crate::send::from_collector_result(&result)
-    });
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::MetricApi, send, None)
-        .await;
-}
-
-/// Resolve whatever platform-metrics send is pending from a previous
-/// invocation, if any — called unconditionally at the start of every
-/// invocation and at `SHUTDOWN`, regardless of `send_tier`. Never aborts
-/// (see `spawn_platform_metrics_flush`'s doc for why). Nothing to buffer on
-/// `Failed`: the send already buffered itself internally on any retryable
-/// failure before returning.
-async fn resolve_pending_platform_metrics(request_id: &str) {
-    let Some(outcome) = SEND_SCHEDULER
-        .resolve_pending_no_abort(crate::send::SendKind::MetricApi)
-        .await
-    else {
-        return;
-    };
-    handle_platform_metrics_outcome(&outcome, request_id);
-}
-
-/// Shared by `resolve_pending_platform_metrics` (SHUTDOWN's safety net) and
-/// `process_apm_request_high`'s shared-budget resolve — see
-/// `handle_logs_outcome`'s doc for why `TimedOut` is reachable here. Always
-/// clears `PLATFORM_METRICS_WRITE_AHEAD` before returning, same lifecycle
-/// reasoning as `handle_logs_outcome`/`LOG_BATCH_WRITE_AHEAD`.
-fn handle_platform_metrics_outcome(outcome: &crate::send::DispatchOutcome, request_id: &str) {
-    let write_ahead = match PLATFORM_METRICS_WRITE_AHEAD.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(e) => {
-            error!("PLATFORM_METRICS_WRITE_AHEAD lock poisoned: {}", e);
-            None
-        }
-    };
-
-    match outcome.result {
-        crate::send::DispatchResult::Sent => {
-            debug!(
-                "APM mode: platform-metrics send for {} completed successfully",
-                request_id
-            );
-        }
-        crate::send::DispatchResult::Failed => {
-            debug!(
-                "APM mode: platform-metrics send for {} failed, already handled internally",
-                request_id
-            );
-        }
-        crate::send::DispatchResult::StillRunning => {
-            debug!(
-                "APM mode: platform-metrics send for {} still running (checked again later)",
-                request_id
-            );
-        }
-        crate::send::DispatchResult::TimedOut => {
-            // Recover via the write-ahead snapshot taken before this send
-            // was spawned — see `PlatformMetricsWriteAhead`'s doc. Attribute
-            // to the snapshot's own request_id/ARN (the invocation that
-            // spawned the send), not this call's `request_id` (which, at
-            // SHUTDOWN, is literally the string "shutdown").
-            if let Some(write_ahead) = write_ahead {
-                buffer_failed_platform_report(
-                    write_ahead.report_line,
-                    &write_ahead.request_id,
-                    &write_ahead.invoked_function_arn,
-                );
-            } else {
-                warn!(
-                    "APM mode: platform-metrics send for {} timed out but \
-                     PLATFORM_METRICS_WRITE_AHEAD was empty — nothing to re-queue, \
-                     that report is lost",
-                    request_id
-                );
-            }
-        }
-        other => {
-            // Dropped/Deferred: unreachable in practice, same reasoning as
-            // handle_logs_outcome.
-            warn!(
-                "APM mode: unexpected {:?} resolving platform-metrics send for {}",
                 other, request_id
             );
         }
@@ -1038,10 +937,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     tokio::spawn(retry_failed_agent_payloads(apm));
                 }
 
-                // SendTier::High only in practice (FAILED_PLATFORM_REPORTS is only ever
-                // populated by the shared-budget abort path) -- detached, same reasoning
-                // as the agent-payload retry above: never block this invocation's /next.
-                {
+                // Only high ever fills FAILED_PLATFORM_REPORTS; default must stay as on main.
+                if components.config.extension.send_tier == crate::send::SendTier::High {
                     let apm = components.apm_app.clone();
                     tokio::spawn(retry_failed_platform_reports(apm));
                 }
@@ -1102,7 +999,13 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     let apm_app = components.apm_app.clone();
                     let current_request_id = request_id.clone();
 
+                    let is_high = config.extension.send_tier == crate::send::SendTier::High;
+
                     async move {
+                        // high delivers earlier requests' data via spawn_pending_batch.
+                        if is_high {
+                            return;
+                        }
                         process_pending_agent_payloads(
                             &config,
                             &global_log_processor,
@@ -1132,20 +1035,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 });
 
                 if components.config.extension.send_tier == crate::send::SendTier::High {
-                    // high tier: never block /next on the late-arriving-payload sweep
-                    // for OTHER requests (pending_task) -- it has its own internal
-                    // FAILED_AGENT_PAYLOADS buffering as a safety net on failure, same
-                    // as every other high-tier send. Detach it entirely; only
-                    // current_task is awaited here, and it's already internally
-                    // bounded by HIGH_TIER_RUNTIME_DONE_BUDGET_MS
-                    // (process_apm_request_high's shared-budget resolve). default/medium
-                    // tier's join below is completely untouched by this branch.
-                    tokio::spawn(async move {
-                        if let Err(e) = pending_task.await {
-                            error!("Error in pending payload processing: {}", e);
-                        }
-                    });
-
+                    // pending_task is a no-op for high (see above); only the
+                    // current request is awaited, bounded by its own send budget.
                     if components.config.extension.pipeline_flush {
                         pending_flush_handles.push(current_task);
                     } else if let Err(e) = current_task.await {
@@ -1307,7 +1198,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if components.config.extension.send_tier == crate::send::SendTier::High {
                     resolve_pending_agent_batch().await;
                     resolve_pending_logs(&components.global_log_processor, "shutdown").await;
-                    resolve_pending_platform_metrics("shutdown").await;
+                    retry_failed_platform_reports(components.apm_app.clone()).await;
                 }
 
                 // CRITICAL: Process ALL remaining pending agent payloads before shutdown
@@ -2027,7 +1918,6 @@ pub async fn process_apm_request(
         crate::send::SendTier::High => {
             process_apm_request_high(
                 &request_id,
-                &invoked_function_arn,
                 &config,
                 &global_log_processor,
                 &apm_app,
@@ -2254,275 +2144,128 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
 }
 
-/// Hard cap on how long `process_apm_request_high` may hold `/next` past
-/// `runtimeDone` waiting on agent-payload/logs/platform-metrics sends,
-/// combined — not per kind. Manager directive: `high` tier must never block
-/// the next `/next` call by more than this, full stop; whatever hasn't sent
-/// by then is aborted and buffered for a background retry, not carried
-/// forward as a blocking resolve on some future invocation's own boundary.
-const HIGH_TIER_RUNTIME_DONE_BUDGET_MS: u64 = 100;
+/// Most we ever hold `/next` after `runtimeDone` for in-flight sends.
+const HIGH_TIER_SEND_BUDGET_MS: u64 = 100;
 
-/// `SendTier::High` — routes agent payload, logs, and platform-metrics
-/// through `SEND_SCHEDULER` (helpers defined above `run_infinite_event_loop`):
-/// spawn the instant data is ready during this invocation, then at this
-/// *same* invocation's own `runtimeDone` boundary, resolve all three against
-/// one shared `HIGH_TIER_RUNTIME_DONE_BUDGET_MS` budget (not deferred to the
-/// next invocation's start — see `HIGH_TIER_RUNTIME_DONE_BUDGET_MS`'s doc).
-/// Anything still unresolved when the budget elapses is aborted and buffered;
-/// its retry runs detached in the background on a later invocation, never
-/// blocking that invocation's own `/next` either (`retry_failed_agent_payloads`
-/// for agent payload; logs/platform-metrics write-ahead buffering is tracked
-/// separately — see `handle_logs_outcome`/`handle_platform_metrics_outcome`).
-/// Entirely separate from `process_apm_request_default` — no shared
-/// internals, per `DUAL_PATH_PLAN.md`.
-///
-/// `#[allow(clippy::too_many_lines)]`: one cohesive Flow-1/metrics/logs
-/// sequence — kept as a single function rather than splitting it differently.
-#[allow(clippy::too_many_lines)]
+/// From this handler duration up, a send has had enough time that it is either
+/// done or genuinely slow, so it gets the full budget rather than a shrinking one.
+const HIGH_TIER_FULL_HOLD_FROM_MS: u64 = 80;
+
+/// Longest we wait at `runtimeDone` for the agent's own payload to land.
+const HIGH_TIER_PAYLOAD_WINDOW_MS: u64 = 25;
+
+/// A shorter handler gave the send (spawned at INVOKE) less head start, so it is
+/// held for the rest of the budget: 100ms total from spawn. Above that the
+/// shrinking stops; reducing the hold further would just abort sends that were
+/// about to finish.
+fn runtime_done_hold(handler: Duration) -> Duration {
+    let budget = Duration::from_millis(HIGH_TIER_SEND_BUDGET_MS);
+    if handler >= Duration::from_millis(HIGH_TIER_FULL_HOLD_FROM_MS) {
+        budget
+    } else {
+        budget.saturating_sub(handler)
+    }
+}
+
+/// `SendTier::High`. Data is delivered by the *next* invocation, in parallel
+/// with its handler (`spawn_pending_batch`), so this invocation only holds
+/// `/next` for work that is already in flight. Short invokes hold nothing.
 async fn process_apm_request_high(
-    request_id: &String,
-    invoked_function_arn: &str,
+    request_id: &str,
     config: &Arc<ExtensionConfig>,
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
     deadline_ms: i64,
     state: &request::RequestProcessingState,
 ) {
+    let invoke_start = tokio::time::Instant::now();
 
-    // APM mode: Check if run_id is available
-    let has_run_id = {
-        let apm_app_guard = apm_app.read().await;
-        apm_app_guard.is_some()
-    };
+    // Collect last invoke's log flush if it finished; never abort it here.
+    resolve_pending_logs(global_log_processor, request_id).await;
+    spawn_pending_batch(request_id, config, global_log_processor, apm_app).await;
 
-    // Check if we have agent payload
-    let agent_payloads = {
-        if let Ok(mut buffer) = state.agent_buffer.lock() {
-            std::mem::take(&mut *buffer)
-        } else {
-            Vec::new()
-        }
-    };
+    // Always wait: the handler's duration decides how long we may hold.
+    let signaled = wait_for_runtime_done(request_id, deadline_ms).await;
+    let handler = invoke_start.elapsed();
 
-    let got_payload = !agent_payloads.is_empty();
+    if handler < Duration::from_millis(config.extension.short_invoke_threshold_ms) {
+        // A trivial function must not pay for telemetry. Leave sends running
+        // (aborting would starve functions that are always short); the next
+        // INVOKE collects them.
+        spawn_log_flush(global_log_processor, request_id).await;
+        return;
+    }
 
-    // Flow 1: If run_id exists and payload arrived, spawn it now — resolved
-    // at the *next* invocation's start (see the top of this function), never
-    // waited on here.
-    if has_run_id && got_payload {
-        debug!(
-            "APM mode (high): run_id available + agent payload arrived ({} payload(s)) - spawning",
-            agent_payloads.len()
-        );
-        let request_id_clone = request_id.clone();
-        let config_clone = config.clone();
-        let global_log_processor_clone = global_log_processor.clone();
-        let apm_app_clone = apm_app.clone();
-        let invoked_function_arn_clone = invoked_function_arn.to_string();
-
-        // Wrap each payload in an Arc once (moves the bytes, no copy); cloning for
-        // the spawned task is then a refcount bump. The original Arc vec is
-        // retained in AGENT_BATCH_META for the timeout fallback.
-        let payloads: Vec<Arc<Vec<u8>>> = agent_payloads.into_iter().map(Arc::new).collect();
-        let payloads_for_task = payloads.clone();
-
-        // Progress cursor: incremented strictly after each payload's send/buffer
-        // outcome is fully resolved — see buffer_unresolved_agent_payloads.
-        let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let cursor_clone = cursor.clone();
-
-        let send: crate::send::BoxedSend = Box::pin(async move {
-            let mut all_sent = true;
-            for payload_bytes in &payloads_for_task {
-                extract_and_coordinate_trace_id(
-                    payload_bytes.as_slice(),
-                    &request_id_clone,
-                    &config_clone,
-                    &global_log_processor_clone,
-                )
-                .await;
-
-                // On failure the payload is buffered into FAILED_AGENT_PAYLOADS
-                // (never silently dropped); the global retry loop resends it on a
-                // later invoke / at shutdown.
-                if !send_agent_payload_or_buffer(
-                    payload_bytes.as_slice(),
-                    &request_id_clone,
-                    &invoked_function_arn_clone,
-                    &apm_app_clone,
-                )
-                .await
-                {
-                    all_sent = false;
-                }
-
-                cursor_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            if all_sent {
-                crate::send::SendOutcome::Success
-            } else {
-                crate::send::SendOutcome::Failure
-            }
-        });
-
-        let meta = AgentBatchMeta {
-            payloads,
-            request_id: request_id.clone(),
-            invoked_function_arn: invoked_function_arn.to_string(),
-        };
-        match AGENT_BATCH_META.lock() {
-            Ok(mut guard) => {
-                if guard.is_some() {
-                    // Defensive, should-not-happen: SEND_SCHEDULER.spawn's own
-                    // orphan-abort below already handles the handle side of this;
-                    // this just keeps the metadata side in lockstep with it.
-                    warn!(
-                        "APM mode (high): overwriting unresolved AGENT_BATCH_META — \
-                         resolve_pending_agent_batch should have run first"
-                    );
-                }
-                *guard = Some(meta);
-            }
-            Err(e) => error!("AGENT_BATCH_META lock poisoned, dropping new entry: {}", e),
-        }
-        SEND_SCHEDULER
-            .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
+    let hold_until = tokio::time::Instant::now() + runtime_done_hold(handler);
+    let window_until = hold_until.min(
+        tokio::time::Instant::now() + Duration::from_millis(HIGH_TIER_PAYLOAD_WINDOW_MS),
+    );
+    // Concurrent, so the two waits cost the longer of them, not the sum.
+    tokio::join!(
+        wait_for_own_payload(request_id, state, config, global_log_processor, apm_app, window_until),
+        async {
+            let _ = tokio::time::timeout_at(
+                hold_until,
+                wait_for_runtime_done_with_grace(request_id, signaled, config, global_log_processor),
+            )
             .await;
-    } else if !has_run_id && got_payload {
-        debug!(
-            "APM mode (high): No run_id yet but agent payload arrived ({} payload(s)) - buffering for when run_id becomes available",
-            agent_payloads.len()
-        );
-        if let Some(buffer_ref) = get_agent_buffer(request_id) {
-            if let Ok(mut buffer) = buffer_ref.lock() {
-                buffer.extend(agent_payloads);
-            }
-        }
-    } else if has_run_id && !got_payload {
-        debug!(
-            "APM mode (high): run_id available but no agent payload yet for request: {} - will catch in next invocation if it arrives late",
-            request_id
-        );
-    } else {
-        debug!(
-            "APM mode (high): No run_id and no agent payload for request: {} - normal flow",
-            request_id
-        );
-    }
+        },
+    );
 
-    // Check for pending platform.report and spawn as metrics — resolved at
-    // the next invocation's start (see the top of this function).
-    if let Some(report_line) = get_pending_report(request_id) {
-        debug!(
-            "APM mode (high): Found platform.report for request {} - converting to metrics",
-            request_id
-        );
-        // Remove pending report immediately -- the spawned task owns report_line
-        // now; nothing left here depends on get_pending_report's entry.
-        remove_pending_report(request_id);
-        spawn_platform_metrics_flush(apm_app, report_line, request_id, invoked_function_arn).await;
-    } else {
-        debug!(
-            "APM mode (high): No platform.report found for request {} (may arrive in next invocation)",
-            request_id
-        );
-    }
-
-    let runtime_done_signaled = if config.extension.send_function_logs {
-        wait_for_runtime_done(request_id, deadline_ms).await
-    } else {
-        false
-    };
-    wait_for_runtime_done_with_grace(
-        request_id,
-        runtime_done_signaled,
-        config,
-        global_log_processor,
-    )
-    .await;
-
-    // Logs: spawned here, at this invocation's own runtimeDone boundary.
-    // PlatformProcessor::flush() is a hardcoded no-op (platform.* lines already
-    // live in LogProcessor's own batch, flushed above) -- nothing to call for it.
     spawn_log_flush(global_log_processor, request_id).await;
 
-    // Single shared bound covering agent payload + logs + platform-metrics
-    // together — never `3 * HIGH_TIER_RUNTIME_DONE_BUDGET_MS`. Whatever's
-    // still running when the budget elapses is aborted here, in *this*
-    // invocation, so the next invocation's `/next` is never the one paying
-    // for it.
+    // Whatever is unfinished at the deadline is aborted and re-buffered by the
+    // outcome handlers: late is acceptable, lost is not.
+    let remaining = hold_until.saturating_duration_since(tokio::time::Instant::now());
     let outcomes = SEND_SCHEDULER
         .resolve_pending_shared_budget(
-            &[
-                crate::send::SendKind::ApmCollector,
-                crate::send::SendKind::Logs,
-                crate::send::SendKind::MetricApi,
-            ],
-            Duration::from_millis(HIGH_TIER_RUNTIME_DONE_BUDGET_MS),
+            &[crate::send::SendKind::ApmCollector, crate::send::SendKind::Logs],
+            remaining,
         )
         .await;
-
     if let Some(outcome) = outcomes.get(&crate::send::SendKind::ApmCollector) {
         handle_agent_batch_outcome(outcome);
     }
     if let Some(outcome) = outcomes.get(&crate::send::SendKind::Logs) {
         handle_logs_outcome(outcome, global_log_processor, request_id);
     }
-    if let Some(outcome) = outcomes.get(&crate::send::SendKind::MetricApi) {
-        handle_platform_metrics_outcome(outcome, request_id);
-    }
 }
 
-/// Send agent payload to APM collector (parses and sends 5 telemetry types)
-async fn send_to_apm_collector(
-    payload_bytes: &[u8],
+/// Waiting for this request's own payload only matters for log correlation:
+/// the payload ships with the next batch either way, but it carries the
+/// trace.id our held logs are waiting for. So wait only when logs are actually
+/// held and an agent is known to exist; otherwise the answer is "don't".
+async fn wait_for_own_payload(
     request_id: &str,
+    state: &request::RequestProcessingState,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let apm_app_guard = apm_app.read().await;
-    if let Some(ref app) = *apm_app_guard {
-        debug!(
-            "APM mode: Processing agent payload for request: {} (size: {} bytes)",
-            request_id,
-            payload_bytes.len()
-        );
-        app.process_agent_payload(payload_bytes.to_vec(), request_id).await?;
-        info!(
-            "APM mode: Agent payload sent successfully for request: {}",
-            request_id
-        );
-    } else {
-        // APM connection still in progress - buffer will be kept for retry
-        warn!(
-            "APM connection still in progress - payload for {} will be buffered and retried",
-            request_id
-        );
-        return Err("APM connection not ready yet - payload buffered for retry".into());
-    }
-    Ok(())
-}
+    until: tokio::time::Instant,
+) {
+    let buffered = || state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false);
 
-/// Send one agent payload to the APM collector; on failure buffer it into
-/// `FAILED_AGENT_PAYLOADS` so `retry_failed_agent_payloads` resends it on the
-/// next invoke / at shutdown. Returns `true` on success, `false` on a
-/// (now-buffered) failure. Mirrors `process_and_send_agent_payload` so the
-/// Flow-1 immediate-send path can never silently drop a payload.
-async fn send_agent_payload_or_buffer(
-    payload_bytes: &[u8],
-    request_id: &str,
-    invoked_function_arn: &str,
-    apm_app: &crate::apm::SharedApmApp,
-) -> bool {
-    match send_to_apm_collector(payload_bytes, request_id, apm_app).await {
-        Ok(()) => true,
-        Err(e) => {
-            warn!(
-                "APM mode: Agent payload send failed for {}, buffering for retry: {}",
-                request_id, e
-            );
-            buffer_failed_agent_payload(payload_bytes, request_id, invoked_function_arn);
-            false
+    let expected = config.new_relic.collect_trace_id
+        && config.extension.send_function_logs
+        && AGENT_PAYLOAD_SEEN.load(std::sync::atomic::Ordering::Relaxed)
+        && global_log_processor.has_held_logs_for(request_id)
+        && apm_app.read().await.is_some();
+    if !expected {
+        return;
+    }
+
+    // No arrival signal exists, so poll; the window is only a few ms.
+    while !buffered() {
+        if tokio::time::Instant::now() >= until {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    // Peek, don't take: the payload still ships in the next batch.
+    let payloads = state.agent_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+    for payload in &payloads {
+        extract_and_coordinate_trace_id(payload, request_id, config, global_log_processor).await;
     }
 }
 

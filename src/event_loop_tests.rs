@@ -3795,13 +3795,19 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
 
 // ── resolve_pending_agent_batch (runtimeDone boundary — via SEND_SCHEDULER) ────
 
+/// One group per payload, so the cursor counts payloads in these tests.
 fn set_agent_batch_meta(payloads: Vec<Arc<Vec<u8>>>, request_id: &str, arn: &str) {
     if let Ok(mut guard) = AGENT_BATCH_META.lock() {
-        *guard = Some(AgentBatchMeta {
-            payloads,
-            request_id: request_id.to_string(),
-            invoked_function_arn: arn.to_string(),
-        });
+        let groups = payloads
+            .into_iter()
+            .map(|p| PendingGroup {
+                request_id: request_id.to_string(),
+                invoked_function_arn: arn.to_string(),
+                payloads: vec![(*p).clone()],
+                report: None,
+            })
+            .collect();
+        *guard = Some(Arc::new(groups));
     }
 }
 
@@ -4115,70 +4121,6 @@ async fn spawn_log_flush_skips_when_a_flush_is_already_pending() {
     let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::Logs).await;
 }
 
-// --- Platform-metrics flush tests (spawn_platform_metrics_flush / resolve_pending_platform_metrics) ---
-
-#[tokio::test]
-#[serial]
-async fn spawn_platform_metrics_flush_then_resolve_round_trip() {
-    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::MetricApi).await;
-
-    // No APM app connected - the spawned future hits its own "not ready"
-    // branch and returns quickly with SendOutcome::Failure. That's enough
-    // to prove the SEND_SCHEDULER wiring round-trips correctly without
-    // needing a real network client.
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-
-    spawn_platform_metrics_flush(&apm_app, "REPORT line".to_string(), "req-metrics-roundtrip", "arn:aws:lambda:us-east-1:123:function:test").await;
-    assert!(
-        SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await,
-        "spawn_platform_metrics_flush must register the send with SEND_SCHEDULER"
-    );
-
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    resolve_pending_platform_metrics("req-metrics-roundtrip").await;
-    assert!(
-        !SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await,
-        "resolve_pending_platform_metrics must clear the entry once the send is finished"
-    );
-}
-
-// Proves the duplicate-send guard: if a metrics send is already pending
-// (StillRunning), spawn_platform_metrics_flush must skip entirely rather
-// than overwrite/abort it.
-#[tokio::test]
-#[serial]
-async fn spawn_platform_metrics_flush_skips_when_a_send_is_already_pending() {
-    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::MetricApi).await;
-
-    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    struct AbortFlag(Arc<std::sync::atomic::AtomicBool>);
-    impl Drop for AbortFlag {
-        fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-    let flag = AbortFlag(aborted.clone());
-    let send: crate::send::BoxedSend = Box::pin(async move {
-        let _flag = flag;
-        std::future::pending::<()>().await;
-        crate::send::SendOutcome::Success
-    });
-    SEND_SCHEDULER.spawn(crate::send::SendKind::MetricApi, send, None).await;
-    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await);
-
-    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
-    spawn_platform_metrics_flush(&apm_app, "REPORT line".to_string(), "req-metrics-skip", "arn:aws:lambda:us-east-1:123:function:test").await;
-    tokio::task::yield_now().await;
-
-    assert!(
-        !aborted.load(std::sync::atomic::Ordering::SeqCst),
-        "spawn_platform_metrics_flush must not abort/overwrite an already-pending send"
-    );
-    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::MetricApi).await);
-
-    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::MetricApi).await;
-}
-
 // --- Write-ahead buffering tests (shared-budget abort -> recoverable, not lost) ---
 
 #[tokio::test]
@@ -4255,41 +4197,6 @@ async fn handle_logs_outcome_sent_clears_write_ahead_without_requeuing() {
 
 #[tokio::test]
 #[serial]
-async fn handle_platform_metrics_outcome_timed_out_buffers_with_original_request_id() {
-    {
-        let mut buf = FAILED_PLATFORM_REPORTS.lock().unwrap();
-        buf.clear();
-    }
-
-    *PLATFORM_METRICS_WRITE_AHEAD.lock().unwrap() = Some(PlatformMetricsWriteAhead {
-        report_line: "platform.report line".to_string(),
-        request_id: "req-original-metrics".to_string(),
-        invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:test".to_string(),
-    });
-
-    // request_id passed here deliberately differs from the write-ahead's own
-    // request_id -- attribution must follow the data, not the caller (this
-    // call site is reached from SHUTDOWN with request_id == "shutdown").
-    handle_platform_metrics_outcome(
-        &crate::send::DispatchOutcome {
-            result: crate::send::DispatchResult::TimedOut,
-            cursor: None,
-        },
-        "shutdown",
-    );
-
-    let buf = FAILED_PLATFORM_REPORTS.lock().unwrap();
-    assert_eq!(buf.len(), 1);
-    assert_eq!(buf[0].request_id, "req-original-metrics");
-    assert_eq!(buf[0].report_line, "platform.report line");
-    assert!(
-        PLATFORM_METRICS_WRITE_AHEAD.lock().unwrap().is_none(),
-        "the write-ahead slot must be cleared once resolved"
-    );
-}
-
-#[tokio::test]
-#[serial]
 async fn retry_failed_platform_reports_drops_entry_after_max_retries() {
     {
         let mut buf = FAILED_PLATFORM_REPORTS.lock().unwrap();
@@ -4319,4 +4226,182 @@ async fn retry_failed_platform_reports_drops_entry_after_max_retries() {
         "with apm_app not ready, the entry must be put back untouched, not dropped or retried"
     );
     assert_eq!(buf[0].retry_count, MAX_PLATFORM_REPORT_RETRIES - 1);
+}
+
+// ── high tier: hold budget, batch groups, short-invoke path ─────────────────────────
+
+fn clear_high_tier_state() {
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+    if let Ok(mut b) = FAILED_PLATFORM_REPORTS.lock() {
+        b.clear();
+    }
+    clear_agent_batch_meta();
+}
+
+fn make_group(request_id: &str, payloads: Vec<Vec<u8>>, report: Option<&str>) -> PendingGroup {
+    PendingGroup {
+        request_id: request_id.to_string(),
+        invoked_function_arn: "arn:test".to_string(),
+        payloads,
+        report: report.map(str::to_string),
+    }
+}
+
+#[test]
+fn runtime_done_hold_shrinks_below_80ms_then_stays_at_the_full_budget() {
+    let hold = |ms| runtime_done_hold(Duration::from_millis(ms)).as_millis();
+    assert_eq!(hold(20), 80);
+    assert_eq!(hold(60), 40);
+    assert_eq!(hold(79), 21);
+    assert_eq!(hold(80), 100);
+    assert_eq!(hold(100), 100);
+    assert_eq!(hold(5_000), 100);
+}
+
+#[test]
+#[serial]
+fn buffer_unresolved_groups_buffers_only_the_tail_with_its_reports() {
+    clear_high_tier_state();
+    let groups = vec![
+        make_group("done", vec![vec![1]], Some("REPORT done")),
+        make_group("cut-off", vec![vec![2], vec![3]], Some("REPORT cut-off")),
+    ];
+
+    buffer_unresolved_groups(&groups, 1);
+
+    let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|p| p.payload_bytes.clone())
+        .collect();
+    assert_eq!(payloads, vec![vec![2u8], vec![3u8]]);
+    let reports = FAILED_PLATFORM_REPORTS.lock().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].request_id, "cut-off");
+    drop(reports);
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn send_pending_groups_without_apm_buffers_everything_and_counts_all_groups() {
+    clear_high_tier_state();
+    let groups = Arc::new(vec![
+        make_group("g1", vec![vec![1]], Some("REPORT 1")),
+        make_group("g2", vec![vec![2]], None),
+    ]);
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let config = Arc::new(config::ExtensionConfig::default());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let outcome = send_pending_groups(
+        groups,
+        cursor.clone(),
+        config.clone(),
+        make_noop_log_processor_serverless(config),
+        apm_app,
+    )
+    .await;
+
+    assert_eq!(outcome, crate::send::SendOutcome::Failure);
+    assert_eq!(cursor.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 2, "no payload may be lost");
+    assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1, "no report may be lost");
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn take_pending_groups_takes_other_requests_and_leaves_the_current_one() {
+    clear_high_tier_state();
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config);
+    for id in ["tpg-previous", "tpg-current"] {
+        let state = create_request_processing_state(id, "arn:test", &factory);
+        state.agent_buffer.lock().unwrap().push(id.as_bytes().to_vec());
+        REQUEST_PROCESSORS.insert(id.to_string(), state);
+    }
+    request::set_pending_report("tpg-previous", "REPORT previous".to_string());
+
+    let groups = take_pending_groups("tpg-current");
+
+    let previous: Vec<&PendingGroup> = groups.iter().filter(|g| g.request_id == "tpg-previous").collect();
+    assert_eq!(previous.len(), 1);
+    assert_eq!(previous[0].payloads, vec![b"tpg-previous".to_vec()]);
+    assert_eq!(previous[0].report.as_deref(), Some("REPORT previous"));
+    assert!(groups.iter().all(|g| g.request_id != "tpg-current"));
+    let still_buffered = get_agent_buffer("tpg-current").map(|b| b.lock().unwrap().len());
+    assert_eq!(still_buffered, Some(1), "the running request's own payload must stay put");
+
+    cleanup_request_processing_state_internal("tpg-current", false);
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn still_running_batch_keeps_its_meta_for_the_real_resolve() {
+    clear_high_tier_state();
+    set_agent_batch_meta(vec![Arc::new(vec![1])], "still-running", "arn:test");
+
+    handle_agent_batch_outcome(&crate::send::DispatchOutcome {
+        result: crate::send::DispatchResult::StillRunning,
+        cursor: Some(0),
+    });
+
+    assert!(AGENT_BATCH_META.lock().unwrap().is_some());
+    clear_high_tier_state();
+}
+
+// A trivial handler must not be held: the point of the short-invoke path.
+#[tokio::test]
+#[serial]
+async fn high_tier_short_invoke_does_not_hold_next() {
+    clear_high_tier_state();
+    let request_id = "high-short-invoke".to_string();
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_tier = crate::send::SendTier::High;
+    cfg.extension.short_invoke_threshold_ms = 1_000;
+    let config = Arc::new(cfg);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(&request_id, "arn:test", &factory);
+    request::record_runtime_done(&request_id);
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let start = tokio::time::Instant::now();
+    process_apm_request_high(&request_id, &config, &log_processor, &apm_app, deadline_ms_from_now(5_000), &state).await;
+
+    assert!(
+        start.elapsed() < Duration::from_millis(50),
+        "short invoke must return without holding, took {:?}",
+        start.elapsed()
+    );
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
+    cleanup_request_processing_state_internal(&request_id, false);
+    clear_high_tier_state();
+}
+
+// default tier must never touch the high-tier scheduler.
+#[tokio::test]
+#[serial]
+async fn default_tier_never_uses_the_send_scheduler() {
+    clear_high_tier_state();
+    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::ApmCollector).await;
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
+    let request_id = "default-no-scheduler";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    request::record_runtime_done(request_id);
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    process_apm_request(request_id.to_string(), "arn:test".to_string(), config, log_processor, apm_app, deadline_ms_from_now(2_000)).await;
+
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await);
+    cleanup_request_processing_state_internal(request_id, false);
+    clear_high_tier_state();
 }
