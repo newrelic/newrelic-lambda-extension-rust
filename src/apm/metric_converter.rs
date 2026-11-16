@@ -252,7 +252,11 @@ pub fn convert_to_apm_metrics(
     let timestamp = chrono::Utc::now().timestamp_millis();
 
     let mut common_attrs = serde_json::Map::new();
-    common_attrs.insert("aws.requestId".to_string(), json!(metrics.request_id));
+    // SPIKE (NR-595562 follow-up): aws.requestId intentionally omitted here.
+    // It's unique per invocation, so leaving it as a dimension is what caused
+    // every invocation to create a brand-new, never-aggregating metric series.
+    // Testing whether dropping it lets these 5 metrics collapse into one
+    // aggregating series each per function instead.
     common_attrs.insert("entity.guid".to_string(), json!(entity_guid));
     common_attrs.insert("entity.name".to_string(), json!(function_name));
     common_attrs.insert("entity.type".to_string(), json!("APM"));
