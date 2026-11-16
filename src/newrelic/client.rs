@@ -12,6 +12,18 @@ use tracing::{debug, info, warn};
 pub(crate) const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Single send timeout for every outbound send to New Relic. Applied to
+/// **both** `connect_timeout` and the total `.timeout()`, so it bounds the
+/// whole request — **connect + send + ack** — for all three telemetry streams:
+///   - agent payload / metrics  → APM collector
+///   - logs                     → log-api
+///   - platform.report metrics  → Metric API
+///
+/// 500ms = backend p99 placeholder; **not env-configurable by design** — it's a
+/// structural default, swap this one constant when the real measured p99 is
+/// available. Replaces the old 20s per-request / 2.4s client defaults.
+pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Error type for outbound telemetry sends.
 /// Distinguishes network failures from server-side exhaustion so callers
 /// can decide whether to buffer for cross-invocation retry.
@@ -145,8 +157,8 @@ pub fn build_outbound_client(proxy_url: Option<&str>) -> DualTlsClient {
     let proxy_url = proxy_url.map(str::to_string);
     DualTlsClient::build(move || {
         let mut builder = Client::builder()
-            .timeout(std::time::Duration::from_millis(2400))
-            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(SEND_TIMEOUT)
+            .connect_timeout(SEND_TIMEOUT)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
             .tcp_keepalive(std::time::Duration::from_secs(30));
@@ -194,15 +206,14 @@ impl NewRelicClient {
             header::HeaderValue::from_str(&get_extension_name_with_version()).unwrap(),
         );
 
-        let http_timeout = config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400));
         let proxy_url = config.new_relic.proxy_url.clone();
         let proxy_logged = std::sync::atomic::AtomicBool::new(false);
 
         let client = DualTlsClient::build(move || {
             let mut builder = Client::builder()
                 .default_headers(headers.clone())
-                .timeout(http_timeout)
-                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(SEND_TIMEOUT)
+                .connect_timeout(SEND_TIMEOUT)
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .pool_max_idle_per_host(10)
                 .tcp_keepalive(std::time::Duration::from_secs(30));
@@ -456,8 +467,7 @@ impl NewRelicClient {
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("[agentsend] Connection issue (will retry): {}", e);
                         } else if e.is_timeout() {
-                            let effective_timeout = config.new_relic.http_timeout.unwrap_or(std::time::Duration::from_millis(2400));
-                            warn!("[agentsend] Request timeout after {:?} (will retry): {}", effective_timeout, e);
+                            warn!("[agentsend] Request timeout after {:?} (will retry): {}", SEND_TIMEOUT, e);
                         } else {
                             warn!("[agentsend] Network error: {}", e);
                         }

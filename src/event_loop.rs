@@ -90,12 +90,18 @@ pub struct FailedAgentPayload {
 pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// Max buffered agent payloads (one per disconnected invoke). A sandbox lives at
-/// most ~30 min, so this is a memory guard, not a retry policy: payloads are kept
-/// until they flush on reconnect or the container shuts down — NOT dropped after
-/// a few retries. ~500 × a few KB ≈ low single-digit MB. When full, the oldest is
-/// evicted (and counted) so a long disconnected period on a busy function can't grow unbounded.
-const MAX_FAILED_AGENT_PAYLOADS: usize = 500;
+/// Max buffered agent payloads = the circuit breaker's **3N** buffer cap, derived
+/// once from `NEW_RELIC_SEND_TIER`: high tier `N=5 → 3N=15`, default tier
+/// `N=10 → 3N=30`. When full, the oldest is evicted (and counted) — FIFO
+/// drop-oldest — so a long disconnected period on a busy function can't grow
+/// unbounded. (Was a flat 500 before the invocation-count breaker model; the
+/// per-tier 3N cap replaces it so the buffer matches the breaker's
+/// fill→retry→slide lifecycle exactly.)
+static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> =
+    once_cell::sync::Lazy::new(|| match crate::send::SendTier::from_env() {
+        crate::send::SendTier::High => 15,
+        crate::send::SendTier::Default => 30,
+    });
 
 /// Count of buffered agent payloads dropped *before* shutdown (evicted when the
 /// buffer is full). Lets the shutdown summary report the true loss, since evicted
@@ -124,12 +130,12 @@ pub fn buffered_agent_payload_request_ids() -> Vec<String> {
 /// is at capacity. Single choke point so both first-failure and retry re-buffer
 /// paths enforce the same cap.
 fn push_failed_payload_capped(buf: &mut Vec<FailedAgentPayload>, payload: FailedAgentPayload) {
-    if buf.len() >= MAX_FAILED_AGENT_PAYLOADS {
+    if buf.len() >= *MAX_FAILED_AGENT_PAYLOADS {
         buf.remove(0);
         DROPPED_AGENT_PAYLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         warn!(
             "Failed agent payload buffer full ({}) - evicted oldest invocation's data",
-            MAX_FAILED_AGENT_PAYLOADS
+            *MAX_FAILED_AGENT_PAYLOADS
         );
     }
     buf.push(payload);
@@ -286,7 +292,14 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
         crate::send::SendMode::Deferred,
-        std::sync::Arc::new(crate::send::AlwaysAllowBreaker),
+        // Real invocation-count breaker, high-tier defaults (N=5 → open 2N=10
+        // → buffer cap 3N=15). SEND_SCHEDULER is only ever used by the
+        // high-tier path (process_apm_request_high), so this does not touch the
+        // default tier's pipeline. `from_env` lets NEW_RELIC_EXTENSION_CIRCUIT_BREAKER_THRESHOLD
+        // override N; everything else derives from it.
+        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::from_env(
+            crate::send::DEFAULT_THRESHOLD_HIGH,
+        )),
         std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
     ));
 
@@ -418,6 +431,13 @@ async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
             sent = false;
         }
     }
+    // Circuit breaker: platform-report metrics ride *inside* the ApmCollector
+    // batch here, so they are gated by the same breaker as the agent payloads
+    // (this `send_group` runs inside the SEND_SCHEDULER.spawn(ApmCollector) task).
+    // This intentionally supersedes the earlier separate MetricApi-gated
+    // platform-metrics flush path — unifying it here avoids a double-send and
+    // still guarantees a report is never sent while the breaker is open (on open,
+    // `buffer_group` buffers payloads and report together).
     if let Some(report) = &group.report {
         if let Err(e) = app.send_platform_report_metrics(report, &group.invoked_function_arn).await {
             warn!("Report metrics send failed for {}: {} - buffering", group.request_id, e);
@@ -473,9 +493,28 @@ async fn spawn_pending_batch(
         global_log_processor.clone(),
         apm_app.clone(),
     ));
-    SEND_SCHEDULER
+    let spawned = SEND_SCHEDULER
         .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
         .await;
+    if !spawned {
+        // Circuit breaker Open for the APM collector (decided inside
+        // SendScheduler::spawn): nothing was spawned. Reclaim the staged batch
+        // meta and buffer the groups for a later retry (drained by
+        // retry_failed_platform_reports / the agent-payload retry loop), rather
+        // than losing them. `buffer_group` buffers each group's payloads and its
+        // platform report together, so this single gate also preserves the
+        // platform-metrics breaker coverage — see `send_group` for why report
+        // metrics ride on the ApmCollector batch.
+        if let Ok(mut guard) = AGENT_BATCH_META.lock() {
+            if let Some(groups) = guard.take() {
+                debug!(
+                    "APM mode (high): circuit breaker open for APM collector — buffering {} group(s)",
+                    groups.len()
+                );
+                groups.iter().for_each(buffer_group);
+            }
+        }
+    }
 }
 
 /// Final drain at SHUTDOWN: no next invocation to defer to.
@@ -564,7 +603,20 @@ async fn spawn_log_flush(log_processor: &Arc<LogProcessor>, request_id: &str) {
             }
         }
     });
-    SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, send, None).await;
+    let spawned = SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, send, None).await;
+    if !spawned {
+        // Circuit breaker Open for logs (decided inside SendScheduler::spawn):
+        // nothing was spawned. Clear the write-ahead we staged; the logs stay
+        // in LogProcessor's own batch and go out on the next flush — same as
+        // the has_pending skip above, nothing is lost.
+        if let Ok(mut guard) = LOG_BATCH_WRITE_AHEAD.lock() {
+            *guard = None;
+        }
+        debug!(
+            "APM mode (high): circuit breaker open for logs — flush skipped, logs for {} stay batched",
+            request_id
+        );
+    }
 }
 
 /// Resolve whatever log flush is pending from a previous invocation, if any —
