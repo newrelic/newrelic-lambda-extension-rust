@@ -169,7 +169,7 @@ pub struct ExtensionSettings {
     pub expected_errors: HashSet<String>,
     /// `NEW_RELIC_SEND_TIER` — `default` (existing `pipeline_flush`-based behavior,
     /// completely unmodified) or `high` (the new `SendScheduler`-based path for
-    /// agent payload, logs, and platform-metrics). Dual-path by design: `default`
+    /// agent payload, logs, and platform-report metrics). Dual-path by design: `default`
     /// routes through the exact pre-existing code, `high` through new code — not a
     /// single pipeline configured by tier. See `DUAL_PATH_PLAN.md`. Read once at
     /// startup.

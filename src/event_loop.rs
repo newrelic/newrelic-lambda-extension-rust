@@ -279,24 +279,10 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 
-/// The scheduler driving every `high`-tier send (agent payload, logs,
-/// platform-metrics) — see `DUAL_PATH_PLAN.md`. `default` tier never
-/// touches this: `process_apm_request_default` is the exact pre-existing
-/// `main` code, untouched, and has no dependency on `SendScheduler` at all.
-/// Only `process_apm_request_high` (and its SHUTDOWN-drain counterpart)
-/// calls into this.
-///
-/// Mode is `Deferred` by construction, but note what that means here is
-/// narrower than the name suggests: `spawn`/`resolve_pending_shared_budget`
-/// are called directly (bypassing `dispatch`'s mode-coupled timing) so the
-/// spawn-then-resolve pair happens within *one* invocation's own
-/// `runtimeDone` boundary (`process_apm_request_high`), not deferred across
-/// invocations — see `HIGH_TIER_RUNTIME_DONE_BUDGET_MS`'s doc for why. The
-/// `resolve_pending`/`resolve_pending_no_abort` single-kind paths below are
-/// still used too, but only by the SHUTDOWN drain-whatever's-left safety net
-/// (`resolve_pending_agent_batch`/`resolve_pending_logs`/
-/// `resolve_pending_platform_metrics`), where nothing is typically pending
-/// at all in the common case.
+/// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
+/// log flush. `default` never touches it. Resolved at `runtimeDone` with an
+/// abort-capable shared budget, left running (no-abort) for short invokes, and
+/// drained at SHUTDOWN.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
         crate::send::SendMode::Deferred,
@@ -322,14 +308,10 @@ static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<Arc<Vec<PendingGroup
 /// uninstrumented function never sends one, so waiting for it would be wasted.
 static AGENT_PAYLOAD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Write-ahead copy of the log batch about to be flushed — mirrors
-/// `AgentBatchMeta`'s role for agent payload. `LogProcessor::flush()` drains
-/// its own `log_batch` internally right before sending, so if the task
-/// wrapping it is aborted mid-send (`SendTier::High`'s shared runtimeDone
-/// budget), that drained copy is gone with nothing external to recover —
-/// this snapshot, taken *before* the send is spawned, is what
-/// `handle_logs_outcome` re-queues via `LogProcessor::requeue_aborted_batch`
-/// on a `TimedOut` outcome. Cleared (not just overwritten) once resolved
+/// Write-ahead copy of the log batch about to be flushed, like
+/// `AGENT_BATCH_META` for payloads. `LogProcessor::flush()` drains its batch
+/// before sending, so an abort would otherwise lose it; this snapshot, taken
+/// before the spawn, is what `handle_logs_outcome` requeues on `TimedOut`. Cleared (not just overwritten) once resolved
 /// either way, same lifecycle as `AGENT_BATCH_META`.
 struct LogBatchWriteAhead {
     batch: Vec<crate::newrelic::payload::LogMessage>,
@@ -608,10 +590,8 @@ async fn resolve_pending_logs(log_processor: &Arc<LogProcessor>, request_id: &st
     handle_logs_outcome(&outcome, log_processor, request_id);
 }
 
-/// Shared by `resolve_pending_logs` (SHUTDOWN's drain-whatever's-left safety
-/// net, never-abort path) and `process_apm_request_high`'s shared-budget
-/// resolve (abort-capable — see `HIGH_TIER_RUNTIME_DONE_BUDGET_MS`), hence
-/// `TimedOut` is a real, reachable case here, unlike the never-abort path.
+/// Shared by `resolve_pending_logs` (never aborts) and the abort-capable
+/// `runtimeDone` resolve, so `TimedOut` is only reachable from the latter.
 /// Always clears `LOG_BATCH_WRITE_AHEAD` before returning, resolved either
 /// way (sent, failed-internally, or requeued on timeout) — it must never
 /// outlive the outcome it was recorded for.

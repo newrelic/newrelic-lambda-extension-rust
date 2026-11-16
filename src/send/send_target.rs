@@ -25,17 +25,10 @@
 //! `apm/metric_api_buffer.rs`); the scheduler calls back into the
 //! appropriate buffer function itself when a send fails or times out.
 //!
-//! `from_collector_result` now has a real caller: `event_loop.rs`'s
-//! `spawn_platform_metrics_flush` maps `send_platform_report_metrics`'s
-//! `anyhow::Result<()>` through it directly. The agent-payload and log-flush
-//! call sites still build their `SendOutcome` inline instead (`if all_sent
-//! { ... }` / `match flush().await`), since neither goes through
-//! `client.rs`/`collector.rs`'s `Result` types directly — so
-//! `from_client_result` has no caller yet, ready for whenever logs' actual
-//! HTTP send (inside `LogProcessor`) is wired through this module instead of
-//! wrapping `LogProcessor::flush()` as a whole. `from_metric_api_result` is
-//! ready for `apm/metric_api_buffer.rs`'s retry path, if that ever routes
-//! through `SendScheduler` too.
+//! The adapters here (`from_collector_result`, `from_client_result`,
+//! `from_metric_api_result`) are ready for callers that return those `Result`
+//! types directly. `event_loop.rs` builds its `SendOutcome` inline instead,
+//! because the batch and log-flush tasks buffer their own failures.
 
 #![allow(dead_code)]
 

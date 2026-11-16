@@ -13,11 +13,10 @@
 //! module implements.
 //!
 //!
-//! `SendScheduler` has a real caller (`event_loop.rs`'s `SEND_SCHEDULER`,
-//! covering all three `SendKind`s now: `ApmCollector` — agent payload,
-//! `Logs` — log flush, `MetricApi` — platform-report-metrics) — this is no
-//! longer unused scaffolding, and every `SendKind` variant has a real
-//! caller. `BreakerState` and `DispatchOutcome` remain unused *by name*
+//! `SendScheduler` has a real caller (`event_loop.rs`'s `SEND_SCHEDULER`) for
+//! `ApmCollector` (the INVOKE-time batch, which carries platform-report
+//! metrics too) and `Logs`. `MetricApi` currently has none: reports ride
+//! inside the batch. `BreakerState` and `DispatchOutcome` remain unused *by name*
 //! outside this module today (accessed via `.state()`/`.result`/`.cursor`
 //! rather than the type name) but are kept exported for Sashwat's real
 //! `CircuitBreaker` work and for callers who want to pattern-match on the

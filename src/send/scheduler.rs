@@ -17,9 +17,8 @@
 //!   if it's still not done.
 //!
 //! **Batch/cursor support.** A dispatched send may be a multi-item batch
-//! (e.g. the agent-payload Flow-1 send: a `Vec` of payloads, each buffering
-//! its own per-item HTTP failure internally — see
-//! `event_loop::send_agent_payload_or_buffer`). For those, the caller
+//! (e.g. the INVOKE-time agent batch: a `Vec` of per-request groups, each
+//! buffering its own HTTP failures — see `event_loop::send_pending_groups`). For those, the caller
 //! passes a shared `Arc<AtomicUsize>` progress cursor alongside the future;
 //! [`DispatchOutcome::cursor`] reports its value at the moment the result
 //! was determined, so the caller can re-buffer only the *unresolved tail*
