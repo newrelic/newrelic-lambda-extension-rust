@@ -11,7 +11,10 @@ use base64::{Engine as _, engine::general_purpose};
 use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 /// Lambda telemetry data structure (protocol v2)
@@ -99,6 +102,66 @@ pub fn parse_agent_payload(payload_bytes: &[u8]) -> Result<(HashMap<String, Vec<
     Ok((data_map, version))
 }
 
+/// Caches a parsed payload by content hash, so the same bytes don't get fully
+/// re-parsed (base64 + gzip + JSON) by multiple call sites. Stores the original
+/// bytes too, so a hash collision is detected and treated as a miss (safe) rather
+/// than returning the wrong payload's data.
+static PARSE_CACHE: once_cell::sync::Lazy<dashmap::DashMap<u64, (Vec<u8>, Arc<(HashMap<String, Vec<Value>>, u8)>)>> =
+    once_cell::sync::Lazy::new(dashmap::DashMap::new);
+
+/// Max cached entries before we just clear the whole cache. Keeps memory bounded.
+const MAX_PARSE_CACHE_ENTRIES: usize = 256;
+
+fn hash_payload_bytes(payload_bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    payload_bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Same as `parse_agent_payload`, but checks `PARSE_CACHE` first and reuses a
+/// previous parse of the same bytes if one exists. Also unwraps payloads that
+/// arrive base64-encoded one extra time (some payloads have the whole envelope
+/// array wrapped in base64, not just the compressed data inside it).
+pub fn parse_agent_payload_cached(payload_bytes: &[u8]) -> Result<Arc<(HashMap<String, Vec<Value>>, u8)>> {
+    let key = hash_payload_bytes(payload_bytes);
+    if let Some(entry) = PARSE_CACHE.get(&key) {
+        let (cached_bytes, cached_parse) = &*entry;
+        if cached_bytes.as_slice() == payload_bytes {
+            trace!("Reusing cached parse for agent payload ({} bytes)", payload_bytes.len());
+            return Ok(Arc::clone(cached_parse));
+        }
+        // Same hash, different bytes — a genuine (vanishingly rare) collision.
+        // Fall through and parse fresh; the insert below overwrites the stale
+        // entry for this key with the correct one.
+        trace!("Parse cache key collision detected for different payload content — re-parsing");
+    }
+
+    let looks_like_raw_array = std::str::from_utf8(payload_bytes)
+        .map(|s| s.trim_start().starts_with('['))
+        .unwrap_or(false);
+    let parsed = if looks_like_raw_array {
+        Arc::new(parse_agent_payload(payload_bytes)?)
+    } else {
+        // Doesn't look like a raw envelope array — try unwrapping one layer of
+        // base64 first. A failure here just falls through to parsing the original
+        // bytes as-is (parse_agent_payload's own empty-map-on-non-'['  behavior),
+        // same as if this fallback didn't exist.
+        match general_purpose::STANDARD.decode(payload_bytes) {
+            Ok(decoded) => Arc::new(parse_agent_payload(&decoded)?),
+            Err(_) => Arc::new(parse_agent_payload(payload_bytes)?),
+        }
+    };
+
+    // Pure optimization cache — if it's grown unexpectedly large (payloads parsed
+    // but never reused), just drop everything rather than evicting one entry at a
+    // time. Worst case is a few avoidable re-parses, never incorrect data.
+    if PARSE_CACHE.len() >= MAX_PARSE_CACHE_ENTRIES {
+        PARSE_CACHE.clear();
+    }
+    PARSE_CACHE.insert(key, (payload_bytes.to_vec(), Arc::clone(&parsed)));
+    Ok(parsed)
+}
+
 /// Decode base64 and decompress gzip data
 fn decode_uncompress(input: &str) -> Result<Vec<u8>> {
     trace!("Decoding base64 string ({} chars)", input.len());
@@ -152,6 +215,63 @@ fn convert_lambda_data_to_map(data: LambdaData) -> HashMap<String, Vec<Value>> {
     map
 }
 
+/// Telemetry types whose wire shape is `[placeholder, {reservoir_size, events_seen},
+/// [events]]` — safe to merge across chunks for the same request by concatenating
+/// the events and combining the metadata: `events_seen` is a count, so it's
+/// summed; `reservoir_size` is a fixed capacity, not a count, so we take the max
+/// instead of summing it. Other types (`metric_data`, `error_data`,
+/// `transaction_sample_data`, `sql_trace_data`, `log_event_data`) have no such
+/// metadata to combine, so they're sent per-chunk, unmerged.
+const MERGEABLE_EVENT_LIST_TYPES: &[&str] = &[
+    "analytic_event_data",
+    "span_event_data",
+    "error_event_data",
+    "custom_event_data",
+];
+
+/// Whether `telemetry_type` is safe to merge across chunks via
+/// [`merge_event_list_payloads`]. See [`MERGEABLE_EVENT_LIST_TYPES`].
+pub fn is_mergeable_event_list_type(telemetry_type: &str) -> bool {
+    MERGEABLE_EVENT_LIST_TYPES.contains(&telemetry_type)
+}
+
+/// Merge multiple chunks of the *same* event-list telemetry type (see
+/// [`is_mergeable_event_list_type`]) into one combined `[placeholder, {reservoir_size,
+/// events_seen}, [events]]` payload. Chunks shorter than 3 elements (malformed/
+/// unexpected shape) are skipped rather than panicking — a defensively-dropped chunk
+/// is better than a corrupted merge.
+pub fn merge_event_list_payloads(chunks: Vec<Vec<Value>>) -> Vec<Value> {
+    let mut total_events_seen: i64 = 0;
+    let mut max_reservoir_size: i64 = 0;
+    let mut merged_events: Vec<Value> = Vec::new();
+
+    for chunk in chunks {
+        if chunk.len() < 3 {
+            continue;
+        }
+        if let Some(meta) = chunk[1].as_object() {
+            if let Some(events_seen) = meta.get("events_seen").and_then(Value::as_i64) {
+                total_events_seen += events_seen;
+            }
+            if let Some(reservoir_size) = meta.get("reservoir_size").and_then(Value::as_i64) {
+                max_reservoir_size = max_reservoir_size.max(reservoir_size);
+            }
+        }
+        if let Some(events) = chunk[2].as_array() {
+            merged_events.extend(events.iter().cloned());
+        }
+    }
+
+    vec![
+        Value::Null,
+        serde_json::json!({
+            "reservoir_size": max_reservoir_size,
+            "events_seen": total_events_seen,
+        }),
+        Value::Array(merged_events),
+    ]
+}
+
 /// Extract the Lambda invocation request id (`aws.requestId`) the agent embedded in the
 /// transaction analytic event of an agent payload.
 ///
@@ -182,8 +302,11 @@ pub fn extract_transaction_request_id(data_map: &HashMap<String, Vec<Value>>) ->
 /// Returns `None` on any parse failure or when no transaction event carries the id
 /// (e.g. metrics-only / log-only harvest). Reuses [`parse_agent_payload`].
 pub fn extract_request_id_from_payload_bytes(payload_bytes: &[u8]) -> Option<String> {
-    let (data_map, _version) = parse_agent_payload(payload_bytes).ok()?;
-    extract_transaction_request_id(&data_map)
+    // Routed through the cache so the later, actual-send parse of these same bytes
+    // (ApmApp::parse_and_normalize_one_payload) can reuse this result instead of
+    // redoing the full base64/gzip/JSON decode from scratch.
+    let parsed = parse_agent_payload_cached(payload_bytes).ok()?;
+    extract_transaction_request_id(&parsed.0)
 }
 
 /// Implement Deserialize for LambdaData manually to handle flexible field names

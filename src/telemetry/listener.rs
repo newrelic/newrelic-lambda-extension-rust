@@ -6,7 +6,7 @@ use crate::{
     platform::processor::PlatformProcessor,
     agent::batch::{AGENT_BATCH_BUFFER, add_to_batch},
     request::{
-        get_agent_buffer, get_request_context, get_runtime_done_notify, set_pending_report,
+        get_agent_buffer, get_request_context, set_pending_report,
         CURRENT_ACTIVE_REQUEST_ID, TELEMETRY_CURRENT_REQUEST_ID,
     },
 };
@@ -173,16 +173,13 @@ async fn handle_telemetry_request(
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 debug!("platform.runtimeDone received for request: {}", request_id_str);
-                                // Wake the event loop's end-of-invocation flush waiter.
-                                // On fast functions (< ~50 ms), runtimeDone can arrive before
-                                // the event loop has created per-request state — get_runtime_done_notify
-                                // returns None in that case. Record it in PREFIRED_RUNTIME_DONE so
-                                // create_request_processing_state() fires the notify immediately.
-                                if let Some(notify) = get_runtime_done_notify(request_id_str) {
-                                    notify.notify_one();
-                                } else {
-                                    crate::request::record_prefired_runtime_done(request_id_str);
-                                }
+                                // Wakes the event loop's end-of-invocation flush waiter AND
+                                // records the firing timestamp (on RequestData if it exists
+                                // yet, else in PREFIRED_RUNTIME_DONE for
+                                // create_request_processing_state() to pick up) — single
+                                // call site so the timestamp is never recorded on one path
+                                // but not the other.
+                                crate::request::record_runtime_done(request_id_str);
                             }
                         }
                         platform_processor.process_record(record);

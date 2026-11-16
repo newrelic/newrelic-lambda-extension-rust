@@ -139,6 +139,7 @@ pub async fn retry_buffered_telemetry(
                 collector_host,
                 run_id,
                 &item.data,
+                &item.request_id,
             )
             .await
         } else {
@@ -164,6 +165,7 @@ pub async fn retry_buffered_telemetry(
                 run_id,
                 command,
                 &item.data,
+                &item.request_id,
             )
             .await
         };

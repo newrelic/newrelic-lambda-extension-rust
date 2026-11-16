@@ -5,6 +5,7 @@ use super::*;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use serde_json::json;
+use serial_test::serial;
 use std::io::Write;
 
 fn create_test_payload(version: &str) -> Vec<u8> {
@@ -201,4 +202,191 @@ fn parse_v1_array_content_returns_parse_error() {
     let result = parse_agent_payload(&payload);
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("v1"));
+}
+
+// ── is_mergeable_event_list_type / merge_event_list_payloads ───────────────────────
+
+#[test]
+fn is_mergeable_event_list_type_is_true_for_the_four_documented_types() {
+    for t in ["analytic_event_data", "span_event_data", "error_event_data", "custom_event_data"] {
+        assert!(is_mergeable_event_list_type(t), "{t} must be mergeable");
+    }
+}
+
+#[test]
+fn is_mergeable_event_list_type_is_false_for_other_types() {
+    for t in ["metric_data", "error_data", "transaction_sample_data", "sql_trace_data", "log_event_data", "unknown_type"] {
+        assert!(!is_mergeable_event_list_type(t), "{t} must not be mergeable");
+    }
+}
+
+#[test]
+fn merge_event_list_payloads_concatenates_events_and_combines_reservoir_metadata() {
+    let chunk_a = vec![
+        Value::Null,
+        json!({"reservoir_size": 100, "events_seen": 3}),
+        json!([{"id": "a1"}, {"id": "a2"}, {"id": "a3"}]),
+    ];
+    let chunk_b = vec![
+        Value::Null,
+        json!({"reservoir_size": 1200, "events_seen": 5}),
+        json!([{"id": "b1"}, {"id": "b2"}]),
+    ];
+
+    let merged = merge_event_list_payloads(vec![chunk_a, chunk_b]);
+
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged[1]["events_seen"], json!(8), "events_seen must sum across chunks");
+    assert_eq!(merged[1]["reservoir_size"], json!(1200), "reservoir_size must be the max across chunks");
+    let events = merged[2].as_array().expect("events must be an array");
+    assert_eq!(events.len(), 5, "events arrays must be concatenated, not deduped or truncated");
+    assert_eq!(events[0]["id"], json!("a1"));
+    assert_eq!(events[4]["id"], json!("b2"));
+}
+
+#[test]
+fn merge_event_list_payloads_skips_malformed_chunks_without_panicking() {
+    let malformed = vec![Value::Null, json!({"reservoir_size": 10, "events_seen": 1})]; // len 2, missing events element
+    let well_formed = vec![
+        Value::Null,
+        json!({"reservoir_size": 50, "events_seen": 2}),
+        json!([{"id": "x"}, {"id": "y"}]),
+    ];
+
+    let merged = merge_event_list_payloads(vec![malformed, well_formed]);
+
+    assert_eq!(merged[1]["events_seen"], json!(2), "malformed chunk's metadata must be skipped, not counted");
+    assert_eq!(merged[1]["reservoir_size"], json!(50));
+    let events = merged[2].as_array().unwrap();
+    assert_eq!(events.len(), 2, "only the well-formed chunk's events must survive");
+}
+
+#[test]
+fn merge_event_list_payloads_on_empty_input_returns_zeroed_shape() {
+    let merged = merge_event_list_payloads(vec![]);
+    assert_eq!(merged.len(), 3);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_with_no_reservoir_metadata_fields() {
+    // chunk[1] is a valid object but has neither events_seen nor reservoir_size —
+    // both .get(...).and_then(...) calls must resolve to None without panicking.
+    let chunk = vec![Value::Null, json!({}), json!([{"id": "x"}])];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_whose_third_element_is_not_an_array() {
+    // chunk[2] present but not an array — .as_array() must resolve to None, skipping
+    // this chunk's events rather than panicking.
+    let chunk = vec![Value::Null, json!({"reservoir_size": 10, "events_seen": 1}), json!("not-an-array")];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(1));
+    assert_eq!(merged[1]["reservoir_size"], json!(10));
+    assert_eq!(merged[2].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn merge_event_list_payloads_tolerates_a_chunk_whose_second_element_is_not_an_object() {
+    // chunk[1] present but not an object — .as_object() must resolve to None.
+    let chunk = vec![Value::Null, json!("not-an-object"), json!([{"id": "x"}])];
+    let merged = merge_event_list_payloads(vec![chunk]);
+    assert_eq!(merged[1]["events_seen"], json!(0));
+    assert_eq!(merged[1]["reservoir_size"], json!(0));
+    assert_eq!(merged[2].as_array().unwrap().len(), 1);
+}
+
+// ── parse_agent_payload_cached ───────────────────────────────────────────────────
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_seeds_and_is_shared_by_a_later_call() {
+    // Clear any leftover state from other tests sharing PARSE_CACHE.
+    PARSE_CACHE.clear();
+
+    let payload = create_test_payload("1");
+    let key = hash_payload_bytes(&payload);
+
+    // First call (e.g. the arrival-time misattribution-guard/routing check): a
+    // genuine parse, seeding the cache for this exact byte content.
+    let first = parse_agent_payload_cached(&payload).expect("first parse must succeed");
+    assert!(
+        PARSE_CACHE.contains_key(&key),
+        "the first call must seed the cache for later reuse"
+    );
+
+    // Second call on the IDENTICAL bytes (e.g. trace-id extraction or the actual
+    // send): must be a cache hit, sharing the same Arc — and the entry must still
+    // be there afterward, since a third reader (e.g. the send, if trace extraction
+    // ran first) may still need it too.
+    let second = parse_agent_payload_cached(&payload).expect("second parse must succeed");
+    assert!(
+        PARSE_CACHE.contains_key(&key),
+        "a cache hit must NOT remove its entry — other readers of the same content may still need it"
+    );
+    assert!(Arc::ptr_eq(&first, &second), "a cache hit must share the exact same Arc, not clone the underlying data");
+}
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_distinguishes_different_payloads() {
+    PARSE_CACHE.clear();
+
+    let payload_a = create_test_payload("1");
+    let payload_b = create_test_payload("2");
+
+    let a = parse_agent_payload_cached(&payload_a).expect("payload a must parse");
+    let b = parse_agent_payload_cached(&payload_b).expect("payload b must parse");
+
+    // Different content must never be confused with each other via the cache —
+    // protocol version differs between the v1 and v2 fixtures used here.
+    assert_eq!(a.1, 1);
+    assert_eq!(b.1, 2);
+}
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_tolerates_a_whole_payload_double_base64_encoded() {
+    // Some payloads arrive with the entire envelope array base64-encoded once more
+    // on top (same shape trace::extract_trace_id_from_payload's own fallback
+    // handled, and that this cached parser now supersedes). Must not just return
+    // an empty map (parse_agent_payload's behavior for bytes that don't start with
+    // '[') — must unwrap the extra layer and parse through to the real data.
+    PARSE_CACHE.clear();
+
+    let inner = create_test_payload("1"); // raw array text, e.g. [1,"NR_LAMBDA_MONITORING","..."]
+    let double_encoded = general_purpose::STANDARD.encode(&inner).into_bytes();
+
+    let result = parse_agent_payload_cached(&double_encoded).expect("double-encoded payload must still parse");
+    assert_eq!(result.1, 1, "protocol version must be recovered after unwrapping the extra encoding");
+    assert!(result.0.contains_key("metric_data"), "telemetry data must be recovered, not an empty map");
+}
+
+#[test]
+#[serial]
+fn parse_agent_payload_cached_detects_hash_collision_and_reparses_correctly() {
+    // Simulate a hash collision: plant payload_b's data under payload_a's key.
+    // The byte check on hit must reject it and re-parse instead of trusting the hash.
+    PARSE_CACHE.clear();
+
+    let payload_a = create_test_payload("1");
+    let payload_b = create_test_payload("2");
+    let key = hash_payload_bytes(&payload_a);
+
+    // Plant a wrong entry: payload_b's bytes/parse result stored under payload_a's key.
+    let wrong_parse = Arc::new(parse_agent_payload(&payload_b).unwrap());
+    PARSE_CACHE.insert(key, (payload_b.clone(), wrong_parse));
+
+    let result = parse_agent_payload_cached(&payload_a).expect("must re-parse despite the planted collision");
+    assert_eq!(result.1, 1, "must return payload_a's own protocol version (1), not payload_b's (2)");
+
+    // The cache must now hold the CORRECT entry for this key, not the stale wrong one.
+    let fixed = PARSE_CACHE.get(&key).expect("entry must exist after re-parse");
+    assert_eq!(fixed.0, payload_a, "cache must be corrected to payload_a's own bytes");
 }

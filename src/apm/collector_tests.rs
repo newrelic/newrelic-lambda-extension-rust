@@ -144,7 +144,7 @@ fn parse_retry_after_missing_header_returns_none() {
 async fn send_error_events_empty_slice_is_noop() {
     // No HTTP call is made — function returns Ok(()) immediately.
     let client = crate::newrelic::tls_fallback::test_client();
-    let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &[]).await;
+    let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &[], "req-1").await;
     assert!(result.is_ok());
 }
 
@@ -154,7 +154,7 @@ async fn send_error_events_connection_refused_returns_error() {
     let _ = take_reconnect_needed();
     let client = crate::newrelic::tls_fallback::test_client();
     let events = vec![serde_json::json!({"type": "TransactionError"})];
-    let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &events).await;
+    let result = send_error_events(&client, "key", "127.0.0.1:1", "run-1", &events, "req-1").await;
     assert!(result.is_err());
     // A network error must NOT trigger a reconnect signal.
     assert!(!take_reconnect_needed());
@@ -168,7 +168,7 @@ async fn send_apm_telemetry_connection_refused_returns_error() {
     let _ = take_reconnect_needed();
     let client = crate::newrelic::tls_fallback::test_client();
     let data = vec![serde_json::json!(null), serde_json::json!({})];
-    let result = send_apm_telemetry(&client, "key", "127.0.0.1:1", "run-1", CMD_METRICS, &data).await;
+    let result = send_apm_telemetry(&client, "key", "127.0.0.1:1", "run-1", CMD_METRICS, &data, "req-1").await;
     assert!(result.is_err());
     assert!(!take_reconnect_needed());
 }

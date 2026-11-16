@@ -169,6 +169,7 @@ pub async fn send_error_events(
     collector_host: &str,
     run_id: &str,
     error_events: &[Value],
+    request_id: &str,
 ) -> Result<()> {
     if error_events.is_empty() {
         return Ok(());
@@ -195,8 +196,9 @@ pub async fn send_error_events(
     let compressed = encoder.finish()?;
 
     debug!(
-        "Sending {} error events: compressed={} bytes, uncompressed={} bytes",
+        "Sending {} error events for request {}: compressed={} bytes, uncompressed={} bytes",
         error_events.len(),
+        request_id,
         compressed.len(),
         uncompressed_len
     );
@@ -226,14 +228,15 @@ pub async fn send_error_events(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
-        debug!("Send {} duration: {}ms", CMD_ERROR_DATA, duration.as_millis());
-        info!("Successfully sent {} error events (status: {})", error_events.len(), status);
+        info!(
+            "Successfully sent {} error events for request {} (status: {}, duration: {}ms)",
+            error_events.len(), request_id, status, duration.as_millis()
+        );
         Ok(())
     } else {
         let body = response.text().await.unwrap_or_default();
         debug!("Status Code for {} telemetry: {}", CMD_ERROR_EVENTS, status_code);
-        
+
         if status_code == 410 {
             error!("APM collector disconnected (410) - agent should stop sending telemetry");
             signal_reconnect_needed();
@@ -250,10 +253,10 @@ pub async fn send_error_events(
             return Err(anyhow::Error::new(CollectorError::RestartException)
                 .context(format!("Collector returned 401 for {}", CMD_ERROR_EVENTS)));
         }
-        
+
         warn!(
-            "Failed to send error events (status: {}, body: {})",
-            status_code, body
+            "Failed to send error events for request {} (status: {}, body: {})",
+            request_id, status_code, body
         );
 
         Err(anyhow::anyhow!("APM collector returned status {}: {}", status_code, body))
@@ -268,6 +271,7 @@ pub async fn send_apm_telemetry(
     run_id: &str,
     command: &str,
     data: &[Value],
+    request_id: &str,
 ) -> Result<()> {
     let mut processed_data = data.to_vec();
     if !processed_data.is_empty() {
@@ -292,20 +296,9 @@ pub async fn send_apm_telemetry(
     let compressed = encoder.finish()?;
 
     debug!(
-        "Sending {} to APM collector: {} bytes compressed (from {} bytes)",
+        "Sending {} for request {} to APM collector: {} bytes compressed (from {} bytes)",
         command,
-        compressed.len(),
-        uncompressed_len
-    );
-    
-    debug!(
-        "Request for command: {}",
-        command
-    );
-    
-    debug!(
-        "Sending {} to APM: compressed={} bytes, uncompressed={} bytes",
-        command,
+        request_id,
         compressed.len(),
         uncompressed_len
     );
@@ -335,15 +328,16 @@ pub async fn send_apm_telemetry(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for {} telemetry: {}", command, status_code);
-        debug!("Send {} duration: {}ms", command, duration.as_millis());
-        info!("Successfully sent {} (status: {})", command, status);
+        info!(
+            "Successfully sent {} for request {} (status: {}, duration: {}ms)",
+            command, request_id, status, duration.as_millis()
+        );
         Ok(())
     } else {
         let body = response.text().await.unwrap_or_default();
-        
+
         debug!("Status Code for {} telemetry: {}", command, status_code);
-        
+
         if status_code == 410 {
             error!("APM collector disconnected (410) - agent should stop sending telemetry");
             signal_reconnect_needed();
@@ -360,10 +354,10 @@ pub async fn send_apm_telemetry(
             return Err(anyhow::Error::new(CollectorError::RestartException)
                 .context(format!("Collector returned 401 for {}", command)));
         }
-        
+
         warn!(
-            "Failed to send {} (status: {}, body: {})",
-            command, status_code, body
+            "Failed to send {} for request {} (status: {}, body: {})",
+            command, request_id, status_code, body
         );
 
         Err(anyhow::anyhow!("APM collector returned status {}: {}", status_code, body))
@@ -431,9 +425,10 @@ pub async fn send_platform_metrics(
     let status_code = status.as_u16();
 
     if status.is_success() {
-        debug!("Status Code for platform_metrics telemetry: {}", status_code);
-        debug!("Send platform_metrics duration: {}ms", duration.as_millis());
-        info!("Successfully sent {} platform metrics", metrics.len());
+        info!(
+            "Successfully sent {} platform metrics (status: {}, duration: {}ms)",
+            metrics.len(), status, duration.as_millis()
+        );
         Ok(())
     } else if is_retryable_status(status_code) {
         let retry_after = parse_retry_after(response.headers());
