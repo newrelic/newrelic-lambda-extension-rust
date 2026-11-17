@@ -299,7 +299,7 @@ struct PendingGroup {
 
 /// The batch currently in flight. The id ties the log lines of one batch together
 /// (start, failures, outcome); the start time lets a batch that outlives
-/// `HIGH_TIER_BATCH_MAX_AGE_MS` stop blocking new ones.
+/// `batch_max_age_ms` stop blocking new ones.
 struct InFlightBatch {
     id: String,
     started_at: std::time::Instant,
@@ -309,14 +309,6 @@ static IN_FLIGHT_BATCH: once_cell::sync::Lazy<Mutex<Option<InFlightBatch>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 static NEXT_BATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-/// A batch still running after this long is almost certainly stuck (each request
-/// has its own timeout). It is detached, not aborted: it keeps running and still
-/// buffers its own failures, but a new batch may start.
-const HIGH_TIER_BATCH_MAX_AGE_MS: u64 = 30_000;
-
-/// Longest SHUTDOWN waits for the last batch. Lambda gives external extensions 2s.
-const HIGH_TIER_SHUTDOWN_BATCH_WAIT_MS: u64 = 1_500;
 
 /// Set once the agent has delivered a payload in this sandbox. An
 /// uninstrumented function never sends one, so waiting for it would be wasted.
@@ -472,10 +464,11 @@ async fn spawn_pending_batch(
         .await
     {
         if outcome.result == crate::send::DispatchResult::StillRunning {
-            if !batch_exceeded_max_age() {
+            let max_age = Duration::from_millis(config.extension.batch_max_age_ms);
+            if !batch_exceeded_max_age(max_age) {
                 return;
             }
-            warn!("APM mode (high): previous batch still running after {}ms - detaching it", HIGH_TIER_BATCH_MAX_AGE_MS);
+            warn!("APM mode (high): previous batch still running after {}ms - detaching it", max_age.as_millis());
             SEND_SCHEDULER.detach(crate::send::SendKind::ApmCollector).await;
         } else {
             log_batch_outcome(&outcome);
@@ -513,18 +506,18 @@ async fn spawn_pending_batch(
         .await;
 }
 
-fn batch_exceeded_max_age() -> bool {
+fn batch_exceeded_max_age(max_age: Duration) -> bool {
     IN_FLIGHT_BATCH
         .lock()
         .ok()
         .and_then(|batch| batch.as_ref().map(|b| b.started_at))
-        .is_some_and(|started| started.elapsed() >= Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS))
+        .is_some_and(|started| started.elapsed() >= max_age)
 }
 
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
 /// Lambda's 2s limit) for the last batch, and leave it running if it is slow.
-async fn resolve_pending_agent_batch() {
-    wait_for_pending_agent_batch(Duration::from_millis(HIGH_TIER_SHUTDOWN_BATCH_WAIT_MS)).await;
+async fn resolve_pending_agent_batch(wait_ms: u64) {
+    wait_for_pending_agent_batch(Duration::from_millis(wait_ms)).await;
 }
 
 async fn wait_for_pending_agent_batch(wait: Duration) {
@@ -1219,7 +1212,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // never touches SEND_SCHEDULER, so nothing is ever pending there) and on the
                 // common case where nothing is pending.
                 if components.config.extension.send_tier == crate::send::SendTier::High {
-                    resolve_pending_agent_batch().await;
+                    resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
                     resolve_pending_logs(&components.global_log_processor, "shutdown").await;
                     retry_failed_platform_reports(components.apm_app.clone()).await;
                 }
@@ -2167,27 +2160,36 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
 }
 
-/// Most we ever hold `/next` after `runtimeDone` for in-flight sends.
-const HIGH_TIER_SEND_BUDGET_MS: u64 = 100;
-
-/// From this handler duration up, a send has had enough time that it is either
-/// done or genuinely slow, so it gets the full budget rather than a shrinking one.
-const HIGH_TIER_FULL_HOLD_FROM_MS: u64 = 80;
-
-/// Longest we wait at `runtimeDone` for the agent's own payload to land.
-const HIGH_TIER_PAYLOAD_WINDOW_MS: u64 = 25;
-
-/// A shorter handler gave the send (spawned at INVOKE) less head start, so it is
-/// held for the rest of the budget: 100ms total from spawn. Above that the
-/// shrinking stops; reducing the hold further would just abort sends that were
-/// about to finish.
-fn runtime_done_hold(handler: Duration) -> Duration {
-    let budget = Duration::from_millis(HIGH_TIER_SEND_BUDGET_MS);
-    if handler >= Duration::from_millis(HIGH_TIER_FULL_HOLD_FROM_MS) {
-        budget
+/// How long to hold `/next` after `runtimeDone`, given the hold cap. A shorter
+/// handler gave the send (spawned at INVOKE) less head start, so it is held for
+/// the rest of the cap, counted from the spawn. From 80% of the cap up the
+/// shrinking stops: reducing the hold further would only cut off sends that were
+/// about to finish, so the full cap applies.
+fn runtime_done_hold(handler: Duration, cap_ms: u64) -> Duration {
+    let cap = Duration::from_millis(cap_ms);
+    if handler >= Duration::from_millis(cap_ms * 4 / 5) {
+        cap
     } else {
-        budget.saturating_sub(handler)
+        cap.saturating_sub(handler)
     }
+}
+
+/// What one invocation cost, logged once per invoke so the placeholder timings can
+/// be set from real numbers (billed time is what `waited_ms` adds).
+struct InvokeTiming {
+    handler_ms: u128,
+    hold_budget_ms: u128,
+    waited_ms: u128,
+    short_invoke: bool,
+    batch_left_running: bool,
+    log_flush_aborted: bool,
+}
+
+fn log_invoke_timing(request_id: &str, t: &InvokeTiming) {
+    info!(
+        "APM high timing: request={} handler_ms={} short_invoke={} hold_budget_ms={} waited_ms={} batch_left_running={} log_flush_aborted={}",
+        request_id, t.handler_ms, t.short_invoke, t.hold_budget_ms, t.waited_ms, t.batch_left_running, t.log_flush_aborted
+    );
 }
 
 /// `SendTier::High`. Data is delivered by the *next* invocation, in parallel
@@ -2216,12 +2218,22 @@ async fn process_apm_request_high(
         // (aborting would starve functions that are always short); the next
         // INVOKE collects them.
         spawn_log_flush(global_log_processor, request_id).await;
+        log_invoke_timing(request_id, &InvokeTiming {
+            handler_ms: handler.as_millis(),
+            hold_budget_ms: 0,
+            waited_ms: 0,
+            short_invoke: true,
+            batch_left_running: SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await,
+            log_flush_aborted: false,
+        });
         return;
     }
 
-    let hold_until = tokio::time::Instant::now() + runtime_done_hold(handler);
+    let hold = runtime_done_hold(handler, config.extension.hold_cap_ms);
+    let hold_started = tokio::time::Instant::now();
+    let hold_until = hold_started + hold;
     let window_until = hold_until.min(
-        tokio::time::Instant::now() + Duration::from_millis(HIGH_TIER_PAYLOAD_WINDOW_MS),
+        hold_started + Duration::from_millis(config.extension.payload_window_ms),
     );
     // Concurrent, so the two waits cost the longer of them, not the sum.
     tokio::join!(
@@ -2258,9 +2270,20 @@ async fn process_apm_request_high(
             .await
             .remove(&crate::send::SendKind::Logs),
     };
+    let log_flush_aborted = log_outcome
+        .as_ref()
+        .is_some_and(|o| o.result == crate::send::DispatchResult::TimedOut);
     if let Some(outcome) = log_outcome {
         handle_logs_outcome(&outcome, global_log_processor, request_id);
     }
+    log_invoke_timing(request_id, &InvokeTiming {
+        handler_ms: handler.as_millis(),
+        hold_budget_ms: hold.as_millis(),
+        waited_ms: hold_started.elapsed().as_millis(),
+        short_invoke: false,
+        batch_left_running: SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await,
+        log_flush_aborted,
+    });
 }
 
 /// Waiting for this request's own payload only matters for log correlation:

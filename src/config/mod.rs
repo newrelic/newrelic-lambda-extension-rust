@@ -180,6 +180,22 @@ pub struct ExtensionSettings {
     /// goes out with the next invocation instead. `0` disables the short path.
     /// Default 20, clamped to `[0, 1000]`.
     pub short_invoke_threshold_ms: u64,
+    /// `NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS` — `high` tier only. Most we hold `/next`
+    /// after `runtimeDone` for in-flight sends. A placeholder to be set from the
+    /// measured p99 of a healthy send. Default 100, clamped to `[0, 1000]`.
+    pub hold_cap_ms: u64,
+    /// `NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS` — `high` tier only. Longest we wait
+    /// at `runtimeDone` for the request's own agent payload (only when its logs are held
+    /// for a trace id). Default 25, clamped to `[0, 250]`.
+    pub payload_window_ms: u64,
+    /// `NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS` — `high` tier only. A batch still
+    /// running after this long is detached (not aborted) so it cannot block new ones.
+    /// Default 30000, clamped to `[1000, 300000]`.
+    pub batch_max_age_ms: u64,
+    /// `NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS` — `high` tier only. Longest SHUTDOWN
+    /// waits for the last batch; Lambda allows external extensions 2000 ms in total.
+    /// Default 1500, clamped to `[0, 1900]`.
+    pub shutdown_batch_wait_ms: u64,
 }
 
 /// Configuration struct that matches the credentials module expectations
@@ -326,6 +342,10 @@ impl Default for ExtensionSettings {
             expected_errors: HashSet::new(),
             send_tier: crate::send::SendTier::Default,
             short_invoke_threshold_ms: 20,
+            hold_cap_ms: 100,
+            payload_window_ms: 25,
+            batch_max_age_ms: 30_000,
+            shutdown_batch_wait_ms: 1_500,
         }
     }
 }
@@ -411,6 +431,18 @@ pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
         _ => return None,
     };
     Some(Duration::from_millis(millis as u64))
+}
+
+/// Milliseconds from an env var: unset or not a number falls back to `default`,
+/// and the result is clamped to `[min, max]` so a typo can't disable a safety bound.
+fn env_ms(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    parse_ms(env::var(name).ok().as_deref(), default, min, max)
+}
+
+pub(crate) fn parse_ms(raw: Option<&str>, default: u64, min: u64, max: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 impl ExtensionConfig {
@@ -623,6 +655,10 @@ impl ExtensionConfig {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(20)
                 .min(1000);
+        config.extension.hold_cap_ms = env_ms("NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS", 100, 0, 1_000);
+        config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
+        config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
+        config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 1_500, 0, 1_900);
 
         // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
         // Default 25 ms — matches the Telemetry API buffer flush window.

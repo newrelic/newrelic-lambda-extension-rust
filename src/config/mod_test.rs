@@ -1548,6 +1548,10 @@ fn test_extension_settings_all_fields() {
         expected_errors: std::collections::HashSet::new(),
         send_tier: crate::send::SendTier::Default,
         short_invoke_threshold_ms: 20,
+        hold_cap_ms: 100,
+        payload_window_ms: 25,
+        batch_max_age_ms: 30_000,
+        shutdown_batch_wait_ms: 1_500,
     };
     
     assert!(settings.send_function_logs);
@@ -2281,4 +2285,23 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
 #[test]
 fn test_short_invoke_threshold_defaults_to_20ms() {
     assert_eq!(ExtensionSettings::default().short_invoke_threshold_ms, 20);
+}
+
+#[test]
+fn test_high_tier_timing_defaults() {
+    let s = ExtensionSettings::default();
+    assert_eq!(
+        (s.hold_cap_ms, s.payload_window_ms, s.batch_max_age_ms, s.shutdown_batch_wait_ms),
+        (100, 25, 30_000, 1_500)
+    );
+}
+
+#[test]
+fn test_parse_ms_falls_back_and_clamps() {
+    assert_eq!(crate::config::parse_ms(None, 100, 0, 1_000), 100, "unset uses the default");
+    assert_eq!(crate::config::parse_ms(Some("abc"), 100, 0, 1_000), 100, "not a number uses the default");
+    assert_eq!(crate::config::parse_ms(Some(" 250 "), 100, 0, 1_000), 250, "whitespace is tolerated");
+    assert_eq!(crate::config::parse_ms(Some("99999"), 100, 0, 1_000), 1_000, "clamped to the max");
+    assert_eq!(crate::config::parse_ms(Some("5"), 100, 1_000, 5_000), 1_000, "clamped to the min");
+    assert_eq!(crate::config::parse_ms(Some("-3"), 100, 0, 1_000), 100, "negative is not a number here");
 }

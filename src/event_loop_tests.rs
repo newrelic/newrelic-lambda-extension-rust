@@ -3808,7 +3808,7 @@ async fn clear_batch_state() {
 async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
     clear_batch_state().await;
     let start = tokio::time::Instant::now();
-    resolve_pending_agent_batch().await;
+    resolve_pending_agent_batch(1_500).await;
     assert!(start.elapsed() < Duration::from_millis(50));
 }
 
@@ -3820,7 +3820,7 @@ async fn resolve_pending_agent_batch_collects_a_finished_batch() {
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    resolve_pending_agent_batch().await;
+    resolve_pending_agent_batch(1_500).await;
 
     assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
 }
@@ -3890,7 +3890,7 @@ async fn spawn_pending_batch_detaches_a_batch_older_than_the_max_age() {
     let send: crate::send::BoxedSend = Box::pin(std::future::pending());
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
     let Some(old) = std::time::Instant::now()
-        .checked_sub(Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS + 1_000))
+        .checked_sub(Duration::from_millis(config::ExtensionConfig::default().extension.batch_max_age_ms + 1_000))
     else {
         return; // host uptime shorter than the max age: cannot fake an old start
     };
@@ -4113,14 +4113,19 @@ fn make_group(request_id: &str, payloads: Vec<Vec<u8>>, report: Option<&str>) ->
 }
 
 #[test]
-fn runtime_done_hold_shrinks_below_80ms_then_stays_at_the_full_budget() {
-    let hold = |ms| runtime_done_hold(Duration::from_millis(ms)).as_millis();
-    assert_eq!(hold(20), 80);
-    assert_eq!(hold(60), 40);
-    assert_eq!(hold(79), 21);
-    assert_eq!(hold(80), 100);
-    assert_eq!(hold(100), 100);
-    assert_eq!(hold(5_000), 100);
+fn runtime_done_hold_shrinks_below_80_percent_of_the_cap_then_stays_at_the_cap() {
+    let hold = |ms, cap| runtime_done_hold(Duration::from_millis(ms), cap).as_millis();
+    assert_eq!(hold(20, 100), 80);
+    assert_eq!(hold(60, 100), 40);
+    assert_eq!(hold(79, 100), 21);
+    assert_eq!(hold(80, 100), 100);
+    assert_eq!(hold(5_000, 100), 100);
+    // The thresholds scale with the cap.
+    assert_eq!(hold(100, 200), 100);
+    assert_eq!(hold(160, 200), 200);
+    // A zero cap never holds.
+    assert_eq!(hold(0, 0), 0);
+    assert_eq!(hold(500, 0), 0);
 }
 
 #[tokio::test]
