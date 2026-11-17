@@ -2508,7 +2508,8 @@ async fn process_apm_request_high(
     invoke_retries: Option<InvokeRetries>,
 ) {
     let invoke_start = tokio::time::Instant::now();
-    let cap = Duration::from_millis(config.extension.hold_cap_ms);
+    let cap_ms = config.extension.hold_cap_ms;
+    let cap = Duration::from_millis(cap_ms);
 
     // Collect last invoke's log flush if it finished; never abort it here.
     resolve_pending_logs(global_log_processor, request_id).await;
@@ -2542,9 +2543,10 @@ async fn process_apm_request_high(
     let signaled = wait_for_runtime_done(request_id, deadline_ms).await;
     let handler = invoke_start.elapsed();
 
-    // Never hold `/next` more than the cap after `runtimeDone`, whatever the sends need.
+    // Never hold `/next` more than the cap after `runtimeDone`, whatever the sends need, and
+    // never so long that the function's own deadline gets close.
     let hold_started = tokio::time::Instant::now();
-    let hard_deadline = hold_started + cap;
+    let hard_deadline = hold_started + Duration::from_millis(bounded_wait_budget_ms(deadline_ms, cap_ms));
     let window_until = hard_deadline.min(
         hold_started + Duration::from_millis(config.extension.payload_window_ms),
     );
@@ -2566,8 +2568,8 @@ async fn process_apm_request_high(
     // flush from now. Unfinished at its deadline, the batch is left running (it may already
     // be at the collector, and aborting would only make its retry a duplicate); logs are
     // one request, so an unfinished flush is aborted and requeued from its write-ahead copy.
-    let batch_left = send_budget_left(send_started, cap);
     let logs_left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let batch_left = send_budget_left(send_started, cap).min(logs_left);
     let (mut batch_done, mut logs_done) = tokio::join!(
         SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::ApmCollector], batch_left),
         SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::Logs], logs_left),

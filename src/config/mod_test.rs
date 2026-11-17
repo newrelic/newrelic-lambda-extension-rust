@@ -1548,7 +1548,7 @@ fn test_extension_settings_all_fields() {
         expected_errors: std::collections::HashSet::new(),
         send_tier: crate::send::SendTier::Default,
         short_invoke_threshold_ms: 20,
-        hold_cap_ms: 100,
+        hold_cap_ms: 500,
         payload_window_ms: 25,
         batch_max_age_ms: 30_000,
         shutdown_batch_wait_ms: 2_000,
@@ -2292,7 +2292,7 @@ fn test_high_tier_timing_defaults() {
     let s = ExtensionSettings::default();
     assert_eq!(
         (s.hold_cap_ms, s.payload_window_ms, s.batch_max_age_ms, s.shutdown_batch_wait_ms),
-        (100, 25, 30_000, 2_000)
+        (crate::newrelic::client::SEND_TIMEOUT.as_millis() as u64, 25, 30_000, 2_000)
     );
 }
 

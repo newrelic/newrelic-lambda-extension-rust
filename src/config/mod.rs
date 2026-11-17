@@ -183,7 +183,9 @@ pub struct ExtensionSettings {
     pub short_invoke_threshold_ms: u64,
     /// `NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS` — `high` tier only. The budget for each send,
     /// counted from when that send started, and the most `/next` is held after `runtimeDone`.
-    /// A placeholder for the measured P99 of a healthy send. Default 100, clamped to `[0, 1000]`.
+    /// Defaults to `newrelic::client::SEND_TIMEOUT`, the shared placeholder for the measured
+    /// P99 of a healthy send, so replacing that one constant moves this cap with it. Clamped
+    /// to `[0, 5000]`; never more than the time left before the function's own deadline.
     pub hold_cap_ms: u64,
     /// `NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS` — `high` tier only. Longest we wait
     /// at `runtimeDone` for the request's own agent payload (only when its logs are held
@@ -344,7 +346,7 @@ impl Default for ExtensionSettings {
             expected_errors: HashSet::new(),
             send_tier: crate::send::SendTier::Default,
             short_invoke_threshold_ms: 20,
-            hold_cap_ms: 100,
+            hold_cap_ms: default_hold_cap_ms(),
             payload_window_ms: 25,
             batch_max_age_ms: 30_000,
             shutdown_batch_wait_ms: 2_000,
@@ -433,6 +435,11 @@ pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
         _ => return None,
     };
     Some(Duration::from_millis(millis as u64))
+}
+
+/// The hold cap's default: the shared send timeout, so one constant holds the P99 placeholder.
+fn default_hold_cap_ms() -> u64 {
+    crate::newrelic::client::SEND_TIMEOUT.as_millis() as u64
 }
 
 /// Milliseconds from an env var: unset or not a number falls back to `default`,
@@ -657,7 +664,7 @@ impl ExtensionConfig {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(20)
                 .min(1000);
-        config.extension.hold_cap_ms = env_ms("NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS", 100, 0, 1_000);
+        config.extension.hold_cap_ms = env_ms("NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS", default_hold_cap_ms(), 0, 5_000);
         config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
         config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
         config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 2_000, 0, 2_000);
