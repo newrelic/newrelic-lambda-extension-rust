@@ -112,10 +112,10 @@ fn failed_agent_payload_buffer_caps_and_counts_evictions() {
     let before = dropped_agent_payload_count();
     let mut buf: Vec<FailedAgentPayload> = Vec::new();
     // Push one past the cap: exactly one eviction, length stays at the cap.
-    for i in 0..(MAX_FAILED_AGENT_PAYLOADS + 1) {
+    for i in 0..(*MAX_FAILED_AGENT_PAYLOADS + 1) {
         push_failed_payload_capped(&mut buf, make_failed_payload(&format!("req-{i}")));
     }
-    assert_eq!(buf.len(), MAX_FAILED_AGENT_PAYLOADS, "must not exceed cap");
+    assert_eq!(buf.len(), *MAX_FAILED_AGENT_PAYLOADS, "must not exceed cap");
     assert_eq!(
         dropped_agent_payload_count(),
         before + 1,
@@ -125,7 +125,7 @@ fn failed_agent_payload_buffer_caps_and_counts_evictions() {
     assert!(!buf.iter().any(|p| p.request_id == "req-0"));
     assert!(buf
         .iter()
-        .any(|p| p.request_id == format!("req-{MAX_FAILED_AGENT_PAYLOADS}")));
+        .any(|p| p.request_id == format!("req-{}", *MAX_FAILED_AGENT_PAYLOADS)));
 }
 
 // Not in-flight (flag = false) → returns immediately without waiting.
@@ -4132,10 +4132,10 @@ fn runtime_done_hold_shrinks_below_80_percent_of_the_cap_then_stays_at_the_cap()
 #[serial]
 async fn send_pending_groups_without_apm_buffers_everything() {
     clear_high_tier_state();
-    let groups = vec![
+    let groups = Arc::new(vec![
         make_group("g1", vec![vec![1]], Some("REPORT 1")),
         make_group("g2", vec![vec![2]], None),
-    ];
+    ]);
     let config = Arc::new(config::ExtensionConfig::default());
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 

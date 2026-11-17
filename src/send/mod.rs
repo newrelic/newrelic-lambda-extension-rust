@@ -32,7 +32,10 @@ pub mod send_target;
 pub mod tier;
 pub mod timeout_provider;
 
-pub use circuit_breaker::{AlwaysAllowBreaker, BreakerState, CircuitBreaker};
+pub use circuit_breaker::{
+    AlwaysAllowBreaker, BreakerState, CircuitBreaker, ConsecutiveFailureBreaker,
+    DEFAULT_THRESHOLD_DEFAULT, DEFAULT_THRESHOLD_HIGH,
+};
 pub use scheduler::{DispatchOutcome, DispatchResult, SendMode, SendScheduler};
 pub use send_target::{from_collector_result, BoxedSend};
 pub use tier::SendTier;

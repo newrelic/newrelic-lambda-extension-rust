@@ -161,7 +161,10 @@ impl SendScheduler {
         match self.mode {
             SendMode::Sync => self.send_now(kind, send, cursor).await,
             SendMode::Deferred => {
-                self.spawn(kind, send, cursor).await;
+                // `dispatch` already consulted the breaker above, so go
+                // straight to the un-gated inner spawn — never `spawn`, or the
+                // breaker's `allow_send` would be counted twice for one send.
+                self.spawn_inner(kind, send, cursor).await;
                 DispatchOutcome {
                     result: DispatchResult::Deferred,
                     cursor: None,
@@ -208,7 +211,34 @@ impl SendScheduler {
     /// callers always call `resolve_pending` before spawning the next send
     /// of the same kind — see module docs), abort the orphaned handle
     /// defensively rather than silently leaking it.
-    pub async fn spawn(&self, kind: SendKind, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) {
+    ///
+    /// **Circuit-breaker gated.** This is the single point where the breaker's
+    /// `allow_send` is consulted for the two-phase spawn/resolve callers (the
+    /// `high` tier) — the breaker lives in `SendScheduler`, not in the call
+    /// sites. Returns:
+    /// - `true`  → the breaker allowed the send; it was spawned and is now
+    ///   tracked for a later `resolve_pending*`.
+    /// - `false` → the breaker is Open for `kind`; **nothing was spawned**. The
+    ///   caller must buffer the payload for a later retry (and undo any
+    ///   write-ahead/metadata it staged for this send). Counts as one
+    ///   Open-window invocation for `kind`.
+    pub async fn spawn(&self, kind: SendKind, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) -> bool {
+        if !self.breaker.allow_send(kind) {
+            tracing::debug!(
+                "SendScheduler: circuit breaker open for {:?} — send skipped, caller buffers",
+                kind
+            );
+            return false;
+        }
+        self.spawn_inner(kind, send, cursor).await;
+        true
+    }
+
+    /// Un-gated spawn body — stores the handle (and cursor) for a later
+    /// `resolve_pending*`. Kept private and separate from [`SendScheduler::spawn`]
+    /// so `dispatch` (which has already consulted the breaker) can reach it
+    /// without double-counting an `allow_send`.
+    async fn spawn_inner(&self, kind: SendKind, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) {
         let handle = tokio::spawn(send);
         let mut guard = self.pending.lock().await;
         if let Some(orphaned) = guard.insert(kind, PendingEntry { handle, cursor }) {
