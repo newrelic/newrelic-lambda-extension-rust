@@ -3798,8 +3798,8 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
 /// Free the batch slot without aborting whatever is in it, and forget its start time.
 async fn clear_batch_state() {
     SEND_SCHEDULER.detach(crate::send::SendKind::ApmCollector).await;
-    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
-        *started = None;
+    if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
+        *in_flight = None;
     }
 }
 
@@ -3844,6 +3844,12 @@ async fn resolve_pending_agent_batch_leaves_a_slow_batch_running() {
     clear_batch_state().await;
 }
 
+fn set_in_flight_batch(id: &str, started_at: std::time::Instant) {
+    if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
+        *in_flight = Some(InFlightBatch { id: id.to_string(), started_at });
+    }
+}
+
 fn register_request_with_payload(request_id: &str, payload: Vec<u8>) {
     let config = make_config_for_serverless(false);
     let factory = make_serverless_processor_factory(config);
@@ -3860,9 +3866,7 @@ async fn spawn_pending_batch_skips_while_the_previous_batch_is_running() {
     clear_batch_state().await;
     let send: crate::send::BoxedSend = Box::pin(std::future::pending());
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
-    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
-        *started = Some(std::time::Instant::now());
-    }
+    set_in_flight_batch("test-running", std::time::Instant::now());
     register_request_with_payload("spb-previous", vec![1, 2, 3]);
     let config = make_config_for_serverless(false);
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
@@ -3890,7 +3894,7 @@ async fn spawn_pending_batch_detaches_a_batch_older_than_the_max_age() {
     else {
         return; // host uptime shorter than the max age: cannot fake an old start
     };
-    *BATCH_STARTED_AT.lock().unwrap() = Some(old);
+    set_in_flight_batch("test-old", old);
     register_request_with_payload("spb-old-previous", vec![9, 9, 9]);
     let config = make_config_for_serverless(false);
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
@@ -4131,6 +4135,7 @@ async fn send_pending_groups_without_apm_buffers_everything() {
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
     let outcome = send_pending_groups(
+        "test-batch".to_string(),
         groups,
         config.clone(),
         make_noop_log_processor_serverless(config),
@@ -4220,4 +4225,34 @@ async fn default_tier_never_uses_the_send_scheduler() {
     assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await);
     cleanup_request_processing_state_internal(request_id, false);
     clear_high_tier_state();
+}
+
+// The batch success signal reads the per-type buffer: a type that got 202 leaves
+// nothing behind, a failed one leaves exactly its own entry.
+#[test]
+#[serial]
+fn buffered_failures_since_counts_only_new_failures_for_that_request() {
+    use crate::apm::telemetry_buffer::{FailedTelemetry, FAILED_TELEMETRY_BUFFER};
+    let entry = |request_id: &str, failed_at| FailedTelemetry {
+        telemetry_type: "metric_data".to_string(),
+        data: vec![],
+        request_id: request_id.to_string(),
+        run_id: "run".to_string(),
+        collector_host: "host".to_string(),
+        failed_at,
+        retry_count: 0,
+    };
+    let start = chrono::Utc::now();
+    {
+        let mut buffer = FAILED_TELEMETRY_BUFFER.lock().unwrap();
+        buffer.clear();
+        buffer.push(entry("req-a", start - chrono::Duration::seconds(30))); // an older retry
+        buffer.push(entry("req-a", start + chrono::Duration::milliseconds(5)));
+        buffer.push(entry("req-b", start + chrono::Duration::milliseconds(5)));
+    }
+
+    assert_eq!(buffered_failures_since("req-a", start), 1);
+    assert_eq!(buffered_failures_since("req-b", start), 1);
+    assert_eq!(buffered_failures_since("req-none", start), 0);
+    FAILED_TELEMETRY_BUFFER.lock().unwrap().clear();
 }

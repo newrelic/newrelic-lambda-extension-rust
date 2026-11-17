@@ -297,10 +297,18 @@ struct PendingGroup {
     report: Option<String>,
 }
 
-/// When the in-flight batch was started, so a batch that outlives
-/// `HIGH_TIER_BATCH_MAX_AGE_MS` stops blocking new ones.
-static BATCH_STARTED_AT: once_cell::sync::Lazy<Mutex<Option<std::time::Instant>>> =
+/// The batch currently in flight. The id ties the log lines of one batch together
+/// (start, failures, outcome); the start time lets a batch that outlives
+/// `HIGH_TIER_BATCH_MAX_AGE_MS` stop blocking new ones.
+struct InFlightBatch {
+    id: String,
+    started_at: std::time::Instant,
+}
+
+static IN_FLIGHT_BATCH: once_cell::sync::Lazy<Mutex<Option<InFlightBatch>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+static NEXT_BATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A batch still running after this long is almost certainly stuck (each request
 /// has its own timeout). It is detached, not aborted: it keeps running and still
@@ -366,6 +374,7 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
 /// Sends one group at a time and buffers its own failures, so the task never
 /// loses data by itself and needs no one to clean up after it. Nothing aborts it.
 async fn send_pending_groups(
+    batch_id: String,
     groups: Vec<PendingGroup>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
@@ -387,6 +396,9 @@ async fn send_pending_groups(
         };
         all_sent &= sent;
     }
+    if !all_sent {
+        warn!("APM mode (high): batch {} had failures; the failed data is buffered for retry", batch_id);
+    }
     if all_sent {
         crate::send::SendOutcome::Success
     } else {
@@ -394,8 +406,26 @@ async fn send_pending_groups(
     }
 }
 
-/// `false` if anything failed (and was buffered).
+/// Failed types the per-type tasks buffered for `request_id` since `since`. A type
+/// that got 202 leaves no entry, so zero means every type landed. Entries from
+/// earlier retries keep their old `failed_at` and are not counted. Approximate if a
+/// background retry drains the buffer at the same moment, which only hides a failure
+/// that is already being retried.
+fn buffered_failures_since(request_id: &str, since: chrono::DateTime<chrono::Utc>) -> usize {
+    crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER
+        .lock()
+        .map_or(0, |buffer| {
+            buffer
+                .iter()
+                .filter(|item| item.request_id == request_id && item.failed_at >= since)
+                .count()
+        })
+}
+
+/// `false` if anything failed. The failed data is already buffered: whole payloads
+/// when nothing was sent, individual types when only some failed.
 async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
+    let started = chrono::Utc::now();
     let mut sent = true;
     if !group.payloads.is_empty() {
         // One POST per telemetry type, not per chunk.
@@ -408,6 +438,13 @@ async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
                 buffer_failed_agent_payload(payload, &group.request_id, &group.invoked_function_arn);
             }
             sent = false;
+        } else {
+            // The merged send returns Ok even when some types failed, so ask the buffer.
+            let failed = buffered_failures_since(&group.request_id, started);
+            if failed > 0 {
+                warn!("{} type(s) of {} failed and were buffered for retry", failed, group.request_id);
+                sent = false;
+            }
         }
     }
     if let Some(report) = &group.report {
@@ -453,10 +490,19 @@ async fn spawn_pending_batch(
         AGENT_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
-        *started = Some(std::time::Instant::now());
+    let batch_id = format!("b{}", NEXT_BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    info!(
+        "APM mode (high): batch {} started: {} request(s), {} payload chunk(s), {} report(s)",
+        batch_id,
+        groups.len(),
+        groups.iter().map(|g| g.payloads.len()).sum::<usize>(),
+        groups.iter().filter(|g| g.report.is_some()).count()
+    );
+    if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
+        *in_flight = Some(InFlightBatch { id: batch_id.clone(), started_at: std::time::Instant::now() });
     }
     let send: crate::send::BoxedSend = Box::pin(send_pending_groups(
+        batch_id,
         groups,
         config.clone(),
         global_log_processor.clone(),
@@ -468,11 +514,11 @@ async fn spawn_pending_batch(
 }
 
 fn batch_exceeded_max_age() -> bool {
-    BATCH_STARTED_AT
+    IN_FLIGHT_BATCH
         .lock()
         .ok()
-        .and_then(|started| *started)
-        .is_some_and(|t| t.elapsed() >= Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS))
+        .and_then(|batch| batch.as_ref().map(|b| b.started_at))
+        .is_some_and(|started| started.elapsed() >= Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS))
 }
 
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
@@ -491,14 +537,18 @@ async fn wait_for_pending_agent_batch(wait: Duration) {
 }
 
 /// A finished batch has nothing left to clean up: each failure was buffered by
-/// the task that hit it. This only records the result.
+/// the task that hit it. This only records which batch finished and how.
 fn log_batch_outcome(outcome: &crate::send::DispatchOutcome) {
+    let finished = IN_FLIGHT_BATCH.lock().ok().and_then(|mut b| b.take());
+    let (id, took_ms) = finished.map_or(("?".to_string(), 0), |b| (b.id, b.started_at.elapsed().as_millis()));
     match outcome.result {
-        crate::send::DispatchResult::Sent => debug!("APM mode (high): batch send finished"),
-        crate::send::DispatchResult::Failed => {
-            warn!("APM mode (high): batch send finished with failures (buffered for retry)");
+        crate::send::DispatchResult::Sent => {
+            info!("APM mode (high): batch {} finished, all data delivered ({}ms since start)", id, took_ms);
         }
-        other => debug!("APM mode (high): batch send ended as {:?}", other),
+        crate::send::DispatchResult::Failed => {
+            warn!("APM mode (high): batch {} finished with failures, buffered for retry ({}ms since start)", id, took_ms);
+        }
+        other => debug!("APM mode (high): batch {} ended as {:?}", id, other),
     }
 }
 
