@@ -4205,7 +4205,10 @@ async fn high_tier_short_invoke_does_not_hold_next() {
         "short invoke must return without holding, took {:?}",
         start.elapsed()
     );
-    let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
+    assert!(
+        !SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await,
+        "a short invoke must not start a log flush: logs stay buffered"
+    );
     cleanup_request_processing_state_internal(&request_id, false);
     clear_high_tier_state();
 }

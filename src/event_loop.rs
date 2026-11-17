@@ -2262,10 +2262,10 @@ async fn process_apm_request_high(
     let handler = invoke_start.elapsed();
 
     if handler < Duration::from_millis(config.extension.short_invoke_threshold_ms) {
-        // A trivial function must not pay for telemetry. Leave sends running
-        // (aborting would starve functions that are always short); the next
-        // INVOKE collects them.
-        spawn_log_flush(global_log_processor, request_id).await;
+        // A trivial function must not pay for telemetry, so do nothing now: no hold
+        // and no log flush. Logs stay buffered in the LogProcessor and go out with a
+        // later flush; the batch started at INVOKE keeps running (aborting would
+        // starve functions that are always short) and the next INVOKE collects it.
         log_invoke_timing(request_id, &InvokeTiming {
             handler_ms: handler.as_millis(),
             hold_budget_ms: 0,
