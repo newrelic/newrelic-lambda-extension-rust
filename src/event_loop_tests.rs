@@ -3793,147 +3793,20 @@ async fn execute_standard_mode_event_loop_handles_shutdown_flush_failure_gracefu
     assert_eq!(event_count, 1, "single SHUTDOWN must count as one event");
 }
 
-// ── resolve_pending_agent_batch (runtimeDone boundary — via SEND_SCHEDULER) ────
+// ── agent batch (SEND_SCHEDULER, never aborted) ─────────────────────────────────────
 
-/// One group per payload, so the cursor counts payloads in these tests.
-fn set_agent_batch_meta(payloads: Vec<Arc<Vec<u8>>>, request_id: &str, arn: &str) {
-    if let Ok(mut guard) = AGENT_BATCH_META.lock() {
-        let groups = payloads
-            .into_iter()
-            .map(|p| PendingGroup {
-                request_id: request_id.to_string(),
-                invoked_function_arn: arn.to_string(),
-                payloads: vec![(*p).clone()],
-                report: None,
-            })
-            .collect();
-        *guard = Some(Arc::new(groups));
-    }
-}
-
-// Common case: the Flow-1 send already finished by the runtimeDone boundary. Resolving
-// it must add ~zero latency and must NOT buffer anything into FAILED_AGENT_PAYLOADS.
-#[tokio::test]
-#[serial]
-async fn resolve_pending_agent_batch_already_done_adds_no_wait_and_buffers_nothing() {
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
-
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
-    let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
-    set_agent_batch_meta(vec![Arc::new(vec![1u8, 2, 3])], "rtd-done-req", "arn:aws:lambda:us-east-1:123:function:test");
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
-        .await;
-
-    // Give the spawned task a moment to actually finish so is_finished() is true and the
-    // fast path is exercised.
-    tokio::task::yield_now().await;
-
-    let start = std::time::Instant::now();
-    resolve_pending_agent_batch().await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed < Duration::from_millis(100),
-        "already-done send must resolve well under the bound, took {elapsed:?}"
-    );
-    let len = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(usize::MAX);
-    assert_eq!(len, 0, "already-done send must not buffer any failed payloads");
-
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
-}
-
-// Worst case with partial completion: the Flow-1 send successfully resolves payload 0
-// (advancing the cursor), then hangs on payload 1 past the bound. Resolving must time
-// out, abort the send, and buffer ONLY the unresolved payload (payload 1) — NOT payload
-// 0, which was already sent. Re-buffering payload 0 would duplicate telemetry /
-// FAILED_AGENT_PAYLOADS entries (the fixed duplicate-send bug).
-#[tokio::test]
-#[serial]
-async fn resolve_pending_agent_batch_timeout_buffers_only_unresolved_payloads() {
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
-
-    // The task advances the cursor after "sending" payload 0, then hangs on payload 1
-    // (mirroring a send stuck mid-flight at the runtimeDone boundary).
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let cursor_task = cursor.clone();
-    let send: crate::send::BoxedSend = Box::pin(async move {
-        // payload 0 "sent" successfully → resolved.
-        cursor_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // payload 1 hangs forever (never resolves, cursor stays at 1).
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        cursor_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        crate::send::SendOutcome::Success
-    });
-
-    // payload 0 = [1,2,3] (already sent), payload 1 = [4,5,6] (stuck → must be buffered).
-    set_agent_batch_meta(
-        vec![Arc::new(vec![1u8, 2, 3]), Arc::new(vec![4u8, 5, 6])],
-        "rtd-timeout-req",
-        "arn:aws:lambda:us-east-1:123:function:test",
-    );
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
-        .await;
-
-    // Let the task advance the cursor past payload 0 before the boundary check.
-    tokio::task::yield_now().await;
-
-    let start = std::time::Instant::now();
-    resolve_pending_agent_batch().await;
-    let elapsed = start.elapsed();
-
-    assert!(
-        elapsed >= Duration::from_millis(90) && elapsed < Duration::from_secs(2),
-        "must wait roughly the configured bound before timing out, not the stuck send's full duration, took {elapsed:?}"
-    );
-
-    let buffered: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS
-        .lock()
-        .map(|b| b.iter().map(|p| p.payload_bytes.clone()).collect())
-        .unwrap_or_default();
-    assert_eq!(
-        buffered.len(),
-        1,
-        "only the unresolved payload (payload 1) must be buffered, not the already-sent payload 0"
-    );
-    assert_eq!(
-        buffered[0],
-        vec![4u8, 5, 6],
-        "the buffered payload must be payload 1 ([4,5,6]) — payload 0 ([1,2,3]) was already sent"
-    );
-
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
-}
-
-// --- SendTier::High deferred agent-send tests (SEND_SCHEDULER / AGENT_BATCH_META) ---
-//
-// These exercise SEND_SCHEDULER.spawn + resolve_pending_agent_batch directly,
-// independent of the full process_apm_request flow, mirroring the same split
-// event_loop_tests.rs already uses for send_agent_payload_or_buffer above. #[serial]
-// because SEND_SCHEDULER, AGENT_BATCH_META, and FAILED_AGENT_PAYLOADS are
-// process-global.
-
-fn clear_agent_batch_meta() {
-    if let Ok(mut guard) = AGENT_BATCH_META.lock() {
-        *guard = None;
+/// Free the batch slot without aborting whatever is in it, and forget its start time.
+async fn clear_batch_state() {
+    SEND_SCHEDULER.detach(crate::send::SendKind::ApmCollector).await;
+    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
+        *started = None;
     }
 }
 
 #[tokio::test]
 #[serial]
 async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
-    clear_agent_batch_meta();
-    // Must return promptly and without panicking - this is also exactly the
-    // first-invocation case, where nothing has ever been spawned yet.
+    clear_batch_state().await;
     let start = tokio::time::Instant::now();
     resolve_pending_agent_batch().await;
     assert!(start.elapsed() < Duration::from_millis(50));
@@ -3941,113 +3814,100 @@ async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
 
 #[tokio::test]
 #[serial]
-async fn spawn_then_resolve_recovers_an_already_finished_send() {
-    clear_agent_batch_meta();
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+async fn resolve_pending_agent_batch_collects_a_finished_batch() {
+    clear_batch_state().await;
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
-    set_agent_batch_meta(vec![Arc::new(vec![1, 2, 3])], "req-deferred-ok", "arn:aws:lambda:us-east-1:123:function:test");
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
-        .await;
-    // Give the trivial task a moment to actually finish before resolving,
-    // simulating it completing well before the next invocation checks it.
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    let start = tokio::time::Instant::now();
     resolve_pending_agent_batch().await;
-    assert!(
-        start.elapsed() < Duration::from_millis(20),
-        "an already-finished deferred send must resolve with ~zero added wait"
-    );
 
-    // Nothing left pending, and nothing should have landed in the durable
-    // buffer for a send that finished successfully.
-    clear_agent_batch_meta();
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
 }
 
+// SHUTDOWN waits a bounded time, then leaves a slow batch alone: aborting it would
+// only turn a possibly-delivered request into a duplicate.
 #[tokio::test]
 #[serial]
-async fn spawn_then_resolve_buffers_an_unfinished_straggler() {
-    clear_agent_batch_meta();
+async fn resolve_pending_agent_batch_leaves_a_slow_batch_running() {
+    clear_batch_state().await;
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
+    let send: crate::send::BoxedSend = Box::pin(std::future::pending());
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
 
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let send: crate::send::BoxedSend = Box::pin(async {
-        // Longer than the configured bound - never actually finishes within
-        // the window this test cares about.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        crate::send::SendOutcome::Success
-    });
-    set_agent_batch_meta(vec![Arc::new(vec![9, 9, 9])], "req-deferred-straggler", "arn:aws:lambda:us-east-1:123:function:test");
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
-        .await;
+    wait_for_pending_agent_batch(Duration::from_millis(50)).await;
 
-    let start = tokio::time::Instant::now();
-    resolve_pending_agent_batch().await;
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(90) && elapsed < Duration::from_secs(1),
-        "resolving a straggler must be bounded to roughly the configured timeout, got {elapsed:?}"
-    );
+    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 0, "nothing is re-buffered");
+    clear_batch_state().await;
+}
 
+fn register_request_with_payload(request_id: &str, payload: Vec<u8>) {
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config);
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(payload);
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+}
+
+// While the previous batch is still running, the next INVOKE must not take new data:
+// it stays buffered for the following one, so nothing is sent twice or lost.
+#[tokio::test]
+#[serial]
+async fn spawn_pending_batch_skips_while_the_previous_batch_is_running() {
+    clear_batch_state().await;
+    let send: crate::send::BoxedSend = Box::pin(std::future::pending());
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
+    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
+        *started = Some(std::time::Instant::now());
+    }
+    register_request_with_payload("spb-previous", vec![1, 2, 3]);
+    let config = make_config_for_serverless(false);
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    spawn_pending_batch("spb-current", &config, &make_noop_log_processor_serverless(config.clone()), &apm_app).await;
+
+    let still_buffered = get_agent_buffer("spb-previous").map(|b| b.lock().unwrap().len());
+    assert_eq!(still_buffered, Some(1), "the data must stay put while a batch is in flight");
+    clear_batch_state().await;
+    cleanup_request_processing_state_internal("spb-previous", false);
+}
+
+// A batch older than the max age stops blocking new ones. It is detached, not aborted.
+#[tokio::test]
+#[serial]
+async fn spawn_pending_batch_detaches_a_batch_older_than_the_max_age() {
+    clear_batch_state().await;
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+    }
+    let send: crate::send::BoxedSend = Box::pin(std::future::pending());
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
+    let Some(old) = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS + 1_000))
+    else {
+        return; // host uptime shorter than the max age: cannot fake an old start
+    };
+    *BATCH_STARTED_AT.lock().unwrap() = Some(old);
+    register_request_with_payload("spb-old-previous", vec![9, 9, 9]);
+    let config = make_config_for_serverless(false);
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    spawn_pending_batch("spb-old-current", &config, &make_noop_log_processor_serverless(config.clone()), &apm_app).await;
+
+    // The new batch took the data; with no APM connection it buffers the payload.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let buffered = FAILED_AGENT_PAYLOADS
         .lock()
-        .map(|b| b.iter().any(|p| p.request_id == "req-deferred-straggler"))
+        .map(|b| b.iter().any(|p| p.request_id == "spb-old-previous"))
         .unwrap_or(false);
-    assert!(
-        buffered,
-        "an unresolved deferred send's payload must be buffered for retry, not dropped"
-    );
-
+    assert!(buffered, "the new batch must have taken and processed the data");
+    clear_batch_state().await;
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
     }
-    clear_agent_batch_meta();
-}
-
-#[tokio::test]
-#[serial]
-async fn spawning_a_second_time_without_resolving_aborts_the_orphan() {
-    clear_agent_batch_meta();
-
-    let first_send: crate::send::BoxedSend = Box::pin(async {
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        crate::send::SendOutcome::Success
-    });
-    set_agent_batch_meta(vec![Arc::new(vec![1])], "req-orphan", "arn:aws:lambda:us-east-1:123:function:test");
-    SEND_SCHEDULER
-        .spawn(
-            crate::send::SendKind::ApmCollector,
-            first_send,
-            Some(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
-        )
-        .await;
-
-    // Second spawn without an intervening resolve - the defensive path should
-    // abort the first handle rather than leaking it, and the second entry
-    // should be the one resolve_pending_agent_batch picks up.
-    let second_send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    set_agent_batch_meta(vec![Arc::new(vec![2])], "req-second", "arn:aws:lambda:us-east-1:123:function:test");
-    SEND_SCHEDULER
-        .spawn(
-            crate::send::SendKind::ApmCollector,
-            second_send,
-            Some(Arc::new(std::sync::atomic::AtomicUsize::new(1))),
-        )
-        .await;
-
-    let start = tokio::time::Instant::now();
-    resolve_pending_agent_batch().await;
-    assert!(
-        start.elapsed() < Duration::from_millis(20),
-        "the second (already-finished) entry must resolve quickly, proving it - not the orphan - is what's stored"
-    );
-
-    clear_agent_batch_meta();
 }
 
 // --- Log flush tests (spawn_log_flush / resolve_pending_logs via SEND_SCHEDULER) ---
@@ -4237,7 +4097,6 @@ fn clear_high_tier_state() {
     if let Ok(mut b) = FAILED_PLATFORM_REPORTS.lock() {
         b.clear();
     }
-    clear_agent_batch_meta();
 }
 
 fn make_group(request_id: &str, payloads: Vec<Vec<u8>>, report: Option<&str>) -> PendingGroup {
@@ -4260,46 +4119,19 @@ fn runtime_done_hold_shrinks_below_80ms_then_stays_at_the_full_budget() {
     assert_eq!(hold(5_000), 100);
 }
 
-#[test]
-#[serial]
-fn buffer_unresolved_groups_buffers_only_the_tail_with_its_reports() {
-    clear_high_tier_state();
-    let groups = vec![
-        make_group("done", vec![vec![1]], Some("REPORT done")),
-        make_group("cut-off", vec![vec![2], vec![3]], Some("REPORT cut-off")),
-    ];
-
-    buffer_unresolved_groups(&groups, 1);
-
-    let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|p| p.payload_bytes.clone())
-        .collect();
-    assert_eq!(payloads, vec![vec![2u8], vec![3u8]]);
-    let reports = FAILED_PLATFORM_REPORTS.lock().unwrap();
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].request_id, "cut-off");
-    drop(reports);
-    clear_high_tier_state();
-}
-
 #[tokio::test]
 #[serial]
-async fn send_pending_groups_without_apm_buffers_everything_and_counts_all_groups() {
+async fn send_pending_groups_without_apm_buffers_everything() {
     clear_high_tier_state();
-    let groups = Arc::new(vec![
+    let groups = vec![
         make_group("g1", vec![vec![1]], Some("REPORT 1")),
         make_group("g2", vec![vec![2]], None),
-    ]);
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    ];
     let config = Arc::new(config::ExtensionConfig::default());
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
     let outcome = send_pending_groups(
         groups,
-        cursor.clone(),
         config.clone(),
         make_noop_log_processor_serverless(config),
         apm_app,
@@ -4307,7 +4139,6 @@ async fn send_pending_groups_without_apm_buffers_everything_and_counts_all_group
     .await;
 
     assert_eq!(outcome, crate::send::SendOutcome::Failure);
-    assert_eq!(cursor.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 2, "no payload may be lost");
     assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1, "no report may be lost");
     clear_high_tier_state();
@@ -4337,21 +4168,6 @@ async fn take_pending_groups_takes_other_requests_and_leaves_the_current_one() {
     assert_eq!(still_buffered, Some(1), "the running request's own payload must stay put");
 
     cleanup_request_processing_state_internal("tpg-current", false);
-    clear_high_tier_state();
-}
-
-#[tokio::test]
-#[serial]
-async fn still_running_batch_keeps_its_meta_for_the_real_resolve() {
-    clear_high_tier_state();
-    set_agent_batch_meta(vec![Arc::new(vec![1])], "still-running", "arn:test");
-
-    handle_agent_batch_outcome(&crate::send::DispatchOutcome {
-        result: crate::send::DispatchResult::StillRunning,
-        cursor: Some(0),
-    });
-
-    assert!(AGENT_BATCH_META.lock().unwrap().is_some());
     clear_high_tier_state();
 }
 

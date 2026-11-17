@@ -280,9 +280,8 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
 
 
 /// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
-/// log flush. `default` never touches it. Resolved at `runtimeDone` with an
-/// abort-capable shared budget, left running (no-abort) for short invokes, and
-/// drained at SHUTDOWN.
+/// log flush. `default` never touches it. The batch is never aborted (it may
+/// already be at the collector); only the log flush is, at the cap.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
         crate::send::SendMode::Deferred,
@@ -298,21 +297,27 @@ struct PendingGroup {
     report: Option<String>,
 }
 
-/// What the in-flight batch send is working on. `SendScheduler` knows nothing
-/// about payloads, so this is what lets an abort re-buffer the unfinished tail.
-/// At most one at a time: it is resolved before the next batch is spawned.
-static AGENT_BATCH_META: once_cell::sync::Lazy<Mutex<Option<Arc<Vec<PendingGroup>>>>> =
+/// When the in-flight batch was started, so a batch that outlives
+/// `HIGH_TIER_BATCH_MAX_AGE_MS` stops blocking new ones.
+static BATCH_STARTED_AT: once_cell::sync::Lazy<Mutex<Option<std::time::Instant>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+/// A batch still running after this long is almost certainly stuck (each request
+/// has its own timeout). It is detached, not aborted: it keeps running and still
+/// buffers its own failures, but a new batch may start.
+const HIGH_TIER_BATCH_MAX_AGE_MS: u64 = 30_000;
+
+/// Longest SHUTDOWN waits for the last batch. Lambda gives external extensions 2s.
+const HIGH_TIER_SHUTDOWN_BATCH_WAIT_MS: u64 = 1_500;
 
 /// Set once the agent has delivered a payload in this sandbox. An
 /// uninstrumented function never sends one, so waiting for it would be wasted.
 static AGENT_PAYLOAD_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Write-ahead copy of the log batch about to be flushed, like
-/// `AGENT_BATCH_META` for payloads. `LogProcessor::flush()` drains its batch
-/// before sending, so an abort would otherwise lose it; this snapshot, taken
-/// before the spawn, is what `handle_logs_outcome` requeues on `TimedOut`. Cleared (not just overwritten) once resolved
-/// either way, same lifecycle as `AGENT_BATCH_META`.
+/// Write-ahead copy of the log batch about to be flushed. `LogProcessor::flush()`
+/// drains its batch before sending, so an abort would otherwise lose it; this
+/// snapshot, taken before the spawn, is what `handle_logs_outcome` requeues on
+/// `TimedOut`. Cleared once the flush is resolved either way.
 struct LogBatchWriteAhead {
     batch: Vec<crate::newrelic::payload::LogMessage>,
     request_id: String,
@@ -320,16 +325,6 @@ struct LogBatchWriteAhead {
 
 static LOG_BATCH_WRITE_AHEAD: once_cell::sync::Lazy<Mutex<Option<LogBatchWriteAhead>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
-
-/// Re-buffer groups the aborted send never got to. Groups before the cursor
-/// are done; a group cut off mid-flight is re-buffered whole, so a retry may
-/// repeat part of it. We prefer a duplicate over a loss.
-fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
-    for group in groups.get(resolved_cursor..).unwrap_or(&[]) {
-        warn!("APM mode: send for {} cut off - buffering for retry", group.request_id);
-        buffer_group(group);
-    }
-}
 
 fn buffer_group(group: &PendingGroup) {
     for payload in &group.payloads {
@@ -369,17 +364,15 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
 }
 
 /// Sends one group at a time and buffers its own failures, so the task never
-/// loses data by itself. `cursor` counts finished groups: that is all an abort
-/// needs to know to re-buffer the rest.
+/// loses data by itself and needs no one to clean up after it. Nothing aborts it.
 async fn send_pending_groups(
-    groups: Arc<Vec<PendingGroup>>,
-    cursor: Arc<std::sync::atomic::AtomicUsize>,
+    groups: Vec<PendingGroup>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
 ) -> crate::send::SendOutcome {
     let mut all_sent = true;
-    for group in groups.iter() {
+    for group in &groups {
         for payload in &group.payloads {
             extract_and_coordinate_trace_id(payload, &group.request_id, &config, &global_log_processor).await;
         }
@@ -393,7 +386,6 @@ async fn send_pending_groups(
             false
         };
         all_sent &= sent;
-        cursor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     if all_sent {
         crate::send::SendOutcome::Success
@@ -436,19 +428,24 @@ async fn spawn_pending_batch(
     global_log_processor: &Arc<LogProcessor>,
     apm_app: &crate::apm::SharedApmApp,
 ) {
-    // A previous send still running (short invokes leave it so) must not be
-    // aborted or orphaned: skip this round, the data stays buffered for the next.
+    // One batch at a time: the previous one may be left running across a freeze.
+    // If it is still going, skip this round; the data waits for the next INVOKE.
     if let Some(outcome) = SEND_SCHEDULER
         .resolve_pending_no_abort(crate::send::SendKind::ApmCollector)
         .await
     {
-        handle_agent_batch_outcome(&outcome);
         if outcome.result == crate::send::DispatchResult::StillRunning {
-            return;
+            if !batch_exceeded_max_age() {
+                return;
+            }
+            warn!("APM mode (high): previous batch still running after {}ms - detaching it", HIGH_TIER_BATCH_MAX_AGE_MS);
+            SEND_SCHEDULER.detach(crate::send::SendKind::ApmCollector).await;
+        } else {
+            log_batch_outcome(&outcome);
         }
     }
 
-    let groups = Arc::new(take_pending_groups(current_request_id));
+    let groups = take_pending_groups(current_request_id);
     if groups.is_empty() {
         return;
     }
@@ -456,56 +453,52 @@ async fn spawn_pending_batch(
         AGENT_PAYLOAD_SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    if let Ok(mut guard) = AGENT_BATCH_META.lock() {
-        *guard = Some(groups.clone());
-    } else {
-        // Without the meta an abort could not re-buffer, so don't send.
-        error!("AGENT_BATCH_META poisoned, buffering instead of sending");
-        groups.iter().for_each(buffer_group);
-        return;
+    if let Ok(mut started) = BATCH_STARTED_AT.lock() {
+        *started = Some(std::time::Instant::now());
     }
-
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let send: crate::send::BoxedSend = Box::pin(send_pending_groups(
         groups,
-        cursor.clone(),
         config.clone(),
         global_log_processor.clone(),
         apm_app.clone(),
     ));
     SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor))
+        .spawn(crate::send::SendKind::ApmCollector, send, None)
         .await;
 }
 
-/// Final drain at SHUTDOWN: no next invocation to defer to.
+fn batch_exceeded_max_age() -> bool {
+    BATCH_STARTED_AT
+        .lock()
+        .ok()
+        .and_then(|started| *started)
+        .is_some_and(|t| t.elapsed() >= Duration::from_millis(HIGH_TIER_BATCH_MAX_AGE_MS))
+}
+
+/// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
+/// Lambda's 2s limit) for the last batch, and leave it running if it is slow.
 async fn resolve_pending_agent_batch() {
-    if let Some(outcome) = SEND_SCHEDULER
-        .resolve_pending(crate::send::SendKind::ApmCollector)
-        .await
-    {
-        handle_agent_batch_outcome(&outcome);
+    wait_for_pending_agent_batch(Duration::from_millis(HIGH_TIER_SHUTDOWN_BATCH_WAIT_MS)).await;
+}
+
+async fn wait_for_pending_agent_batch(wait: Duration) {
+    let done = SEND_SCHEDULER
+        .wait_finished(&[crate::send::SendKind::ApmCollector], wait)
+        .await;
+    if let Some(outcome) = done.get(&crate::send::SendKind::ApmCollector) {
+        log_batch_outcome(outcome);
     }
 }
 
-fn handle_agent_batch_outcome(outcome: &crate::send::DispatchOutcome) {
-    use crate::send::DispatchResult::{Failed, Sent, StillRunning, TimedOut};
-    // Still running: the meta must survive for whoever resolves it for real.
-    if outcome.result == StillRunning {
-        return;
-    }
-    let Some(groups) = AGENT_BATCH_META.lock().ok().and_then(|mut g| g.take()) else {
-        error!("batch send resolved but AGENT_BATCH_META was empty - nothing to re-buffer");
-        return;
-    };
+/// A finished batch has nothing left to clean up: each failure was buffered by
+/// the task that hit it. This only records the result.
+fn log_batch_outcome(outcome: &crate::send::DispatchOutcome) {
     match outcome.result {
-        // Failed: the task already buffered its own failures.
-        Sent | Failed => {}
-        TimedOut => buffer_unresolved_groups(&groups, outcome.cursor.unwrap_or(0)),
-        other => {
-            warn!("unexpected {:?} resolving batch send - buffering everything", other);
-            buffer_unresolved_groups(&groups, 0);
+        crate::send::DispatchResult::Sent => debug!("APM mode (high): batch send finished"),
+        crate::send::DispatchResult::Failed => {
+            warn!("APM mode (high): batch send finished with failures (buffered for retry)");
         }
+        other => debug!("APM mode (high): batch send ended as {:?}", other),
     }
 }
 
@@ -2194,20 +2187,29 @@ async fn process_apm_request_high(
 
     spawn_log_flush(global_log_processor, request_id).await;
 
-    // Whatever is unfinished at the deadline is aborted and re-buffered by the
-    // outcome handlers: late is acceptable, lost is not.
+    // Let both finish if they can within the hold. The agent batch is then left
+    // running if it hasn't (never aborted: it may already be at the collector, and
+    // aborting would only make its retry a duplicate). Logs are one request, so
+    // an unfinished flush is aborted and requeued from its write-ahead copy.
     let remaining = hold_until.saturating_duration_since(tokio::time::Instant::now());
-    let outcomes = SEND_SCHEDULER
-        .resolve_pending_shared_budget(
+    let mut done = SEND_SCHEDULER
+        .wait_finished(
             &[crate::send::SendKind::ApmCollector, crate::send::SendKind::Logs],
             remaining,
         )
         .await;
-    if let Some(outcome) = outcomes.get(&crate::send::SendKind::ApmCollector) {
-        handle_agent_batch_outcome(outcome);
+    if let Some(outcome) = done.remove(&crate::send::SendKind::ApmCollector) {
+        log_batch_outcome(&outcome);
     }
-    if let Some(outcome) = outcomes.get(&crate::send::SendKind::Logs) {
-        handle_logs_outcome(outcome, global_log_processor, request_id);
+    let log_outcome = match done.remove(&crate::send::SendKind::Logs) {
+        Some(outcome) => Some(outcome),
+        None => SEND_SCHEDULER
+            .resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO)
+            .await
+            .remove(&crate::send::SendKind::Logs),
+    };
+    if let Some(outcome) = log_outcome {
+        handle_logs_outcome(&outcome, global_log_processor, request_id);
     }
 }
 

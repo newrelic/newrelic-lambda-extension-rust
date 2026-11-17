@@ -419,6 +419,48 @@ impl SendScheduler {
     }
 }
 
+impl SendScheduler {
+    /// Wait up to `budget` for each of `kinds` to finish, and hand back only the ones
+    /// that did. Unlike `resolve_pending_shared_budget` this never aborts: a send still
+    /// running stays registered and keeps going, so the caller can return to Lambda
+    /// without killing a request that may already be at the collector (killing it would
+    /// make the retry a duplicate). `biased` makes an already-finished send win even
+    /// when the budget is spent.
+    pub async fn wait_finished(
+        &self,
+        kinds: &[SendKind],
+        budget: std::time::Duration,
+    ) -> HashMap<SendKind, DispatchOutcome> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut finished = HashMap::new();
+        for &kind in kinds {
+            let entry = self.pending.lock().await.remove(&kind);
+            let Some(PendingEntry { mut handle, cursor }) = entry else { continue };
+            let result = tokio::select! {
+                biased;
+                res = &mut handle => Some(res),
+                () = tokio::time::sleep_until(deadline) => None,
+            };
+            match result {
+                Some(res) => {
+                    finished.insert(kind, self.finish(kind, res, cursor.as_deref()));
+                }
+                None => {
+                    self.pending.lock().await.insert(kind, PendingEntry { handle, cursor });
+                }
+            }
+        }
+        finished
+    }
+
+    /// Stop tracking `kind` without aborting it. For a send that outlived its useful
+    /// life: its owner still finishes (and buffers its own failures), but a new send of
+    /// the same kind may start. Returns whether anything was detached.
+    pub async fn detach(&self, kind: SendKind) -> bool {
+        self.pending.lock().await.remove(&kind).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,5 +970,85 @@ mod tests {
             )
             .await;
         assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_finished_returns_a_finished_send_and_clears_it() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::ApmCollector, boxed(SendOutcome::Success), None).await;
+
+        let done = scheduler
+            .wait_finished(&[SendKind::ApmCollector], Duration::from_millis(200))
+            .await;
+
+        assert_eq!(done.get(&SendKind::ApmCollector).map(|o| o.result), Some(DispatchResult::Sent));
+        assert!(!scheduler.has_pending(SendKind::ApmCollector).await);
+    }
+
+    #[tokio::test]
+    async fn wait_finished_leaves_a_slow_send_running_instead_of_aborting_it() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler
+            .spawn(SendKind::ApmCollector, boxed_delayed(SendOutcome::Success, Duration::from_millis(300)), None)
+            .await;
+
+        let start = tokio::time::Instant::now();
+        let done = scheduler
+            .wait_finished(&[SendKind::ApmCollector], Duration::from_millis(50))
+            .await;
+
+        assert!(done.is_empty(), "an unfinished send must not be reported");
+        assert!(start.elapsed() < Duration::from_millis(200), "must give up at the budget");
+        assert!(scheduler.has_pending(SendKind::ApmCollector).await, "the send stays registered");
+
+        // It was not aborted: it still completes and can be collected later.
+        let later = scheduler
+            .wait_finished(&[SendKind::ApmCollector], Duration::from_millis(500))
+            .await;
+        assert_eq!(later.get(&SendKind::ApmCollector).map(|o| o.result), Some(DispatchResult::Sent));
+    }
+
+    #[tokio::test]
+    async fn wait_finished_shares_one_budget_across_kinds() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::ApmCollector, boxed_never(), None).await;
+        scheduler.spawn(SendKind::Logs, boxed_never(), None).await;
+
+        let start = tokio::time::Instant::now();
+        let _ = scheduler
+            .wait_finished(&[SendKind::ApmCollector, SendKind::Logs], Duration::from_millis(80))
+            .await;
+
+        assert!(
+            start.elapsed() < Duration::from_millis(160),
+            "two kinds must share one budget, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_frees_the_slot_without_aborting() {
+        let scheduler = SendScheduler::new(
+            SendMode::Deferred,
+            ToggleBreaker::closed(),
+            Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
+        );
+        scheduler.spawn(SendKind::ApmCollector, boxed_never(), None).await;
+
+        assert!(scheduler.detach(SendKind::ApmCollector).await);
+        assert!(!scheduler.has_pending(SendKind::ApmCollector).await);
+        assert!(!scheduler.detach(SendKind::ApmCollector).await, "nothing left to detach");
     }
 }
