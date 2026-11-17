@@ -1551,7 +1551,7 @@ fn test_extension_settings_all_fields() {
         hold_cap_ms: 100,
         payload_window_ms: 25,
         batch_max_age_ms: 30_000,
-        shutdown_batch_wait_ms: 1_500,
+        shutdown_batch_wait_ms: 2_000,
     };
     
     assert!(settings.send_function_logs);
@@ -2292,7 +2292,7 @@ fn test_high_tier_timing_defaults() {
     let s = ExtensionSettings::default();
     assert_eq!(
         (s.hold_cap_ms, s.payload_window_ms, s.batch_max_age_ms, s.shutdown_batch_wait_ms),
-        (100, 25, 30_000, 1_500)
+        (100, 25, 30_000, 2_000)
     );
 }
 

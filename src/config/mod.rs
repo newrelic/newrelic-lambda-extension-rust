@@ -194,7 +194,8 @@ pub struct ExtensionSettings {
     pub batch_max_age_ms: u64,
     /// `NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS` — `high` tier only. Longest SHUTDOWN
     /// waits for the last batch; Lambda allows external extensions 2000 ms in total.
-    /// Default 1500, clamped to `[0, 1900]`.
+    /// Default 2000 (the whole Shutdown phase), clamped to `[0, 2000]`. It is a ceiling, not a
+    /// delay: SHUTDOWN returns as soon as the batch finishes.
     pub shutdown_batch_wait_ms: u64,
 }
 
@@ -345,7 +346,7 @@ impl Default for ExtensionSettings {
             hold_cap_ms: 100,
             payload_window_ms: 25,
             batch_max_age_ms: 30_000,
-            shutdown_batch_wait_ms: 1_500,
+            shutdown_batch_wait_ms: 2_000,
         }
     }
 }
@@ -658,7 +659,7 @@ impl ExtensionConfig {
         config.extension.hold_cap_ms = env_ms("NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS", 100, 0, 1_000);
         config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
         config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
-        config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 1_500, 0, 1_900);
+        config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 2_000, 0, 2_000);
 
         // Parse NEW_RELIC_RUNTIME_DONE_GRACE_MS once at startup. Clamp to [0, 2000].
         // Default 25 ms — matches the Telemetry API buffer flush window.
