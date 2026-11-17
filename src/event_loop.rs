@@ -91,7 +91,7 @@ pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgen
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
 /// Max buffered agent payloads = the circuit breaker's **3N** buffer cap, derived
-/// once from `NEW_RELIC_SEND_TIER`: high tier `N=5 → 3N=15`, default tier
+/// once from `NEW_RELIC_EXTENSION_SEND_TIER`: high tier `N=5 → 3N=15`, default tier
 /// `N=10 → 3N=30`. When full, the oldest is evicted (and counted) — FIFO
 /// drop-oldest — so a long disconnected period on a busy function can't grow
 /// unbounded. (Was a flat 500 before the invocation-count breaker model; the

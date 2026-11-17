@@ -1,7 +1,7 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared send-path primitives for the `NEW_RELIC_SEND_TIER` redesign.
+//! Shared send-path primitives for the `NEW_RELIC_EXTENSION_SEND_TIER` redesign.
 //!
 //! `circuit_breaker` and `timeout_provider` define the two trait contracts
 //! that let the scheduler (added in a later phase) and their real

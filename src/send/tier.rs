@@ -1,7 +1,7 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Phase C — the one customer-facing knob: `NEW_RELIC_SEND_TIER`.
+//! Phase C — the one customer-facing knob: `NEW_RELIC_EXTENSION_SEND_TIER`.
 //!
 //! Maps to the internal [`SendMode`] + timeout + blocking-connect knobs per
 //! `REDESIGN_PLAN.md` §3.3/§10.2 — customers only ever see `high`/`default`;
@@ -39,7 +39,7 @@ use super::{AlwaysAllowBreaker, CircuitBreaker, FixedTimeoutProvider, SendMode, 
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const SEND_TIER_ENV_VAR: &str = "NEW_RELIC_SEND_TIER";
+pub const SEND_TIER_ENV_VAR: &str = "NEW_RELIC_EXTENSION_SEND_TIER";
 
 /// Behavior-preserving placeholder — matches the existing shipped
 /// `resolve_agent_send_at_boundary` bound. Replace with the real
@@ -80,7 +80,7 @@ impl SendTier {
         }
     }
 
-    /// Reads `NEW_RELIC_SEND_TIER` from the environment. Missing env var is
+    /// Reads `NEW_RELIC_EXTENSION_SEND_TIER` from the environment. Missing env var is
     /// not a warning case (it's the expected default-on-upgrade path) -
     /// only a *present but unrecognized* value warns.
     pub fn from_env() -> Self {

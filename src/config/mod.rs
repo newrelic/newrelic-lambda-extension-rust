@@ -167,7 +167,7 @@ pub struct ExtensionSettings {
     /// `error.expected: true` on the `TransactionError` event, excluding them from
     /// error rate/Apdex while keeping them visible in Errors Inbox. APM mode only.
     pub expected_errors: HashSet<String>,
-    /// `NEW_RELIC_SEND_TIER` — `default` (existing `pipeline_flush`-based behavior,
+    /// `NEW_RELIC_EXTENSION_SEND_TIER` — `default` (existing `pipeline_flush`-based behavior,
     /// completely unmodified) or `high` (the new `SendScheduler`-based path for
     /// agent payload, logs, and platform-report metrics). Dual-path by design: `default`
     /// routes through the exact pre-existing code, `high` through new code — not a
@@ -654,7 +654,7 @@ impl ExtensionConfig {
         let extension_logs_enabled_str = env::var("NEW_RELIC_EXTENSION_LOGS_ENABLED").unwrap_or_else(|_| "true".to_string());
         config.extension.extension_logs_enabled = parse_bool(&extension_logs_enabled_str);
 
-        // NEW_RELIC_SEND_TIER: default|high. Unknown/missing values fall back to
+        // NEW_RELIC_EXTENSION_SEND_TIER: default|high. Unknown/missing values fall back to
         // Default inside SendTier::from_env itself (warns, never panics).
         config.extension.send_tier = crate::send::SendTier::from_env();
 
