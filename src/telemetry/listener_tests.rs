@@ -335,6 +335,40 @@ mod tests {
         clear_telemetry_state();
     }
 
+    // The event's own metrics.durationMs is kept: it is what tells a 3 ms invocation from a
+    // 25 ms one, which our arrival-time clock cannot (the Telemetry API delivers up to 25 ms late).
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_runtime_done_keeps_the_events_duration_ms() {
+        clear_telemetry_state();
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, false, false)
+            .await
+            .expect("listener");
+
+        let body = serde_json::json!([
+            {"time": "2024-01-01T00:00:00Z", "type": "platform.runtimeDone",
+             "record": {"requestId": "dur-req-with", "status": "success",
+                        "metrics": {"durationMs": 3.25, "producedBytes": 16}}},
+            {"time": "2024-01-01T00:00:00Z", "type": "platform.runtimeDone",
+             "record": {"requestId": "dur-req-without", "status": "failure"}}
+        ]);
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+
+        assert_eq!(crate::request::get_runtime_done_duration_ms("dur-req-with"), Some(3.25));
+        assert_eq!(crate::request::get_runtime_done_duration_ms("dur-req-without"), None);
+
+        crate::request::cleanup_request_processing_state_internal("dur-req-with", false);
+        crate::request::cleanup_request_processing_state_internal("dur-req-without", false);
+        clear_telemetry_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_runtime_done_via_http() {

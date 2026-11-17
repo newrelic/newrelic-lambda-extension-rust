@@ -179,7 +179,12 @@ async fn handle_telemetry_request(
                                 // create_request_processing_state() to pick up) — single
                                 // call site so the timestamp is never recorded on one path
                                 // but not the other.
-                                crate::request::record_runtime_done(request_id_str);
+                                let duration_ms = record
+                                    .record
+                                    .get("metrics")
+                                    .and_then(|m| m.get("durationMs"))
+                                    .and_then(serde_json::Value::as_f64);
+                                crate::request::record_runtime_done_with_duration(request_id_str, duration_ms);
                             }
                         }
                         platform_processor.process_record(record);

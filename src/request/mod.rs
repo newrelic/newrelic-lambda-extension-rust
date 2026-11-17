@@ -292,6 +292,27 @@ pub fn record_runtime_done(request_id: &str) {
     }
 }
 
+/// `metrics.durationMs` of each request's `platform.runtimeDone` event: how long the
+/// runtime ran, as measured by Lambda. Unlike our arrival-time clock it does not include
+/// the Telemetry API's delivery lag (up to its `timeoutMs`), so it can tell a 3 ms
+/// invocation from a 25 ms one.
+static RUNTIME_DONE_DURATION_MS: Lazy<DashMap<String, f64>> = Lazy::new(DashMap::new);
+
+/// Like `record_runtime_done`, also keeping the event's own duration when it has one.
+/// The duration is stored first so whoever the notify wakes can already read it.
+pub fn record_runtime_done_with_duration(request_id: &str, duration_ms: Option<f64>) {
+    if let Some(duration_ms) = duration_ms {
+        RUNTIME_DONE_DURATION_MS.insert(request_id.to_string(), duration_ms);
+    }
+    record_runtime_done(request_id);
+}
+
+/// The runtime duration Lambda reported for `request_id`, if `runtimeDone` has arrived
+/// and carried one.
+pub fn get_runtime_done_duration_ms(request_id: &str) -> Option<f64> {
+    RUNTIME_DONE_DURATION_MS.get(request_id).map(|d| *d)
+}
+
 /// Epoch-ms elapsed since `request_id`'s `platform.runtimeDone`, or `None` if it hasn't
 /// fired yet (or the request is unregistered). Used to log exactly how late a deferred
 /// agent payload is, instead of just that it was late.
@@ -459,6 +480,7 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         // (create_request_processing_state for a completed request_id is never called again).
         REQUEST_DATA.remove(request_id);
         PREFIRED_RUNTIME_DONE.remove(request_id);
+        RUNTIME_DONE_DURATION_MS.remove(request_id);
     }
     // Partial cleanup (skip_buffer_cleanup=true): keep context/buffer/creation_invocation
     // AND pending_report — do not clear it here. It was already .take()n by

@@ -1690,6 +1690,24 @@ mod tests {
 
     #[test]
     #[serial]
+    fn runtime_done_duration_is_stored_readable_and_cleared_with_the_request() {
+        clear_request_state();
+
+        record_runtime_done_with_duration("req-dur-1", Some(7.5));
+        record_runtime_done_with_duration("req-dur-2", None);
+
+        assert_eq!(get_runtime_done_duration_ms("req-dur-1"), Some(7.5));
+        assert_eq!(get_runtime_done_duration_ms("req-dur-2"), None, "no duration in the event means none stored");
+
+        cleanup_request_processing_state_internal("req-dur-1", false);
+        assert_eq!(get_runtime_done_duration_ms("req-dur-1"), None, "a full cleanup drops it");
+
+        PREFIRED_RUNTIME_DONE.clear();
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
     fn record_prefired_runtime_done_inserts_into_prefired_map() {
         clear_request_state();
         PREFIRED_RUNTIME_DONE.clear();
