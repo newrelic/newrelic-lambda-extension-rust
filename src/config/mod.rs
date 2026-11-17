@@ -174,15 +174,16 @@ pub struct ExtensionSettings {
     /// single pipeline configured by tier. See `DUAL_PATH_PLAN.md`. Read once at
     /// startup.
     pub send_tier: crate::send::SendTier,
-    /// `NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS` — `high` tier only.
-    /// A handler that finishes faster than this gets no post-`runtimeDone` hold at
-    /// all: a trivial function should never pay for telemetry delivery, which just
-    /// goes out with the next invocation instead. `0` disables the short path.
+    /// `NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS` — `high` tier only. An invocation
+    /// shorter than this (judged from the agent's payload or `runtimeDone`, whichever comes
+    /// first) is a short invoke: the batch started at INVOKE is cancelled and its unsent data
+    /// kept, and nothing else is started or held. A trivial function should never pay for
+    /// telemetry delivery; it goes out with a longer invoke. `0` disables the short path.
     /// Default 20, clamped to `[0, 1000]`.
     pub short_invoke_threshold_ms: u64,
-    /// `NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS` — `high` tier only. Most we hold `/next`
-    /// after `runtimeDone` for in-flight sends. A placeholder to be set from the
-    /// measured p99 of a healthy send. Default 100, clamped to `[0, 1000]`.
+    /// `NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS` — `high` tier only. The budget for each send,
+    /// counted from when that send started, and the most `/next` is held after `runtimeDone`.
+    /// A placeholder for the measured P99 of a healthy send. Default 100, clamped to `[0, 1000]`.
     pub hold_cap_ms: u64,
     /// `NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS` — `high` tier only. Longest we wait
     /// at `runtimeDone` for the request's own agent payload (only when its logs are held

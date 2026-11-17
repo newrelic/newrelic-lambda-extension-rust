@@ -3801,6 +3801,9 @@ async fn clear_batch_state() {
     if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
         *in_flight = None;
     }
+    if let Ok(mut meta) = BATCH_META.lock() {
+        *meta = None;
+    }
 }
 
 #[tokio::test]
@@ -4109,23 +4112,20 @@ fn make_group(request_id: &str, payloads: Vec<Vec<u8>>, report: Option<&str>) ->
         invoked_function_arn: "arn:test".to_string(),
         payloads,
         report: report.map(str::to_string),
+        started: std::sync::atomic::AtomicBool::new(false),
     }
 }
 
-#[test]
-fn runtime_done_hold_shrinks_below_80_percent_of_the_cap_then_stays_at_the_cap() {
-    let hold = |ms, cap| runtime_done_hold(Duration::from_millis(ms), cap).as_millis();
-    assert_eq!(hold(20, 100), 80);
-    assert_eq!(hold(60, 100), 40);
-    assert_eq!(hold(79, 100), 21);
-    assert_eq!(hold(80, 100), 100);
-    assert_eq!(hold(5_000, 100), 100);
-    // The thresholds scale with the cap.
-    assert_eq!(hold(100, 200), 100);
-    assert_eq!(hold(160, 200), 200);
-    // A zero cap never holds.
-    assert_eq!(hold(0, 0), 0);
-    assert_eq!(hold(500, 0), 0);
+// The cap is counted from when a send started; a send that has had its time gets none.
+#[tokio::test]
+async fn send_budget_left_counts_from_the_start_of_the_send() {
+    let cap = Duration::from_millis(100);
+    let fresh = send_budget_left(tokio::time::Instant::now(), cap);
+    assert!(fresh > Duration::from_millis(90) && fresh <= cap, "a fresh send has almost the whole cap, got {fresh:?}");
+
+    let Some(old) = tokio::time::Instant::now().checked_sub(Duration::from_millis(250)) else { return };
+    assert_eq!(send_budget_left(old, cap), Duration::ZERO, "a send older than the cap gets nothing");
+    assert_eq!(send_budget_left(tokio::time::Instant::now(), Duration::ZERO), Duration::ZERO, "a zero cap never holds");
 }
 
 #[tokio::test]
@@ -4139,9 +4139,12 @@ async fn send_pending_groups_without_apm_buffers_everything() {
     let config = Arc::new(config::ExtensionConfig::default());
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let outcome = send_pending_groups(
         "test-batch".to_string(),
+        99,
         groups,
+        cursor.clone(),
         config.clone(),
         make_noop_log_processor_serverless(config),
         apm_app,
@@ -4149,6 +4152,7 @@ async fn send_pending_groups_without_apm_buffers_everything() {
     .await;
 
     assert_eq!(outcome, crate::send::SendOutcome::Failure);
+    assert_eq!(cursor.load(std::sync::atomic::Ordering::SeqCst), 2, "both groups were processed");
     assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 2, "no payload may be lost");
     assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1, "no report may be lost");
     clear_high_tier_state();
@@ -4198,7 +4202,7 @@ async fn high_tier_short_invoke_does_not_hold_next() {
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
 
     let start = tokio::time::Instant::now();
-    process_apm_request_high(&request_id, &config, &log_processor, &apm_app, deadline_ms_from_now(5_000), &state).await;
+    process_apm_request_high(&request_id, &config, &log_processor, &apm_app, deadline_ms_from_now(5_000), &state, None).await;
 
     assert!(
         start.elapsed() < Duration::from_millis(50),
@@ -4263,4 +4267,216 @@ fn buffered_failures_since_counts_only_new_failures_for_that_request() {
     assert_eq!(buffered_failures_since("req-b", start), 1);
     assert_eq!(buffered_failures_since("req-none", start), 0);
     FAILED_TELEMETRY_BUFFER.lock().unwrap().clear();
+}
+
+// ── short-invoke detection ────────────────────────────────────────────────────────────
+
+fn detection_state(request_id: &str) -> request::RequestProcessingState {
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config);
+    create_request_processing_state(request_id, "arn:test", &factory)
+}
+
+#[tokio::test]
+#[serial]
+async fn detect_uses_the_duration_lambda_reports_in_runtime_done() {
+    for (id, reported_ms, expected) in [
+        ("det-rd-short", 5.0, InvokeLength::Short),
+        ("det-rd-long", 500.0, InvokeLength::NotShort),
+    ] {
+        let state = detection_state(id);
+        request::record_runtime_done_with_duration(id, Some(reported_ms));
+        let verdict = detect_short_invoke(id, &state, Duration::from_millis(20), tokio::time::Instant::now()).await;
+        assert_eq!(verdict, expected, "durationMs {reported_ms} against a 20 ms threshold");
+        cleanup_request_processing_state_internal(id, false);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn detect_falls_back_to_arrival_time_when_runtime_done_has_no_duration() {
+    let state = detection_state("det-rd-nodur");
+    request::record_runtime_done_with_duration("det-rd-nodur", None);
+    let verdict = detect_short_invoke("det-rd-nodur", &state, Duration::from_millis(500), tokio::time::Instant::now()).await;
+    assert_eq!(verdict, InvokeLength::Short, "it arrived almost at once, far under 500 ms");
+    cleanup_request_processing_state_internal("det-rd-nodur", false);
+}
+
+// The agent's payload is a signal too, and it needs no runtimeDone at all.
+#[tokio::test]
+#[serial]
+async fn detect_treats_an_early_agent_payload_as_the_end_of_the_invocation() {
+    let state = detection_state("det-payload");
+    state.agent_buffer.lock().unwrap().push(b"not a parseable payload".to_vec());
+    let started = tokio::time::Instant::now();
+    let verdict = detect_short_invoke("det-payload", &state, Duration::from_millis(500), started).await;
+    assert_eq!(verdict, InvokeLength::Short);
+    assert!(started.elapsed() < Duration::from_millis(100), "decided as soon as the payload was seen");
+    cleanup_request_processing_state_internal("det-payload", false);
+}
+
+// No signal in threshold + the Telemetry API's lag means the invoke is not short.
+#[tokio::test]
+#[serial]
+async fn detect_gives_up_after_the_threshold_plus_delivery_lag() {
+    let state = detection_state("det-none");
+    let started = tokio::time::Instant::now();
+    let verdict = detect_short_invoke("det-none", &state, Duration::from_millis(10), started).await;
+    assert_eq!(verdict, InvokeLength::NotShort);
+    let waited = started.elapsed();
+    let window = Duration::from_millis(10 + crate::runtime::TELEMETRY_BUFFER_TIMEOUT_MS);
+    assert!(waited >= window && waited < window + Duration::from_millis(150), "waited {waited:?}, window {window:?}");
+    cleanup_request_processing_state_internal("det-none", false);
+}
+
+#[tokio::test]
+async fn detect_is_off_when_the_threshold_is_zero() {
+    let state = detection_state("det-off");
+    let verdict = detect_short_invoke("det-off", &state, Duration::ZERO, tokio::time::Instant::now()).await;
+    assert_eq!(verdict, InvokeLength::NotShort);
+    cleanup_request_processing_state_internal("det-off", false);
+}
+
+#[test]
+fn transaction_duration_reads_the_first_transaction_event() {
+    let telemetry = std::collections::HashMap::from([(
+        "analytic_event_data".to_string(),
+        vec![
+            serde_json::Value::Null,
+            serde_json::json!({"events_seen": 1}),
+            serde_json::json!([[{"duration": 0.0042, "type": "Transaction"}, {}, {}]]),
+        ],
+    )]);
+    assert_eq!(transaction_duration(&telemetry), Some(Duration::from_micros(4_200)));
+    assert_eq!(transaction_duration(&std::collections::HashMap::new()), None, "no transaction events");
+}
+
+// ── cancelling the batch on a short invoke ────────────────────────────────────────────
+
+async fn spawn_hanging_batch(owner: u64, groups: Vec<PendingGroup>) {
+    clear_batch_state().await;
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    if let Ok(mut meta) = BATCH_META.lock() {
+        *meta = Some(BatchMeta { owner, groups: Arc::new(groups) });
+    }
+    let send: crate::send::BoxedSend = Box::pin(std::future::pending());
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, Some(cursor)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn cancelling_puts_unstarted_groups_back_with_their_reports_and_stops_the_batch() {
+    clear_high_tier_state();
+    spawn_hanging_batch(
+        501,
+        vec![
+            make_group("cancel-a", vec![vec![1]], Some("REPORT a")),
+            make_group("cancel-b", vec![vec![2]], None),
+        ],
+    )
+    .await;
+
+    assert!(cancel_in_flight_batch().await, "a running batch is cancelled");
+
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await, "the batch task is stopped");
+    let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.payload_bytes.clone()).collect();
+    assert_eq!(payloads, vec![vec![1u8], vec![2u8]], "everything unsent is kept for a longer invoke");
+    assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1);
+    assert_eq!(
+        FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.retry_count).sum::<usize>(),
+        0,
+        "deferring is not a retry"
+    );
+    clear_high_tier_state();
+}
+
+// A group whose POSTs were already handed out is cleaned up per type by `inflight`;
+// only its report is still ours, and re-buffering its payload would repeat types that landed.
+#[tokio::test]
+#[serial]
+async fn cancelling_a_started_group_buffers_only_its_report() {
+    clear_high_tier_state();
+    let started = make_group("cancel-started", vec![vec![7]], Some("REPORT started"));
+    started.started.store(true, std::sync::atomic::Ordering::SeqCst);
+    spawn_hanging_batch(502, vec![started, make_group("cancel-later", vec![vec![8]], None)]).await;
+
+    assert!(cancel_in_flight_batch().await);
+
+    let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.payload_bytes.clone()).collect();
+    assert_eq!(payloads, vec![vec![8u8]], "only the group that never started");
+    assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1);
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn cancelling_a_finished_batch_changes_nothing() {
+    clear_high_tier_state();
+    clear_batch_state().await;
+    if let Ok(mut meta) = BATCH_META.lock() {
+        *meta = Some(BatchMeta { owner: 503, groups: Arc::new(vec![make_group("done", vec![vec![9]], None)]) });
+    }
+    let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
+    SEND_SCHEDULER
+        .spawn(crate::send::SendKind::ApmCollector, send, Some(Arc::new(std::sync::atomic::AtomicUsize::new(1))))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    assert!(!cancel_in_flight_batch().await, "nothing was running");
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 0, "a delivered batch is never put back");
+    clear_high_tier_state();
+}
+
+// ── the high tier as a whole: retries only run for invokes that are not short ──────────
+
+fn retries_probe() -> (InvokeRetries, Arc<std::sync::atomic::AtomicUsize>) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    (Box::new(move || { seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }), calls)
+}
+
+fn high_config(threshold_ms: u64) -> Arc<config::ExtensionConfig> {
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_tier = crate::send::SendTier::High;
+    cfg.extension.short_invoke_threshold_ms = threshold_ms;
+    cfg.extension.hold_cap_ms = 0; // do not hold: these tests are about the decision
+    Arc::new(cfg)
+}
+
+#[tokio::test]
+#[serial]
+async fn a_short_invoke_starts_no_retries() {
+    clear_high_tier_state();
+    let id = "hi-short-retries";
+    let config = high_config(500);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(2.0));
+    let (retries, calls) = retries_probe();
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(5_000), &state, Some(retries)).await;
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "retries wait for a longer invoke");
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await, "and no log flush is started");
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn a_longer_invoke_starts_the_retries_once() {
+    clear_high_tier_state();
+    let id = "hi-long-retries";
+    let config = high_config(20);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    let (retries, calls) = retries_probe();
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(5_000), &state, Some(retries)).await;
+
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO).await;
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
 }

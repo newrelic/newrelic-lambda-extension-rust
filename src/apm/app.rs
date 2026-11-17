@@ -387,7 +387,10 @@ impl ApmApp {
         let collector_host = self.collector_host.clone();
         let run_id = self.run_id.clone();
 
-        tokio::spawn(async move {
+        // Inside a high-tier batch this registers the POST so the batch can be cancelled
+        // (see `inflight`); everywhere else it is a plain spawn.
+        let tracked = super::inflight::prepare(&telemetry_type, &data, &request_id, &run_id, &collector_host);
+        super::inflight::spawn_tracked(tracked, move |mut guard| tokio::spawn(async move {
             let command = match telemetry_type.as_str() {
                 "metric_data" => CMD_METRICS,
                 "span_event_data" => CMD_SPAN_EVENTS,
@@ -414,17 +417,23 @@ impl ApmApp {
             )
             .await;
 
+            // No await between this and the buffering below, so a cancel cannot land
+            // between deciding to buffer and buffering. If a cancel claimed this POST,
+            // it buffers it instead and we must not.
+            let owns_outcome = guard.finish();
             if let Err(e) = send_result {
-                warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
-                super::telemetry_buffer::buffer_failed_telemetry(
-                    telemetry_type.clone(),
-                    data,
-                    request_id,
-                    run_id,
-                    collector_host,
-                );
+                if owns_outcome {
+                    warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
+                    super::telemetry_buffer::buffer_failed_telemetry(
+                        telemetry_type.clone(),
+                        data,
+                        request_id,
+                        run_id,
+                        collector_host,
+                    );
+                }
             }
-        })
+        }))
     }
 
     /// Like `process_agent_payload`, but for multiple chunks from the same request —

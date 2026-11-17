@@ -36,6 +36,11 @@ pub(crate) const EXTENSION_ID_HEADER: &str = "Lambda-Extension-Identifier";
 /// path segment is what produced the LMI subscription `404 page not found`.
 pub const TELEMETRY_API_VERSION: &str = "2022-07-01";
 
+/// How long the Telemetry API may buffer events before delivering them, in ms. 25 is the
+/// AWS minimum (the default is 1000), so an event can reach us up to this long after it
+/// happened. Anything that infers timing from event arrival has to allow for it.
+pub const TELEMETRY_BUFFER_TIMEOUT_MS: u64 = 25;
+
 /// Shutdown reasons from AWS Lambda (matching Go extension implementation)
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -199,7 +204,7 @@ async fn subscribe_once(
             "maxItems": 1000,
             // Minimum value to ensure platform.report events are delivered in
             // the current invocation rather than after the freeze.
-            "timeoutMs": 25
+            "timeoutMs": TELEMETRY_BUFFER_TIMEOUT_MS
         },
         "destination": {
             "protocol": "HTTP",

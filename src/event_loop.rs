@@ -204,6 +204,45 @@ fn buffer_failed_platform_report(report_line: String, request_id: &str, invoked_
     }
 }
 
+/// The high tier's INVOKE-time retries of earlier failures, every one spawned and none
+/// awaited: failed agent payloads, failed platform reports, buffered per-type telemetry
+/// (needs a live APM session) and buffered Metric API sends. Same conditions as the
+/// default tier's inline retries; they only run later, once the invoke is not short.
+async fn run_invoke_retries(
+    apm_app: crate::apm::SharedApmApp,
+    apm_client: crate::newrelic::tls_fallback::DualTlsClient,
+    license_key: String,
+    apm_mode_enabled: bool,
+) {
+    tokio::spawn(retry_failed_agent_payloads(apm_app.clone()));
+    tokio::spawn(retry_failed_platform_reports(apm_app.clone()));
+
+    if apm_mode_enabled && crate::apm::telemetry_buffer::get_buffer_count() > 0 {
+        let session = apm_app
+            .read()
+            .await
+            .as_ref()
+            .map(|app| (app.run_id.clone(), app.collector_host.clone()));
+        if let Some((run_id, collector_host)) = session {
+            let (client, key) = (apm_client.clone(), license_key.clone());
+            tokio::spawn(async move {
+                crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                    &client,
+                    &key,
+                    Some(run_id.as_str()),
+                    Some(collector_host.as_str()),
+                )
+                .await;
+            });
+        }
+    }
+    if apm_mode_enabled && crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0 {
+        tokio::spawn(async move {
+            crate::apm::metric_api_buffer::retry_buffered_metric_api(&apm_client, &license_key).await;
+        });
+    }
+}
+
 /// Retry buffered platform-report sends (APM mode, `SendTier::High` only —
 /// `FAILED_PLATFORM_REPORTS` is only ever populated by the shared-budget
 /// abort path). Spawned detached, alongside `retry_failed_agent_payloads`,
@@ -308,6 +347,9 @@ struct PendingGroup {
     invoked_function_arn: String,
     payloads: Vec<Vec<u8>>,
     report: Option<String>,
+    /// Set once the payload POSTs were handed to their per-type tasks. From then on a
+    /// cancel cleans that group up per type (`inflight`), not as a whole.
+    started: std::sync::atomic::AtomicBool,
 }
 
 /// The batch currently in flight. The id ties the log lines of one batch together
@@ -322,6 +364,17 @@ static IN_FLIGHT_BATCH: once_cell::sync::Lazy<Mutex<Option<InFlightBatch>>> =
     once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 static NEXT_BATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// What the in-flight batch is working on, kept only so a short invoke can cancel it:
+/// the groups, and the owner id its POSTs are registered under in `inflight`. How far
+/// it got is the scheduler's cursor.
+struct BatchMeta {
+    owner: u64,
+    groups: Arc<Vec<PendingGroup>>,
+}
+
+static BATCH_META: once_cell::sync::Lazy<Mutex<Option<BatchMeta>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(None));
 
 /// Set once the agent has delivered a payload in this sandbox. An
 /// uninstrumented function never sends one, so waiting for it would be wasted.
@@ -370,7 +423,13 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
         cleanup_request_processing_state_internal(&request_id, false);
 
         if !payloads.is_empty() || report.is_some() {
-            groups.push(PendingGroup { request_id, invoked_function_arn, payloads, report });
+            groups.push(PendingGroup {
+                request_id,
+                invoked_function_arn,
+                payloads,
+                report,
+                started: std::sync::atomic::AtomicBool::new(false),
+            });
         }
     }
     groups
@@ -380,7 +439,24 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
 /// loses data by itself and needs no one to clean up after it. Nothing aborts it.
 async fn send_pending_groups(
     batch_id: String,
+    owner: u64,
     groups: Arc<Vec<PendingGroup>>,
+    cursor: Arc<std::sync::atomic::AtomicUsize>,
+    config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+    apm_app: crate::apm::SharedApmApp,
+) -> crate::send::SendOutcome {
+    // Every POST this batch starts is registered under `owner`, so it can be cancelled.
+    crate::apm::inflight::scope(owner, async move {
+        send_groups(batch_id, groups, cursor, config, global_log_processor, apm_app).await
+    })
+    .await
+}
+
+async fn send_groups(
+    batch_id: String,
+    groups: Arc<Vec<PendingGroup>>,
+    cursor: Arc<std::sync::atomic::AtomicUsize>,
     config: Arc<ExtensionConfig>,
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
@@ -400,6 +476,7 @@ async fn send_pending_groups(
             false
         };
         all_sent &= sent;
+        cursor.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     if !all_sent {
         warn!("APM mode (high): batch {} had failures; the failed data is buffered for retry", batch_id);
@@ -433,6 +510,9 @@ async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
     let started = chrono::Utc::now();
     let mut sent = true;
     if !group.payloads.is_empty() {
+        // The merged send hands every type to its own task before its first await, so
+        // this flag and that hand-off cannot be split by a cancel.
+        group.started.store(true, std::sync::atomic::Ordering::SeqCst);
         // One POST per telemetry type, not per chunk.
         let result = app
             .process_merged_agent_payloads(group.payloads.clone(), &group.request_id, &group.invoked_function_arn)
@@ -506,7 +586,9 @@ async fn spawn_pending_batch(
     // Shared with the send task so the data can still be buffered if the circuit
     // breaker refuses to spawn it.
     let groups = Arc::new(groups);
-    let batch_id = format!("b{}", NEXT_BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let owner = NEXT_BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let batch_id = format!("b{owner}");
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     info!(
         "APM mode (high): batch {} started: {} request(s), {} payload chunk(s), {} report(s)",
         batch_id,
@@ -516,17 +598,22 @@ async fn spawn_pending_batch(
     );
     let send: crate::send::BoxedSend = Box::pin(send_pending_groups(
         batch_id.clone(),
+        owner,
         groups.clone(),
+        cursor.clone(),
         config.clone(),
         global_log_processor.clone(),
         apm_app.clone(),
     ));
     let spawned = SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, None)
+        .spawn(crate::send::SendKind::ApmCollector, send, Some(cursor.clone()))
         .await;
     if spawned {
         if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
             *in_flight = Some(InFlightBatch { id: batch_id, started_at: std::time::Instant::now() });
+        }
+        if let Ok(mut meta) = BATCH_META.lock() {
+            *meta = Some(BatchMeta { owner, groups });
         }
     } else {
         // Circuit breaker open for the APM collector (decided inside
@@ -538,6 +625,139 @@ async fn spawn_pending_batch(
             groups.len()
         );
         groups.iter().for_each(buffer_group);
+    }
+}
+
+/// What a cancelled batch had not delivered goes back to the normal retry buffers,
+/// with retry count 0: deferring is not a failure. Groups before `resolved_cursor` are
+/// done. A group whose POSTs were already handed out is not re-buffered whole (that would
+/// repeat the types that landed): `inflight` buffers just its unfinished types, and only
+/// its report, which is sent afterwards, is still ours.
+fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
+    for (index, group) in groups.iter().enumerate().skip(resolved_cursor) {
+        if index == resolved_cursor && group.started.load(std::sync::atomic::Ordering::SeqCst) {
+            if let Some(report) = &group.report {
+                buffer_failed_platform_report(report.clone(), &group.request_id, &group.invoked_function_arn);
+            }
+        } else {
+            buffer_group(group);
+        }
+    }
+}
+
+/// A short invoke was detected: stop the batch started at INVOKE and put back whatever
+/// it had not delivered. Returns whether anything was cancelled. A batch that already
+/// finished has nothing to put back; types that already got an answer are never resent.
+async fn cancel_in_flight_batch() -> bool {
+    let meta = BATCH_META.lock().ok().and_then(|mut m| m.take());
+    let Some(meta) = meta else { return false };
+    if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
+        *in_flight = None;
+    }
+    // Zero budget: a finished batch is collected, a running one is aborted.
+    let mut outcomes = SEND_SCHEDULER
+        .resolve_pending_shared_budget(&[crate::send::SendKind::ApmCollector], Duration::ZERO)
+        .await;
+    let Some(outcome) = outcomes.remove(&crate::send::SendKind::ApmCollector) else { return false };
+    if outcome.result != crate::send::DispatchResult::TimedOut {
+        return false;
+    }
+    let cancelled = crate::apm::inflight::abort_owner(meta.owner);
+    buffer_unresolved_groups(&meta.groups, outcome.cursor.unwrap_or(0));
+    info!(
+        "APM mode (high): short invoke - batch cancelled ({} POST(s) stopped, unsent data kept for the next longer invoke)",
+        cancelled
+    );
+    true
+}
+
+/// Whether an invocation is short enough that nothing should be sent for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokeLength {
+    Short,
+    NotShort,
+}
+
+/// Runs the INVOKE-time retries, but only once the invoke is known not to be short.
+type InvokeRetries = Box<dyn FnOnce() + Send>;
+
+/// How long the agent says the invocation's transaction took: the `duration` (seconds) of
+/// the first transaction event in its payload.
+fn transaction_duration(telemetry: &std::collections::HashMap<String, Vec<serde_json::Value>>) -> Option<Duration> {
+    let events = telemetry.get("analytic_event_data")?.get(2)?.as_array()?;
+    let seconds = events.first()?.get(0)?.get("duration")?.as_f64()?;
+    (seconds >= 0.0).then(|| Duration::from_secs_f64(seconds))
+}
+
+/// What an agent payload says about the current invocation.
+enum PayloadSignal {
+    /// It belongs to another request (a late payload routed here): not a signal.
+    OtherRequest,
+    /// How long the agent measured the transaction.
+    Took(Duration),
+    /// It is this invocation's payload but carries no duration.
+    NoDuration,
+}
+
+fn read_payload_signal(payload_bytes: &[u8], request_id: &str) -> PayloadSignal {
+    if let Some(owner) = crate::apm::payload_parser::extract_request_id_from_payload_bytes(payload_bytes) {
+        if owner != request_id {
+            return PayloadSignal::OtherRequest;
+        }
+    }
+    match crate::apm::payload_parser::parse_agent_payload_cached(payload_bytes) {
+        Ok(parsed) => transaction_duration(&parsed.0).map_or(PayloadSignal::NoDuration, PayloadSignal::Took),
+        Err(_) => PayloadSignal::NoDuration,
+    }
+}
+
+/// Decide whether this invocation is short, as soon as a signal allows and no later than
+/// `threshold` plus the Telemetry API's worst delivery lag (an event can arrive that much
+/// after it happened, so waiting less could mistake a short invoke for a long one).
+///
+/// Whichever signal comes first decides, and it supplies the duration:
+/// - the agent's payload for this request: written as the invocation ends with no
+///   buffering, so it arrives well before `runtimeDone`, and it carries the transaction's
+///   own duration (without the agent's post-code work);
+/// - `platform.runtimeDone`: Lambda's own `durationMs` when the event has one, else how
+///   long it took to reach us.
+///
+/// Neither signal consumes the `runtimeDone` notify permit, so the normal wait afterwards
+/// still works.
+async fn detect_short_invoke(
+    request_id: &str,
+    state: &request::RequestProcessingState,
+    threshold: Duration,
+    invoke_start: tokio::time::Instant,
+) -> InvokeLength {
+    if threshold.is_zero() {
+        return InvokeLength::NotShort;
+    }
+    let verdict = |took: Duration| if took < threshold { InvokeLength::Short } else { InvokeLength::NotShort };
+    let window = threshold + Duration::from_millis(crate::runtime::TELEMETRY_BUFFER_TIMEOUT_MS);
+    let mut payload_judged = false;
+    loop {
+        let elapsed = invoke_start.elapsed();
+        if !payload_judged {
+            let first = state.agent_buffer.lock().ok().and_then(|b| b.first().cloned());
+            if let Some(bytes) = first {
+                payload_judged = true; // judge each arrival once; parsing is not free
+                match read_payload_signal(&bytes, request_id) {
+                    PayloadSignal::Took(took) => return verdict(took),
+                    PayloadSignal::NoDuration => return verdict(elapsed),
+                    PayloadSignal::OtherRequest => {}
+                }
+            }
+        }
+        if request::get_runtime_done_elapsed_ms(request_id).is_some() {
+            let ran = request::get_runtime_done_duration_ms(request_id)
+                .map_or(elapsed, |ms| Duration::from_secs_f64(ms.max(0.0) / 1000.0));
+            return verdict(ran);
+        }
+        if elapsed >= window {
+            return InvokeLength::NotShort;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -853,7 +1073,11 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 // Retry buffered telemetry on each invoke. APM telemetry needs a live session
                 // (run_id), so it only fires when apm_app is Some. Metric API is license-key-only
                 // and retries unconditionally.
-                if components.apm_mode_enabled
+                // The high tier runs these same retries later, once the invoke is known not
+                // to be short (see `run_invoke_retries`); the default tier runs them here.
+                let is_high = components.config.extension.send_tier == crate::send::SendTier::High;
+                if !is_high
+                    && components.apm_mode_enabled
                     && crate::apm::telemetry_buffer::get_buffer_count() > 0
                     && components.apm_app.read().await.is_some()
                 {
@@ -877,7 +1101,8 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     });
                 }
 
-                if components.apm_mode_enabled
+                if !is_high
+                    && components.apm_mode_enabled
                     && crate::apm::metric_api_buffer::get_metric_api_buffer_count() > 0
                 {
                     let apm_client = components.apm_client.clone();
@@ -996,15 +1221,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 // Retry any previously-failed agent payloads in the background so the
                 // HTTP round-trips happen during function execution, not post-runtime-done.
-                {
+                if !is_high {
                     let apm = components.apm_app.clone();
                     tokio::spawn(retry_failed_agent_payloads(apm));
-                }
-
-                // Only high ever fills FAILED_PLATFORM_REPORTS; default must stay as on main.
-                if components.config.extension.send_tier == crate::send::SendTier::High {
-                    let apm = components.apm_app.clone();
-                    tokio::spawn(retry_failed_platform_reports(apm));
                 }
 
                 // Create per-request state (platform_processor, agent_buffer, context)
@@ -1086,14 +1305,28 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 let global_log_processor_clone = components.global_log_processor.clone();
                 let apm_app_clone = components.apm_app.clone();
 
+                // High tier: the INVOKE-time retries wait until the invoke is known not to be short.
+                let invoke_retries: Option<InvokeRetries> = if is_high {
+                    let apm_app = components.apm_app.clone();
+                    let apm_client = components.apm_client.clone();
+                    let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
+                    let apm_mode_enabled = components.apm_mode_enabled;
+                    Some(Box::new(move || {
+                        tokio::spawn(run_invoke_retries(apm_app, apm_client, license_key, apm_mode_enabled));
+                    }))
+                } else {
+                    None
+                };
+
                 let current_task = tokio::spawn(async move {
-                    process_apm_request(
+                    process_apm_request_with(
                         request_id_clone,
                         invoked_function_arn_clone,
                         config_clone,
                         global_log_processor_clone,
                         apm_app_clone,
                         deadline_ms,
+                        invoke_retries,
                     )
                     .await;
                 });
@@ -1931,6 +2164,7 @@ fn format_elapsed_for_log(elapsed_ms: Option<i64>) -> String {
     }
 }
 
+#[cfg(test)]
 pub async fn process_apm_request(
     request_id: String,
     invoked_function_arn: String,
@@ -1938,6 +2172,21 @@ pub async fn process_apm_request(
     global_log_processor: Arc<LogProcessor>,
     apm_app: crate::apm::SharedApmApp,
     deadline_ms: i64,
+) {
+    process_apm_request_with(request_id, invoked_function_arn, config, global_log_processor, apm_app, deadline_ms, None).await;
+}
+
+/// `invoke_retries` is the high tier's INVOKE-time retries of earlier failures: held back
+/// until the invoke is known not to be short. The default tier passes `None` and runs
+/// its retries inline, as before.
+async fn process_apm_request_with(
+    request_id: String,
+    invoked_function_arn: String,
+    config: Arc<ExtensionConfig>,
+    global_log_processor: Arc<LogProcessor>,
+    apm_app: crate::apm::SharedApmApp,
+    deadline_ms: i64,
+    invoke_retries: Option<InvokeRetries>,
 ) {
     debug!("APM mode: Starting processing for request: {}", request_id);
 
@@ -1987,6 +2236,7 @@ pub async fn process_apm_request(
                 &apm_app,
                 deadline_ms,
                 &state,
+                invoke_retries,
             ).await;
         }
     }
@@ -2208,18 +2458,11 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
 }
 
-/// How long to hold `/next` after `runtimeDone`, given the hold cap. A shorter
-/// handler gave the send (spawned at INVOKE) less head start, so it is held for
-/// the rest of the cap, counted from the spawn. From 80% of the cap up the
-/// shrinking stops: reducing the hold further would only cut off sends that were
-/// about to finish, so the full cap applies.
-fn runtime_done_hold(handler: Duration, cap_ms: u64) -> Duration {
-    let cap = Duration::from_millis(cap_ms);
-    if handler >= Duration::from_millis(cap_ms * 4 / 5) {
-        cap
-    } else {
-        cap.saturating_sub(handler)
-    }
+/// What is left of a send's budget. The hold cap (a placeholder for the measured P99 of a
+/// healthy send) is counted from when the send *started*, so a send that has already had
+/// its time gets none. There is no other rule.
+fn send_budget_left(started: tokio::time::Instant, cap: Duration) -> Duration {
+    (started + cap).saturating_duration_since(tokio::time::Instant::now())
 }
 
 /// What one invocation cost, logged once per invoke so the placeholder timings can
@@ -2229,20 +2472,32 @@ struct InvokeTiming {
     hold_budget_ms: u128,
     waited_ms: u128,
     short_invoke: bool,
+    cancelled: bool,
     batch_left_running: bool,
     log_flush_aborted: bool,
+    /// Lambda's own `metrics.durationMs` from `runtimeDone`, when it had arrived.
+    runtime_done_ms: Option<f64>,
 }
 
 fn log_invoke_timing(request_id: &str, t: &InvokeTiming) {
     info!(
-        "APM high timing: request={} handler_ms={} short_invoke={} hold_budget_ms={} waited_ms={} batch_left_running={} log_flush_aborted={}",
-        request_id, t.handler_ms, t.short_invoke, t.hold_budget_ms, t.waited_ms, t.batch_left_running, t.log_flush_aborted
+        "APM high timing: request={} handler_ms={} runtime_done_ms={} short_invoke={} cancelled={} hold_budget_ms={} waited_ms={} batch_left_running={} log_flush_aborted={}",
+        request_id,
+        t.handler_ms,
+        t.runtime_done_ms.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.1}")),
+        t.short_invoke,
+        t.cancelled,
+        t.hold_budget_ms,
+        t.waited_ms,
+        t.batch_left_running,
+        t.log_flush_aborted
     );
 }
 
-/// `SendTier::High`. Data is delivered by the *next* invocation, in parallel
-/// with its handler (`spawn_pending_batch`), so this invocation only holds
-/// `/next` for work that is already in flight. Short invokes hold nothing.
+/// `SendTier::High`. Data from earlier invocations starts sending at INVOKE, in parallel
+/// with the handler (`spawn_pending_batch`). If the invoke turns out short, that is
+/// cancelled and nothing else is started; otherwise `/next` is held only while a send is
+/// still within its budget.
 async fn process_apm_request_high(
     request_id: &str,
     config: &Arc<ExtensionConfig>,
@@ -2250,37 +2505,47 @@ async fn process_apm_request_high(
     apm_app: &crate::apm::SharedApmApp,
     deadline_ms: i64,
     state: &request::RequestProcessingState,
+    invoke_retries: Option<InvokeRetries>,
 ) {
     let invoke_start = tokio::time::Instant::now();
+    let cap = Duration::from_millis(config.extension.hold_cap_ms);
 
     // Collect last invoke's log flush if it finished; never abort it here.
     resolve_pending_logs(global_log_processor, request_id).await;
     spawn_pending_batch(request_id, config, global_log_processor, apm_app).await;
+    let send_started = tokio::time::Instant::now();
+
+    let threshold = Duration::from_millis(config.extension.short_invoke_threshold_ms);
+    if detect_short_invoke(request_id, state, threshold, invoke_start).await == InvokeLength::Short {
+        // A trivial function must not pay for telemetry. Stop what INVOKE started and put
+        // its unsent data back; start no log flush (logs stay buffered) and no retries
+        // (they wait for a longer invoke). Return at once.
+        let cancelled = cancel_in_flight_batch().await;
+        log_invoke_timing(request_id, &InvokeTiming {
+            handler_ms: invoke_start.elapsed().as_millis(),
+            hold_budget_ms: 0,
+            waited_ms: 0,
+            short_invoke: true,
+            cancelled,
+            batch_left_running: false,
+            log_flush_aborted: false,
+            runtime_done_ms: request::get_runtime_done_duration_ms(request_id),
+        });
+        return;
+    }
+    // Not short: earlier failures may be retried now.
+    if let Some(retries) = invoke_retries {
+        retries();
+    }
 
     // Always wait: the handler's duration decides how long we may hold.
     let signaled = wait_for_runtime_done(request_id, deadline_ms).await;
     let handler = invoke_start.elapsed();
 
-    if handler < Duration::from_millis(config.extension.short_invoke_threshold_ms) {
-        // A trivial function must not pay for telemetry, so do nothing now: no hold
-        // and no log flush. Logs stay buffered in the LogProcessor and go out with a
-        // later flush; the batch started at INVOKE keeps running (aborting would
-        // starve functions that are always short) and the next INVOKE collects it.
-        log_invoke_timing(request_id, &InvokeTiming {
-            handler_ms: handler.as_millis(),
-            hold_budget_ms: 0,
-            waited_ms: 0,
-            short_invoke: true,
-            batch_left_running: SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await,
-            log_flush_aborted: false,
-        });
-        return;
-    }
-
-    let hold = runtime_done_hold(handler, config.extension.hold_cap_ms);
+    // Never hold `/next` more than the cap after `runtimeDone`, whatever the sends need.
     let hold_started = tokio::time::Instant::now();
-    let hold_until = hold_started + hold;
-    let window_until = hold_until.min(
+    let hard_deadline = hold_started + cap;
+    let window_until = hard_deadline.min(
         hold_started + Duration::from_millis(config.extension.payload_window_ms),
     );
     // Concurrent, so the two waits cost the longer of them, not the sum.
@@ -2288,7 +2553,7 @@ async fn process_apm_request_high(
         wait_for_own_payload(request_id, state, config, global_log_processor, apm_app, window_until),
         async {
             let _ = tokio::time::timeout_at(
-                hold_until,
+                hard_deadline,
                 wait_for_runtime_done_with_grace(request_id, signaled, config, global_log_processor),
             )
             .await;
@@ -2297,21 +2562,20 @@ async fn process_apm_request_high(
 
     spawn_log_flush(global_log_processor, request_id).await;
 
-    // Let both finish if they can within the hold. The agent batch is then left
-    // running if it hasn't (never aborted: it may already be at the collector, and
-    // aborting would only make its retry a duplicate). Logs are one request, so
-    // an unfinished flush is aborted and requeued from its write-ahead copy.
-    let remaining = hold_until.saturating_duration_since(tokio::time::Instant::now());
-    let mut done = SEND_SCHEDULER
-        .wait_finished(
-            &[crate::send::SendKind::ApmCollector, crate::send::SendKind::Logs],
-            remaining,
-        )
-        .await;
-    if let Some(outcome) = done.remove(&crate::send::SendKind::ApmCollector) {
+    // Each send gets the cap counted from its own start: the batch from INVOKE, the log
+    // flush from now. Unfinished at its deadline, the batch is left running (it may already
+    // be at the collector, and aborting would only make its retry a duplicate); logs are
+    // one request, so an unfinished flush is aborted and requeued from its write-ahead copy.
+    let batch_left = send_budget_left(send_started, cap);
+    let logs_left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
+    let (mut batch_done, mut logs_done) = tokio::join!(
+        SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::ApmCollector], batch_left),
+        SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::Logs], logs_left),
+    );
+    if let Some(outcome) = batch_done.remove(&crate::send::SendKind::ApmCollector) {
         log_batch_outcome(&outcome);
     }
-    let log_outcome = match done.remove(&crate::send::SendKind::Logs) {
+    let log_outcome = match logs_done.remove(&crate::send::SendKind::Logs) {
         Some(outcome) => Some(outcome),
         None => SEND_SCHEDULER
             .resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO)
@@ -2326,11 +2590,13 @@ async fn process_apm_request_high(
     }
     log_invoke_timing(request_id, &InvokeTiming {
         handler_ms: handler.as_millis(),
-        hold_budget_ms: hold.as_millis(),
+        hold_budget_ms: batch_left.max(logs_left).as_millis(),
         waited_ms: hold_started.elapsed().as_millis(),
         short_invoke: false,
+        cancelled: false,
         batch_left_running: SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await,
         log_flush_aborted,
+        runtime_done_ms: request::get_runtime_done_duration_ms(request_id),
     });
 }
 
