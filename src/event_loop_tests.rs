@@ -4859,3 +4859,175 @@ async fn a_long_invoke_waits_for_the_batch_to_finish() {
     }
     clear_high_tier_state();
 }
+
+// ── default tier: the platform.report send runs in the background; /next waits for it ──
+
+fn flag_after(ms: u64) -> (tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>) {
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = done.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    (handle, done)
+}
+
+#[tokio::test]
+#[serial]
+async fn waiting_for_report_sends_with_none_in_flight_returns_at_once() {
+    let started = tokio::time::Instant::now();
+    wait_for_report_sends(Duration::from_secs(5)).await;
+    assert!(started.elapsed() < Duration::from_millis(50), "took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+#[serial]
+async fn waiting_for_report_sends_returns_only_after_they_finish() {
+    let (slow, slow_done) = flag_after(150);
+    let (quick, quick_done) = flag_after(20);
+    track_report_send(slow);
+    track_report_send(quick);
+
+    let started = tokio::time::Instant::now();
+    wait_for_report_sends(Duration::from_secs(5)).await;
+
+    assert!(slow_done.load(std::sync::atomic::Ordering::SeqCst), "the slowest send was waited for");
+    assert!(quick_done.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(started.elapsed() >= Duration::from_millis(140), "waited {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(400), "sends ran together, waited {:?}", started.elapsed());
+}
+
+#[tokio::test]
+#[serial]
+async fn the_wait_is_bounded_and_does_not_cancel_the_send() {
+    let (slow, slow_done) = flag_after(300);
+    track_report_send(slow);
+
+    let started = tokio::time::Instant::now();
+    wait_for_report_sends(Duration::from_millis(60)).await;
+    assert!(started.elapsed() < Duration::from_millis(200), "bounded by the budget, took {:?}", started.elapsed());
+    assert!(!slow_done.load(std::sync::atomic::Ordering::SeqCst), "not finished yet");
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(slow_done.load(std::sync::atomic::Ordering::SeqCst), "the send was left running, not aborted");
+    wait_for_report_sends(Duration::from_millis(10)).await; // nothing left in the registry
+}
+
+// The default flow must not return to /next while a report send is still going.
+#[tokio::test]
+#[serial]
+async fn the_default_flow_holds_next_until_a_report_send_is_done() {
+    clear_high_tier_state();
+    let id = "def-report-wait";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.synchronous_flush = false;
+    let config = Arc::new(cfg);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let (slow, slow_done) = flag_after(250);
+    track_report_send(slow);
+
+    let started = tokio::time::Instant::now();
+    process_apm_request_default(
+        &id.to_string(),
+        &"arn:test".to_string(),
+        &config,
+        &make_noop_log_processor_serverless(config.clone()),
+        &apm_app,
+        deadline_ms_from_now(5_000),
+        &state,
+    )
+    .await;
+
+    assert!(slow_done.load(std::sync::atomic::Ordering::SeqCst), "the report send finished before the flow returned");
+    assert!(started.elapsed() >= Duration::from_millis(240), "took {:?}", started.elapsed());
+    cleanup_request_processing_state_internal(id, false);
+}
+
+// ── SHUTDOWN: independent work runs at once ──────────────────────────────────────────────
+
+fn boxed<'a, T>(fut: impl std::future::Future<Output = T> + Send + 'a) -> BoxedFuture<'a, T> {
+    Box::pin(fut)
+}
+
+#[tokio::test]
+async fn join_all_concurrently_with_nothing_returns_at_once() {
+    let results: Vec<u8> = join_all_concurrently(Vec::new()).await;
+    assert!(results.is_empty());
+}
+
+#[tokio::test]
+async fn join_all_concurrently_runs_everything_together_and_keeps_input_order() {
+    let futures: Vec<BoxedFuture<'_, usize>> = (0..5usize)
+        .map(|i| {
+            boxed(async move {
+                tokio::time::sleep(Duration::from_millis(150 - (i as u64) * 20)).await;
+                i
+            })
+        })
+        .collect();
+
+    let started = tokio::time::Instant::now();
+    let results = join_all_concurrently(futures).await;
+
+    assert_eq!(results, vec![0, 1, 2, 3, 4], "results come back in input order, not finish order");
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "five sends of up to 150 ms must overlap, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn shutdown_takes_every_pending_payload_except_a_dropped_short_invoke() {
+    use crate::send::short_invoke::{mark, ShortOutcome};
+    clear_high_tier_state();
+    put_earlier_request("sd-keep-a", b"a");
+    put_earlier_request("sd-keep-b", b"b");
+    put_earlier_request("sd-dropped", b"c");
+    mark("sd-dropped", ShortOutcome::Dropped);
+
+    let mut taken: Vec<(String, Vec<u8>)> = shutdown_take_payloads()
+        .into_iter()
+        .filter(|p| p.request_id.starts_with("sd-"))
+        .map(|p| (p.request_id, p.bytes))
+        .collect();
+    taken.sort();
+
+    assert_eq!(
+        taken,
+        vec![("sd-keep-a".to_string(), b"a".to_vec()), ("sd-keep-b".to_string(), b"b".to_vec())]
+    );
+    assert!(get_agent_buffer("sd-keep-a").unwrap().lock().unwrap().is_empty(), "taken means gone from the buffer");
+    for id in ["sd-keep-a", "sd-keep-b", "sd-dropped"] {
+        cleanup_request_processing_state_internal(id, false);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn shutdown_lists_every_pending_platform_report() {
+    for id in ["sd-rep-1", "sd-rep-2"] {
+        request::ensure_lmi_request_slot(id);
+        request::set_pending_report(id, format!("REPORT {id}"));
+    }
+
+    let mut reports: Vec<(String, String)> = shutdown_pending_reports()
+        .into_iter()
+        .filter(|(id, _)| id.starts_with("sd-rep-"))
+        .collect();
+    reports.sort();
+
+    assert_eq!(
+        reports,
+        vec![
+            ("sd-rep-1".to_string(), "REPORT sd-rep-1".to_string()),
+            ("sd-rep-2".to_string(), "REPORT sd-rep-2".to_string())
+        ]
+    );
+    for id in ["sd-rep-1", "sd-rep-2"] {
+        cleanup_request_processing_state_internal(id, false);
+    }
+}

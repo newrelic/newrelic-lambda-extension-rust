@@ -58,6 +58,32 @@ pub struct TelemetryRecord {
     pub record: serde_json::Value,
 }
 
+/// Sends one `platform.report` as metrics. A report that could not be sent (no APM session
+/// yet, or the send failed) is stored for a later invoke to retry, exactly as when this ran
+/// inline in the handler.
+pub(crate) async fn send_platform_report_in_background(request_id: String, report_line: String, arn: String) {
+    let app = crate::APM_APP.read().await.clone();
+    let failed = if let Some(app) = app {
+        match app.send_platform_report_metrics(&report_line, &arn).await {
+            Ok(()) => {
+                debug!("APM mode: Sent platform.report metrics for request: {}", request_id);
+                false
+            }
+            Err(e) => {
+                warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id, e);
+                true
+            }
+        }
+    } else {
+        warn!("APM mode: APM app not ready - storing report for retry");
+        true
+    };
+    if failed {
+        set_pending_report(&request_id, report_line);
+        debug!("APM mode: Stored failed platform.report for request: {} (will retry later)", request_id);
+    }
+}
+
 /// When the listener was busy handling recent Telemetry batches: (received, answered). Lambda
 /// hands over the next batch only after the previous one is answered, so this separates a
 /// delivery that was held up by our own handling from one the platform made late by itself.
@@ -300,6 +326,19 @@ async fn handle_telemetry_batch(
                                         // The next INVOKE's batch sends the report.
                                         crate::event_loop::stash_platform_report(request_id_str, report_line);
                                         debug!("APM mode (high): platform.report for {} kept for the next batch", request_id_str);
+                                    } else if is_apm_mode && !is_lmi {
+                                        // Default tier: send in the background. Awaiting the Metric API
+                                        // here would hold this handler, and with it the next batch of
+                                        // events (runtimeDone), for a whole round trip. The invocation
+                                        // waits for the send before /next instead.
+                                        let current_arn = crate::get_global_fallback_arn();
+                                        crate::event_loop::track_report_send(tokio::spawn(
+                                            send_platform_report_in_background(
+                                                request_id_str.to_string(),
+                                                report_line,
+                                                current_arn,
+                                            ),
+                                        ));
                                     } else if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;

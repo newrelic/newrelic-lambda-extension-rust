@@ -2030,4 +2030,26 @@ mod busy_time_tests {
         assert_eq!(busy_ms_within(&batches, at(300), at(300)), 0);
         assert_eq!(busy_ms_within(&batches, at(400), at(300)), 0);
     }
+
+// ── default tier: a platform.report is sent in the background and kept for retry on failure ──
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
+    use crate::request::{get_pending_report, remove_pending_report};
+    *crate::APM_APP.write().await = None; // no APM session: the send cannot be made
+    let id = "bg-report-no-app";
+    crate::request::ensure_lmi_request_slot(id); // the request exists from its INVOKE in real flows
+    remove_pending_report(id);
+
+    crate::telemetry::listener::send_platform_report_in_background(
+        id.to_string(),
+        "REPORT line".to_string(),
+        "arn:test".to_string(),
+    )
+    .await;
+
+    assert_eq!(get_pending_report(id).as_deref(), Some("REPORT line"), "kept so a later invoke retries it");
+    crate::request::cleanup_request_processing_state_internal(id, false);
+}
 }

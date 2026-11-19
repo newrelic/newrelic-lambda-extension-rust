@@ -324,6 +324,47 @@ pub static LAST_REQUEST_CONTEXT: once_cell::sync::Lazy<Arc<Mutex<Option<(String,
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(None)));
 
 
+/// Default tier: `platform.report` sends that the telemetry listener started in the
+/// background. The listener answers Lambda at once instead of waiting for the Metric API,
+/// so `runtimeDone` is not held back; the invocation then waits here, in parallel with its
+/// own sends, before calling `/next`, so a send is never left to be frozen mid-flight.
+static INFLIGHT_REPORT_SENDS: once_cell::sync::Lazy<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Remember a background report send so `wait_for_report_sends` can wait for it.
+pub(crate) fn track_report_send(handle: tokio::task::JoinHandle<()>) {
+    if let Ok(mut sends) = INFLIGHT_REPORT_SENDS.lock() {
+        sends.retain(|h| !h.is_finished());
+        sends.push(handle);
+    }
+}
+
+/// Wait until every tracked report send has finished, but no longer than `budget`. Sends
+/// still running at the budget are left running (a send that has already reached the
+/// Metric API must not be cut off and repeated); each failed send keeps its own report
+/// for retry, so nothing is lost either way.
+async fn wait_for_report_sends(budget: Duration) {
+    let handles: Vec<_> = INFLIGHT_REPORT_SENDS
+        .lock()
+        .map(|mut sends| std::mem::take(&mut *sends))
+        .unwrap_or_default();
+    if handles.is_empty() {
+        return;
+    }
+    let waited = tokio::time::timeout(budget, async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    })
+    .await;
+    if waited.is_err() {
+        warn!("Platform report send still running after {}ms - not waiting longer", budget.as_millis());
+    }
+}
+
+/// Most SHUTDOWN waits for the last invocation's report send.
+const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
+
 /// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
 /// log flush. `default` never touches it. The batch is never aborted (it may
 /// already be at the collector); only the log flush is, at the cap.
@@ -1524,165 +1565,53 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 let mut shutdown_diagnostic: Option<ShutdownDropDiagnostic> = None;
 
                 let shutdown_result = tokio::time::timeout(Duration::from_millis(SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS), async {
-                if components.config.extension.pipeline_flush {
-                    for handle in pending_flush_handles.drain(..) {
-                        debug!("APM shutdown: awaiting in-flight pipeline flush");
-                        if let Err(e) = handle.await {
-                            error!("Pipeline flush task panicked during APM shutdown: {}", e);
-                        }
-                    }
-                }
+                // SHUTDOWN has about two seconds in total, so everything that does not depend on
+                // something else runs at the same time.
 
-                // Synthesize and send error based on shutdown reason (to APM collector)
-                if let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) {
-                    let apm_app_guard = components.apm_app.read().await;
-                    if let Some(ref app) = *apm_app_guard {
-                        send_error_for_shutdown_reason(app, shutdown_reason, &last_request_id, &last_arn, &components.config).await;
-                    } else {
-                        // Drop the read lock before calling write().await on the same RwLock —
-                        // holding a read guard while awaiting a write lock on the same lock deadlocks.
-                        drop(apm_app_guard);
+                // 1. The only prerequisite: a session, if we have none (the sends below need it).
+                shutdown_reconnect_if_needed(components).await;
 
-                        // If APM was permanently disabled (auth rejected), a reconnect
-                        // cannot succeed — don't waste the shutdown budget. The data is
-                        // lost, which the earlier error log already recorded.
-                        if crate::apm::connection::is_handshake_fatal() {
-                            error!("APM permanently disabled (auth rejected) — shutdown error event DROPPED");
-                        } else {
-                        // One last synchronous attempt during shutdown — sandbox is still active
-                        // for the duration of the SHUTDOWN handler so no freeze risk.
-                        debug!("APM not connected at shutdown — attempting final sync reconnect");
-                        let lambda_function_name = components.config.aws.function_name.clone();
-                        let function_name = std::env::var("NEW_RELIC_APP_NAME")
-                            .ok()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or_else(|| lambda_function_name.clone());
-                        let shutdown_app = crate::apm::ApmApp::new(
-                            components.config.new_relic.license_key.clone().unwrap_or_default(),
-                            components.config.new_relic.apm_host.clone(),
-                            components.config.new_relic.metric_endpoint.clone(),
-                            components.apm_client.clone(),
-                            function_name,
-                            lambda_function_name,
-                            components.config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
-                            components.config.aws.account_id.clone(),
-                            components.config.aws.region.clone(),
-                            // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
-                            components.config.new_relic.apm_handshake_timeout_secs.min(2),
-                            components.config.deployment,
-                        )
-                        .await;
-
-                        match shutdown_app {
-                            Ok(app) => {
-                                info!("APM reconnect succeeded during shutdown - Entity GUID: {}", app.get_entity_guid());
-                                send_error_for_shutdown_reason(&app, shutdown_reason, &last_request_id, &last_arn, &components.config).await;
-                                let mut w = components.apm_app.write().await;
-                                *w = Some(app);
-                            }
-                            Err(e) => {
-                                // Shutdown is the last chance to flush; a failure here means
-                                // the shutdown error event is permanently lost — log as error.
-                                error!("APM not connected at shutdown and final reconnect failed: {} - shutdown error event DROPPED", e);
-                            }
-                        }
-                        }
-                    }
-                }
-
-                // Yield to let the IPC pipe collector task route any last in-flight
-                // payloads before we collect from REQUEST_DATA below. The collector
-                // runs in a separate tokio task; two yields ensure items already in
-                // the mpsc channel are routed before the shutdown collect.
+                // Let the IPC pipe collector route last in-flight payloads before we take them;
+                // it runs in its own task, so two yields let items already in the channel through.
                 tokio::task::yield_now().await;
                 tokio::task::yield_now().await;
 
-                // SendTier::High only: there's no "next invocation" at shutdown to defer
-                // to, so drain whatever the last high-tier invocation left pending in
-                // SEND_SCHEDULER first. No-op under SendTier::Default (process_apm_request_default
-                // never touches SEND_SCHEDULER, so nothing is ever pending there) and on the
-                // common case where nothing is pending.
-                if components.config.extension.send_tier == crate::send::SendTier::High {
-                    resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
-                    resolve_pending_logs(&components.global_log_processor, "shutdown").await;
-                    drain_stashed_reports_into_retry_buffer();
-                    retry_failed_platform_reports(components.apm_app.clone()).await;
+                // 2. No network: take the buffered payloads, extract their trace ids so logs held
+                // for them are stamped, and release logs whose payload never arrived (untagged,
+                // the last chance before the sandbox dies).
+                let payloads = shutdown_take_payloads();
+                for payload in &payloads {
+                    extract_and_coordinate_trace_id(
+                        &payload.bytes,
+                        &payload.request_id,
+                        &components.config,
+                        &components.global_log_processor,
+                    )
+                    .await;
                 }
+                components.global_log_processor.flush_pending_logs_unstamped();
 
-                // CRITICAL: Process ALL remaining pending agent payloads before shutdown
-                debug!("APM mode shutdown: Processing all remaining agent payloads");
+                // 3. All the sending, at once: the error event, every payload, every pending
+                // report, the last invocation's report (default tier), the high tier's last
+                // batch, the log flushes, and any pipeline flushes still running.
+                tokio::join!(
+                    shutdown_await_pipeline_flushes(&mut pending_flush_handles, components.config.extension.pipeline_flush),
+                    shutdown_send_error_event(components, shutdown_reason.clone()),
+                    shutdown_send_payloads(components, &payloads),
+                    shutdown_send_reports(components),
+                    wait_for_report_sends(Duration::from_millis(SHUTDOWN_REPORT_WAIT_MS)),
+                    shutdown_drain_high_tier(components),
+                    shutdown_flush_logs(components),
+                );
 
                 // Distinct request_ids (invocations) whose telemetry we could not
                 // deliver — used to build the single shutdown summary below.
                 let mut dropped_request_ids: std::collections::BTreeSet<String> =
                     std::collections::BTreeSet::new();
 
-                // Check all request buffers for unsent payloads
-                let all_request_ids: Vec<String> = REQUEST_DATA
-                    .iter()
-                    .map(|entry| entry.key().clone())
-                    .collect();
-                
-                if !all_request_ids.is_empty() {
-                    debug!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
-                    
-                    for request_id in all_request_ids {
-                        // A short invoke without an error is dropped, even if its payload came late.
-                        if crate::send::short_invoke::get(&request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
-                            continue;
-                        }
-                        if let Some(buffer) = get_agent_buffer(&request_id) {
-                            let payloads = {
-                                if let Ok(mut buf) = buffer.lock() {
-                                    std::mem::take(&mut *buf)
-                                } else {
-                                    Vec::new()
-                                }
-                            };
-                            
-                            if !payloads.is_empty() {
-                                info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
-                                
-                                let invoked_function_arn = get_request_context(&request_id)
-                                    .and_then(|ctx_ref| {
-                                        ctx_ref.lock()
-                                            .ok()
-                                            .map(|ctx| ctx.invoked_function_arn.clone())
-                                            .filter(|arn| !arn.is_empty())
-                                    })
-                                    .unwrap_or_else(crate::get_global_fallback_arn);
-                                
-                                for payload_bytes in payloads {
-                                    // process_and_send_agent_payload always returns Ok and
-                                    // logs its own outcome, so we don't branch on Err here.
-                                    //
-                                    // Also deliberately not adding to dropped_request_ids here:
-                                    // the retry below might still redeliver this payload, and
-                                    // dropped_request_ids is never pruned, so an early insert
-                                    // could wrongly mark a later-delivered request as dropped.
-                                    // The accounting happens once, after retries run, from the
-                                    // actual buffer contents (see buffered_agent_payload_request_ids below).
-                                    let _ = process_and_send_agent_payload(
-                                        &payload_bytes,
-                                        &request_id,
-                                        &invoked_function_arn,
-                                        &components.global_log_processor,
-                                        &components.config,
-                                        &components.apm_app,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    debug!("APM mode shutdown: No pending agent payloads to process");
-                }
-
-                // Any logs still held for a request whose payload never arrived (true
-                // orphans) get flushed now, untagged — last chance before the sandbox dies.
-                components.global_log_processor.flush_pending_logs_unstamped();
-
+                // 4. One last retry of whatever failed above (the three buffers are independent,
+                // so they are retried together), so the drop count below reflects only what
+                // genuinely could not be delivered.
                 debug!("APM mode shutdown: Retrying all buffered telemetry");
                 let license_key = components.config.new_relic.license_key.clone().unwrap_or_default();
                 let (cur_run_id, cur_collector_host) = {
@@ -1692,22 +1621,16 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         None => (None, None),
                     }
                 };
-                crate::apm::telemetry_buffer::retry_buffered_telemetry(
-                    &components.apm_client,
-                    &license_key,
-                    cur_run_id.as_deref(),
-                    cur_collector_host.as_deref(),
-                )
-                .await;
-                crate::apm::metric_api_buffer::retry_buffered_metric_api(
-                    &components.apm_client,
-                    &license_key,
-                )
-                .await;
-                // Final attempt for failed agent payloads too (APM collector), so the
-                // drop count below reflects only what genuinely couldn't be delivered.
-                // Keeps FAILED_AGENT_PAYLOADS symmetric with the two buffers above.
-                retry_failed_agent_payloads(components.apm_app.clone()).await;
+                tokio::join!(
+                    crate::apm::telemetry_buffer::retry_buffered_telemetry(
+                        &components.apm_client,
+                        &license_key,
+                        cur_run_id.as_deref(),
+                        cur_collector_host.as_deref(),
+                    ),
+                    crate::apm::metric_api_buffer::retry_buffered_metric_api(&components.apm_client, &license_key),
+                    retry_failed_agent_payloads(components.apm_app.clone()),
+                );
 
                 // Gather every request_id whose data is still un-delivered:
                 //  - agent payloads buffered while disconnected (the main bucket),
@@ -1779,54 +1702,6 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                         request_id_count: affected,
                         item_count: remaining_count,
                     });
-                }
-
-                // Process any pending platform.report lines as metrics (APM mode)
-                let all_pending_reports: Vec<(String, String)> = REQUEST_DATA
-                    .iter()
-                    .filter_map(|entry| {
-                        entry.pending_report.as_ref().map(|report| {
-                            (entry.key().clone(), report.clone())
-                        })
-                    })
-                    .collect();
-
-                if !all_pending_reports.is_empty() {
-                    debug!("APM mode shutdown: Found {} pending platform.report(s) to send as metrics", all_pending_reports.len());
-
-                    let apm_app_guard = components.apm_app.read().await;
-                    if let Some(ref app) = *apm_app_guard {
-                        for (request_id, report_line) in all_pending_reports {
-                            debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
-
-                            let shutdown_arn = LAST_REQUEST_CONTEXT.lock().ok()
-                                .and_then(|g| g.clone().map(|(_, arn)| arn))
-                                .unwrap_or_default();
-                            // send_platform_report_metrics always returns Ok (permanent-drop
-                            // and buffered-for-retry are Ok too, by design) and already logs
-                            // its own accurate outcome internally — don't re-log here.
-                            let _ = app.send_platform_report_metrics(&report_line, &shutdown_arn).await;
-
-                            // Remove pending report after sending
-                            remove_pending_report(&request_id);
-                        }
-                    } else {
-                        warn!("APM mode shutdown: APM app not initialized - cannot send platform metrics");
-                    }
-                } else {
-                    debug!("APM mode shutdown: No pending platform.report lines to process");
-                }
-
-                // Emergency flush of pre-invoke buffer (logs from INIT phase if shutdown before first INVOKE)
-                if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
-                    error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
-                }
-
-                // Shutdown drain: flush + re-flush any entries pushed back into
-                // failed_logs_buffer by send failures in the flush itself. Bounded by
-                // MAX_RETRIES (via per-entry retry_count filter in start_invocation_retry).
-                if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
-                    error!("APM mode shutdown: Failed to flush logs: {}", e);
                 }
                 }).await;
 
@@ -2570,7 +2445,13 @@ async fn process_apm_request_default(
         }
     };
 
-    tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
+    // Report sends the listener started in the background: /next waits for them too.
+    let reports_in_flight_fut = wait_for_report_sends(Duration::from_millis(bounded_wait_budget_ms(
+        deadline_ms,
+        MAX_SEND_WAIT_MS,
+    )));
+
+    tokio::join!(agent_send_fut, report_send_fut, log_flush_fut, reports_in_flight_fut);
 }
 
 /// What one invocation cost, logged once per invoke so the placeholder timings can
@@ -2900,6 +2781,237 @@ async fn wait_for_runtime_done_with_grace(
         }
     }
     // else: wait_for_runtime_done already logged the deadline-reached case.
+}
+
+/// A future that is boxed so a list of different async blocks can be run together.
+type BoxedFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// Run every future at the same time and return once all have finished, with the results in
+/// input order. (No `futures` dependency is needed for this: it polls each one until done.)
+async fn join_all_concurrently<'a, T>(futures: Vec<BoxedFuture<'a, T>>) -> Vec<T> {
+    let mut slots: Vec<Option<BoxedFuture<'a, T>>> = futures.into_iter().map(Some).collect();
+    let mut results: Vec<Option<T>> = (0..slots.len()).map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let finished = match slot.as_mut() {
+                Some(future) => match future.as_mut().poll(cx) {
+                    std::task::Poll::Ready(value) => Some(value),
+                    std::task::Poll::Pending => {
+                        pending = true;
+                        None
+                    }
+                },
+                None => None,
+            };
+            if let Some(value) = finished {
+                results[index] = Some(value);
+                *slot = None;
+            }
+        }
+        if pending {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(())
+        }
+    })
+    .await;
+    results.into_iter().flatten().collect()
+}
+
+/// One agent payload still buffered when SHUTDOWN arrives.
+struct ShutdownPayload {
+    request_id: String,
+    arn: String,
+    bytes: Vec<u8>,
+}
+
+/// SHUTDOWN: take every agent payload still buffered. A short invoke that was decided to be
+/// dropped is skipped, even if its payload came late.
+fn shutdown_take_payloads() -> Vec<ShutdownPayload> {
+    let request_ids: Vec<String> = REQUEST_DATA.iter().map(|entry| entry.key().clone()).collect();
+    let mut taken = Vec::new();
+    for request_id in request_ids {
+        if crate::send::short_invoke::get(&request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
+            continue;
+        }
+        let Some(buffer) = get_agent_buffer(&request_id) else { continue };
+        let payloads = buffer.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
+        if payloads.is_empty() {
+            continue;
+        }
+        info!("APM mode shutdown: Sending {} unsent payload(s) for request: {}", payloads.len(), request_id);
+        let arn = get_request_context(&request_id)
+            .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()).filter(|arn| !arn.is_empty()))
+            .unwrap_or_else(crate::get_global_fallback_arn);
+        taken.extend(payloads.into_iter().map(|bytes| ShutdownPayload {
+            request_id: request_id.clone(),
+            arn: arn.clone(),
+            bytes,
+        }));
+    }
+    taken
+}
+
+/// SHUTDOWN, only when APM is not connected: one last attempt to connect, because the sends
+/// below need a session. Nothing else can start until this is done.
+async fn shutdown_reconnect_if_needed(components: &ExtensionComponents) {
+    if components.apm_app.read().await.is_some() {
+        return;
+    }
+    if crate::apm::connection::is_handshake_fatal() {
+        // A reconnect cannot succeed after a permanent auth rejection - don't spend the budget.
+        error!("APM permanently disabled (auth rejected) — shutdown error event DROPPED");
+        return;
+    }
+    // The sandbox stays active for the whole SHUTDOWN handler, so there is no freeze risk.
+    debug!("APM not connected at shutdown — attempting final sync reconnect");
+    let lambda_function_name = components.config.aws.function_name.clone();
+    let function_name = std::env::var("NEW_RELIC_APP_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| lambda_function_name.clone());
+    let shutdown_app = crate::apm::ApmApp::new(
+        components.config.new_relic.license_key.clone().unwrap_or_default(),
+        components.config.new_relic.apm_host.clone(),
+        components.config.new_relic.metric_endpoint.clone(),
+        components.apm_client.clone(),
+        function_name,
+        lambda_function_name,
+        components.config.aws.function_version.clone().unwrap_or_else(|| "$LATEST".to_string()),
+        components.config.aws.account_id.clone(),
+        components.config.aws.region.clone(),
+        // Lambda gives ~2s for SHUTDOWN; cap to avoid being killed mid-flight.
+        components.config.new_relic.apm_handshake_timeout_secs.min(2),
+        components.config.deployment,
+    )
+    .await;
+    match shutdown_app {
+        Ok(app) => {
+            info!("APM reconnect succeeded during shutdown - Entity GUID: {}", app.get_entity_guid());
+            *components.apm_app.write().await = Some(app);
+        }
+        Err(e) => {
+            // Shutdown is the last chance to flush; a failure here means the shutdown error
+            // event is permanently lost - log as error.
+            error!("APM not connected at shutdown and final reconnect failed: {} - shutdown error event DROPPED", e);
+        }
+    }
+}
+
+/// SHUTDOWN: send the error event that matches the shutdown reason, if there is a session.
+async fn shutdown_send_error_event(components: &ExtensionComponents, shutdown_reason: runtime::ShutdownReason) {
+    let Some((last_request_id, last_arn)) = LAST_REQUEST_CONTEXT.lock().ok().and_then(|guard| guard.clone()) else {
+        return;
+    };
+    // Clone out: a read lock held across the POST would block a reconnect.
+    let app = components.apm_app.read().await.clone();
+    if let Some(app) = app {
+        send_error_for_shutdown_reason(&app, shutdown_reason, &last_request_id, &last_arn, &components.config).await;
+    }
+}
+
+/// SHUTDOWN: send every buffered agent payload, all at once.
+async fn shutdown_send_payloads(components: &ExtensionComponents, payloads: &[ShutdownPayload]) {
+    // process_and_send_agent_payload always returns Ok and logs its own outcome. The drop
+    // accounting is done once, afterwards, from the real buffer contents.
+    let sends: Vec<BoxedFuture<'_, ()>> = payloads
+        .iter()
+        .map(|p| {
+            Box::pin(async move {
+                let _ = process_and_send_agent_payload(
+                    &p.bytes,
+                    &p.request_id,
+                    &p.arn,
+                    &components.global_log_processor,
+                    &components.config,
+                    &components.apm_app,
+                )
+                .await;
+            }) as BoxedFuture<'_, ()>
+        })
+        .collect();
+    join_all_concurrently(sends).await;
+}
+
+/// Every `platform.report` that is still waiting to be sent (request id, report line).
+fn shutdown_pending_reports() -> Vec<(String, String)> {
+    REQUEST_DATA
+        .iter()
+        .filter_map(|entry| entry.pending_report.as_ref().map(|report| (entry.key().clone(), report.clone())))
+        .collect()
+}
+
+/// SHUTDOWN: send every pending `platform.report` as metrics, all at once.
+async fn shutdown_send_reports(components: &ExtensionComponents) {
+    let reports = shutdown_pending_reports();
+    if reports.is_empty() {
+        debug!("APM mode shutdown: No pending platform.report lines to process");
+        return;
+    }
+    debug!("APM mode shutdown: Found {} pending platform.report(s) to send as metrics", reports.len());
+    let Some(app) = components.apm_app.read().await.clone() else {
+        warn!("APM mode shutdown: APM app not initialized - cannot send platform metrics");
+        return;
+    };
+    let arn = LAST_REQUEST_CONTEXT
+        .lock()
+        .ok()
+        .and_then(|g| g.clone().map(|(_, arn)| arn))
+        .unwrap_or_default();
+    let sends: Vec<BoxedFuture<'_, ()>> = reports
+        .into_iter()
+        .map(|(request_id, report_line)| {
+            let (app, arn) = (&app, &arn);
+            Box::pin(async move {
+                debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
+                // Always Ok (permanent-drop and buffered-for-retry are Ok too, by design) and
+                // it logs its own outcome.
+                let _ = app.send_platform_report_metrics(&report_line, arn).await;
+                remove_pending_report(&request_id);
+            }) as BoxedFuture<'_, ()>
+        })
+        .collect();
+    join_all_concurrently(sends).await;
+}
+
+/// SHUTDOWN, high tier only: there is no next invocation to defer to, so settle the last batch
+/// and retry the platform reports it left behind.
+async fn shutdown_drain_high_tier(components: &ExtensionComponents) {
+    if components.config.extension.send_tier != crate::send::SendTier::High {
+        return;
+    }
+    resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
+    drain_stashed_reports_into_retry_buffer();
+    retry_failed_platform_reports(components.apm_app.clone()).await;
+}
+
+/// SHUTDOWN: flush every log. The steps share the log processor's batch, so they stay in order.
+async fn shutdown_flush_logs(components: &ExtensionComponents) {
+    if components.config.extension.send_tier == crate::send::SendTier::High {
+        resolve_pending_logs(&components.global_log_processor, "shutdown").await;
+    }
+    // Logs from INIT, if shutdown came before the first INVOKE.
+    if let Err(e) = components.global_log_processor.flush_pre_invoke_buffer_on_shutdown().await {
+        error!("APM mode shutdown: Failed to flush pre-invoke buffer: {}", e);
+    }
+    // Flush, and re-flush any entries a send failure pushed back; bounded by MAX_RETRIES.
+    if let Err(e) = components.global_log_processor.flush_on_shutdown().await {
+        error!("APM mode shutdown: Failed to flush logs: {}", e);
+    }
+}
+
+/// SHUTDOWN: wait for pipeline flushes that were started during earlier invocations.
+async fn shutdown_await_pipeline_flushes(handles: &mut Vec<tokio::task::JoinHandle<()>>, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    for handle in handles.drain(..) {
+        debug!("APM shutdown: awaiting in-flight pipeline flush");
+        if let Err(e) = handle.await {
+            error!("Pipeline flush task panicked during APM shutdown: {}", e);
+        }
+    }
 }
 
 /// Sends the appropriate APM error event for a given shutdown reason.
