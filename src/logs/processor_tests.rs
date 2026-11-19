@@ -2911,4 +2911,44 @@ mod coverage_tests {
             "serverless mode keeps its first attempt plus 3 retries"
         );
     }
+
+    // ── several log chunks go out at the same time ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_flush_of_several_chunks_sends_them_together() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(202).set_delay(std::time::Duration::from_millis(300)))
+            .mount(&server)
+            .await;
+        let mut config = ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.log_endpoint = format!("{}/log/v1", server.uri());
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "req-chunks".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        let p = LogProcessor::new(Arc::new(NewRelicClient::new(&config)), config, ctx, None);
+        // Each log is more than half of the 1 MB chunk limit, so each one is its own chunk.
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..3 {
+                batch.push(make_log(&format!("{i}-{}", "x".repeat(600_000))));
+            }
+        }
+
+        let started = std::time::Instant::now();
+        p.send_and_clear_batch_simple().await.unwrap();
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 3, "three chunks, three requests");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(800),
+            "three 300 ms uploads must overlap, took {:?}",
+            started.elapsed()
+        );
+        assert!(p.log_batch.lock().unwrap().is_empty());
+    }
 }

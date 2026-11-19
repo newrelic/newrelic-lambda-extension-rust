@@ -3,6 +3,7 @@
 
 
 use tracing::{debug, error, info, trace, warn};
+use crate::send::concurrent::{join_all_concurrently, BoxedFuture};
 use crate::{
     config::ExtensionConfig,
     config::deployment::DeploymentContext,
@@ -119,6 +120,10 @@ impl LogType {
         }
     }
 }
+
+/// The result of sending one log chunk: how many logs it held, and either success or the error
+/// together with the logs handed back so the caller can carry them to the next invoke.
+type ChunkOutcome = (usize, Result<(), (std::io::Error, Vec<payload::LogMessage>)>);
 
 /// The LogProcessor is responsible for handling and transforming function and extension logs.
 #[derive(Debug, Clone)]
@@ -2113,11 +2118,22 @@ impl LogProcessor {
         }
         
         let mut successful_chunks = 0;
+        let request_id = context.request_id.clone();
 
-        for chunk in chunks {
-            let chunk_len = chunk.len();
-            let request_id = context.request_id.clone();
-            match self.try_send_chunk(&client, &config, chunk, &effective_arn).await {
+        // The chunks are independent requests, so they go out together: a burst over the 1 MB
+        // chunk size costs one round trip, not one per chunk. Each result is handled afterwards,
+        // exactly as before.
+        let sends: Vec<BoxedFuture<'_, ChunkOutcome>> = chunks
+            .into_iter()
+            .map(|chunk| {
+                let chunk_len = chunk.len();
+                let (client, config, arn) = (&client, &config, &effective_arn);
+                Box::pin(async move { (chunk_len, self.try_send_chunk(client, config, chunk, arn).await) })
+                    as BoxedFuture<'_, _>
+            })
+            .collect();
+        for (chunk_len, result) in join_all_concurrently(sends).await {
+            match result {
                 Ok(()) => {
                     successful_chunks += 1;
                 },
@@ -2267,12 +2283,19 @@ impl LogProcessor {
             debug!("Chunking logs into {} batches (max 1MB each)", chunks.len());
         }
 
-        for chunk in chunks {
-            let dropped = chunk.len();
-            if let Err(e) = client.send_logs(config, &chunk, function_arn).await {
-                error!("Failed to send log chunk on shutdown — {} logs permanently dropped: {}", dropped, e);
-            }
-        }
+        // At shutdown there is no time to send one chunk after another: send them together.
+        let sends: Vec<BoxedFuture<'_, ()>> = chunks
+            .into_iter()
+            .map(|chunk| {
+                Box::pin(async move {
+                    let dropped = chunk.len();
+                    if let Err(e) = client.send_logs(config, &chunk, function_arn).await {
+                        error!("Failed to send log chunk on shutdown — {} logs permanently dropped: {}", dropped, e);
+                    }
+                }) as BoxedFuture<'_, ()>
+            })
+            .collect();
+        join_all_concurrently(sends).await;
     }
 
 }
