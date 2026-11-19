@@ -5031,3 +5031,68 @@ async fn shutdown_lists_every_pending_platform_report() {
         cleanup_request_processing_state_internal(id, false);
     }
 }
+
+// ── default tier: the upload starts when the payload arrives, not at runtimeDone ─────────
+
+#[tokio::test]
+async fn waiting_for_an_agent_payload_returns_as_soon_as_one_is_buffered() {
+    let id = "early-payload-arrives";
+    let state = detection_state(id);
+    let buffer = state.agent_buffer.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        buffer.lock().unwrap().push(b"payload".to_vec());
+    });
+
+    let started = tokio::time::Instant::now();
+    wait_for_agent_payload(&state).await;
+
+    assert!(started.elapsed() >= Duration::from_millis(50), "not before the payload: {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(120), "and soon after it: {:?}", started.elapsed());
+    cleanup_request_processing_state_internal(id, false);
+}
+
+#[tokio::test]
+async fn waiting_for_an_agent_payload_never_returns_without_one() {
+    let id = "early-payload-never";
+    let state = detection_state(id);
+    let waited = tokio::time::timeout(Duration::from_millis(120), wait_for_agent_payload(&state)).await;
+    assert!(waited.is_err(), "no payload, so it keeps waiting");
+    cleanup_request_processing_state_internal(id, false);
+}
+
+/// A payload that arrives before runtimeDone while APM has no session is not sent early: it
+/// stays buffered for the next invoke, as before, and the flow still waits for runtimeDone.
+#[tokio::test]
+#[serial]
+async fn a_payload_that_arrives_early_without_an_apm_session_stays_buffered() {
+    clear_high_tier_state();
+    let id = "early-payload-no-session";
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.synchronous_flush = false;
+    let config = Arc::new(cfg);
+    let state = detection_state(id);
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    state.agent_buffer.lock().unwrap().push(b"payload".to_vec());
+    let notified = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        request::record_runtime_done_with_duration(id, Some(5.0));
+    });
+
+    let started = tokio::time::Instant::now();
+    process_apm_request_default(
+        &id.to_string(),
+        &"arn:test".to_string(),
+        &config,
+        &make_noop_log_processor_serverless(config.clone()),
+        &apm_app,
+        deadline_ms_from_now(5_000),
+        &state,
+    )
+    .await;
+    notified.await.unwrap();
+
+    assert!(started.elapsed() >= Duration::from_millis(140), "it still waited for runtimeDone: {:?}", started.elapsed());
+    assert_eq!(state.agent_buffer.lock().unwrap().len(), 1, "the payload waits for the next invoke");
+    cleanup_request_processing_state_internal(id, false);
+}

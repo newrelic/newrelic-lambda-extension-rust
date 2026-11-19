@@ -2254,6 +2254,79 @@ async fn process_apm_request_with(
 /// (which didn't trip this lint at its old boundary) -- the code itself is
 /// unchanged, not newly complex.
 #[allow(clippy::too_many_lines)]
+/// Default tier: send an invocation's agent payload(s) to the APM collector in the background.
+/// The handle yields (all sent, the payloads). A payload that could not be sent is buffered for
+/// retry inside the task, so nothing is lost if the caller ignores the result.
+fn spawn_default_agent_send(
+    request_id: &str,
+    invoked_function_arn: &str,
+    config: &Arc<ExtensionConfig>,
+    global_log_processor: &Arc<LogProcessor>,
+    apm_app: &crate::apm::SharedApmApp,
+    agent_payloads: Vec<Vec<u8>>,
+) -> tokio::task::JoinHandle<(bool, Vec<Vec<u8>>)> {
+    let request_id_clone = request_id.to_string();
+    let config_clone = config.clone();
+    let global_log_processor_clone = global_log_processor.clone();
+    let apm_app_clone = apm_app.clone();
+    let agent_payloads_clone = agent_payloads;
+    let invoked_function_arn_clone = invoked_function_arn.to_string();
+
+    tokio::spawn(async move {
+        // Trace-id extraction is per-chunk (independent of telemetry-map
+        // merging) — same as process_pending_agent_payloads's identical step.
+        for payload_bytes in &agent_payloads_clone {
+            extract_and_coordinate_trace_id(
+                payload_bytes,
+                &request_id_clone,
+                &config_clone,
+                &global_log_processor_clone,
+            )
+            .await;
+        }
+
+        // Merge mergeable event-list types across all of this request's
+        // buffered chunks into one collector POST per type, rather than one
+        // POST per chunk per type — mirrors process_pending_agent_payloads's
+        // identical call for the previous-invocation drain path. Before this,
+        // only that drain path got the batching win; this same-invoke path
+        // (the common case) still sent one POST per chunk per type.
+        // Clone out of the lock and drop it right away — don't hold a read
+        // lock across the send below, or it blocks a reconnect from writing.
+        let app_owned = apm_app_clone.read().await.clone();
+        let all_sent = if let Some(app) = app_owned {
+            let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
+            send_result.is_ok()
+        } else {
+            false
+        };
+
+        if !all_sent {
+            // On failure the payloads are buffered into FAILED_AGENT_PAYLOADS
+            // (never silently dropped); the global retry loop resends them on a
+            // later invoke / at shutdown. Mirrors process_pending_agent_payloads's
+            // identical fallback when apm_app isn't ready or the merged send errors.
+            for payload_bytes in &agent_payloads_clone {
+                buffer_failed_agent_payload(payload_bytes, &request_id_clone, &invoked_function_arn_clone);
+            }
+        }
+        (all_sent, agent_payloads_clone)
+    })
+}
+
+/// Wait until the agent has put a payload in this request's buffer. The agent writes it as the
+/// invocation ends, about 25 ms (the Telemetry API's buffering window) before `runtimeDone` is
+/// delivered, so this is the earliest moment the upload can start. Never returns if no payload
+/// comes: callers race it against `runtimeDone`.
+async fn wait_for_agent_payload(state: &request::RequestProcessingState) {
+    loop {
+        if state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 async fn process_apm_request_default(
     request_id: &String,
     invoked_function_arn: &String,
@@ -2264,10 +2337,39 @@ async fn process_apm_request_default(
     state: &request::RequestProcessingState,
 ) {
     // Wait for the handler to actually finish (platform.runtimeDone) BEFORE deciding
-    // whether the agent payload / platform.report have arrived. Bounded by the
-    // invocation's own remaining deadline. Always runs regardless of
-    // NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS.
-    let runtime_done_signaled = wait_for_runtime_done(request_id, deadline_ms).await;
+    // whether the platform.report has arrived. Bounded by the invocation's own remaining
+    // deadline. Always runs regardless of NEW_RELIC_EXTENSION_SEND_FUNCTION_LOGS.
+    //
+    // The agent writes its payload as the invocation ends, about 25 ms (the Telemetry API's
+    // buffering window) before runtimeDone is delivered. If APM already has a session when the
+    // payload arrives, upload it at once instead of idling until runtimeDone. Without a session
+    // (or if runtimeDone comes first) the flow below decides, exactly as before.
+    let mut runtime_done = std::pin::pin!(wait_for_runtime_done(request_id, deadline_ms));
+    let mut early_send = None;
+    let runtime_done_signaled = tokio::select! {
+        signaled = &mut runtime_done => signaled,
+        () = wait_for_agent_payload(state) => {
+            if apm_app.read().await.is_some() {
+                let payloads = state.agent_buffer.lock().map(|mut b| std::mem::take(&mut *b)).unwrap_or_default();
+                if !payloads.is_empty() {
+                    debug!(
+                        "APM mode: agent payload arrived before runtimeDone for {} - uploading now ({} payload(s))",
+                        request_id,
+                        payloads.len()
+                    );
+                    early_send = Some(spawn_default_agent_send(
+                        request_id,
+                        invoked_function_arn,
+                        config,
+                        global_log_processor,
+                        apm_app,
+                        payloads,
+                    ));
+                }
+            }
+            (&mut runtime_done).await
+        }
+    };
 
     // APM mode: Check if run_id is available
     let has_run_id = {
@@ -2293,53 +2395,14 @@ async fn process_apm_request_default(
             "APM mode: run_id available + agent payload arrived ({} payload(s)) - sending immediately",
             agent_payloads.len()
         );
-        let request_id_clone = request_id.clone();
-        let config_clone = config.clone();
-        let global_log_processor_clone = global_log_processor.clone();
-        let apm_app_clone = apm_app.clone();
-        let agent_payloads_clone = agent_payloads.clone();
-        let invoked_function_arn_clone = invoked_function_arn.clone();
-
-        Some(tokio::spawn(async move {
-            // Trace-id extraction is per-chunk (independent of telemetry-map
-            // merging) — same as process_pending_agent_payloads's identical step.
-            for payload_bytes in &agent_payloads_clone {
-                extract_and_coordinate_trace_id(
-                    payload_bytes,
-                    &request_id_clone,
-                    &config_clone,
-                    &global_log_processor_clone,
-                )
-                .await;
-            }
-
-            // Merge mergeable event-list types across all of this request's
-            // buffered chunks into one collector POST per type, rather than one
-            // POST per chunk per type — mirrors process_pending_agent_payloads's
-            // identical call for the previous-invocation drain path. Before this,
-            // only that drain path got the batching win; this same-invoke path
-            // (the common case) still sent one POST per chunk per type.
-            // Clone out of the lock and drop it right away — don't hold a read
-            // lock across the send below, or it blocks a reconnect from writing.
-            let app_owned = apm_app_clone.read().await.clone();
-            let all_sent = if let Some(app) = app_owned {
-                let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
-                send_result.is_ok()
-            } else {
-                false
-            };
-
-            if !all_sent {
-                // On failure the payloads are buffered into FAILED_AGENT_PAYLOADS
-                // (never silently dropped); the global retry loop resends them on a
-                // later invoke / at shutdown. Mirrors process_pending_agent_payloads's
-                // identical fallback when apm_app isn't ready or the merged send errors.
-                for payload_bytes in &agent_payloads_clone {
-                    buffer_failed_agent_payload(payload_bytes, &request_id_clone, &invoked_function_arn_clone);
-                }
-            }
-            (all_sent, agent_payloads_clone)
-        }))
+        Some(spawn_default_agent_send(
+            request_id,
+            invoked_function_arn,
+            config,
+            global_log_processor,
+            apm_app,
+            agent_payloads.clone(),
+        ))
     } else {
         // Flow 2 or 3: Either no run_id yet, or no payload yet
         if !has_run_id && got_payload {
@@ -2378,7 +2441,7 @@ async fn process_apm_request_default(
         // genuinely completes — with its own result observed — before this
         // invocation returns to /next, instead of racing the sandbox freeze in
         // the background.
-        if let Some(handle) = send_agent_task {
+        for handle in early_send.into_iter().chain(send_agent_task) {
             match handle.await {
                 Ok((success, payloads)) => {
                     if !success && !payloads.is_empty() {
