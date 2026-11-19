@@ -2175,7 +2175,7 @@ impl LogProcessor {
         const MAX_SPLIT_DEPTH: u8 = 4;
 
         // APM mode (both tiers): one attempt, a failed chunk is carried to the next invoke.
-        let single_attempt = self.apm_app.is_some();
+        let single_attempt = config.new_relic.apm_lambda_mode;
         let sent = if single_attempt {
             client.send_logs_once(config, &chunk, function_arn).await
         } else {
