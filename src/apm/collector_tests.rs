@@ -289,3 +289,172 @@ async fn send_platform_metrics_network_error_is_retryable() {
     assert!(!err.is_permanent());
     assert!(matches!(err, MetricApiError::Network(_)));
 }
+
+// ── splitting metric data points into Metric API requests (1 MB limit) ────────────────────
+
+#[test]
+fn split_by_payload_size_with_nothing_is_empty() {
+    assert!(split_by_payload_size(&[], 100).is_empty());
+}
+
+#[test]
+fn split_by_payload_size_keeps_small_items_together() {
+    assert_eq!(split_by_payload_size(&[10, 20, 30], 1_000), vec![0..3]);
+}
+
+#[test]
+fn split_by_payload_size_starts_a_new_request_when_the_next_item_would_not_fit() {
+    // Overhead per request is reserved, so use sizes well clear of the boundary.
+    let max = 1_000;
+    let groups = split_by_payload_size(&[400, 400, 400, 400, 400], max);
+    assert_eq!(groups, vec![0..2, 2..4, 4..5]);
+}
+
+#[test]
+fn split_by_payload_size_puts_an_oversized_item_alone() {
+    let groups = split_by_payload_size(&[100, 5_000, 100], 1_000);
+    assert_eq!(groups, vec![0..1, 1..2, 2..3]);
+}
+
+#[test]
+fn split_by_payload_size_covers_every_item_in_order() {
+    let sizes: Vec<usize> = (1..=57).map(|i| i * 13).collect();
+    let groups = split_by_payload_size(&sizes, 900);
+    let mut next = 0;
+    for g in &groups {
+        assert_eq!(g.start, next, "no gap and no overlap");
+        assert!(g.end > g.start);
+        next = g.end;
+    }
+    assert_eq!(next, sizes.len());
+}
+
+// ── Metric API body: attributes shared by every data point move to `common` ───────────────
+
+fn metric(name: &str, ts: i64, attrs: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"name": name, "type": "gauge", "value": 1.5, "timestamp": ts, "attributes": attrs})
+}
+
+fn attrs_of(m: &serde_json::Value) -> serde_json::Value {
+    m.get("attributes").cloned().unwrap_or(serde_json::Value::Null)
+}
+
+#[test]
+fn shared_attributes_move_to_common_but_per_request_ones_stay_on_each_metric() {
+    let shared = |rid: &str| serde_json::json!({"entity.guid": "g1", "aws.lambda.arn": "arn:x", "aws.requestId": rid});
+    let metrics = vec![
+        metric("duration", 100, shared("req-1")),
+        metric("billed", 100, shared("req-1")),
+        metric("duration", 200, shared("req-2")),
+        metric("billed", 200, shared("req-2")),
+    ];
+
+    let payload = build_metric_payload(&metrics);
+
+    let map = &payload[0];
+    assert_eq!(map["common"]["attributes"], serde_json::json!({"entity.guid": "g1", "aws.lambda.arn": "arn:x"}));
+    let out = map["metrics"].as_array().unwrap();
+    assert_eq!(attrs_of(&out[0]), serde_json::json!({"aws.requestId": "req-1"}));
+    assert_eq!(attrs_of(&out[1]), serde_json::json!({"aws.requestId": "req-1"}));
+    assert_eq!(attrs_of(&out[2]), serde_json::json!({"aws.requestId": "req-2"}), "a different request keeps its own id");
+    assert_eq!(attrs_of(&out[3]), serde_json::json!({"aws.requestId": "req-2"}));
+}
+
+#[test]
+fn expanding_common_gives_back_exactly_the_original_metrics() {
+    let metrics = vec![
+        metric("a", 1, serde_json::json!({"k": "same", "only_here": true, "n": 7})),
+        metric("b", 2, serde_json::json!({"k": "same", "n": 8})),
+        metric("c", 3, serde_json::json!({"k": "same", "n": 7, "extra": "x"})),
+    ];
+    let payload = build_metric_payload(&metrics);
+    assert_eq!(expand_common(&payload), metrics, "nothing added, nothing lost, same order");
+}
+
+#[test]
+fn a_single_request_hoists_everything_it_shares() {
+    let attrs = serde_json::json!({"entity.guid": "g", "aws.requestId": "only"});
+    let metrics = vec![metric("a", 5, attrs.clone()), metric("b", 5, attrs.clone()), metric("c", 5, attrs)];
+    let payload = build_metric_payload(&metrics);
+    assert_eq!(payload[0]["common"]["attributes"]["aws.requestId"], "only");
+    assert!(payload[0]["metrics"][0].get("attributes").is_none(), "nothing left to repeat");
+    assert_eq!(expand_common(&payload), metrics);
+}
+
+#[test]
+fn an_attribute_missing_from_one_metric_is_not_hoisted() {
+    let metrics = vec![
+        metric("a", 1, serde_json::json!({"k": "v", "both": 1})),
+        metric("b", 1, serde_json::json!({"k": "v"})),
+    ];
+    let payload = build_metric_payload(&metrics);
+    assert_eq!(payload[0]["common"]["attributes"], serde_json::json!({"k": "v"}));
+    assert_eq!(attrs_of(&payload[0]["metrics"][0]), serde_json::json!({"both": 1}));
+    assert_eq!(expand_common(&payload), metrics);
+}
+
+#[test]
+fn the_same_key_with_a_different_value_or_type_is_not_hoisted() {
+    let metrics = vec![
+        metric("a", 1, serde_json::json!({"mem": 128, "flag": true})),
+        metric("b", 1, serde_json::json!({"mem": "128", "flag": true})),
+    ];
+    let payload = build_metric_payload(&metrics);
+    assert_eq!(payload[0]["common"]["attributes"], serde_json::json!({"flag": true}), "128 and \"128\" differ");
+    assert_eq!(expand_common(&payload), metrics);
+}
+
+#[test]
+fn one_metric_or_metrics_without_attributes_get_no_common_block() {
+    let one = vec![metric("a", 1, serde_json::json!({"k": "v"}))];
+    assert!(build_metric_payload(&one)[0].get("common").is_none(), "nothing to share with one metric");
+    assert_eq!(expand_common(&build_metric_payload(&one)), one);
+
+    let bare = vec![serde_json::json!({"name": "a", "value": 1}), serde_json::json!({"name": "b", "value": 2})];
+    let payload = build_metric_payload(&bare);
+    assert!(payload[0].get("common").is_none());
+    assert_eq!(payload[0]["metrics"], serde_json::json!(bare));
+}
+
+#[test]
+fn only_attributes_are_hoisted_never_names_values_or_timestamps() {
+    let metrics = vec![
+        metric("a", 111, serde_json::json!({"k": "v"})),
+        metric("b", 222, serde_json::json!({"k": "v"})),
+    ];
+    let out = build_metric_payload(&metrics);
+    let out = out[0]["metrics"].as_array().unwrap();
+    assert_eq!((out[0]["name"].as_str(), out[0]["timestamp"].as_i64()), (Some("a"), Some(111)));
+    assert_eq!((out[1]["name"].as_str(), out[1]["timestamp"].as_i64()), (Some("b"), Some(222)));
+    assert!(out.iter().all(|m| m["type"] == "gauge" && m["value"] == 1.5));
+}
+
+#[tokio::test]
+async fn send_platform_metrics_posts_a_gzip_body_with_the_common_block() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).mount(&server).await;
+    let client = crate::newrelic::tls_fallback::test_client();
+    let attrs = |rid: &str| serde_json::json!({"entity.guid": "g", "aws.requestId": rid});
+    let metrics = vec![metric("a", 1, attrs("r1")), metric("a", 2, attrs("r2"))];
+
+    send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.headers.get("content-encoding").map(|v| v.to_str().unwrap()), Some("gzip"));
+    assert_eq!(request.headers.get("content-type").map(|v| v.to_str().unwrap()), Some("application/json"));
+    assert_eq!(request.headers.get("api-key").map(|v| v.to_str().unwrap()), Some("test-key"));
+    let payload = decode_metric_request(&request.body);
+    assert_eq!(payload[0]["common"]["attributes"], serde_json::json!({"entity.guid": "g"}));
+    assert_eq!(expand_common(&payload), metrics, "the receiver sees exactly the metrics we were given");
+}
+
+#[test]
+fn gzip_shrinks_a_repetitive_metric_body() {
+    let attrs = serde_json::json!({"entity.guid": "g", "aws.lambda.arn": "arn:aws:lambda:ap-south-1:123456789012:function:f"});
+    let metrics: Vec<_> = (0..40).map(|i| metric("apm.lambda.transaction.duration", i, attrs.clone())).collect();
+    let raw = serde_json::to_vec(&serde_json::json!([{"metrics": metrics}])).unwrap();
+    let sent = gzip_bytes(&serde_json::to_vec(&build_metric_payload(&metrics)).unwrap()).unwrap();
+    assert!(sent.len() * 5 < raw.len(), "{} bytes sent for {} raw", sent.len(), raw.len());
+}

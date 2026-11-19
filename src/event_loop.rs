@@ -2907,7 +2907,8 @@ fn shutdown_pending_reports() -> Vec<(String, String)> {
         .collect()
 }
 
-/// SHUTDOWN: send every pending `platform.report` as metrics, all at once.
+/// SHUTDOWN: send every pending `platform.report` as metrics. They go out together in as few
+/// Metric API requests as the size limit allows (normally one), not one request per report.
 async fn shutdown_send_reports(components: &ExtensionComponents) {
     let reports = shutdown_pending_reports();
     if reports.is_empty() {
@@ -2924,20 +2925,12 @@ async fn shutdown_send_reports(components: &ExtensionComponents) {
         .ok()
         .and_then(|g| g.clone().map(|(_, arn)| arn))
         .unwrap_or_default();
-    let sends: Vec<BoxedFuture<'_, ()>> = reports
-        .into_iter()
-        .map(|(request_id, report_line)| {
-            let (app, arn) = (&app, &arn);
-            Box::pin(async move {
-                debug!("APM mode shutdown: Sending platform report metrics for request: {}", request_id);
-                // Always Ok (permanent-drop and buffered-for-retry are Ok too, by design) and
-                // it logs its own outcome.
-                let _ = app.send_platform_report_metrics(&report_line, arn).await;
-                remove_pending_report(&request_id);
-            }) as BoxedFuture<'_, ()>
-        })
-        .collect();
-    join_all_concurrently(sends).await;
+    let lines: Vec<(String, String)> = reports.iter().map(|(_, line)| (line.clone(), arn.clone())).collect();
+    // Always handled: a failed send is buffered for retry inside, so each report is done with.
+    app.send_platform_reports_batched(&lines).await;
+    for (request_id, _) in &reports {
+        remove_pending_report(request_id);
+    }
 }
 
 /// SHUTDOWN, high tier only: there is no next invocation to defer to, so settle the last batch

@@ -74,15 +74,13 @@ pub fn buffer_failed_metric_api(metrics: Vec<Value>, endpoint: String, retry_aft
     }
 }
 
-/// What happened to one buffered batch during a retry pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetryOutcome {
-    Success,
-    Failed,
-    /// Not retried: backoff not elapsed, or too old.
-    Skipped,
-}
 /// Retry all buffered platform-metric batches.
+///
+/// Batches for the same endpoint go out together in one request (the Metric API takes any
+/// number of data points in a request, up to 1 MB), so a backlog costs one round trip, not
+/// one per batch. A backlog larger than the limit is split into several requests, sent at
+/// the same time. If the API rejects a merged request for good, each batch is tried on its
+/// own so one bad batch cannot take the others with it.
 pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::DualTlsClient, license_key: &str) {
     let buffered = {
         if let Ok(mut buffer) = FAILED_METRIC_API_BUFFER.lock() {
@@ -103,18 +101,13 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
     );
 
     let now = Utc::now();
-
-    // Every batch is retried at once: a timeout on one must not make the others wait behind it.
-    let outcomes = join_all_concurrently(
-        buffered
-            .into_iter()
-            .map(|mut item| {
-                Box::pin(async move {
+    let mut due = Vec::new();
+    for mut item in buffered {
         // Honor Retry-After: re-buffer untouched if the backoff window hasn't elapsed.
         if let Some(next) = item.next_retry_at {
             if now < next {
                 re_buffer(item);
-                return RetryOutcome::Skipped;
+                continue;
             }
         }
 
@@ -125,54 +118,144 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
                 now.signed_duration_since(item.failed_at).num_minutes(),
                 item.retry_count
             );
-            return RetryOutcome::Skipped;
+            continue;
         }
 
         item.retry_count += 1;
+        due.push(item);
+    }
 
-        match super::collector::send_platform_metrics(
-            client,
-            license_key,
-            &item.endpoint,
-            &item.metrics,
-        )
-        .await
-        {
-            Ok(()) => {
-                debug!("Successfully retried platform metrics (attempt {})", item.retry_count);
-                RetryOutcome::Success
-            }
-            Err(e) if e.is_permanent() => {
-                error!("Dropping platform metrics after permanent error on retry: {}", e);
-                RetryOutcome::Failed
-            }
-            Err(e) => {
-                if item.retry_count < MAX_RETRY_ATTEMPTS {
-                    item.next_retry_at = e.retry_after().and_then(|d| {
-                        chrono::Duration::from_std(d).ok().map(|cd| Utc::now() + cd)
-                    });
-                    re_buffer(item);
-                } else {
-                    error!(
-                        "Dropping platform metrics after {} retry attempts: {}",
-                        item.retry_count, e
-                    );
-                }
-                RetryOutcome::Failed
-            }
-        }
-                }) as BoxedFuture<'_, RetryOutcome>
+    let requests = plan_requests(due);
+    let outcomes = join_all_concurrently(
+        requests
+            .into_iter()
+            .map(|(endpoint, items)| {
+                Box::pin(send_merged(client, license_key, endpoint, items)) as BoxedFuture<'_, (usize, usize)>
             })
             .collect(),
     )
     .await;
-    let success = outcomes.iter().filter(|o| **o == RetryOutcome::Success).count();
-    let still_failed = outcomes.iter().filter(|o| **o == RetryOutcome::Failed).count();
+    let success: usize = outcomes.iter().map(|(ok, _)| ok).sum();
+    let still_failed: usize = outcomes.iter().map(|(_, failed)| failed).sum();
 
     if success > 0 || still_failed > 0 {
         debug!(
             "APM metric API retry results: {} successful, {} still failed",
             success, still_failed
+        );
+    }
+}
+
+/// Group the batches that are due into requests: the same endpoint shares a request, and a
+/// request never goes over the Metric API's size limit. Order is kept.
+fn plan_requests(due: Vec<FailedMetricApi>) -> Vec<(String, Vec<FailedMetricApi>)> {
+    let mut by_endpoint: Vec<(String, Vec<FailedMetricApi>)> = Vec::new();
+    for item in due {
+        match by_endpoint.iter_mut().find(|(endpoint, _)| *endpoint == item.endpoint) {
+            Some((_, items)) => items.push(item),
+            None => by_endpoint.push((item.endpoint.clone(), vec![item])),
+        }
+    }
+
+    let mut requests = Vec::new();
+    for (endpoint, items) in by_endpoint {
+        let sizes: Vec<usize> = items
+            .iter()
+            .map(|item| serde_json::to_vec(&item.metrics).map_or(0, |bytes| bytes.len()))
+            .collect();
+        let mut items = items.into_iter();
+        for range in super::collector::split_by_payload_size(&sizes, super::collector::MAX_METRIC_PAYLOAD_BYTES) {
+            requests.push((endpoint.clone(), items.by_ref().take(range.len()).collect()));
+        }
+    }
+    requests
+}
+
+/// Send the batches of one request together. Returns (batches delivered, batches not).
+async fn send_merged(
+    client: &crate::newrelic::tls_fallback::DualTlsClient,
+    license_key: &str,
+    endpoint: String,
+    items: Vec<FailedMetricApi>,
+) -> (usize, usize) {
+    if items.len() == 1 {
+        return send_one(client, license_key, items.into_iter().next().unwrap_or_else(|| unreachable!())).await;
+    }
+
+    let merged: Vec<Value> = items.iter().flat_map(|item| item.metrics.iter().cloned()).collect();
+    match super::collector::send_platform_metrics(client, license_key, &endpoint, &merged).await {
+        Ok(()) => {
+            debug!(
+                "Successfully retried {} platform-metric batch(es) in one request",
+                items.len()
+            );
+            (items.len(), 0)
+        }
+        Err(e) if e.is_permanent() => {
+            // The API rejected the merged request for good. One batch may be the cause, so
+            // try each on its own and let only that one be dropped. (The attempt was already
+            // counted for each batch.)
+            warn!(
+                "Merged platform-metric request rejected ({}) - retrying its {} batches one by one",
+                e,
+                items.len()
+            );
+            let outcomes = join_all_concurrently(
+                items
+                    .into_iter()
+                    .map(|item| Box::pin(send_one(client, license_key, item)) as BoxedFuture<'_, (usize, usize)>)
+                    .collect(),
+            )
+            .await;
+            (
+                outcomes.iter().map(|(ok, _)| ok).sum(),
+                outcomes.iter().map(|(_, failed)| failed).sum(),
+            )
+        }
+        Err(e) => {
+            let failed = items.len();
+            for item in items {
+                reschedule_or_drop(item, &e);
+            }
+            (0, failed)
+        }
+    }
+}
+
+/// Send one batch by itself. Returns (1, 0) if delivered, (0, 1) if not.
+async fn send_one(
+    client: &crate::newrelic::tls_fallback::DualTlsClient,
+    license_key: &str,
+    item: FailedMetricApi,
+) -> (usize, usize) {
+    match super::collector::send_platform_metrics(client, license_key, &item.endpoint, &item.metrics).await {
+        Ok(()) => {
+            debug!("Successfully retried platform metrics (attempt {})", item.retry_count);
+            (1, 0)
+        }
+        Err(e) if e.is_permanent() => {
+            error!("Dropping platform metrics after permanent error on retry: {}", e);
+            (0, 1)
+        }
+        Err(e) => {
+            reschedule_or_drop(item, &e);
+            (0, 1)
+        }
+    }
+}
+
+/// A transient failure: keep the batch for another try (honoring Retry-After), or drop it
+/// once it has used all its attempts.
+fn reschedule_or_drop(mut item: FailedMetricApi, e: &super::collector::MetricApiError) {
+    if item.retry_count < MAX_RETRY_ATTEMPTS {
+        item.next_retry_at = e
+            .retry_after()
+            .and_then(|d| chrono::Duration::from_std(d).ok().map(|cd| Utc::now() + cd));
+        re_buffer(item);
+    } else {
+        error!(
+            "Dropping platform metrics after {} retry attempts: {}",
+            item.retry_count, e
         );
     }
 }

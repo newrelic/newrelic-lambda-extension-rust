@@ -612,6 +612,73 @@ impl ApmApp {
         }
     }
 
+    /// Send several `platform.report` lines as platform metrics in as few requests as possible.
+    /// Each entry is a (REPORT log line, function ARN) pair. The Metric API takes any number of
+    /// data points in one request (up to 1 MB), so a backlog costs one round trip, not one per
+    /// report; a bigger one is split, and the requests go out at the same time. A request that
+    /// fails transiently is buffered for retry, as in `send_platform_report_metrics`.
+    pub async fn send_platform_reports_batched(&self, reports: &[(String, String)]) {
+        if super::collector::is_telemetry_disabled("platform_metrics") {
+            debug!("APM platform metrics disabled - skipping REPORT conversion/send");
+            return;
+        }
+        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+            .unwrap_or_else(|_| std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_else(|_| "unknown".to_string()));
+
+        // (request id, its data points) for every line that really is a REPORT.
+        let converted: Vec<(String, Vec<Value>)> = reports
+            .iter()
+            .filter_map(|(log_line, function_arn)| {
+                let data = parse_lambda_report_log(log_line, self.deployment)?;
+                let metrics = convert_to_apm_metrics(&data, &self.entity_guid, &function_name, function_arn);
+                Some((data.request_id.clone(), metrics))
+            })
+            .collect();
+        if converted.is_empty() {
+            return;
+        }
+
+        let sizes: Vec<usize> = converted
+            .iter()
+            .map(|(_, metrics)| serde_json::to_vec(metrics).map_or(0, |bytes| bytes.len()))
+            .collect();
+        let sends: Vec<crate::send::concurrent::BoxedFuture<'_, ()>> =
+            super::collector::split_by_payload_size(&sizes, super::collector::MAX_METRIC_PAYLOAD_BYTES)
+                .into_iter()
+                .map(|range| {
+                    let group = &converted[range];
+                    Box::pin(self.send_report_group(group)) as crate::send::concurrent::BoxedFuture<'_, ()>
+                })
+                .collect();
+        crate::send::concurrent::join_all_concurrently(sends).await;
+    }
+
+    /// One request's worth of reports: send, and buffer the data points if it fails transiently.
+    async fn send_report_group(&self, group: &[(String, Vec<Value>)]) {
+        let metrics: Vec<Value> = group.iter().flat_map(|(_, metrics)| metrics.iter().cloned()).collect();
+        match send_platform_metrics(&self.client, &self.license_key, &self.metric_endpoint, &metrics).await {
+            Ok(()) => {
+                for (request_id, _) in group {
+                    // Same wording as the single-report path, so existing log queries still match.
+                    info!("APM mode: Successfully sent platform report metrics for request {}", request_id);
+                }
+            }
+            // Permanent failures (non-retryable 4xx) are dropped: retrying cannot help.
+            Err(e) if e.is_permanent() => {
+                error!("Platform metrics dropped (permanent): {}", e);
+            }
+            Err(e) => {
+                warn!(
+                    "Platform metrics for {} request(s) buffered for retry: {}",
+                    group.len(),
+                    e
+                );
+                let retry_after = e.retry_after();
+                super::metric_api_buffer::buffer_failed_metric_api(metrics, self.metric_endpoint.clone(), retry_after);
+            }
+        }
+    }
+
     /// Send synthesized error events, buffering them for retry on failure so a
     /// transient collector error or stale run_id does not silently drop them.
     async fn send_error_events_buffered(

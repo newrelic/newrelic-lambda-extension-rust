@@ -327,3 +327,170 @@ async fn drop_after_max_retries_removes_item() {
     );
     clear();
 }
+
+// ── merged retries: several buffered batches share one request ────────────────────────────
+
+use crate::apm::collector::{decode_metric_request, expand_common};
+use wiremock::matchers::method;
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn metric_server(status: u16) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+    server
+}
+
+fn buffer_named(endpoint: &str, names: &[&str]) {
+    let metrics = names.iter().map(|n| json!({"name": n, "type": "gauge", "value": 1})).collect();
+    buffer_failed_metric_api(metrics, endpoint.to_string(), None);
+}
+
+/// Metric names in one request body, which must be the documented shape: a gzip-compressed
+/// JSON array whose only map holds the `metrics` array.
+fn metric_names(body: &[u8]) -> Vec<String> {
+    let parsed = decode_metric_request(body);
+    let maps = parsed.as_array().expect("the body is an array of maps");
+    assert_eq!(maps.len(), 1, "one map per request");
+    assert!(maps[0]["metrics"].is_array(), "each map has a metrics array");
+    expand_common(&parsed)
+        .iter()
+        .map(|m| m["name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Matches a request whose (decompressed) body contains the text.
+struct BodyContains(&'static str);
+impl wiremock::Match for BodyContains {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        crate::apm::collector::gunzip_text(&request.body).contains(self.0)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn several_buffered_batches_go_out_in_one_request() {
+    clear();
+    let server = metric_server(202).await;
+    let endpoint = format!("{}/metric/v1", server.uri());
+    buffer_named(&endpoint, &["a1", "a2"]);
+    buffer_named(&endpoint, &["b1"]);
+    buffer_named(&endpoint, &["c1", "c2", "c3"]);
+    let client = crate::newrelic::tls_fallback::test_client();
+
+    retry_buffered_metric_api(&client, "lk").await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "three batches, one request");
+    let mut names = metric_names(&requests[0].body);
+    names.sort();
+    assert_eq!(names, vec!["a1", "a2", "b1", "c1", "c2", "c3"], "every data point is in it");
+    assert_eq!(get_metric_api_buffer_count(), 0);
+    clear();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn batches_for_different_endpoints_are_not_merged() {
+    clear();
+    let (eu, us) = (metric_server(202).await, metric_server(202).await);
+    buffer_named(&format!("{}/metric/v1", eu.uri()), &["eu1"]);
+    buffer_named(&format!("{}/metric/v1", us.uri()), &["us1"]);
+    buffer_named(&format!("{}/metric/v1", eu.uri()), &["eu2"]);
+    let client = crate::newrelic::tls_fallback::test_client();
+
+    retry_buffered_metric_api(&client, "lk").await;
+
+    let (eu_requests, us_requests) = (eu.received_requests().await.unwrap(), us.received_requests().await.unwrap());
+    assert_eq!((eu_requests.len(), us_requests.len()), (1, 1), "one request per endpoint");
+    let mut eu_names = metric_names(&eu_requests[0].body);
+    eu_names.sort();
+    assert_eq!(eu_names, vec!["eu1", "eu2"]);
+    assert_eq!(metric_names(&us_requests[0].body), vec!["us1"]);
+    clear();
+}
+
+/// The Metric API rejects a POST over 1 MB (10^6 bytes), so a big backlog is split.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_backlog_over_the_size_limit_is_split_into_requests_under_it() {
+    clear();
+    let server = metric_server(202).await;
+    let endpoint = format!("{}/metric/v1", server.uri());
+    let big = "x".repeat(300_000);
+    for name in ["big1", "big2", "big3", "big4"] {
+        buffer_failed_metric_api(
+            vec![json!({"name": name, "type": "gauge", "value": 1, "attributes": {"blob": big}})],
+            endpoint.clone(),
+            None,
+        );
+    }
+    let client = crate::newrelic::tls_fallback::test_client();
+
+    retry_buffered_metric_api(&client, "lk").await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests.len() >= 2, "1.2 MB cannot go in one request, got {}", requests.len());
+    assert!(
+        requests.iter().all(|r| crate::apm::collector::gunzip_text(&r.body).len() < 1_000_000),
+        "every request stays under 1 MB even before compression"
+    );
+    let mut names: Vec<String> = requests.iter().flat_map(|r| metric_names(&r.body)).collect();
+    names.sort();
+    assert_eq!(names, vec!["big1", "big2", "big3", "big4"], "nothing lost in the split");
+    assert_eq!(get_metric_api_buffer_count(), 0);
+    clear();
+}
+
+/// One bad batch must not take the good ones down with it: when the merged request is
+/// rejected for good, each batch is tried on its own, so only the bad one is dropped.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_rejected_merged_request_falls_back_to_one_request_per_batch() {
+    clear();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(BodyContains("BAD"))
+        .respond_with(ResponseTemplate::new(400))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).with_priority(5).mount(&server).await;
+    let endpoint = format!("{}/metric/v1", server.uri());
+    buffer_named(&endpoint, &["good"]);
+    buffer_named(&endpoint, &["BAD"]);
+    let client = crate::newrelic::tls_fallback::test_client();
+
+    retry_buffered_metric_api(&client, "lk").await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3, "the merged request, then one per batch");
+    let delivered: Vec<Vec<String>> = requests
+        .iter()
+        .map(|r| metric_names(&r.body))
+        .filter(|names| !names.iter().any(|n| n == "BAD"))
+        .collect();
+    assert_eq!(delivered, vec![vec!["good".to_string()]], "the good batch got through on its own");
+    assert_eq!(get_metric_api_buffer_count(), 0, "the bad one is dropped, not retried forever");
+    clear();
+}
+
+/// A transient failure puts every batch back separately, each with its attempt counted.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_transient_failure_rebuffers_every_batch_separately() {
+    clear();
+    let server = metric_server(503).await;
+    let endpoint = format!("{}/metric/v1", server.uri());
+    buffer_named(&endpoint, &["a"]);
+    buffer_named(&endpoint, &["b"]);
+    buffer_named(&endpoint, &["c"]);
+    let client = crate::newrelic::tls_fallback::test_client();
+
+    retry_buffered_metric_api(&client, "lk").await;
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1, "one merged attempt");
+    assert_eq!(get_metric_api_buffer_count(), 3, "all three are back");
+    let counts: Vec<usize> = FAILED_METRIC_API_BUFFER.lock().unwrap().iter().map(|i| i.retry_count).collect();
+    assert_eq!(counts, vec![1, 1, 1], "the attempt counts for each");
+    clear();
+}

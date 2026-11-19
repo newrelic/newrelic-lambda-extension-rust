@@ -1034,3 +1034,72 @@ async fn send_shutdown_error_event_buffers_on_network_failure() {
         .await;
     assert!(result.is_ok());
 }
+
+// ── several platform reports in one Metric API request ────────────────────────────────────
+
+const REPORT_A: &str = "REPORT RequestId: req-a Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
+const REPORT_B: &str = "REPORT RequestId: req-b Duration: 20.0 ms Billed Duration: 21 ms Memory Size: 128 MB Max Memory Used: 60 MB";
+const REPORT_C: &str = "REPORT RequestId: req-c Duration: 99.0 ms Billed Duration: 100 ms Memory Size: 128 MB Max Memory Used: 61 MB";
+
+#[tokio::test]
+async fn several_reports_are_sent_in_one_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).mount(&server).await;
+    let mut app = test_apm_app();
+    app.metric_endpoint = server.uri();
+
+    app.send_platform_reports_batched(&[
+        (REPORT_A.to_string(), "arn:a".to_string()),
+        (REPORT_B.to_string(), "arn:b".to_string()),
+        ("START RequestId: x Version: $LATEST".to_string(), "arn:x".to_string()),
+        (REPORT_C.to_string(), "arn:c".to_string()),
+    ])
+    .await;
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "three reports, one request (the non-REPORT line is skipped)");
+    let body = crate::apm::collector::decode_metric_request(&requests[0].body);
+    let maps = body.as_array().expect("an array of maps");
+    assert_eq!(maps.len(), 1);
+    assert!(maps[0]["metrics"].is_array(), "a metrics array");
+    let metrics = crate::apm::collector::expand_common(&body);
+    let durations: Vec<&serde_json::Value> =
+        metrics.iter().filter(|m| m["name"] == "apm.lambda.transaction.duration").collect();
+    assert_eq!(durations.len(), 3, "one duration data point per report");
+    // Each report's data points keep their own request id: the ids differ, so they were not merged away.
+    let mut ids: Vec<&str> = durations.iter().map(|m| m["attributes"]["aws.requestId"].as_str().unwrap()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["req-a", "req-b", "req-c"]);
+    // And what they share went to the common block once.
+    assert!(maps[0]["common"]["attributes"].get("entity.guid").is_some());
+    assert!(maps[0]["common"]["attributes"].get("aws.requestId").is_none(), "per-request ids are never hoisted");
+}
+
+#[tokio::test]
+async fn no_reports_means_no_request() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).mount(&server).await;
+    let mut app = test_apm_app();
+    app.metric_endpoint = server.uri();
+
+    app.send_platform_reports_batched(&[]).await;
+    app.send_platform_reports_batched(&[("START RequestId: x".to_string(), "arn".to_string())]).await;
+
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn a_failed_batched_send_is_buffered_for_retry() {
+    crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock().unwrap().clear();
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(503)).mount(&server).await;
+    let mut app = test_apm_app();
+    app.metric_endpoint = server.uri();
+
+    app.send_platform_reports_batched(&[(REPORT_A.to_string(), "arn:a".to_string()), (REPORT_B.to_string(), "arn:b".to_string())]).await;
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "the data points wait for a later retry");
+    crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock().unwrap().clear();
+}

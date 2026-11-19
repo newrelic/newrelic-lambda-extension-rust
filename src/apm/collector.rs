@@ -119,6 +119,132 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::
         .map(std::time::Duration::from_secs)
 }
 
+/// Build the Metric API request body: an array with one map, `{"common": {"attributes": ...},
+/// "metrics": [...]}`.
+///
+/// An attribute goes into `common` only if **every** data point in the request has it with the
+/// same value, and it is then removed from each data point, so the receiver sees exactly the
+/// same metrics, with the shared attributes written once. An attribute that differs between
+/// data points (the request id of different invocations, say) is never moved: each data point
+/// keeps its own. Timestamps, names, types and values are never touched. With fewer than two
+/// data points nothing is shared, so there is no `common` block.
+pub fn build_metric_payload(metrics: &[Value]) -> Value {
+    let shared = shared_attributes(metrics);
+    if shared.is_empty() {
+        return serde_json::json!([{ "metrics": metrics }]);
+    }
+    let stripped: Vec<Value> = metrics.iter().map(|metric| without_attributes(metric, &shared)).collect();
+    serde_json::json!([{ "common": { "attributes": shared }, "metrics": stripped }])
+}
+
+/// The attributes that every data point has, with the same value.
+fn shared_attributes(metrics: &[Value]) -> serde_json::Map<String, Value> {
+    if metrics.len() < 2 {
+        return serde_json::Map::new();
+    }
+    let attributes_of = |metric: &Value| metric.get("attributes").and_then(Value::as_object).cloned();
+    let Some(mut shared) = attributes_of(&metrics[0]) else {
+        return serde_json::Map::new();
+    };
+    for metric in &metrics[1..] {
+        let Some(attributes) = attributes_of(metric) else {
+            return serde_json::Map::new();
+        };
+        shared.retain(|key, value| attributes.get(key) == Some(value));
+        if shared.is_empty() {
+            break;
+        }
+    }
+    shared
+}
+
+/// A copy of the data point without the attributes that moved to `common`.
+fn without_attributes(metric: &Value, shared: &serde_json::Map<String, Value>) -> Value {
+    let mut metric = metric.clone();
+    if let Some(attributes) = metric.get_mut("attributes").and_then(Value::as_object_mut) {
+        attributes.retain(|key, _| !shared.contains_key(key));
+        if attributes.is_empty() {
+            if let Some(object) = metric.as_object_mut() {
+                object.remove("attributes");
+            }
+        }
+    }
+    metric
+}
+
+/// gzip-compress a request body (the Metric API takes `Content-Encoding: gzip`).
+pub(crate) fn gzip_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data)?;
+    encoder.finish()
+}
+
+/// Test helper: the text of a gzip-compressed request body.
+#[cfg(test)]
+pub(crate) fn gunzip_text(body: &[u8]) -> String {
+    use std::io::Read;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(body).read_to_string(&mut text).expect("a valid gzip body");
+    text
+}
+
+/// Test helper: the JSON payload of a gzip-compressed Metric API request body.
+#[cfg(test)]
+pub(crate) fn decode_metric_request(body: &[u8]) -> Value {
+    serde_json::from_str(&gunzip_text(body)).expect("the body is JSON")
+}
+
+/// Test helper: the data points a receiver ends up with, i.e. `common` attributes merged back
+/// into each one (a data point's own value wins, as the API defines).
+#[cfg(test)]
+pub(crate) fn expand_common(payload: &Value) -> Vec<Value> {
+    let mut all = Vec::new();
+    for map in payload.as_array().expect("an array of maps") {
+        let common = map["common"]["attributes"].as_object().cloned().unwrap_or_default();
+        for metric in map["metrics"].as_array().expect("a metrics array") {
+            let mut metric = metric.clone();
+            if !common.is_empty() {
+                let mut merged = common.clone();
+                if let Some(own) = metric.get("attributes").and_then(Value::as_object) {
+                    merged.extend(own.clone());
+                }
+                metric["attributes"] = Value::Object(merged);
+            }
+            all.push(metric);
+        }
+    }
+    all
+}
+
+/// The Metric API rejects a POST over 1 MB (10^6 bytes). Requests are kept under this, with
+/// margin for what the body adds around the data points.
+pub const MAX_METRIC_PAYLOAD_BYTES: usize = 900_000;
+
+/// Bytes around the data points in a request body: `[{"metrics":[` and `]}]`, with room to spare.
+const METRIC_PAYLOAD_OVERHEAD_BYTES: usize = 16;
+
+/// Split items (given by their serialized size) into consecutive groups that each fit one
+/// request of at most `max` bytes. An item larger than `max` gets a group of its own: it is
+/// sent as it is, and the API's answer decides what happens to it.
+pub fn split_by_payload_size(sizes: &[usize], max: usize) -> Vec<std::ops::Range<usize>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut total = METRIC_PAYLOAD_OVERHEAD_BYTES;
+    for (index, size) in sizes.iter().enumerate() {
+        let needed = size + 1; // the comma between data points
+        if index > start && total + needed > max {
+            groups.push(start..index);
+            start = index;
+            total = METRIC_PAYLOAD_OVERHEAD_BYTES;
+        }
+        total += needed;
+    }
+    if start < sizes.len() {
+        groups.push(start..sizes.len());
+    }
+    groups
+}
+
 /// Outcome classification for a Metric API send failure.
 #[derive(Debug)]
 pub enum MetricApiError {
@@ -378,22 +504,26 @@ pub async fn send_platform_metrics(
         return Ok(());
     }
 
-    let payload = serde_json::json!([{
-        "metrics": metrics
-    }]);
+    let payload = build_metric_payload(metrics);
 
-    let payload_json = match serde_json::to_string(&payload) {
-        Ok(s) => s,
+    let payload_json = match serde_json::to_vec(&payload) {
+        Ok(bytes) => bytes,
         Err(e) => return Err(MetricApiError::Network(anyhow::Error::new(e))),
     };
 
-    debug!("Platform metrics payload JSON: {}", payload_json);
+    debug!("Platform metrics payload JSON: {}", String::from_utf8_lossy(&payload_json));
+
+    let body = match gzip_bytes(&payload_json) {
+        Ok(bytes) => bytes,
+        Err(e) => return Err(MetricApiError::Network(anyhow::Error::new(e))),
+    };
 
     debug!(
-        "Sending {} platform metrics to Metric API endpoint: {} ({} bytes uncompressed)",
+        "Sending {} platform metrics to Metric API endpoint: {} ({} bytes uncompressed, {} compressed)",
         metrics.len(),
         metric_endpoint,
-        payload_json.len()
+        payload_json.len(),
+        body.len()
     );
 
     let start_time = std::time::Instant::now();
@@ -402,7 +532,8 @@ pub async fn send_platform_metrics(
         .post(metric_endpoint)
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
-        .body(payload_json)
+        .header("Content-Encoding", "gzip")
+        .body(body)
         .send()
         .await
     {
