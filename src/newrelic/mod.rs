@@ -7,4 +7,5 @@
 pub mod client;
 pub mod payload;
 pub mod flush;
+pub mod send_error;
 pub mod tls_fallback;

@@ -423,7 +423,7 @@ impl ApmApp {
             let owns_outcome = guard.finish();
             if let Err(e) = send_result {
                 if owns_outcome {
-                    warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, e);
+                    warn!("Failed to send {} for request {}: {} - buffering for retry", telemetry_type, request_id, crate::newrelic::send_error::describe_anyhow(&e));
                     super::telemetry_buffer::buffer_failed_telemetry(
                         telemetry_type.clone(),
                         data,

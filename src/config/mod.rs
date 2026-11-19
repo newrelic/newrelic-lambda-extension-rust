@@ -176,17 +176,12 @@ pub struct ExtensionSettings {
     pub send_tier: crate::send::SendTier,
     /// `NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS` — `high` tier only. An invocation
     /// shorter than this (judged from the agent's payload or `runtimeDone`, whichever comes
-    /// first) is a short invoke: the batch started at INVOKE is cancelled and its unsent data
-    /// kept, and nothing else is started or held. A trivial function should never pay for
-    /// telemetry delivery; it goes out with a longer invoke. `0` disables the short path.
-    /// Default 20, clamped to `[0, 1000]`.
+    /// first) is a short invoke: nothing is sent or held for it. Unless it recorded an
+    /// error, its own telemetry is dropped; with an error its agent payload, report and
+    /// ERROR-level logs are kept for the next long invoke. Earlier invokes' data waits
+    /// untouched. Sending starts only once an invoke is known to be long. `0` disables the
+    /// short path. Default 10, clamped to `[0, 1000]`.
     pub short_invoke_threshold_ms: u64,
-    /// `NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS` — `high` tier only. The budget for each send,
-    /// counted from when that send started, and the most `/next` is held after `runtimeDone`.
-    /// Defaults to `newrelic::client::SEND_TIMEOUT`, the shared placeholder for the measured
-    /// P99 of a healthy send, so replacing that one constant moves this cap with it. Clamped
-    /// to `[0, 5000]`; never more than the time left before the function's own deadline.
-    pub hold_cap_ms: u64,
     /// `NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS` — `high` tier only. Longest we wait
     /// at `runtimeDone` for the request's own agent payload (only when its logs are held
     /// for a trace id). Default 25, clamped to `[0, 250]`.
@@ -345,8 +340,7 @@ impl Default for ExtensionSettings {
             ignore_errors: HashSet::new(),
             expected_errors: HashSet::new(),
             send_tier: crate::send::SendTier::Default,
-            short_invoke_threshold_ms: 20,
-            hold_cap_ms: default_hold_cap_ms(),
+            short_invoke_threshold_ms: 10,
             payload_window_ms: 25,
             batch_max_age_ms: 30_000,
             shutdown_batch_wait_ms: 2_000,
@@ -435,11 +429,6 @@ pub(crate) fn parse_duration(raw: &str) -> Option<Duration> {
         _ => return None,
     };
     Some(Duration::from_millis(millis as u64))
-}
-
-/// The hold cap's default: the shared send timeout, so one constant holds the P99 placeholder.
-fn default_hold_cap_ms() -> u64 {
-    crate::newrelic::client::SEND_TIMEOUT.as_millis() as u64
 }
 
 /// Milliseconds from an env var: unset or not a number falls back to `default`,
@@ -662,9 +651,8 @@ impl ExtensionConfig {
             env::var("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(20)
+                .unwrap_or(10)
                 .min(1000);
-        config.extension.hold_cap_ms = env_ms("NEW_RELIC_EXTENSION_APM_HOLD_CAP_MS", default_hold_cap_ms(), 0, 5_000);
         config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
         config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
         config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 2_000, 0, 2_000);

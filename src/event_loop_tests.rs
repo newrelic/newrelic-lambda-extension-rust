@@ -4116,18 +4116,6 @@ fn make_group(request_id: &str, payloads: Vec<Vec<u8>>, report: Option<&str>) ->
     }
 }
 
-// The cap is counted from when a send started; a send that has had its time gets none.
-#[tokio::test]
-async fn send_budget_left_counts_from_the_start_of_the_send() {
-    let cap = Duration::from_millis(100);
-    let fresh = send_budget_left(tokio::time::Instant::now(), cap);
-    assert!(fresh > Duration::from_millis(90) && fresh <= cap, "a fresh send has almost the whole cap, got {fresh:?}");
-
-    let Some(old) = tokio::time::Instant::now().checked_sub(Duration::from_millis(250)) else { return };
-    assert_eq!(send_budget_left(old, cap), Duration::ZERO, "a send older than the cap gets nothing");
-    assert_eq!(send_budget_left(tokio::time::Instant::now(), Duration::ZERO), Duration::ZERO, "a zero cap never holds");
-}
-
 #[tokio::test]
 #[serial]
 async fn send_pending_groups_without_apm_buffers_everything() {
@@ -4351,36 +4339,34 @@ fn transaction_duration_reads_the_first_transaction_event() {
     assert_eq!(transaction_duration(&std::collections::HashMap::new()), None, "no transaction events");
 }
 
-// ── cancelling the batch on a short invoke ────────────────────────────────────────────
+// ── a batch the function's deadline cut off ───────────────────────────────────────────
 
-async fn spawn_hanging_batch(owner: u64, groups: Vec<PendingGroup>) {
-    clear_batch_state().await;
-    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+fn timed_out_at(cursor: usize) -> crate::send::DispatchOutcome {
+    crate::send::DispatchOutcome { result: crate::send::DispatchResult::TimedOut, cursor: Some(cursor) }
+}
+
+fn set_batch_meta(owner: u64, groups: Vec<PendingGroup>) {
     if let Ok(mut meta) = BATCH_META.lock() {
         *meta = Some(BatchMeta { owner, groups: Arc::new(groups) });
     }
-    let send: crate::send::BoxedSend = Box::pin(std::future::pending());
-    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, Some(cursor)).await;
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn cancelling_puts_unstarted_groups_back_with_their_reports_and_stops_the_batch() {
+fn a_batch_cut_off_by_the_deadline_puts_unstarted_groups_back_with_their_reports() {
     clear_high_tier_state();
-    spawn_hanging_batch(
+    set_batch_meta(
         501,
         vec![
             make_group("cancel-a", vec![vec![1]], Some("REPORT a")),
             make_group("cancel-b", vec![vec![2]], None),
         ],
-    )
-    .await;
+    );
 
-    assert!(cancel_in_flight_batch().await, "a running batch is cancelled");
+    assert!(finish_batch_outcome(&timed_out_at(0)), "a cut-off batch is reported as such");
 
-    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await, "the batch task is stopped");
     let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.payload_bytes.clone()).collect();
-    assert_eq!(payloads, vec![vec![1u8], vec![2u8]], "everything unsent is kept for a longer invoke");
+    assert_eq!(payloads, vec![vec![1u8], vec![2u8]], "everything unsent is kept for the next invoke");
     assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1);
     assert_eq!(
         FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.retry_count).sum::<usize>(),
@@ -4392,15 +4378,15 @@ async fn cancelling_puts_unstarted_groups_back_with_their_reports_and_stops_the_
 
 // A group whose POSTs were already handed out is cleaned up per type by `inflight`;
 // only its report is still ours, and re-buffering its payload would repeat types that landed.
-#[tokio::test]
+#[test]
 #[serial]
-async fn cancelling_a_started_group_buffers_only_its_report() {
+fn a_cut_off_started_group_buffers_only_its_report() {
     clear_high_tier_state();
     let started = make_group("cancel-started", vec![vec![7]], Some("REPORT started"));
     started.started.store(true, std::sync::atomic::Ordering::SeqCst);
-    spawn_hanging_batch(502, vec![started, make_group("cancel-later", vec![vec![8]], None)]).await;
+    set_batch_meta(502, vec![started, make_group("cancel-later", vec![vec![8]], None)]);
 
-    assert!(cancel_in_flight_batch().await);
+    assert!(finish_batch_outcome(&timed_out_at(0)));
 
     let payloads: Vec<Vec<u8>> = FAILED_AGENT_PAYLOADS.lock().unwrap().iter().map(|p| p.payload_bytes.clone()).collect();
     assert_eq!(payloads, vec![vec![8u8]], "only the group that never started");
@@ -4408,22 +4394,17 @@ async fn cancelling_a_started_group_buffers_only_its_report() {
     clear_high_tier_state();
 }
 
-#[tokio::test]
+#[test]
 #[serial]
-async fn cancelling_a_finished_batch_changes_nothing() {
+fn a_finished_batch_puts_nothing_back() {
     clear_high_tier_state();
-    clear_batch_state().await;
-    if let Ok(mut meta) = BATCH_META.lock() {
-        *meta = Some(BatchMeta { owner: 503, groups: Arc::new(vec![make_group("done", vec![vec![9]], None)]) });
-    }
-    let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
-    SEND_SCHEDULER
-        .spawn(crate::send::SendKind::ApmCollector, send, Some(Arc::new(std::sync::atomic::AtomicUsize::new(1))))
-        .await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    set_batch_meta(503, vec![make_group("done", vec![vec![9]], None)]);
+    let done = crate::send::DispatchOutcome { result: crate::send::DispatchResult::Sent, cursor: Some(1) };
 
-    assert!(!cancel_in_flight_batch().await, "nothing was running");
+    assert!(!finish_batch_outcome(&done));
+
     assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 0, "a delivered batch is never put back");
+    assert!(BATCH_META.lock().unwrap().is_none(), "and its bookkeeping is cleared");
     clear_high_tier_state();
 }
 
@@ -4439,7 +4420,6 @@ fn high_config(threshold_ms: u64) -> Arc<config::ExtensionConfig> {
     let mut cfg = config::ExtensionConfig::default();
     cfg.extension.send_tier = crate::send::SendTier::High;
     cfg.extension.short_invoke_threshold_ms = threshold_ms;
-    cfg.extension.hold_cap_ms = 0; // do not hold: these tests are about the decision
     Arc::new(cfg)
 }
 
@@ -4478,5 +4458,404 @@ async fn a_longer_invoke_starts_the_retries_once() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO).await;
     cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+// ── high tier: logs start at INVOKE and never hold /next ──────────────────────────────
+
+async fn clear_log_flush() {
+    let _ = SEND_SCHEDULER
+        .resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO)
+        .await;
+}
+
+// A log flush still running at runtimeDone is waited for, but never past the function's
+// own deadline: then it is stopped and its logs kept.
+#[tokio::test]
+#[serial]
+async fn a_running_log_flush_is_waited_for_until_the_deadline_then_stopped() {
+    clear_high_tier_state();
+    clear_log_flush().await;
+    let id = "hi-logs-deadline";
+    let config = high_config(20);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let hanging: crate::send::BoxedSend = Box::pin(std::future::pending());
+    SEND_SCHEDULER.spawn(crate::send::SendKind::Logs, hanging, None).await;
+
+    // 500 ms of safety margin + 300 ms: the wait may last about 300 ms.
+    let started = tokio::time::Instant::now();
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(800), &state, None).await;
+
+    assert!(started.elapsed() >= Duration::from_millis(200), "it must wait for the send, took {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_millis(700), "but not past the deadline, took {:?}", started.elapsed());
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await, "the unfinished flush is stopped");
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+// With nothing hanging, /next is not held at all.
+#[tokio::test]
+#[serial]
+async fn finished_sends_do_not_hold_next() {
+    clear_high_tier_state();
+    clear_log_flush().await;
+    let id = "hi-nothing-to-wait";
+    let config = high_config(20);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let started = tokio::time::Instant::now();
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(5_000), &state, None).await;
+
+    assert!(started.elapsed() < Duration::from_millis(300), "took {:?}", started.elapsed());
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+// The flush for a not-short invoke starts at INVOKE, while the handler is still running,
+// not after runtimeDone.
+#[tokio::test]
+#[serial]
+async fn a_not_short_invoke_starts_its_log_flush_before_runtime_done() {
+    clear_high_tier_state();
+    clear_log_flush().await;
+    let id = "hi-logs-early";
+    let config = high_config(10);
+    let state = Arc::new(detection_state(id));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+
+    let run = {
+        let (config, state, apm_app, log_processor) = (config.clone(), state.clone(), apm_app.clone(), log_processor.clone());
+        tokio::spawn(async move {
+            process_apm_request_high(id, &config, &log_processor, &apm_app, deadline_ms_from_now(5_000), &state, None).await;
+        })
+    };
+    // Past the detection window (10 ms + 25 ms) and well before runtimeDone.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await, "the flush started while the handler was still running");
+
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    run.await.unwrap();
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::Logs).await, "resolved at runtimeDone");
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+// ── high tier: platform.report is kept for the next batch, never sent by the listener ──
+
+fn clear_stashed_reports() {
+    let _ = take_stashed_reports("");
+}
+
+#[test]
+#[serial]
+fn a_stashed_report_is_taken_once_and_never_for_the_current_request() {
+    clear_stashed_reports();
+    stash_platform_report("stash-old", "REPORT old".to_string());
+    stash_platform_report("stash-current", "REPORT current".to_string());
+
+    let taken = take_stashed_reports("stash-current");
+
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].request_id, "stash-old");
+    assert_eq!(taken[0].report, "REPORT old");
+    assert!(take_stashed_reports("stash-current").is_empty(), "taken means gone");
+    assert_eq!(take_stashed_reports("").len(), 1, "the current request's report is still waiting");
+    clear_stashed_reports();
+}
+
+#[test]
+#[serial]
+fn the_stash_is_capped_and_drops_the_oldest_report() {
+    clear_stashed_reports();
+    for i in 0..(MAX_STASHED_REPORTS + 3) {
+        stash_platform_report(&format!("cap-{i}"), format!("REPORT {i}"));
+    }
+
+    let kept = take_stashed_reports("");
+
+    assert_eq!(kept.len(), MAX_STASHED_REPORTS);
+    assert_eq!(kept[0].request_id, "cap-3", "the three oldest were dropped");
+    clear_stashed_reports();
+}
+
+#[tokio::test]
+#[serial]
+async fn the_batch_sends_a_stashed_report_with_the_payload_of_the_same_request() {
+    clear_high_tier_state();
+    clear_stashed_reports();
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config);
+    for id in ["grp-prev", "grp-current"] {
+        let state = create_request_processing_state(id, "arn:test", &factory);
+        state.agent_buffer.lock().unwrap().push(id.as_bytes().to_vec());
+        REQUEST_PROCESSORS.insert(id.to_string(), state);
+    }
+    stash_platform_report("grp-prev", "REPORT prev".to_string());
+    stash_platform_report("grp-current", "REPORT current".to_string());
+
+    let groups = take_pending_groups("grp-current");
+
+    let prev: Vec<&PendingGroup> = groups.iter().filter(|g| g.request_id == "grp-prev").collect();
+    assert_eq!(prev.len(), 1, "one group, payload and report together");
+    assert_eq!(prev[0].payloads, vec![b"grp-prev".to_vec()]);
+    assert_eq!(prev[0].report.as_deref(), Some("REPORT prev"));
+    assert!(groups.iter().all(|g| g.request_id != "grp-current"), "the running request is left alone");
+    assert_eq!(take_stashed_reports("").len(), 1, "its report stays for a later batch");
+    cleanup_request_processing_state_internal("grp-current", false);
+    clear_stashed_reports();
+    clear_high_tier_state();
+}
+
+// The payload usually left in an earlier batch; the report then travels alone.
+#[tokio::test]
+#[serial]
+async fn a_report_whose_payload_already_left_goes_in_a_report_only_group() {
+    clear_high_tier_state();
+    clear_stashed_reports();
+    stash_platform_report("late-report", "REPORT late".to_string());
+
+    let groups = take_pending_groups("some-other-current");
+
+    let late: Vec<&PendingGroup> = groups.iter().filter(|g| g.request_id == "late-report").collect();
+    assert_eq!(late.len(), 1);
+    assert!(late[0].payloads.is_empty());
+    assert_eq!(late[0].report.as_deref(), Some("REPORT late"));
+    clear_stashed_reports();
+    clear_high_tier_state();
+}
+
+#[test]
+#[serial]
+fn at_shutdown_stashed_reports_move_to_the_retry_buffer() {
+    clear_high_tier_state();
+    clear_stashed_reports();
+    stash_platform_report("shut-1", "REPORT 1".to_string());
+    stash_platform_report("shut-2", "REPORT 2".to_string());
+
+    drain_stashed_reports_into_retry_buffer();
+
+    assert!(take_stashed_reports("").is_empty());
+    assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 2, "so the shutdown retry sends them");
+    clear_high_tier_state();
+}
+
+// ── a group's payload POSTs and its report POST go out together ───────────────────────
+
+#[tokio::test]
+async fn a_groups_payloads_and_report_are_sent_at_the_same_time() {
+    let slow = |ms: u64, ok: bool| async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        ok
+    };
+
+    let started = tokio::time::Instant::now();
+    let sent = send_group_in_parallel(slow(150, true), slow(150, true)).await;
+
+    assert!(sent);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "two 150 ms sends must overlap, took {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_group_is_not_sent_if_either_its_payloads_or_its_report_failed() {
+    let done = |ok: bool| async move { ok };
+
+    assert!(!send_group_in_parallel(done(true), done(false)).await, "report failed");
+    assert!(!send_group_in_parallel(done(false), done(true)).await, "payloads failed");
+    assert!(!send_group_in_parallel(done(false), done(false)).await);
+    assert!(send_group_in_parallel(done(true), done(true)).await);
+}
+
+// The 14.5 s bug: platform.start made the slot, runtimeDone reached it, then the INVOKE
+// replaced it and the wake-up was lost, so the extension waited for the whole deadline.
+#[tokio::test]
+#[serial]
+async fn a_runtime_done_before_the_invoke_does_not_make_the_extension_wait_for_the_deadline() {
+    clear_high_tier_state();
+    let id = "hi-runtime-done-first";
+    let config = high_config(20);
+    request::ensure_lmi_request_slot(id); // platform.start
+    request::record_runtime_done_with_duration(id, Some(13.2)); // runtimeDone, before the INVOKE
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(id, "arn:test", &factory); // the INVOKE
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let started = tokio::time::Instant::now();
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(3_000), &state, None).await;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "waited {:?}: the early runtimeDone must count",
+        started.elapsed()
+    );
+    cleanup_request_processing_state_internal(id, false);
+    clear_high_tier_state();
+}
+
+// ── high tier: short invokes (nothing sent; dropped unless they recorded an error) ────
+
+fn put_earlier_request(id: &str, payload: &[u8]) {
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config);
+    let state = create_request_processing_state(id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(payload.to_vec());
+    REQUEST_PROCESSORS.insert(id.to_string(), state);
+}
+
+#[test]
+fn error_events_in_a_payload_count_as_an_error() {
+    let with = |key: &str, data: Vec<serde_json::Value>| std::collections::HashMap::from([(key.to_string(), data)]);
+    let events = vec![serde_json::Value::Null, serde_json::json!({}), serde_json::json!([["an error event"]])];
+    assert!(telemetry_has_errors(&with("error_event_data", events)));
+    let traced = vec![serde_json::Value::Null, serde_json::json!([["an error trace"]])];
+    assert!(telemetry_has_errors(&with("error_data", traced)));
+
+    let empty_events = vec![serde_json::Value::Null, serde_json::json!({}), serde_json::json!([])];
+    assert!(!telemetry_has_errors(&with("error_event_data", empty_events)), "no events, no error");
+    assert!(!telemetry_has_errors(&std::collections::HashMap::new()));
+    assert!(!payload_has_errors(b"not a payload"), "an unreadable payload is not an error");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_short_invoke_without_an_error_is_dropped_and_remembered() {
+    use crate::send::short_invoke::{get, ShortOutcome};
+    clear_stashed_reports();
+    let id = "short-clean";
+    let config = high_config(10);
+    let state = detection_state(id);
+    state.agent_buffer.lock().unwrap().push(b"payload".to_vec());
+    stash_platform_report(id, "REPORT".to_string());
+    stash_platform_report("short-clean-earlier", "REPORT earlier".to_string());
+    let logs = make_noop_log_processor_serverless(config);
+
+    assert!(!handle_short_invoke(id, &state, &logs));
+
+    assert!(state.agent_buffer.lock().unwrap().is_empty(), "its payload is dropped");
+    let stashed = take_stashed_reports("");
+    assert_eq!(stashed.len(), 1, "its report is dropped, an earlier invoke's is not");
+    assert_eq!(stashed[0].request_id, "short-clean-earlier");
+    assert_eq!(get(id), Some(ShortOutcome::Dropped));
+    cleanup_request_processing_state_internal(id, false);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_short_invoke_whose_runtime_done_failed_is_kept() {
+    use crate::send::short_invoke::{get, ShortOutcome};
+    clear_stashed_reports();
+    let id = "short-failed";
+    let config = high_config(10);
+    let state = detection_state(id);
+    state.agent_buffer.lock().unwrap().push(b"payload".to_vec());
+    stash_platform_report(id, "REPORT".to_string());
+    request::record_runtime_done_status(id, Some("error"));
+    let logs = make_noop_log_processor_serverless(config);
+
+    assert!(handle_short_invoke(id, &state, &logs));
+
+    assert_eq!(state.agent_buffer.lock().unwrap().len(), 1, "its payload waits for the next long invoke");
+    assert_eq!(take_stashed_reports("").len(), 1, "and so does its report");
+    assert_eq!(get(id), Some(ShortOutcome::ErrorKept));
+    cleanup_request_processing_state_internal(id, false);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_successful_runtime_done_is_not_an_error() {
+    let id = "short-success-status";
+    let config = high_config(10);
+    let state = detection_state(id);
+    request::record_runtime_done_status(id, Some("success"));
+    let logs = make_noop_log_processor_serverless(config);
+    assert!(!short_invoke_had_error(id, &state, &logs));
+    cleanup_request_processing_state_internal(id, false);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_next_batch_skips_a_dropped_short_invoke_but_takes_an_errored_one() {
+    use crate::send::short_invoke::{mark, ShortOutcome};
+    clear_high_tier_state();
+    clear_stashed_reports();
+    put_earlier_request("skip-dropped", b"a");
+    put_earlier_request("skip-errored", b"b");
+    put_earlier_request("skip-plain", b"c");
+    mark("skip-dropped", ShortOutcome::Dropped);
+    mark("skip-errored", ShortOutcome::ErrorKept);
+    stash_platform_report("skip-dropped", "REPORT late".to_string());
+
+    let groups = take_pending_groups("skip-current");
+
+    let mut ids: Vec<&str> = groups.iter().map(|g| g.request_id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["skip-errored", "skip-plain"], "late data of a dropped invoke is not sent");
+    for id in ["skip-dropped", "skip-errored", "skip-plain"] {
+        cleanup_request_processing_state_internal(id, false);
+    }
+    clear_stashed_reports();
+}
+
+// A short invoke starts nothing at all: earlier invokes' data stays exactly where it was.
+#[tokio::test]
+#[serial]
+async fn a_short_invoke_starts_no_batch_and_leaves_earlier_data_alone() {
+    clear_high_tier_state();
+    clear_batch_state().await;
+    clear_stashed_reports();
+    put_earlier_request("hi-short-earlier", b"earlier");
+    let id = "hi-short-nothing";
+    let config = high_config(500);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(2.0));
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    let started = tokio::time::Instant::now();
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(5_000), &state, None).await;
+
+    assert!(started.elapsed() < Duration::from_millis(200), "/next is not held, took {:?}", started.elapsed());
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await, "no batch is started");
+    assert_eq!(get_agent_buffer("hi-short-earlier").unwrap().lock().unwrap().len(), 1, "earlier data waits");
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 0);
+    for id in ["hi-short-earlier", id] {
+        cleanup_request_processing_state_internal(id, false);
+    }
+    clear_high_tier_state();
+}
+
+// A long invoke sends earlier data and does not return before the send is finished.
+#[tokio::test]
+#[serial]
+async fn a_long_invoke_waits_for_the_batch_to_finish() {
+    clear_high_tier_state();
+    clear_batch_state().await;
+    clear_log_flush().await;
+    clear_stashed_reports();
+    put_earlier_request("hi-long-earlier", b"earlier");
+    stash_platform_report("hi-long-earlier", "REPORT earlier".to_string());
+    let id = "hi-long-wait";
+    let config = high_config(20);
+    let state = detection_state(id);
+    request::record_runtime_done_with_duration(id, Some(300.0));
+    // No APM session: the batch ends at once, buffering its group; what matters is that
+    // the invoke has resolved it by the time it returns.
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+
+    process_apm_request_high(id, &config, &make_noop_log_processor_serverless(config.clone()), &apm_app, deadline_ms_from_now(5_000), &state, None).await;
+
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await, "the batch is resolved before /next");
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 1, "and its outcome was recorded");
+    assert_eq!(FAILED_PLATFORM_REPORTS.lock().unwrap().len(), 1);
+    for id in ["hi-long-earlier", id] {
+        cleanup_request_processing_state_internal(id, false);
+    }
     clear_high_tier_state();
 }

@@ -2712,4 +2712,147 @@ mod coverage_tests {
         let _ = p.send_and_clear_batch_simple().await;
         assert_eq!(p.log_batch.lock().unwrap().len(), 0, "batch cleared after dedup + send");
     }
+
+    // ── high tier: no count-based flush, short-invoke handling ────────────────
+
+    fn high_tier_processor(arn: &str, request_id: &str) -> LogProcessor {
+        high_tier_processor_with(arn, request_id, false)
+    }
+
+    /// Same, with trace-id collection on, so logs can be held for a trace id.
+    fn high_tier_processor_tracing(arn: &str, request_id: &str) -> LogProcessor {
+        high_tier_processor_with(arn, request_id, true)
+    }
+
+    fn high_tier_processor_with(arn: &str, request_id: &str, collect_trace_id: bool) -> LogProcessor {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.extension.send_function_logs = true;
+        config.extension.send_tier = crate::send::SendTier::High;
+        config.new_relic.collect_trace_id = collect_trace_id;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: request_id.to_string(),
+            invoked_function_arn: arn.to_string(),
+            trace_id: None,
+        }));
+        LogProcessor::new(client, config, ctx, None)
+    }
+
+    fn stamped_log(request_id: &str, level: &str, msg: &str) -> LogMessage {
+        let mut log = make_log(msg);
+        log.attributes.insert("faas.execution".to_string(), serde_json::json!(request_id));
+        log.attributes.insert("level".to_string(), serde_json::json!(level));
+        log
+    }
+
+    #[tokio::test]
+    async fn high_tier_never_flushes_on_a_count() {
+        let p = high_tier_processor("arn:aws:lambda:us-east-1:123:function:f", "req-hi-25");
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..24 {
+                batch.push(make_log(&format!("log-{i}")));
+            }
+        }
+        let rec = crate::telemetry::listener::TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({
+                "timestamp": 0, "level": "INFO",
+                "requestId": "req-hi-25", "message": "log-24"
+            }),
+        };
+        p.process_record(rec).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(p.log_batch.lock().unwrap().len() >= 25, "25 logs do not trigger a flush in the high tier");
+    }
+
+    #[test]
+    fn high_tier_keeps_the_unsent_batch_bounded() {
+        let p = high_tier_processor("arn:aws:lambda:us-east-1:123:function:f", "req-hi-cap");
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            for i in 0..(super::super::HIGH_TIER_LOG_BATCH_MAX + 10) {
+                batch.push(make_log(&format!("log-{i}")));
+            }
+        }
+        p.try_spawn_auto_flush();
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), super::super::HIGH_TIER_LOG_BATCH_MAX);
+        assert_eq!(batch[0].message, "log-10", "the oldest were dropped");
+    }
+
+    #[test]
+    fn has_error_log_for_sees_batched_and_held_error_logs_of_that_request_only() {
+        let p = high_tier_processor_tracing("arn:aws:lambda:us-east-1:123:function:f", "req-err");
+        assert!(!p.has_error_log_for("req-err"));
+
+        p.log_batch.lock().unwrap().push(stamped_log("req-err", "INFO", "fine"));
+        p.log_batch.lock().unwrap().push(stamped_log("other", "ERROR", "someone else's"));
+        assert!(!p.has_error_log_for("req-err"), "only this request's logs count");
+
+        p.pending_logs.as_ref().unwrap().lock().unwrap().push("req-err", stamped_log("req-err", "ERROR", "held"));
+        assert!(p.has_error_log_for("req-err"), "a held ERROR log counts");
+    }
+
+    #[test]
+    fn a_short_invoke_without_an_error_loses_all_its_logs_and_nothing_else() {
+        let p = high_tier_processor_tracing("arn:aws:lambda:us-east-1:123:function:f", "req-short");
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            batch.push(stamped_log("req-short", "INFO", "mine"));
+            batch.push(stamped_log("req-earlier", "INFO", "earlier invoke"));
+        }
+        p.pending_logs.as_ref().unwrap().lock().unwrap().push("req-short", stamped_log("req-short", "INFO", "held"));
+
+        p.apply_short_invoke("req-short", false);
+
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].message, "earlier invoke", "earlier invokes' logs are untouched");
+        drop(batch);
+        assert!(!p.has_held_logs_for("req-short"), "held logs are dropped too");
+    }
+
+    #[test]
+    fn a_short_invoke_with_an_error_keeps_only_its_error_logs() {
+        let p = high_tier_processor_tracing("arn:aws:lambda:us-east-1:123:function:f", "req-short-err");
+        {
+            let mut batch = p.log_batch.lock().unwrap();
+            batch.push(stamped_log("req-short-err", "INFO", "chatter"));
+            batch.push(stamped_log("req-short-err", "ERROR", "boom"));
+            batch.push(stamped_log("req-earlier", "INFO", "earlier invoke"));
+        }
+        p.pending_logs.as_ref().unwrap().lock().unwrap().push("req-short-err", stamped_log("req-short-err", "ERROR", "held boom"));
+        p.pending_logs.as_ref().unwrap().lock().unwrap().push("req-short-err", stamped_log("req-short-err", "DEBUG", "held chatter"));
+
+        p.apply_short_invoke("req-short-err", true);
+
+        let messages: Vec<String> = p.log_batch.lock().unwrap().iter().map(|l| l.message.clone()).collect();
+        assert_eq!(messages, vec!["boom", "earlier invoke", "held boom"]);
+        assert!(!p.has_held_logs_for("req-short-err"));
+    }
+
+    #[tokio::test]
+    async fn a_late_log_of_a_decided_short_invoke_is_filtered() {
+        use crate::send::short_invoke::{mark, ShortOutcome};
+        let p = high_tier_processor("arn:aws:lambda:us-east-1:123:function:f", "req-late-drop");
+        mark("req-late-drop", ShortOutcome::Dropped);
+
+        let rec = |level: &str| crate::telemetry::listener::TelemetryRecord {
+            time: chrono::DateTime::from_timestamp(0, 0).expect("epoch"),
+            record_type: "function".to_string(),
+            record: serde_json::json!({"timestamp": 0, "level": level, "requestId": "req-late-drop", "message": "late"}),
+        };
+        p.process_record(rec("ERROR")).await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "a dropped short invoke takes no more logs");
+
+        mark("req-late-drop", ShortOutcome::ErrorKept);
+        p.process_record(rec("INFO")).await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0, "a non-error log of an error invoke is dropped");
+        p.process_record(rec("ERROR")).await;
+        assert_eq!(p.log_batch.lock().unwrap().len(), 1, "its ERROR log is kept");
+    }
 }

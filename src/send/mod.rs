@@ -29,6 +29,7 @@ pub mod scheduler;
 #[cfg(test)]
 mod scheduler_integration_tests;
 pub mod send_target;
+pub mod short_invoke;
 pub mod tier;
 pub mod timeout_provider;
 

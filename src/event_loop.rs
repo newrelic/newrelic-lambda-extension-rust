@@ -341,7 +341,8 @@ static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
         std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
     ));
 
-/// One earlier request's un-sent data, taken out of `REQUEST_DATA` at INVOKE.
+/// One earlier request's un-sent data, taken out of `REQUEST_DATA` once the invoke is known
+/// to be long.
 struct PendingGroup {
     request_id: String,
     invoked_function_arn: String,
@@ -365,7 +366,8 @@ static IN_FLIGHT_BATCH: once_cell::sync::Lazy<Mutex<Option<InFlightBatch>>> =
 
 static NEXT_BATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// What the in-flight batch is working on, kept only so a short invoke can cancel it:
+/// What the in-flight batch is working on, kept only so a batch the function's deadline cuts
+/// off can be put back:
 /// the groups, and the owner id its POSTs are registered under in `inflight`. How far
 /// it got is the scheduler's cursor.
 struct BatchMeta {
@@ -422,6 +424,10 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
             .unwrap_or_else(crate::get_global_fallback_arn);
         cleanup_request_processing_state_internal(&request_id, false);
 
+        // A short invoke without an error is dropped, whenever its data got here.
+        if crate::send::short_invoke::get(&request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
+            continue;
+        }
         if !payloads.is_empty() || report.is_some() {
             groups.push(PendingGroup {
                 request_id,
@@ -432,7 +438,94 @@ fn take_pending_groups(current_request_id: &str) -> Vec<PendingGroup> {
             });
         }
     }
+    // Reports the listener kept: they ride with their request's payload when it is still
+    // here, alone when the payload already left.
+    for stashed in take_stashed_reports(current_request_id) {
+        if crate::send::short_invoke::get(&stashed.request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
+            continue;
+        }
+        match groups.iter_mut().find(|g| g.request_id == stashed.request_id && g.report.is_none()) {
+            Some(group) => group.report = Some(stashed.report),
+            None => groups.push(PendingGroup {
+                request_id: stashed.request_id,
+                invoked_function_arn: stashed.invoked_function_arn,
+                payloads: Vec::new(),
+                report: Some(stashed.report),
+                started: std::sync::atomic::AtomicBool::new(false),
+            }),
+        }
+    }
     groups
+}
+
+/// A `platform.report` the telemetry listener received and did not send. In the high tier the
+/// listener never sends it: it answers Lambda's delivery request only after the send, and a
+/// slow Metric API POST there held back the next batch of events, `runtimeDone` with it. The
+/// next INVOKE's batch sends it instead, after that request's payloads.
+pub(crate) struct StashedReport {
+    pub(crate) request_id: String,
+    pub(crate) report: String,
+    pub(crate) invoked_function_arn: String,
+}
+
+static STASHED_REPORTS: once_cell::sync::Lazy<std::sync::Mutex<Vec<StashedReport>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(Vec::new()));
+
+/// Same bound as the failed-report buffer: past it the oldest report is dropped.
+const MAX_STASHED_REPORTS: usize = 100;
+
+/// Whether the listener keeps reports for the batch (high tier, APM mode, not LMI).
+static REPORTS_RIDE_THE_BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_reports_ride_the_batch(on: bool) {
+    REPORTS_RIDE_THE_BATCH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn reports_ride_the_batch() -> bool {
+    REPORTS_RIDE_THE_BATCH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn stash_lock() -> std::sync::MutexGuard<'static, Vec<StashedReport>> {
+    STASHED_REPORTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Keep a report for the next batch. Called by the listener instead of sending it.
+pub fn stash_platform_report(request_id: &str, report: String) {
+    let invoked_function_arn = get_request_context(request_id)
+        .and_then(|ctx| ctx.lock().ok().map(|c| c.invoked_function_arn.clone()))
+        .filter(|arn| !arn.is_empty())
+        .unwrap_or_else(crate::get_global_fallback_arn);
+    let mut stash = stash_lock();
+    if stash.len() >= MAX_STASHED_REPORTS {
+        stash.remove(0);
+        warn!("Stashed platform-report buffer full ({}) - dropped the oldest", MAX_STASHED_REPORTS);
+    }
+    stash.push(StashedReport { request_id: request_id.to_string(), report, invoked_function_arn });
+}
+
+/// Take every kept report except the running request's: its own batch is still to come.
+pub(crate) fn take_stashed_reports(current_request_id: &str) -> Vec<StashedReport> {
+    let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut *stash_lock())
+        .into_iter()
+        .partition(|s| s.request_id == current_request_id);
+    *stash_lock() = keep;
+    take
+}
+
+/// Discard the report kept for `request_id` (a short invoke that is dropped).
+fn drop_stashed_report(request_id: &str) {
+    stash_lock().retain(|stashed| stashed.request_id != request_id);
+}
+
+/// SHUTDOWN has no next batch: hand what is kept to the failed-report buffer, which the
+/// shutdown retry sends.
+fn drain_stashed_reports_into_retry_buffer() {
+    for stashed in take_stashed_reports("") {
+        if crate::send::short_invoke::get(&stashed.request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
+            continue;
+        }
+        buffer_failed_platform_report(stashed.report, &stashed.request_id, &stashed.invoked_function_arn);
+    }
 }
 
 /// Sends one group at a time and buffers its own failures, so the task never
@@ -506,51 +599,70 @@ fn buffered_failures_since(request_id: &str, since: chrono::DateTime<chrono::Utc
 
 /// `false` if anything failed. The failed data is already buffered: whole payloads
 /// when nothing was sent, individual types when only some failed.
+///
+/// The payload POSTs go to the APM collector and the report POST to the Metric API: different
+/// hosts, nothing needs one before the other, so they go out at the same time and the group
+/// takes one round trip, not two.
 async fn send_group(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
-    let started = chrono::Utc::now();
-    let mut sent = true;
-    if !group.payloads.is_empty() {
-        // The merged send hands every type to its own task before its first await, so
-        // this flag and that hand-off cannot be split by a cancel.
-        group.started.store(true, std::sync::atomic::Ordering::SeqCst);
-        // One POST per telemetry type, not per chunk.
-        let result = app
-            .process_merged_agent_payloads(group.payloads.clone(), &group.request_id, &group.invoked_function_arn)
-            .await;
-        if let Err(e) = result {
-            warn!("Agent payload send failed for {}: {} - buffering", group.request_id, e);
-            for payload in &group.payloads {
-                buffer_failed_agent_payload(payload, &group.request_id, &group.invoked_function_arn);
-            }
-            sent = false;
-        } else {
-            // The merged send returns Ok even when some types failed, so ask the buffer.
-            let failed = buffered_failures_since(&group.request_id, started);
-            if failed > 0 {
-                warn!("{} type(s) of {} failed and were buffered for retry", failed, group.request_id);
-                sent = false;
-            }
-        }
-    }
-    // Circuit breaker: platform-report metrics ride *inside* the ApmCollector
-    // batch here, so they are gated by the same breaker as the agent payloads
-    // (this `send_group` runs inside the SEND_SCHEDULER.spawn(ApmCollector) task).
-    // This intentionally supersedes the earlier separate MetricApi-gated
-    // platform-metrics flush path — unifying it here avoids a double-send and
-    // still guarantees a report is never sent while the breaker is open (on open,
-    // `buffer_group` buffers payloads and report together).
-    if let Some(report) = &group.report {
-        if let Err(e) = app.send_platform_report_metrics(report, &group.invoked_function_arn).await {
-            warn!("Report metrics send failed for {}: {} - buffering", group.request_id, e);
-            buffer_failed_platform_report(report.clone(), &group.request_id, &group.invoked_function_arn);
-            sent = false;
-        }
-    }
-    sent
+    send_group_in_parallel(send_group_payloads(app, group), send_group_report(app, group)).await
 }
 
-/// `high` tier, at INVOKE: start sending what earlier invocations left behind,
-/// so the round-trips overlap this invocation's handler instead of following it.
+/// Runs a group's two sends together; the group is sent only if both were.
+async fn send_group_in_parallel(
+    payloads: impl std::future::Future<Output = bool>,
+    report: impl std::future::Future<Output = bool>,
+) -> bool {
+    let (payloads_sent, report_sent) = tokio::join!(payloads, report);
+    payloads_sent && report_sent
+}
+
+/// The group's agent payloads, one POST per telemetry type, all at once.
+async fn send_group_payloads(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
+    if group.payloads.is_empty() {
+        return true;
+    }
+    let started = chrono::Utc::now();
+    // The merged send hands every type to its own task before its first await, so
+    // this flag and that hand-off cannot be split by a cancel.
+    group.started.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = app
+        .process_merged_agent_payloads(group.payloads.clone(), &group.request_id, &group.invoked_function_arn)
+        .await;
+    if let Err(e) = result {
+        warn!("Agent payload send failed for {}: {} - buffering", group.request_id, e);
+        for payload in &group.payloads {
+            buffer_failed_agent_payload(payload, &group.request_id, &group.invoked_function_arn);
+        }
+        return false;
+    }
+    // The merged send returns Ok even when some types failed, so ask the buffer.
+    let failed = buffered_failures_since(&group.request_id, started);
+    if failed > 0 {
+        warn!("{} type(s) of {} failed and were buffered for retry", failed, group.request_id);
+        return false;
+    }
+    true
+}
+
+/// The group's platform-report metrics (Metric API). They ride *inside* the `ApmCollector`
+/// batch, so the same circuit breaker gates them as the agent payloads (this runs inside the
+/// `SEND_SCHEDULER.spawn(ApmCollector)` task), and on open `buffer_group` buffers payloads and
+/// report together.
+async fn send_group_report(app: &crate::apm::ApmApp, group: &PendingGroup) -> bool {
+    let Some(report) = &group.report else { return true };
+    match app.send_platform_report_metrics(report, &group.invoked_function_arn).await {
+        Ok(()) => true,
+        Err(e) => {
+            warn!("Report metrics send failed for {}: {} - buffering", group.request_id, e);
+            buffer_failed_platform_report(report.clone(), &group.request_id, &group.invoked_function_arn);
+            false
+        }
+    }
+}
+
+/// `high` tier, once the invoke is known to be long (not before: a short invoke starts
+/// nothing): start sending what earlier invocations left behind, so the round-trips
+/// overlap this invocation's handler instead of following it.
 async fn spawn_pending_batch(
     current_request_id: &str,
     config: &Arc<ExtensionConfig>,
@@ -632,7 +744,7 @@ async fn spawn_pending_batch(
 /// with retry count 0: deferring is not a failure. Groups before `resolved_cursor` are
 /// done. A group whose POSTs were already handed out is not re-buffered whole (that would
 /// repeat the types that landed): `inflight` buffers just its unfinished types, and only
-/// its report, which is sent afterwards, is still ours.
+/// its report, sent at the same time but not tracked there, is still ours.
 fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
     for (index, group) in groups.iter().enumerate().skip(resolved_cursor) {
         if index == resolved_cursor && group.started.load(std::sync::atomic::Ordering::SeqCst) {
@@ -645,28 +757,26 @@ fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
     }
 }
 
-/// A short invoke was detected: stop the batch started at INVOKE and put back whatever
-/// it had not delivered. Returns whether anything was cancelled. A batch that already
-/// finished has nothing to put back; types that already got an answer are never resent.
-async fn cancel_in_flight_batch() -> bool {
+/// The batch's outcome after the wait that ends at the function's deadline. A batch that
+/// finished needs nothing but its outcome logged. One the deadline cut off is stopped, and
+/// whatever it had not delivered goes back to the normal retry buffers: groups before the
+/// cursor are done, types that already got an answer are never resent. Returns whether
+/// the batch was cut off.
+fn finish_batch_outcome(outcome: &crate::send::DispatchOutcome) -> bool {
     let meta = BATCH_META.lock().ok().and_then(|mut m| m.take());
-    let Some(meta) = meta else { return false };
+    if outcome.result != crate::send::DispatchResult::TimedOut {
+        log_batch_outcome(outcome);
+        return false;
+    }
     if let Ok(mut in_flight) = IN_FLIGHT_BATCH.lock() {
         *in_flight = None;
     }
-    // Zero budget: a finished batch is collected, a running one is aborted.
-    let mut outcomes = SEND_SCHEDULER
-        .resolve_pending_shared_budget(&[crate::send::SendKind::ApmCollector], Duration::ZERO)
-        .await;
-    let Some(outcome) = outcomes.remove(&crate::send::SendKind::ApmCollector) else { return false };
-    if outcome.result != crate::send::DispatchResult::TimedOut {
-        return false;
-    }
-    let cancelled = crate::apm::inflight::abort_owner(meta.owner);
+    let Some(meta) = meta else { return true };
+    let stopped = crate::apm::inflight::abort_owner(meta.owner);
     buffer_unresolved_groups(&meta.groups, outcome.cursor.unwrap_or(0));
-    info!(
-        "APM mode (high): short invoke - batch cancelled ({} POST(s) stopped, unsent data kept for the next longer invoke)",
-        cancelled
+    warn!(
+        "APM mode (high): batch reached the function deadline - {} POST(s) stopped, unsent data kept for the next invoke",
+        stopped
     );
     true
 }
@@ -1495,6 +1605,7 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                 if components.config.extension.send_tier == crate::send::SendTier::High {
                     resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
                     resolve_pending_logs(&components.global_log_processor, "shutdown").await;
+                    drain_stashed_reports_into_retry_buffer();
                     retry_failed_platform_reports(components.apm_app.clone()).await;
                 }
 
@@ -1516,6 +1627,10 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
                     debug!("APM mode shutdown: Found {} request(s) with potential unsent payloads", all_request_ids.len());
                     
                     for request_id in all_request_ids {
+                        // A short invoke without an error is dropped, even if its payload came late.
+                        if crate::send::short_invoke::get(&request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped) {
+                            continue;
+                        }
                         if let Some(buffer) = get_agent_buffer(&request_id) {
                             let payloads = {
                                 if let Ok(mut buf) = buffer.lock() {
@@ -2458,46 +2573,103 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut);
 }
 
-/// What is left of a send's budget. The hold cap (a placeholder for the measured P99 of a
-/// healthy send) is counted from when the send *started*, so a send that has already had
-/// its time gets none. There is no other rule.
-fn send_budget_left(started: tokio::time::Instant, cap: Duration) -> Duration {
-    (started + cap).saturating_duration_since(tokio::time::Instant::now())
-}
-
 /// What one invocation cost, logged once per invoke so the placeholder timings can
 /// be set from real numbers (billed time is what `waited_ms` adds).
 struct InvokeTiming {
     handler_ms: u128,
-    hold_budget_ms: u128,
     waited_ms: u128,
     short_invoke: bool,
-    cancelled: bool,
-    batch_left_running: bool,
-    log_flush_aborted: bool,
+    /// The function's deadline cut a send off before it finished.
+    deadline_cut: bool,
     /// Lambda's own `metrics.durationMs` from `runtimeDone`, when it had arrived.
     runtime_done_ms: Option<f64>,
 }
 
 fn log_invoke_timing(request_id: &str, t: &InvokeTiming) {
     info!(
-        "APM high timing: request={} handler_ms={} runtime_done_ms={} short_invoke={} cancelled={} hold_budget_ms={} waited_ms={} batch_left_running={} log_flush_aborted={}",
+        "APM high timing: request={} handler_ms={} runtime_done_ms={} short_invoke={} waited_ms={} deadline_cut={}",
         request_id,
         t.handler_ms,
         t.runtime_done_ms.map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.1}")),
         t.short_invoke,
-        t.cancelled,
-        t.hold_budget_ms,
         t.waited_ms,
-        t.batch_left_running,
-        t.log_flush_aborted
+        t.deadline_cut
     );
 }
 
-/// `SendTier::High`. Data from earlier invocations starts sending at INVOKE, in parallel
-/// with the handler (`spawn_pending_batch`). If the invoke turns out short, that is
-/// cancelled and nothing else is started; otherwise `/next` is held only while a send is
-/// still within its budget.
+/// Whether a short invoke recorded an error: the agent reported error events, Lambda's
+/// `runtimeDone` status is not success, or the invoke logged at ERROR level.
+fn short_invoke_had_error(
+    request_id: &str,
+    state: &request::RequestProcessingState,
+    log_processor: &Arc<LogProcessor>,
+) -> bool {
+    let payloads = state.agent_buffer.lock().map(|b| b.clone()).unwrap_or_default();
+    request::runtime_done_failed(request_id)
+        || log_processor.has_error_log_for(request_id)
+        || payloads.iter().any(|bytes| payload_has_errors(bytes))
+}
+
+/// Whether an agent payload carries error events (`error_event_data`) or traced errors
+/// (`error_data`).
+fn payload_has_errors(payload_bytes: &[u8]) -> bool {
+    let Ok(parsed) = crate::apm::payload_parser::parse_agent_payload_cached(payload_bytes) else {
+        return false;
+    };
+    telemetry_has_errors(&parsed.0)
+}
+
+fn telemetry_has_errors(telemetry: &std::collections::HashMap<String, Vec<serde_json::Value>>) -> bool {
+    let non_empty = |key: &str, index: usize| {
+        telemetry
+            .get(key)
+            .and_then(|data| data.get(index))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    };
+    non_empty("error_event_data", 2) || non_empty("error_data", 1)
+}
+
+/// A short invoke is decided: nothing is sent or held for it. Without an error its own
+/// agent payload, report and logs are dropped; with one they are kept for the next long
+/// invoke's batch (logs: ERROR level only). Either way the verdict is remembered, so data
+/// of this request that arrives later is treated the same. Earlier invokes' data is not
+/// touched. Returns whether an error was recorded.
+fn handle_short_invoke(
+    request_id: &str,
+    state: &request::RequestProcessingState,
+    log_processor: &Arc<LogProcessor>,
+) -> bool {
+    use crate::send::short_invoke::{mark, ShortOutcome};
+
+    let had_error = short_invoke_had_error(request_id, state, log_processor);
+    if had_error {
+        mark(request_id, ShortOutcome::ErrorKept);
+        log_processor.apply_short_invoke(request_id, true);
+        info!("APM mode (high): short invoke {} recorded an error - its data goes with the next long invoke", request_id);
+    } else {
+        mark(request_id, ShortOutcome::Dropped);
+        if let Ok(mut buffer) = state.agent_buffer.lock() {
+            buffer.clear();
+        }
+        remove_pending_report(request_id);
+        drop_stashed_report(request_id);
+        log_processor.apply_short_invoke(request_id, false);
+        debug!("APM mode (high): short invoke {} had no error - its data is dropped", request_id);
+    }
+    had_error
+}
+
+/// The longest any wait in the high tier may last; the function's own deadline cuts it
+/// shorter in practice.
+const MAX_SEND_WAIT_MS: u64 = 15 * 60 * 1_000;
+
+/// `SendTier::High`. Nothing is sent until the invoke is known to be long (the agent's
+/// own duration, or `runtimeDone`, past `short_invoke_threshold_ms`). A short invoke
+/// sends nothing and is not held: its own data is dropped unless it recorded an error.
+/// A long invoke then sends everything earlier invokes left (agent payloads, platform
+/// reports, logs) in parallel with the handler, and `/next` waits until all of it is
+/// done, bounded only by the function's own deadline.
 async fn process_apm_request_high(
     request_id: &str,
     config: &Arc<ExtensionConfig>,
@@ -2508,96 +2680,71 @@ async fn process_apm_request_high(
     invoke_retries: Option<InvokeRetries>,
 ) {
     let invoke_start = tokio::time::Instant::now();
-    let cap_ms = config.extension.hold_cap_ms;
-    let cap = Duration::from_millis(cap_ms);
 
     // Collect last invoke's log flush if it finished; never abort it here.
     resolve_pending_logs(global_log_processor, request_id).await;
-    spawn_pending_batch(request_id, config, global_log_processor, apm_app).await;
-    let send_started = tokio::time::Instant::now();
 
     let threshold = Duration::from_millis(config.extension.short_invoke_threshold_ms);
     if detect_short_invoke(request_id, state, threshold, invoke_start).await == InvokeLength::Short {
-        // A trivial function must not pay for telemetry. Stop what INVOKE started and put
-        // its unsent data back; start no log flush (logs stay buffered) and no retries
-        // (they wait for a longer invoke). Return at once.
-        let cancelled = cancel_in_flight_batch().await;
+        handle_short_invoke(request_id, state, global_log_processor);
         log_invoke_timing(request_id, &InvokeTiming {
             handler_ms: invoke_start.elapsed().as_millis(),
-            hold_budget_ms: 0,
             waited_ms: 0,
             short_invoke: true,
-            cancelled,
-            batch_left_running: false,
-            log_flush_aborted: false,
+            deadline_cut: false,
             runtime_done_ms: request::get_runtime_done_duration_ms(request_id),
         });
         return;
     }
-    // Not short: earlier failures may be retried now.
+
+    // Long invoke: everything from earlier invokes starts now, all at once. Earlier
+    // failures may be retried too.
+    spawn_pending_batch(request_id, config, global_log_processor, apm_app).await;
     if let Some(retries) = invoke_retries {
         retries();
     }
+    spawn_log_flush(global_log_processor, request_id).await;
 
-    // Always wait: the handler's duration decides how long we may hold.
-    let signaled = wait_for_runtime_done(request_id, deadline_ms).await;
+    let wait_started = tokio::time::Instant::now();
+    let _ = wait_for_runtime_done(request_id, deadline_ms).await;
     let handler = invoke_start.elapsed();
+    debug!(
+        "APM mode (high): runtimeDone for {} reached the extension {}ms after INVOKE (waited {}ms for it, Lambda's own handler time: {})",
+        request_id,
+        handler.as_millis(),
+        wait_started.elapsed().as_millis(),
+        request::get_runtime_done_duration_ms(request_id).map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.1}ms")),
+    );
 
-    // Never hold `/next` more than the cap after `runtimeDone`, whatever the sends need, and
-    // never so long that the function's own deadline gets close.
+    // The sends may take as long as they need, but never past the function's own deadline.
     let hold_started = tokio::time::Instant::now();
-    let hard_deadline = hold_started + Duration::from_millis(bounded_wait_budget_ms(deadline_ms, cap_ms));
+    let hard_deadline = hold_started + Duration::from_millis(bounded_wait_budget_ms(deadline_ms, MAX_SEND_WAIT_MS));
     let window_until = hard_deadline.min(
         hold_started + Duration::from_millis(config.extension.payload_window_ms),
     );
-    // Concurrent, so the two waits cost the longer of them, not the sum.
-    tokio::join!(
-        wait_for_own_payload(request_id, state, config, global_log_processor, apm_app, window_until),
-        async {
-            let _ = tokio::time::timeout_at(
-                hard_deadline,
-                wait_for_runtime_done_with_grace(request_id, signaled, config, global_log_processor),
-            )
-            .await;
-        },
-    );
+    wait_for_own_payload(request_id, state, config, global_log_processor, apm_app, window_until).await;
 
-    spawn_log_flush(global_log_processor, request_id).await;
-
-    // Each send gets the cap counted from its own start: the batch from INVOKE, the log
-    // flush from now. Unfinished at its deadline, the batch is left running (it may already
-    // be at the collector, and aborting would only make its retry a duplicate); logs are
-    // one request, so an unfinished flush is aborted and requeued from its write-ahead copy.
-    let logs_left = hard_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let batch_left = send_budget_left(send_started, cap).min(logs_left);
-    let (mut batch_done, mut logs_done) = tokio::join!(
-        SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::ApmCollector], batch_left),
-        SEND_SCHEDULER.wait_finished(&[crate::send::SendKind::Logs], logs_left),
-    );
-    if let Some(outcome) = batch_done.remove(&crate::send::SendKind::ApmCollector) {
-        log_batch_outcome(&outcome);
-    }
-    let log_outcome = match logs_done.remove(&crate::send::SendKind::Logs) {
-        Some(outcome) => Some(outcome),
-        None => SEND_SCHEDULER
-            .resolve_pending_shared_budget(&[crate::send::SendKind::Logs], Duration::ZERO)
-            .await
-            .remove(&crate::send::SendKind::Logs),
+    let mut outcomes = SEND_SCHEDULER
+        .resolve_pending_shared_budget(
+            &[crate::send::SendKind::ApmCollector, crate::send::SendKind::Logs],
+            hard_deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+    let batch_cut = outcomes
+        .remove(&crate::send::SendKind::ApmCollector)
+        .is_some_and(|outcome| finish_batch_outcome(&outcome));
+    let logs_cut = match outcomes.remove(&crate::send::SendKind::Logs) {
+        Some(outcome) => {
+            handle_logs_outcome(&outcome, global_log_processor, request_id);
+            outcome.result == crate::send::DispatchResult::TimedOut
+        }
+        None => false,
     };
-    let log_flush_aborted = log_outcome
-        .as_ref()
-        .is_some_and(|o| o.result == crate::send::DispatchResult::TimedOut);
-    if let Some(outcome) = log_outcome {
-        handle_logs_outcome(&outcome, global_log_processor, request_id);
-    }
     log_invoke_timing(request_id, &InvokeTiming {
         handler_ms: handler.as_millis(),
-        hold_budget_ms: batch_left.max(logs_left).as_millis(),
         waited_ms: hold_started.elapsed().as_millis(),
         short_invoke: false,
-        cancelled: false,
-        batch_left_running: SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await,
-        log_flush_aborted,
+        deadline_cut: batch_cut || logs_cut,
         runtime_done_ms: request::get_runtime_done_duration_ms(request_id),
     });
 }

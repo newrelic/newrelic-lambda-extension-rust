@@ -21,6 +21,9 @@ use std::{
 
 // Pre-interned attribute key constants — avoids per-record heap allocation of the same strings.
 const ATTR_LEVEL: &str = "level";
+
+/// High tier only: most logs the unsent batch may hold while no count-based flush exists.
+const HIGH_TIER_LOG_BATCH_MAX: usize = 5_000;
 const ATTR_LOG_PATTERN: &str = "newrelic.logPattern";
 const ATTR_SOURCE: &str = "newrelic.source";
 const ATTR_LOG_TYPE: &str = "_nr.logType";
@@ -306,6 +309,10 @@ impl RequestLogBuffer {
         self.by_request.contains_key(request_id)
     }
 
+    fn peek(&self, request_id: &str) -> &[payload::LogMessage] {
+        self.by_request.get(request_id).map_or(&[], Vec::as_slice)
+    }
+
     #[cfg(test)]
     fn len_for(&self, request_id: &str) -> usize {
         self.by_request.get(request_id).map_or(0, Vec::len)
@@ -407,6 +414,34 @@ impl FailedBuffer {
     }
 }
 
+/// Whether `log` was stamped as belonging to `request_id`.
+fn log_is_for(log: &payload::LogMessage, request_id: &str) -> bool {
+    log.attributes
+        .get(ATTR_FAAS_EXECUTION)
+        .and_then(|v| v.as_str())
+        .is_some_and(|id| id == request_id)
+}
+
+fn log_is_error(log: &payload::LogMessage) -> bool {
+    log.attributes
+        .get(ATTR_LEVEL)
+        .and_then(|v| v.as_str())
+        .is_some_and(|level| level.eq_ignore_ascii_case("ERROR"))
+}
+
+/// A log of a request that was already decided to be a short invoke: dropped, or (when the
+/// invoke recorded an error) kept only if it is an ERROR-level log.
+fn is_filtered_by_short_invoke(log: &payload::LogMessage) -> bool {
+    let Some(request_id) = log.attributes.get(ATTR_FAAS_EXECUTION).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    match crate::send::short_invoke::get(request_id) {
+        Some(crate::send::short_invoke::ShortOutcome::Dropped) => true,
+        Some(crate::send::short_invoke::ShortOutcome::ErrorKept) => !log_is_error(log),
+        None => false,
+    }
+}
+
 /// Extract structured log level from JSON record
 /// Returns the uppercase level string if found in common level field names
 fn get_structured_log_level(record: &serde_json::Value) -> Option<String> {
@@ -494,6 +529,65 @@ impl LogProcessor {
         }
     }
 
+    /// Keep the unsent batch bounded while nothing flushes it on a count: past
+    /// `HIGH_TIER_LOG_BATCH_MAX` the oldest logs are dropped.
+    fn cap_batch_for_high_tier(&self) {
+        let mut batch = self.log_batch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if batch.len() > HIGH_TIER_LOG_BATCH_MAX {
+            let excess = batch.len() - HIGH_TIER_LOG_BATCH_MAX;
+            batch.drain(..excess);
+            warn!(
+                "APM mode (high): log batch over {} - dropped the {} oldest log(s)",
+                HIGH_TIER_LOG_BATCH_MAX, excess
+            );
+        }
+    }
+
+    /// Whether any log of `request_id` that is still unsent (batched or held for its
+    /// trace id) is ERROR level.
+    pub fn has_error_log_for(&self, request_id: &str) -> bool {
+        let in_batch = self
+            .log_batch
+            .lock()
+            .map(|b| b.iter().any(|l| log_is_for(l, request_id) && log_is_error(l)))
+            .unwrap_or(false);
+        in_batch
+            || self
+                .pending_logs
+                .as_ref()
+                .and_then(|p| p.lock().ok())
+                .is_some_and(|p| p.peek(request_id).iter().any(log_is_error))
+    }
+
+    /// A short invoke was decided: apply it to the logs already collected for `request_id`
+    /// (batched ones and ones held for a trace id). `errors_only` keeps its ERROR-level
+    /// logs; otherwise all of its logs are dropped. Logs that arrive later are filtered
+    /// the same way in `process_record`, through the `short_invoke` registry.
+    pub fn apply_short_invoke(&self, request_id: &str, errors_only: bool) {
+        let mut dropped = 0usize;
+        if let Ok(mut batch) = self.log_batch.lock() {
+            let before = batch.len();
+            batch.retain(|l| !log_is_for(l, request_id) || (errors_only && log_is_error(l)));
+            dropped += before - batch.len();
+        }
+        let held = self
+            .pending_logs
+            .as_ref()
+            .and_then(|p| p.lock().ok().map(|mut p| p.take(request_id)))
+            .unwrap_or_default();
+        let (kept, discarded): (Vec<_>, Vec<_>) = held.into_iter().partition(|l| errors_only && log_is_error(l));
+        dropped += discarded.len();
+        if !kept.is_empty() {
+            if let Ok(mut batch) = self.log_batch.lock() {
+                batch.extend(kept);
+            }
+        }
+        debug!(
+            "APM mode (high): short invoke {} - dropped {} log(s) (errors only kept: {})",
+            request_id, dropped, errors_only
+        );
+    }
+
     /// If `log_batch` has reached the auto-flush threshold, drain it and spawn a
     /// background task that ships the drained logs in 1 MB chunks with per-chunk
     /// retry. Shared by `process_record` (per-log push) and by bulk-insert paths
@@ -505,6 +599,13 @@ impl LogProcessor {
     fn try_spawn_auto_flush(&self) {
         const FLUSH_THRESHOLD: usize = 25;
         const LMI_FLUSH_THRESHOLD_BYTES: usize = 1_000_000;
+
+        // High tier: logs are never flushed on a count. They go out only with the batch an
+        // invoke starts once it is known to be long, so here the batch just stays bounded.
+        if self.config.extension.send_tier == crate::send::SendTier::High && !self.config.deployment.is_lmi() {
+            self.cap_batch_for_high_tier();
+            return;
+        }
 
         let logs_to_send = {
             let mut batch = self.log_batch.lock().unwrap();
@@ -931,6 +1032,11 @@ impl LogProcessor {
             }
 
             let log_message = self.apply_current_invocation_metadata(log_message, per_record_request_id.as_deref());
+
+            // High tier: a late log of a request already decided to be a short invoke.
+            if is_filtered_by_short_invoke(&log_message) {
+                return;
+            }
 
             // trace.id buffering (only when collect_trace_id is on). Hold each log under
             // its own request_id until that request's trace.id is known, then stamp + send.

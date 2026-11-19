@@ -655,6 +655,62 @@ mod tests {
         clear_request_state();
     }
 
+    // platform.start can create the request's slot before the INVOKE is handled (the listener
+    // does it in APM mode). Whatever reached that slot first must survive the INVOKE.
+    fn processor_factory_for_slot_tests() -> Arc<ProcessorFactory> {
+        let config = Arc::new(crate::config::ExtensionConfig::default());
+        let newrelic_client = Arc::new(crate::newrelic::client::NewRelicClient::new(&config));
+        let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+        Arc::new(ProcessorFactory::new(newrelic_client, config, apm_app))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn a_runtime_done_that_arrives_before_the_invoke_is_not_lost() {
+        clear_request_state();
+        let id = "slot-runtime-done-first";
+        ensure_lmi_request_slot(id); // platform.start reached the listener first
+        record_runtime_done_with_duration(id, Some(13.2)); // then runtimeDone, before INVOKE
+
+        let _state = create_request_processing_state(id, "arn:test", &processor_factory_for_slot_tests()); // INVOKE
+
+        assert!(get_runtime_done_elapsed_ms(id).is_some(), "the arrival time survives, so short detection can use it");
+        assert_eq!(get_runtime_done_duration_ms(id), Some(13.2));
+        let notify = get_runtime_done_notify(id).expect("registered");
+        let woke = tokio::time::timeout(std::time::Duration::from_millis(100), notify.notified()).await;
+        assert!(woke.is_ok(), "the wake-up must not be lost, or the extension waits for the whole deadline");
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn payloads_that_reached_the_slot_before_the_invoke_are_kept() {
+        clear_request_state();
+        let id = "slot-payload-first";
+        ensure_lmi_request_slot(id);
+        get_agent_buffer(id).expect("slot").lock().unwrap().push(vec![1, 2, 3]);
+
+        let state = create_request_processing_state(id, "arn:test", &processor_factory_for_slot_tests());
+
+        assert_eq!(state.agent_buffer.lock().unwrap().clone(), vec![vec![1u8, 2, 3]], "the state sees the payload");
+        assert_eq!(get_agent_buffer(id).expect("registered").lock().unwrap().len(), 1, "and so does the global entry");
+        clear_request_state();
+    }
+
+    #[test]
+    #[serial]
+    fn the_invoke_sets_the_arn_and_context_on_an_existing_slot() {
+        clear_request_state();
+        let id = "slot-arn";
+        ensure_lmi_request_slot(id);
+
+        let state = create_request_processing_state(id, "arn:from-invoke", &processor_factory_for_slot_tests());
+
+        assert_eq!(state.context.lock().unwrap().invoked_function_arn, "arn:from-invoke");
+        assert_eq!(get_request_context(id).unwrap().lock().unwrap().invoked_function_arn, "arn:from-invoke");
+        clear_request_state();
+    }
+
     // ========================================================================
     // cleanup_old_request_buffers tests
     // ========================================================================

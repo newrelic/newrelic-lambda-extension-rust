@@ -307,6 +307,25 @@ pub fn record_runtime_done_with_duration(request_id: &str, duration_ms: Option<f
     record_runtime_done(request_id);
 }
 
+/// `status` of each request's `platform.runtimeDone` event (`success`, `failure`, `error`,
+/// `timeout`). Kept only to tell whether a short invoke ended in error.
+static RUNTIME_DONE_STATUS: Lazy<DashMap<String, String>> = Lazy::new(DashMap::new);
+
+/// Store `runtimeDone`'s status. Call before `record_runtime_done_with_duration` so whoever
+/// that wakes can already read it.
+pub fn record_runtime_done_status(request_id: &str, status: Option<&str>) {
+    if let Some(status) = status {
+        RUNTIME_DONE_STATUS.insert(request_id.to_string(), status.to_string());
+    }
+}
+
+/// Whether `runtimeDone` reported anything but success for `request_id`.
+pub fn runtime_done_failed(request_id: &str) -> bool {
+    RUNTIME_DONE_STATUS
+        .get(request_id)
+        .is_some_and(|s| !s.eq_ignore_ascii_case("success"))
+}
+
 /// The runtime duration Lambda reported for `request_id`, if `runtimeDone` has arrived
 /// and carried one.
 pub fn get_runtime_done_duration_ms(request_id: &str) -> Option<f64> {
@@ -404,7 +423,44 @@ pub fn create_request_processing_state(
     let log_processor = processor_factory.create_log_processor(context.clone());
     let platform_processor = processor_factory.create_platform_processor(context.clone(), log_processor.clone());
 
-    let agent_buffer = Arc::new(Mutex::new(Vec::new()));
+    // The listener can create this request's slot on `platform.start` before the INVOKE is
+    // handled, and `platform.runtimeDone` or an agent payload can reach it before then too.
+    // Keep that slot (its buffer, its notify and the time runtimeDone fired): replacing it
+    // would lose the wake-up, and the extension would wait for the whole deadline.
+    let (agent_buffer, runtime_done_notify, runtime_done_at_ms) = match REQUEST_DATA.entry(request_id.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+            let existing = slot.get_mut();
+            existing.context = context.clone();
+            existing.invoked_function_arn = invoked_function_arn.to_string();
+            existing.creation_invocation = current_invocation_count();
+            (
+                existing.agent_buffer.clone(),
+                existing.runtime_done_notify.clone(),
+                existing.runtime_done_at_ms.clone(),
+            )
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            let created = RequestData {
+                context: context.clone(),
+                agent_buffer: Arc::new(Mutex::new(Vec::new())),
+                pending_report: None,
+                creation_invocation: current_invocation_count(),
+                runtime_done_notify: Arc::new(Notify::new()),
+                runtime_done_at_ms: Arc::new(AtomicI64::new(0)),
+                pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+                invoked_function_arn: invoked_function_arn.to_string(),
+            };
+            let parts = (
+                created.agent_buffer.clone(),
+                created.runtime_done_notify.clone(),
+                created.runtime_done_at_ms.clone(),
+            );
+            // Inserted BEFORE checking PREFIRED_RUNTIME_DONE below, not after: a runtimeDone
+            // arriving in between would be missed by both and never signalled.
+            vacant.insert(created);
+            parts
+        }
+    };
 
     // Drain orphaned payloads into this request's buffer
     // Orphaned payloads arrive via named pipe before the first INVOKE event creates a request
@@ -422,29 +478,10 @@ pub fn create_request_processing_state(
         }
     }
 
-    let runtime_done_notify = Arc::new(Notify::new());
-    let runtime_done_at_ms = Arc::new(AtomicI64::new(0));
-
-    // Insert into REQUEST_DATA BEFORE checking PREFIRED_RUNTIME_DONE below, not
-    // after — otherwise a runtimeDone arriving in between would be missed by both
-    // and never signalled.
-    REQUEST_DATA.insert(request_id.to_string(), RequestData {
-        context: context.clone(),
-        agent_buffer: agent_buffer.clone(),
-        pending_report: None,
-        creation_invocation: current_invocation_count(),
-        runtime_done_notify: runtime_done_notify.clone(),
-        runtime_done_at_ms: runtime_done_at_ms.clone(),
-        pending_send_handles: Arc::new(Mutex::new(Vec::new())),
-        invoked_function_arn: invoked_function_arn.to_string(),
-    });
-
-    // If platform.runtimeDone already fired for this request before the insert
-    // above (fast functions where runtimeDone races the event loop setup), fire
-    // the notify now so wait_for_runtime_done_with_grace doesn't sleep until the
-    // deadline — and carry the timestamp it fired at forward onto
-    // runtime_done_at_ms rather than losing it (the Notify permit alone doesn't
-    // tell a later "how late" check when it actually happened).
+    // If platform.runtimeDone already fired for this request before the entry existed
+    // (fast functions where runtimeDone races the event loop setup), fire the notify now so
+    // the wait for it doesn't sleep until the deadline — and carry the timestamp it fired at
+    // forward onto runtime_done_at_ms rather than losing it.
     if let Some((_, ts)) = PREFIRED_RUNTIME_DONE.remove(request_id) {
         tracing::debug!(
             "runtime.done pre-fire detected for {} (fired at {}) — signalling notify immediately",
@@ -481,6 +518,7 @@ pub fn cleanup_request_processing_state_internal(request_id: &str, skip_buffer_c
         REQUEST_DATA.remove(request_id);
         PREFIRED_RUNTIME_DONE.remove(request_id);
         RUNTIME_DONE_DURATION_MS.remove(request_id);
+        RUNTIME_DONE_STATUS.remove(request_id);
     }
     // Partial cleanup (skip_buffer_cleanup=true): keep context/buffer/creation_invocation
     // AND pending_report — do not clear it here. It was already .take()n by

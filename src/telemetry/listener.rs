@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     convert::Infallible,
 };
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use hyper::{Request, Response, StatusCode};
 use hyper::body::{Incoming, Bytes};
 use hyper::service::service_fn;
@@ -56,6 +56,55 @@ pub struct TelemetryRecord {
     #[serde(rename = "type")]
     pub record_type: String,
     pub record: serde_json::Value,
+}
+
+/// When the listener was busy handling recent Telemetry batches: (received, answered). Lambda
+/// hands over the next batch only after the previous one is answered, so this separates a
+/// delivery that was held up by our own handling from one the platform made late by itself.
+static RECENT_BATCHES: once_cell::sync::Lazy<std::sync::Mutex<std::collections::VecDeque<(DateTime<Utc>, DateTime<Utc>)>>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+const RECENT_BATCHES_KEPT: usize = 16;
+
+fn note_batch_handled(received: DateTime<Utc>, answered: DateTime<Utc>) {
+    let mut recent = RECENT_BATCHES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if recent.len() >= RECENT_BATCHES_KEPT {
+        recent.pop_front();
+    }
+    recent.push_back((received, answered));
+}
+
+/// Milliseconds of `[from, to]` during which the listener was handling a batch (batches that
+/// overlap count once).
+pub(crate) fn busy_ms_within(batches: &[(DateTime<Utc>, DateTime<Utc>)], from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    if to <= from {
+        return 0;
+    }
+    let mut clipped: Vec<(DateTime<Utc>, DateTime<Utc>)> = batches
+        .iter()
+        .map(|&(start, end)| (start.max(from), end.min(to)))
+        .filter(|(start, end)| start < end)
+        .collect();
+    clipped.sort();
+    let mut busy = 0;
+    let mut covered_to: Option<DateTime<Utc>> = None;
+    for (start, end) in clipped {
+        let begin = covered_to.map_or(start, |c| start.max(c));
+        if end > begin {
+            busy += (end - begin).num_milliseconds();
+            covered_to = Some(end);
+        }
+    }
+    busy
+}
+
+fn busy_with_earlier_batches_ms(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    let recent: Vec<_> = RECENT_BATCHES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .copied()
+        .collect();
+    busy_ms_within(&recent, from, to)
 }
 
 /// Starts a simple HTTP listener to receive telemetry events.
@@ -117,6 +166,20 @@ async fn handle_telemetry_request(
     is_apm_mode: bool,
     is_lmi: bool,
 ) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
+    let received = Utc::now();
+    let response = handle_telemetry_batch(req, log_processor, platform_processor, is_apm_mode, is_lmi, received).await;
+    note_batch_handled(received, Utc::now());
+    response
+}
+
+async fn handle_telemetry_batch(
+    req: Request<Incoming>,
+    log_processor: Arc<LogProcessor>,
+    platform_processor: Arc<PlatformProcessor>,
+    is_apm_mode: bool,
+    is_lmi: bool,
+    batch_received: DateTime<Utc>,
+) -> std::result::Result<Response<Full<Bytes>>, Infallible> {
     let body_bytes = match req.collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(_) => {
@@ -131,6 +194,10 @@ async fn handle_telemetry_request(
 
     match serde_json::from_str::<Vec<TelemetryRecord>>(&body_str) {
         Ok(records) => {
+            // For the runtimeDone timing log: how long this batch had been in our hands, and
+            // how many records it carried, by the time we got to runtimeDone.
+            let batch_started = std::time::Instant::now();
+            let batch_len = records.len();
             let mut function_completed = false;
             let mut function_count = 0;
             let mut extension_count = 0;
@@ -172,7 +239,34 @@ async fn handle_telemetry_request(
                     "platform.runtimeDone" => {
                         if let Some(request_id_value) = record.record.get("requestId") {
                             if let Some(request_id_str) = request_id_value.as_str() {
-                                debug!("platform.runtimeDone received for request: {}", request_id_str);
+                                info!(
+                                    "runtimeDone timeline: request={} platform_stamp={} batch_received={} stamp_to_received_ms={} listener_busy_in_that_time_ms={} lambda_handler_ms={} records_in_batch={}",
+                                    request_id_str,
+                                    record.time.format("%H:%M:%S%.3f"),
+                                    batch_received.format("%H:%M:%S%.3f"),
+                                    (batch_received - record.time).num_milliseconds(),
+                                    busy_with_earlier_batches_ms(record.time, batch_received),
+                                    record
+                                        .record
+                                        .get("metrics")
+                                        .and_then(|m| m.get("durationMs"))
+                                        .and_then(serde_json::Value::as_f64)
+                                        .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.1}")),
+                                    batch_len,
+                                );
+                                debug!(
+                                    "platform.runtimeDone received for request: {} (platform stamped it {}ms ago; {} record(s) in this batch, {}ms spent on the batch before this record; Lambda handler time: {})",
+                                    request_id_str,
+                                    (Utc::now() - record.time).num_milliseconds(),
+                                    batch_len,
+                                    batch_started.elapsed().as_millis(),
+                                    record
+                                        .record
+                                        .get("metrics")
+                                        .and_then(|m| m.get("durationMs"))
+                                        .and_then(serde_json::Value::as_f64)
+                                        .map_or_else(|| "n/a".to_string(), |ms| format!("{ms:.1}ms")),
+                                );
                                 // Wakes the event loop's end-of-invocation flush waiter AND
                                 // records the firing timestamp (on RequestData if it exists
                                 // yet, else in PREFIRED_RUNTIME_DONE for
@@ -184,6 +278,10 @@ async fn handle_telemetry_request(
                                     .get("metrics")
                                     .and_then(|m| m.get("durationMs"))
                                     .and_then(serde_json::Value::as_f64);
+                                crate::request::record_runtime_done_status(
+                                    request_id_str,
+                                    record.record.get("status").and_then(serde_json::Value::as_str),
+                                );
                                 crate::request::record_runtime_done_with_duration(request_id_str, duration_ms);
                             }
                         }
@@ -195,7 +293,14 @@ async fn handle_telemetry_request(
                             if let Some(request_id_str) = request_id_value.as_str() {
                                 if let Some(report_line) = platform_processor.convert_platform_report_to_log_line(&record) {
 
-                                    if is_apm_mode {
+                                    if is_apm_mode && !is_lmi && crate::event_loop::reports_ride_the_batch() {
+                                        // High tier: never send here. This handler answers Lambda's
+                                        // delivery request only when it returns, so a slow send would
+                                        // hold back the next batch of events (runtimeDone with it).
+                                        // The next INVOKE's batch sends the report.
+                                        crate::event_loop::stash_platform_report(request_id_str, report_line);
+                                        debug!("APM mode (high): platform.report for {} kept for the next batch", request_id_str);
+                                    } else if is_apm_mode {
                                         // APM MODE: Send platform.report as metrics immediately, NO matching with agent payloads
                                         let apm_app_read = crate::APM_APP.read().await;
                                         let current_arn = crate::get_global_fallback_arn();

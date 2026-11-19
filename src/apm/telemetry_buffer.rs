@@ -182,7 +182,7 @@ pub async fn retry_buffered_telemetry(
                 retry_failed_count += 1;
                 warn!(
                     "Failed to retry {} for request {}: {}",
-                    item.telemetry_type, item.request_id, e
+                    item.telemetry_type, item.request_id, crate::newrelic::send_error::describe_anyhow(&e)
                 );
 
                 // 409/401: session expired — not a data error. Don't consume a retry slot;

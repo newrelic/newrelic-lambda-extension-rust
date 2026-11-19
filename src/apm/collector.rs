@@ -154,7 +154,7 @@ impl std::fmt::Display for MetricApiError {
             MetricApiError::Permanent { status } => {
                 write!(f, "Metric API permanent error (status {status})")
             }
-            MetricApiError::Network(e) => write!(f, "Metric API network error: {e}"),
+            MetricApiError::Network(e) => write!(f, "Metric API network error: {}", crate::newrelic::send_error::describe_anyhow(e)),
         }
     }
 }
@@ -412,7 +412,7 @@ pub async fn send_platform_metrics(
             // license key travels in the `Api-Key` header here (not the URL), but
             // strip the URL anyway for defense-in-depth before logging.
             let e = e.without_url();
-            warn!("Platform metrics network error: {} - will retry", e);
+            warn!("Platform metrics network error: {} - will retry", crate::newrelic::send_error::describe_reqwest_error(&e));
             return Err(MetricApiError::Network(anyhow::Error::new(e)));
         }
     };

@@ -1547,8 +1547,7 @@ fn test_extension_settings_all_fields() {
         ignore_errors: std::collections::HashSet::new(),
         expected_errors: std::collections::HashSet::new(),
         send_tier: crate::send::SendTier::Default,
-        short_invoke_threshold_ms: 20,
-        hold_cap_ms: 500,
+        short_invoke_threshold_ms: 10,
         payload_window_ms: 25,
         batch_max_age_ms: 30_000,
         shutdown_batch_wait_ms: 2_000,
@@ -2283,16 +2282,16 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
 
 
 #[test]
-fn test_short_invoke_threshold_defaults_to_20ms() {
-    assert_eq!(ExtensionSettings::default().short_invoke_threshold_ms, 20);
+fn test_short_invoke_threshold_defaults_to_10ms() {
+    assert_eq!(ExtensionSettings::default().short_invoke_threshold_ms, 10);
 }
 
 #[test]
 fn test_high_tier_timing_defaults() {
     let s = ExtensionSettings::default();
     assert_eq!(
-        (s.hold_cap_ms, s.payload_window_ms, s.batch_max_age_ms, s.shutdown_batch_wait_ms),
-        (crate::newrelic::client::SEND_TIMEOUT.as_millis() as u64, 25, 30_000, 2_000)
+        (s.payload_window_ms, s.batch_max_age_ms, s.shutdown_batch_wait_ms),
+        (25, 30_000, 2_000)
     );
 }
 

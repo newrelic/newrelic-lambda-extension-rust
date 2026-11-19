@@ -471,6 +471,43 @@ mod tests {
         clear_telemetry_state();
     }
 
+    // High tier: the listener must not send the report (that would delay the answer to Lambda,
+    // and the next batch with runtimeDone in it); it keeps it for the next batch instead.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn high_tier_listener_keeps_the_report_for_the_next_batch_and_does_not_send_it() {
+        clear_telemetry_state();
+        let _ = crate::event_loop::take_stashed_reports("");
+        crate::event_loop::set_reports_ride_the_batch(true);
+        let (log_processor, platform_processor) = create_test_processors();
+        let addr = setup_telemetry_listener(log_processor, platform_processor, true, false).await.expect("listener");
+
+        let body = serde_json::json!([{
+            "time": "2024-01-01T00:00:00Z",
+            "type": "platform.report",
+            "record": {
+                "requestId": "report-high-1",
+                "metrics": {"durationMs": 100.5, "billedDurationMs": 200, "memorySizeMB": 128, "maxMemoryUsedMB": 64}
+            }
+        }]);
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{}/", addr.port()))
+            .json(&body)
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        let kept = crate::event_loop::take_stashed_reports("");
+        assert_eq!(kept.len(), 1, "the report is kept for the next batch");
+        assert_eq!(kept[0].request_id, "report-high-1");
+        assert!(crate::request::get_pending_report("report-high-1").is_none(), "and not parked as a failed send");
+
+        crate::event_loop::set_reports_ride_the_batch(false);
+        clear_telemetry_state();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[serial]
     async fn test_handle_platform_report_matches_batch_buffer() {
@@ -1955,5 +1992,42 @@ mod tests {
 
         reset_lmi_cold_start_seen();
         clear_telemetry_state();
+    }
+}
+
+#[cfg(test)]
+mod busy_time_tests {
+    use crate::telemetry::listener::busy_ms_within;
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn at(ms: i64) -> DateTime<Utc> {
+        Utc.timestamp_millis_opt(1_700_000_000_000 + ms).unwrap()
+    }
+
+    #[test]
+    fn counts_only_the_part_of_each_batch_inside_the_window() {
+        // batches handled at 0-100, 150-300 and 900-950; window 50..200
+        let batches = [(at(0), at(100)), (at(150), at(300)), (at(900), at(950))];
+        assert_eq!(busy_ms_within(&batches, at(50), at(200)), 50 + 50);
+    }
+
+    #[test]
+    fn overlapping_batches_are_counted_once() {
+        let batches = [(at(0), at(200)), (at(100), at(300))];
+        assert_eq!(busy_ms_within(&batches, at(0), at(300)), 300);
+    }
+
+    #[test]
+    fn an_idle_listener_has_no_busy_time() {
+        let batches = [(at(0), at(10))];
+        assert_eq!(busy_ms_within(&batches, at(100), at(400)), 0);
+        assert_eq!(busy_ms_within(&[], at(0), at(400)), 0);
+    }
+
+    #[test]
+    fn an_empty_or_backwards_window_is_zero() {
+        let batches = [(at(0), at(500))];
+        assert_eq!(busy_ms_within(&batches, at(300), at(300)), 0);
+        assert_eq!(busy_ms_within(&batches, at(400), at(300)), 0);
     }
 }

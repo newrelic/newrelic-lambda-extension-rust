@@ -583,7 +583,7 @@ impl NewRelicClient {
                     crate::newrelic::tls_fallback::classify_and_maybe_flip(&e);
 
                     if retries == 0 {
-                        warn!("Network error sending payload: {}", e);
+                        warn!("Network error sending payload: {}", crate::newrelic::send_error::describe_reqwest_error(&e));
                     }
                     if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                         retries += 1;

@@ -574,6 +574,11 @@ async fn perform_one_time_initialization(
                 temp_log_processor.set_fallback_arn(arn);
             }
 
+            crate::event_loop::set_reports_ride_the_batch(
+                config.extension.send_tier == crate::send::SendTier::High
+                    && config.new_relic.apm_lambda_mode
+                    && !config.deployment.is_lmi(),
+            );
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
@@ -605,6 +610,11 @@ async fn perform_one_time_initialization(
                 temp_log_processor.set_fallback_arn(arn);
             }
 
+            crate::event_loop::set_reports_ride_the_batch(
+                config.extension.send_tier == crate::send::SendTier::High
+                    && config.new_relic.apm_lambda_mode
+                    && !config.deployment.is_lmi(),
+            );
             let telemetry_listener_address = setup_telemetry_listener(
                 temp_log_processor.clone(),
                 temp_platform_processor,
