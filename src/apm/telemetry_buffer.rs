@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
+use crate::send::concurrent::{join_all_concurrently, BoxedFuture};
 use tracing::{debug, error, warn};
 
 /// Sentinel telemetry type for *synthesized* error events (timeout/fault errors).
@@ -74,6 +75,15 @@ pub fn buffer_failed_telemetry(
     }
 }
 
+/// What happened to one buffered item during a retry pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOutcome {
+    Success,
+    Failed,
+    /// Dropped (too old, unknown type): neither a success nor a failure.
+    Skipped,
+}
+
 /// Retry all buffered telemetry.
 ///
 /// `current_run_id`/`current_collector_host`, when supplied, OVERRIDE the values
@@ -107,10 +117,12 @@ pub async fn retry_buffered_telemetry(
         failed_telemetry.len()
     );
 
-    let mut retry_success_count = 0;
-    let mut retry_failed_count = 0;
-
-    for mut item in failed_telemetry {
+    // Every item is retried at once: a timeout on one must not make the others wait behind it.
+    let outcomes = join_all_concurrently(
+        failed_telemetry
+            .into_iter()
+            .map(|mut item| {
+                Box::pin(async move {
         // Check age - drop if older than 1 hour (Lambda container lifecycle is short)
         let age = Utc::now().signed_duration_since(item.failed_at);
         if age.num_minutes() > 60 {
@@ -120,7 +132,7 @@ pub async fn retry_buffered_telemetry(
                 age.num_minutes(),
                 item.request_id
             );
-            continue;
+            return RetryOutcome::Skipped;
         }
 
         debug!(
@@ -155,7 +167,7 @@ pub async fn retry_buffered_telemetry(
                 "sql_trace_data" => super::collector::CMD_SLOW_SQLS,
                 _ => {
                     warn!("Unknown telemetry type: {}", item.telemetry_type);
-                    continue;
+                    return RetryOutcome::Skipped;
                 }
             };
             super::collector::send_apm_telemetry(
@@ -172,14 +184,13 @@ pub async fn retry_buffered_telemetry(
 
         match result {
             Ok(()) => {
-                retry_success_count += 1;
                 debug!(
                     "Successfully retried {} for request {}",
                     item.telemetry_type, item.request_id
                 );
+                RetryOutcome::Success
             }
             Err(e) => {
-                retry_failed_count += 1;
                 warn!(
                     "Failed to retry {} for request {}: {}",
                     item.telemetry_type, item.request_id, crate::newrelic::send_error::describe_anyhow(&e)
@@ -212,9 +223,16 @@ pub async fn retry_buffered_telemetry(
                         );
                     }
                 }
+                RetryOutcome::Failed
             }
         }
-    }
+                }) as BoxedFuture<'_, RetryOutcome>
+            })
+            .collect(),
+    )
+    .await;
+    let retry_success_count = outcomes.iter().filter(|o| **o == RetryOutcome::Success).count();
+    let retry_failed_count = outcomes.iter().filter(|o| **o == RetryOutcome::Failed).count();
 
     if retry_success_count > 0 || retry_failed_count > 0 {
         debug!(

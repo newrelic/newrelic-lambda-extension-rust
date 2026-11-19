@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use crate::send::concurrent::{join_all_concurrently, BoxedFuture};
 use tracing::{debug, error, warn};
 
 /// Maximum retry attempts before a metric batch is dropped.
@@ -73,6 +74,14 @@ pub fn buffer_failed_metric_api(metrics: Vec<Value>, endpoint: String, retry_aft
     }
 }
 
+/// What happened to one buffered batch during a retry pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryOutcome {
+    Success,
+    Failed,
+    /// Not retried: backoff not elapsed, or too old.
+    Skipped,
+}
 /// Retry all buffered platform-metric batches.
 pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::DualTlsClient, license_key: &str) {
     let buffered = {
@@ -94,15 +103,18 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
     );
 
     let now = Utc::now();
-    let mut success = 0;
-    let mut still_failed = 0;
 
-    for mut item in buffered {
+    // Every batch is retried at once: a timeout on one must not make the others wait behind it.
+    let outcomes = join_all_concurrently(
+        buffered
+            .into_iter()
+            .map(|mut item| {
+                Box::pin(async move {
         // Honor Retry-After: re-buffer untouched if the backoff window hasn't elapsed.
         if let Some(next) = item.next_retry_at {
             if now < next {
                 re_buffer(item);
-                continue;
+                return RetryOutcome::Skipped;
             }
         }
 
@@ -113,7 +125,7 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
                 now.signed_duration_since(item.failed_at).num_minutes(),
                 item.retry_count
             );
-            continue;
+            return RetryOutcome::Skipped;
         }
 
         item.retry_count += 1;
@@ -127,15 +139,14 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
         .await
         {
             Ok(()) => {
-                success += 1;
                 debug!("Successfully retried platform metrics (attempt {})", item.retry_count);
+                RetryOutcome::Success
             }
             Err(e) if e.is_permanent() => {
-                still_failed += 1;
                 error!("Dropping platform metrics after permanent error on retry: {}", e);
+                RetryOutcome::Failed
             }
             Err(e) => {
-                still_failed += 1;
                 if item.retry_count < MAX_RETRY_ATTEMPTS {
                     item.next_retry_at = e.retry_after().and_then(|d| {
                         chrono::Duration::from_std(d).ok().map(|cd| Utc::now() + cd)
@@ -147,9 +158,16 @@ pub async fn retry_buffered_metric_api(client: &crate::newrelic::tls_fallback::D
                         item.retry_count, e
                     );
                 }
+                RetryOutcome::Failed
             }
         }
-    }
+                }) as BoxedFuture<'_, RetryOutcome>
+            })
+            .collect(),
+    )
+    .await;
+    let success = outcomes.iter().filter(|o| **o == RetryOutcome::Success).count();
+    let still_failed = outcomes.iter().filter(|o| **o == RetryOutcome::Failed).count();
 
     if success > 0 || still_failed > 0 {
         debug!(

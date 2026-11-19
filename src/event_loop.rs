@@ -8,6 +8,7 @@ use tokio::sync::watch;
 use std::time::Duration;
 use reqwest::Client;
 use tracing::{debug, error, info, trace, warn};
+use crate::send::concurrent::{join_all_concurrently, BoxedFuture};
 
 use crate::{
     runtime,
@@ -2783,42 +2784,6 @@ async fn wait_for_runtime_done_with_grace(
     // else: wait_for_runtime_done already logged the deadline-reached case.
 }
 
-/// A future that is boxed so a list of different async blocks can be run together.
-type BoxedFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
-
-/// Run every future at the same time and return once all have finished, with the results in
-/// input order. (No `futures` dependency is needed for this: it polls each one until done.)
-async fn join_all_concurrently<'a, T>(futures: Vec<BoxedFuture<'a, T>>) -> Vec<T> {
-    let mut slots: Vec<Option<BoxedFuture<'a, T>>> = futures.into_iter().map(Some).collect();
-    let mut results: Vec<Option<T>> = (0..slots.len()).map(|_| None).collect();
-    std::future::poll_fn(|cx| {
-        let mut pending = false;
-        for (index, slot) in slots.iter_mut().enumerate() {
-            let finished = match slot.as_mut() {
-                Some(future) => match future.as_mut().poll(cx) {
-                    std::task::Poll::Ready(value) => Some(value),
-                    std::task::Poll::Pending => {
-                        pending = true;
-                        None
-                    }
-                },
-                None => None,
-            };
-            if let Some(value) = finished {
-                results[index] = Some(value);
-                *slot = None;
-            }
-        }
-        if pending {
-            std::task::Poll::Pending
-        } else {
-            std::task::Poll::Ready(())
-        }
-    })
-    .await;
-    results.into_iter().flatten().collect()
-}
-
 /// One agent payload still buffered when SHUTDOWN arrives.
 struct ShutdownPayload {
     request_id: String,
@@ -3974,6 +3939,17 @@ pub(crate) fn buffer_failed_agent_payload(
     }
 }
 
+/// What happened to one buffered agent payload during a retry pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPayloadOutcome {
+    Success,
+    Failed,
+    /// APM had no session yet: kept buffered, not a failed send.
+    NotConnected,
+    /// Dropped for being absurdly old.
+    Skipped,
+}
+
 /// Retry failed agent payloads via the APM collector (APM mode only).
 ///
 /// `FAILED_AGENT_PAYLOADS` is populated solely by the APM payload path
@@ -3983,9 +3959,6 @@ pub(crate) fn buffer_failed_agent_payload(
 /// Payloads that still can't be sent (APM not connected) stay buffered for the next
 /// invoke / shutdown. Mirrors the Err→re-buffer convention of the initial send path.
 async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
-    let mut retry_successful_count = 0;
-    let mut retry_failed_count = 0;
-
     let failed_payloads = {
         if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
             std::mem::take(&mut *failed_payloads)
@@ -4005,7 +3978,13 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
         failed_payloads.len()
     );
 
-    for mut failed_payload in failed_payloads {
+    // Every payload is retried at once: a timeout on one must not make the others wait behind it.
+    let apm_app = &apm_app;
+    let outcomes = join_all_concurrently(
+        failed_payloads
+            .into_iter()
+            .map(|mut failed_payload| {
+                Box::pin(async move {
         failed_payload.retry_count += 1;
 
         // A sandbox lives at most ~30 min, so this 24h guard effectively never
@@ -4020,7 +3999,7 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
                 failed_payload.request_id
             );
             DROPPED_AGENT_PAYLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            continue;
+            return RetryPayloadOutcome::Skipped;
         }
 
         debug!(
@@ -4046,19 +4025,19 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
 
         match send_result {
             Some(Ok(())) => {
-                retry_successful_count += 1;
                 info!(
                     "Successfully retried agent payload for request {} (APM collector)",
                     failed_payload.request_id
                 );
+                RetryPayloadOutcome::Success
             }
             Some(Err(e)) => {
-                retry_failed_count += 1;
                 warn!("Failed to retry agent payload to APM collector: {}", e);
                 // Keep it buffered (capped) so it retries on the next invoke / reconnect.
                 if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
                     push_failed_payload_capped(&mut failed_payloads, failed_payload);
                 }
+                RetryPayloadOutcome::Failed
             }
             None => {
                 // APM not connected yet — not a failed send; keep buffered for later.
@@ -4069,9 +4048,16 @@ async fn retry_failed_agent_payloads(apm_app: crate::apm::SharedApmApp) {
                 if let Ok(mut failed_payloads) = FAILED_AGENT_PAYLOADS.lock() {
                     push_failed_payload_capped(&mut failed_payloads, failed_payload);
                 }
+                RetryPayloadOutcome::NotConnected
             }
         }
-    }
+                }) as BoxedFuture<'_, RetryPayloadOutcome>
+            })
+            .collect(),
+    )
+    .await;
+    let retry_successful_count = outcomes.iter().filter(|o| **o == RetryPayloadOutcome::Success).count();
+    let retry_failed_count = outcomes.iter().filter(|o| **o == RetryPayloadOutcome::Failed).count();
 
     if retry_successful_count > 0 || retry_failed_count > 0 {
         debug!(

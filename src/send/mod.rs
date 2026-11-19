@@ -25,6 +25,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod circuit_breaker;
+pub(crate) mod concurrent;
 pub mod scheduler;
 #[cfg(test)]
 mod scheduler_integration_tests;
