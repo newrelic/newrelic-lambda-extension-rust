@@ -2174,7 +2174,14 @@ impl LogProcessor {
 
         const MAX_SPLIT_DEPTH: u8 = 4;
 
-        match client.send_logs(config, &chunk, function_arn).await {
+        // APM mode (both tiers): one attempt, a failed chunk is carried to the next invoke.
+        let single_attempt = self.apm_app.is_some();
+        let sent = if single_attempt {
+            client.send_logs_once(config, &chunk, function_arn).await
+        } else {
+            client.send_logs(config, &chunk, function_arn).await
+        };
+        match sent {
             Ok(()) => Ok(()),
             Err(e) => {
                 let msg = e.to_string();

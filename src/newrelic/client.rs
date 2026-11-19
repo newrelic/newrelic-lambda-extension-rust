@@ -263,6 +263,26 @@ impl NewRelicClient {
         batch: &[payload::LogMessage],
         function_arn: &str,
     ) -> Result<(), SendError> {
+        self.send_logs_inner(config, batch, function_arn, false).await
+    }
+
+    /// Like `send_logs`, but one attempt only: a failure is returned for the caller to carry forward.
+    pub async fn send_logs_once(
+        &self,
+        config: &ExtensionConfig,
+        batch: &[payload::LogMessage],
+        function_arn: &str,
+    ) -> Result<(), SendError> {
+        self.send_logs_inner(config, batch, function_arn, true).await
+    }
+
+    async fn send_logs_inner(
+        &self,
+        config: &ExtensionConfig,
+        batch: &[payload::LogMessage],
+        function_arn: &str,
+        single_attempt: bool,
+    ) -> Result<(), SendError> {
         if batch.is_empty() {
             warn!("Attempted to send empty log batch");
             return Ok(());
@@ -308,6 +328,7 @@ impl NewRelicClient {
             body,
             Some(log_count),
             config.new_relic.data_collection_timeout,
+            single_attempt,
         )
         .await
     }
@@ -498,6 +519,7 @@ impl NewRelicClient {
         body: String,
         log_count: Option<usize>,
         budget: Option<std::time::Duration>,
+        single_attempt: bool,
     ) -> Result<(), SendError> {
         let start_time = std::time::Instant::now();
         let uncompressed_size = body.len();
@@ -565,7 +587,7 @@ impl NewRelicClient {
                         if status.is_client_error() {
                             return Err(SendError::ClientRejected { status: status.as_u16() });
                         }
-                        if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
+                        if !single_attempt && retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                             retries += 1;
                             let delay = match budget {
                                 Some(_) => get_growing_backoff_delay(retries),
@@ -585,7 +607,7 @@ impl NewRelicClient {
                     if retries == 0 {
                         warn!("Network error sending payload: {}", crate::newrelic::send_error::describe_reqwest_error(&e));
                     }
-                    if retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
+                    if !single_attempt && retry_allowed(retries, start_time.elapsed(), budget, MAX_RETRIES) {
                         retries += 1;
                         let delay = match budget {
                             Some(_) => get_growing_backoff_delay(retries),
