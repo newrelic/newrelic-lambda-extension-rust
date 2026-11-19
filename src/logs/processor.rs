@@ -2175,6 +2175,9 @@ impl LogProcessor {
         const MAX_SPLIT_DEPTH: u8 = 4;
 
         // APM mode (both tiers): one attempt, a failed chunk is carried to the next invoke.
+        // Keyed on the mode itself, not on `self.apm_app.is_some()`: the processor is handed an
+        // APM handle in every mode (it holds `None` when APM is off), so that check would also be
+        // true in serverless mode and turn off the retries that mode relies on.
         let single_attempt = config.new_relic.apm_lambda_mode;
         let sent = if single_attempt {
             client.send_logs_once(config, &chunk, function_arn).await

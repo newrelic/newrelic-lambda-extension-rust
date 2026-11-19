@@ -2855,4 +2855,60 @@ mod coverage_tests {
         p.process_record(rec("ERROR")).await;
         assert_eq!(p.log_batch.lock().unwrap().len(), 1, "its ERROR log is kept");
     }
+
+    // ── logs: one attempt in APM mode, the usual retries in serverless mode ───────────────────
+
+    async fn failing_log_server() -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A processor built the way `ProcessorFactory` builds it: it is always handed an APM
+    /// handle, even when APM mode is off (the handle then simply holds `None`).
+    fn processor_for_mode(server: &wiremock::MockServer, apm_lambda_mode: bool) -> (LogProcessor, NewRelicClient, ExtensionConfig) {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.log_endpoint = format!("{}/log/v1", server.uri());
+        config.new_relic.apm_lambda_mode = apm_lambda_mode;
+        let config = Arc::new(config);
+        let client = NewRelicClient::new(&config);
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        let apm_handle = Some(Arc::new(tokio::sync::RwLock::new(None)));
+        let processor = LogProcessor::new(Arc::new(NewRelicClient::new(&config)), config.clone(), ctx, apm_handle);
+        (processor, client, (*config).clone())
+    }
+
+    #[tokio::test]
+    async fn apm_mode_makes_one_attempt_to_send_a_log_chunk() {
+        let server = failing_log_server().await;
+        let (p, client, config) = processor_for_mode(&server, true);
+
+        let result = p
+            .try_send_chunk(&client, &config, vec![make_log("one")], "arn:aws:lambda:us-east-1:123:function:f")
+            .await;
+
+        assert!(result.is_err(), "the chunk is handed back to be carried to the next invoke");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1, "no retry inside the call");
+    }
+
+    #[tokio::test]
+    async fn serverless_mode_still_retries_a_failing_log_endpoint() {
+        let server = failing_log_server().await;
+        let (p, client, config) = processor_for_mode(&server, false);
+
+        let result = p
+            .try_send_chunk(&client, &config, vec![make_log("one")], "arn:aws:lambda:us-east-1:123:function:f")
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            4,
+            "serverless mode keeps its first attempt plus 3 retries"
+        );
+    }
 }
