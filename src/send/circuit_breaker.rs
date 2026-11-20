@@ -47,6 +47,11 @@ pub trait CircuitBreaker: Send + Sync {
 
     /// Current state per kind, for logging state transitions.
     fn state(&self, kind: SendKind) -> BreakerState;
+
+    /// The retry that `allow_send` let through never ran, so there is no result to record.
+    /// Goes back to Open with the full `2N` already skipped, so the next call retries again.
+    /// A no-op unless the kind is `HalfOpen`.
+    fn release_probe(&self, _kind: SendKind) {}
 }
 
 /// Stub implementation: always allows sends, never opens. Kept for tests and as
@@ -200,6 +205,16 @@ impl CircuitBreaker for ConsecutiveFailureBreaker {
     fn state(&self, kind: SendKind) -> BreakerState {
         self.state.lock().unwrap().get(&kind).map_or(BreakerState::Closed, |s| s.state)
     }
+
+    fn release_probe(&self, kind: SendKind) {
+        let open_window = self.open_window();
+        let mut map = self.state.lock().unwrap();
+        let entry = map.entry(kind).or_default();
+        if entry.state == BreakerState::HalfOpen {
+            entry.state = BreakerState::Open;
+            entry.skips_while_open = open_window;
+        }
+    }
 }
 
 /// The one env var this module introduces: the failure threshold `N`.
@@ -229,7 +244,7 @@ pub fn parse_threshold(raw: &str, default: u32) -> u32 {
     })
 }
 
-fn threshold_from_env(default: u32) -> u32 {
+pub fn threshold_from_env(default: u32) -> u32 {
     std::env::var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR).map_or(default, |raw| parse_threshold(&raw, default))
 }
 
@@ -403,3 +418,7 @@ mod tests {
         assert_eq!(parse_threshold("-1", 7), 7);
     }
 }
+
+#[cfg(test)]
+#[path = "circuit_breaker_tests.rs"]
+mod circuit_breaker_tests;

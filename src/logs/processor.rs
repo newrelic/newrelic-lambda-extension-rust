@@ -178,6 +178,14 @@ struct FailedLogEntry {
 
 /// Configuration constants for batching and retry logic
 const MAX_RETRIES: usize = 3;
+
+/// Log chunks whose send failed and was kept for a later retry, since startup.
+static LOG_SEND_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many log chunks have failed to send so far; compare before and after a flush.
+pub fn log_send_failure_count() -> u64 {
+    LOG_SEND_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Per-LogType capacity. Each of Function/Platform/Extension has its own queue,
 /// so the overall cap equals `MAX_FAILED_BUFFER_PER_TYPE * 3 = 300` — preserving
 /// the original total. With per-type queues, eviction is O(1) (pop_front on the
@@ -2238,6 +2246,7 @@ impl LogProcessor {
                         Err((std::io::Error::new(std::io::ErrorKind::InvalidData, msg), Vec::new()))
                     }
                     SendError::ServerExhausted { .. } | SendError::Network(_) => {
+                        LOG_SEND_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         Err((std::io::Error::new(std::io::ErrorKind::Other, msg), chunk))
                     }
                 }

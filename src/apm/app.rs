@@ -539,19 +539,43 @@ impl ApmApp {
         log_line: &str,
         function_arn: &str,
     ) -> Result<()> {
+        self.send_platform_report_metrics_outcome(log_line, function_arn).await.map(|_| ())
+    }
+
+    /// Queue a REPORT's metrics for a later Metric API retry without sending them.
+    pub fn buffer_platform_report_metrics(&self, log_line: &str, function_arn: &str) {
+        if super::collector::is_telemetry_disabled("platform_metrics") {
+            return;
+        }
+        let Some(metrics_data) = parse_lambda_report_log(log_line, self.deployment) else {
+            return;
+        };
+        let function_name = std::env::var("NEW_RELIC_APP_NAME")
+            .unwrap_or_else(|_| std::env::var("AWS_LAMBDA_FUNCTION_NAME").unwrap_or_else(|_| "unknown".to_string()));
+        let metrics = convert_to_apm_metrics(&metrics_data, &self.entity_guid, &function_name, function_arn);
+        super::metric_api_buffer::buffer_failed_metric_api(metrics, self.metric_endpoint.clone(), None);
+    }
+
+    /// Like `send_platform_report_metrics`, but reports what happened:
+    /// `Some(true)` delivered, `Some(false)` failed and buffered, `None` nothing was sent.
+    pub async fn send_platform_report_metrics_outcome(
+        &self,
+        log_line: &str,
+        function_arn: &str,
+    ) -> Result<Option<bool>> {
         // Customer disabled platform metrics (NEW_RELIC_APM_DISABLE_TELEMETRY contains
         // platform_metrics): skip conversion and the Metric API send entirely.
         // Error-synthesis memory capture is a separate path and is unaffected.
         if super::collector::is_telemetry_disabled("platform_metrics") {
             debug!("APM platform metrics disabled - skipping REPORT conversion/send");
-            return Ok(());
+            return Ok(None);
         }
 
         let metrics_data = match parse_lambda_report_log(log_line, self.deployment) {
             Some(data) => data,
             None => {
                 debug!("Not a REPORT log or parse failed");
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -586,12 +610,12 @@ impl ApmApp {
                     "APM mode: Successfully sent platform report metrics for request {}",
                     metrics_data.request_id
                 );
-                Ok(())
+                Ok(Some(true))
             }
             // Permanent failures (non-retryable 4xx) are dropped at the send site — nothing to retry.
             Err(e) if e.is_permanent() => {
                 error!("Platform metrics dropped (permanent): {}", e);
-                Ok(())
+                Ok(None)
             }
             // Transient/network failures: buffer for retry on a later invoke / at shutdown.
             Err(e) => {
@@ -607,7 +631,7 @@ impl ApmApp {
                     self.metric_endpoint.clone(),
                     retry_after,
                 );
-                Ok(())
+                Ok(Some(false))
             }
         }
     }

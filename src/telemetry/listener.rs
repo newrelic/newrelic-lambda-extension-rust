@@ -62,16 +62,30 @@ pub struct TelemetryRecord {
 /// yet, or the send failed) is stored for a later invoke to retry, exactly as when this ran
 /// inline in the handler.
 pub(crate) async fn send_platform_report_in_background(request_id: String, report_line: String, arn: String) {
+    use crate::send::{CircuitBreaker, SendKind, SendOutcome};
+    let breaker = &crate::event_loop::DEFAULT_BREAKER;
     let app = crate::APM_APP.read().await.clone();
     let failed = if let Some(app) = app {
-        match app.send_platform_report_metrics(&report_line, &arn).await {
-            Ok(()) => {
-                debug!("APM mode: Sent platform.report metrics for request: {}", request_id);
-                false
-            }
-            Err(e) => {
-                warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id, e);
-                true
+        if !breaker.allow_send(SendKind::MetricApi) {
+            debug!("APM mode: circuit breaker open - buffering platform.report metrics for request: {}", request_id);
+            app.buffer_platform_report_metrics(&report_line, &arn);
+            false
+        } else {
+            match app.send_platform_report_metrics_outcome(&report_line, &arn).await {
+                Ok(outcome) => {
+                    match outcome {
+                        Some(true) => breaker.record_result(SendKind::MetricApi, SendOutcome::Success),
+                        Some(false) => breaker.record_result(SendKind::MetricApi, SendOutcome::Failure),
+                        None => breaker.release_probe(SendKind::MetricApi),
+                    }
+                    debug!("APM mode: Sent platform.report metrics for request: {}", request_id);
+                    false
+                }
+                Err(e) => {
+                    breaker.release_probe(SendKind::MetricApi);
+                    warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id, e);
+                    true
+                }
             }
         }
     } else {

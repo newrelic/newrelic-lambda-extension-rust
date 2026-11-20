@@ -408,7 +408,9 @@ impl SendScheduler {
 
         for (kind, handle, cursor) in running {
             handle.abort();
-            self.breaker.record_result(kind, SendOutcome::Failure);
+            // Cut off by the caller's own limit, not answered by the backend: no result to
+            // record, and a probe cut off here is given back.
+            self.breaker.release_probe(kind);
             results.insert(
                 kind,
                 DispatchOutcome {
@@ -487,7 +489,17 @@ impl SendScheduler {
     /// life: its owner still finishes (and buffers its own failures), but a new send of
     /// the same kind may start. Returns whether anything was detached.
     pub async fn detach(&self, kind: SendKind) -> bool {
-        self.pending.lock().await.remove(&kind).is_some()
+        let detached = self.pending.lock().await.remove(&kind).is_some();
+        if detached {
+            // No result will be recorded for it; a probe that was in flight is given back.
+            self.breaker.release_probe(kind);
+        }
+        detached
+    }
+
+    /// Whether the breaker for `kind` is closed, i.e. sends are normal. Does not count an invocation.
+    pub fn breaker_closed(&self, kind: SendKind) -> bool {
+        self.breaker.state(kind) == crate::send::circuit_breaker::BreakerState::Closed
     }
 }
 
@@ -1082,3 +1094,7 @@ mod tests {
         assert!(!scheduler.detach(SendKind::ApmCollector).await, "nothing left to detach");
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler_tests.rs"]
+mod scheduler_tests;
