@@ -2951,4 +2951,37 @@ mod coverage_tests {
         );
         assert!(p.log_batch.lock().unwrap().is_empty());
     }
+    // ── logs: a failed chunk is counted, so the logs breaker can see it ───────────────────
+
+    #[tokio::test]
+    async fn a_failed_log_chunk_is_counted() {
+        use crate::logs::processor::log_send_failure_count;
+        let server = failing_log_server().await;
+        let (p, client, config) = processor_for_mode(&server, true);
+        let before = log_send_failure_count();
+
+        let result = p
+            .try_send_chunk(&client, &config, vec![make_log("one")], "arn:aws:lambda:us-east-1:123:function:f")
+            .await;
+
+        assert!(result.is_err());
+        assert!(log_send_failure_count() > before, "the failed chunk is counted");
+    }
+
+    #[tokio::test]
+    async fn a_delivered_log_chunk_is_not_counted_as_a_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let (p, client, config) = processor_for_mode(&server, true);
+
+        let result = p
+            .try_send_chunk(&client, &config, vec![make_log("one")], "arn:aws:lambda:us-east-1:123:function:f")
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 }

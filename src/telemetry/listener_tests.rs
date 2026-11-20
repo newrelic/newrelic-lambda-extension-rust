@@ -2052,4 +2052,158 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
     assert_eq!(get_pending_report(id).as_deref(), Some("REPORT line"), "kept so a later invoke retries it");
     crate::request::cleanup_request_processing_state_internal(id, false);
 }
+
+    // ── Circuit breaker on the default tier's background platform.report send ─────────────
+
+    use serial_test::serial;
+
+    const BREAKER_REPORT: &str =
+        "REPORT RequestId: lbrk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
+
+    fn breaker_n() -> u32 {
+        crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+    }
+
+    /// Bring the default-tier Metric API breaker back to Closed from any state.
+    fn close_metric_breaker() {
+        use crate::send::{BreakerState, CircuitBreaker, SendKind, SendOutcome};
+        let breaker = &crate::event_loop::DEFAULT_BREAKER;
+        for _ in 0..500 {
+            match breaker.state(SendKind::MetricApi) {
+                BreakerState::Closed => return,
+                BreakerState::Open => {
+                    let _ = breaker.allow_send(SendKind::MetricApi);
+                }
+                BreakerState::HalfOpen => breaker.record_result(SendKind::MetricApi, SendOutcome::Success),
+            }
+        }
+        panic!("could not close the Metric API breaker");
+    }
+
+    fn fail_metric_breaker(times: u32) {
+        use crate::send::{CircuitBreaker, SendKind, SendOutcome};
+        for _ in 0..times {
+            crate::event_loop::DEFAULT_BREAKER.record_result(SendKind::MetricApi, SendOutcome::Failure);
+        }
+    }
+
+    fn clear_metric_buffer() {
+        if let Ok(mut b) = crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock() {
+            b.clear();
+        }
+    }
+
+    /// Clears the global APM session when a test ends, even if one of its assertions fails.
+    struct ClearSessionOnDrop;
+
+    impl Drop for ClearSessionOnDrop {
+        fn drop(&mut self) {
+            if let Ok(mut session) = crate::APM_APP.try_write() {
+                *session = None;
+            }
+        }
+    }
+
+    /// An APM session whose Metric API is the mock server, installed as the global session.
+    async fn install_session_with_metric_server(status: u16) -> wiremock::MockServer {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(status))
+            .mount(&server)
+            .await;
+        let app = crate::apm::ApmApp {
+            run_id: "test-run-id".to_string(),
+            entity_guid: "test-entity-guid".to_string(),
+            app_name: "test-app-name".to_string(),
+            collector_host: "127.0.0.1:1".to_string(),
+            license_key: "test-license-key".to_string(),
+            metric_endpoint: format!("{}/metrics", server.uri()),
+            client: crate::newrelic::tls_fallback::test_client(),
+            deployment: crate::config::deployment::DeploymentContext::Normal {
+                mode: crate::config::deployment::TelemetryMode::Apm,
+            },
+        };
+        *crate::APM_APP.write().await = Some(app);
+        server
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_report_is_buffered_not_sent_while_the_metric_api_breaker_is_open() {
+        use crate::send::{CircuitBreaker, SendKind};
+        close_metric_breaker();
+        fail_metric_breaker(breaker_n());
+        clear_metric_buffer();
+        let server = install_session_with_metric_server(202).await;
+        let _clear = ClearSessionOnDrop;
+
+        crate::telemetry::listener::send_platform_report_in_background(
+            "lbrk-1".to_string(),
+            BREAKER_REPORT.to_string(),
+            "arn:test".to_string(),
+        )
+        .await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 0, "nothing was sent");
+        assert!(!crate::event_loop::DEFAULT_BREAKER.allow_send(SendKind::MetricApi), "the call used one skip");
+
+        *crate::APM_APP.write().await = None;
+        clear_metric_buffer();
+        close_metric_breaker();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_report_success_keeps_the_metric_api_breaker_closed() {
+        use crate::send::{BreakerState, CircuitBreaker, SendKind};
+        close_metric_breaker();
+        fail_metric_breaker(breaker_n() - 1);
+        clear_metric_buffer();
+        let server = install_session_with_metric_server(202).await;
+        let _clear = ClearSessionOnDrop;
+
+        crate::telemetry::listener::send_platform_report_in_background(
+            "lbrk-1".to_string(),
+            BREAKER_REPORT.to_string(),
+            "arn:test".to_string(),
+        )
+        .await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        // A success resets the count, so it takes N more failures to open it again.
+        fail_metric_breaker(breaker_n() - 1);
+        assert_eq!(crate::event_loop::DEFAULT_BREAKER.state(SendKind::MetricApi), BreakerState::Closed);
+
+        *crate::APM_APP.write().await = None;
+        close_metric_breaker();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_report_failure_counts_and_opens_the_metric_api_breaker() {
+        use crate::send::{BreakerState, CircuitBreaker, SendKind};
+        close_metric_breaker();
+        fail_metric_breaker(breaker_n() - 1);
+        clear_metric_buffer();
+        let server = install_session_with_metric_server(503).await;
+        let _clear = ClearSessionOnDrop;
+
+        crate::telemetry::listener::send_platform_report_in_background(
+            "lbrk-1".to_string(),
+            BREAKER_REPORT.to_string(),
+            "arn:test".to_string(),
+        )
+        .await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(
+            crate::event_loop::DEFAULT_BREAKER.state(SendKind::MetricApi),
+            BreakerState::Open,
+            "the failed send is the Nth failure in a row"
+        );
+
+        *crate::APM_APP.write().await = None;
+        clear_metric_buffer();
+        close_metric_breaker();
+    }
 }

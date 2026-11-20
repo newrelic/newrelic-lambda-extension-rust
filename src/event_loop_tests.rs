@@ -5096,3 +5096,451 @@ async fn a_payload_that_arrives_early_without_an_apm_session_stays_buffered() {
     assert_eq!(state.agent_buffer.lock().unwrap().len(), 1, "the payload waits for the next invoke");
     cleanup_request_processing_state_internal(id, false);
 }
+// ── Circuit breaker: default tier ────────────────────────────────────────────────────
+//
+// `DEFAULT_BREAKER` is process-global, so every test here is #[serial] and leaves it closed.
+
+const BREAKER_REPORT_LINE: &str =
+    "REPORT RequestId: brk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
+
+/// N of the default-tier breaker (the failures in a row that open it).
+fn breaker_n() -> u32 {
+    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+}
+
+/// Bring the default-tier breaker for `kind` back to Closed from any state.
+fn force_default_breaker_closed(kind: crate::send::SendKind) {
+    use crate::send::{BreakerState, CircuitBreaker, SendOutcome};
+    for _ in 0..500 {
+        match DEFAULT_BREAKER.state(kind) {
+            BreakerState::Closed => return,
+            BreakerState::Open => {
+                let _ = DEFAULT_BREAKER.allow_send(kind);
+            }
+            BreakerState::HalfOpen => DEFAULT_BREAKER.record_result(kind, SendOutcome::Success),
+        }
+    }
+    panic!("could not close the default breaker for {kind:?}");
+}
+
+fn fail_default_breaker(kind: crate::send::SendKind, times: u32) {
+    use crate::send::{CircuitBreaker, SendOutcome};
+    for _ in 0..times {
+        DEFAULT_BREAKER.record_result(kind, SendOutcome::Failure);
+    }
+}
+
+/// Register a request whose agent buffer holds one payload that cannot be parsed, so a send
+/// that is attempted fails at once, without any network.
+fn register_unparseable_payload(request_id: &str, config: &Arc<config::ExtensionConfig>) {
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(vec![0xFF, 0xFE, 0xFD]);
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+}
+
+async fn run_default_invoke(request_id: &str, config: Arc<config::ExtensionConfig>, apm_connected: bool) {
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let session = if apm_connected { Some(make_test_apm_app()) } else { None };
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(session));
+    process_apm_request(
+        request_id.to_string(),
+        "arn:test".to_string(),
+        config,
+        log_processor,
+        apm_app,
+        deadline_ms_from_now(500),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn default_breaker_closed_follows_the_breaker_state() {
+    let kind = crate::send::SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    assert!(default_breaker_closed(kind));
+
+    fail_default_breaker(kind, breaker_n());
+    assert!(!default_breaker_closed(kind), "open after N failures in a row");
+
+    force_default_breaker_closed(kind);
+    assert!(default_breaker_closed(kind));
+}
+
+#[tokio::test]
+#[serial]
+async fn default_breaker_probes_after_2n_skipped_invocations() {
+    use crate::send::{BreakerState, CircuitBreaker};
+    let kind = crate::send::SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+
+    for _ in 0..(2 * breaker_n()) {
+        assert!(!DEFAULT_BREAKER.allow_send(kind), "skipped while open");
+    }
+    assert!(DEFAULT_BREAKER.allow_send(kind), "the probe after 2N skips");
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::HalfOpen);
+
+    force_default_breaker_closed(kind);
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_collector_failure_counts_towards_the_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let collector = SendKind::ApmCollector;
+    force_default_breaker_closed(collector);
+    fail_default_breaker(collector, breaker_n() - 1);
+    assert_eq!(DEFAULT_BREAKER.state(collector), BreakerState::Closed, "one failure short of opening");
+    clear_high_tier_state();
+
+    let request_id = "brk-default-failure";
+    let config = make_config_for_serverless(false);
+    register_unparseable_payload(request_id, &config);
+    run_default_invoke(request_id, config, true).await;
+
+    assert_eq!(
+        DEFAULT_BREAKER.state(collector),
+        BreakerState::Open,
+        "the failed same-invoke send is the Nth failure in a row"
+    );
+
+    REQUEST_DATA.remove(request_id);
+    clear_high_tier_state();
+    force_default_breaker_closed(collector);
+}
+
+/// A valid agent payload (protocol v1) with one metric, so a send really is attempted per type.
+fn valid_agent_payload() -> Vec<u8> {
+    use base64::Engine as _;
+    use std::io::Write;
+    let data = serde_json::json!({
+        "data": { "metric_data": [null, 1.0, 2.0, [[{"name": "Custom/brk"}, [1, 0.5, 0.5, 0.5, 0.5, 0.25]]]] }
+    });
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data.to_string().as_bytes()).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(encoder.finish().unwrap());
+    format!("[\"1\",\"{b64}\"]").into_bytes()
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_counts_a_failed_type_send_towards_the_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let collector = SendKind::ApmCollector;
+    force_default_breaker_closed(collector);
+    fail_default_breaker(collector, breaker_n() - 1);
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+
+    // The collector refuses connections, so the per-type POST fails and the type is buffered,
+    // while the merged send itself still returns Ok. That must count as a failure.
+    let request_id = "brk-default-type-failure";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(valid_agent_payload());
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+    run_default_invoke(request_id, config, true).await;
+
+    let buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER
+        .lock()
+        .map(|b| b.iter().filter(|i| i.request_id == request_id).count())
+        .unwrap_or(0);
+    assert!(buffered > 0, "the failed type was buffered by its own send");
+    assert_eq!(
+        DEFAULT_BREAKER.state(collector),
+        BreakerState::Open,
+        "a type that failed is the Nth failure in a row, even though the merged send returned Ok"
+    );
+
+    REQUEST_DATA.remove(request_id);
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+    force_default_breaker_closed(collector);
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_does_not_send_while_the_collector_breaker_is_open() {
+    use crate::send::{CircuitBreaker, SendKind};
+    let collector = SendKind::ApmCollector;
+    force_default_breaker_closed(collector);
+    fail_default_breaker(collector, breaker_n());
+    clear_high_tier_state();
+
+    let request_id = "brk-default-open";
+    let config = make_config_for_serverless(false);
+    register_unparseable_payload(request_id, &config);
+    run_default_invoke(request_id, config, true).await;
+
+    let buffered = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().filter(|p| p.request_id == request_id).count())
+        .unwrap_or(0);
+    assert_eq!(buffered, 1, "the payload is buffered for later, not dropped");
+
+    // The invoke used exactly one of the 2N skips: the next 2N-1 calls are still skipped.
+    let mut skipped = 0;
+    while !DEFAULT_BREAKER.allow_send(collector) {
+        skipped += 1;
+        assert!(skipped <= 2 * breaker_n(), "the probe never came");
+    }
+    assert_eq!(skipped, 2 * breaker_n() - 1);
+
+    REQUEST_DATA.remove(request_id);
+    clear_high_tier_state();
+    force_default_breaker_closed(collector);
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let collector = SendKind::ApmCollector;
+    force_default_breaker_closed(collector);
+    fail_default_breaker(collector, breaker_n());
+    for _ in 0..(2 * breaker_n()) {
+        assert!(!DEFAULT_BREAKER.allow_send(collector));
+    }
+
+    // This invoke gets the probe, but it has no payload and no session, so nothing is sent.
+    let request_id = "brk-default-probe-unused";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    run_default_invoke(request_id, config, false).await;
+
+    assert_eq!(
+        DEFAULT_BREAKER.state(collector),
+        BreakerState::Open,
+        "not stuck half-open: the probe goes back"
+    );
+    assert!(DEFAULT_BREAKER.allow_send(collector), "the next invoke probes again");
+
+    REQUEST_DATA.remove(request_id);
+    force_default_breaker_closed(collector);
+}
+
+// ── Circuit breaker: platform report in the high-tier batch ──────────────────────────
+
+fn clear_metric_api_buffer() {
+    if let Ok(mut b) = crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock() {
+        b.clear();
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn send_group_report_fails_the_group_when_the_metric_api_fails() {
+    clear_high_tier_state();
+    clear_metric_api_buffer();
+    let app = make_test_apm_app(); // the Metric API endpoint refuses connections
+    let group = make_group("sgr-fail", vec![], Some(BREAKER_REPORT_LINE));
+
+    assert!(!send_group_report(&app, &group).await, "a failed report fails the group");
+
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "buffered once, for retry");
+    assert_eq!(
+        FAILED_PLATFORM_REPORTS.lock().map(|b| b.len()).unwrap_or(0),
+        0,
+        "not buffered a second time"
+    );
+    clear_metric_api_buffer();
+}
+
+#[tokio::test]
+#[serial]
+async fn send_group_report_succeeds_when_the_metric_api_accepts() {
+    clear_high_tier_state();
+    clear_metric_api_buffer();
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(202))
+        .mount(&server)
+        .await;
+    let mut app = make_test_apm_app();
+    app.metric_endpoint = format!("{}/metrics", server.uri());
+    let group = make_group("sgr-ok", vec![], Some(BREAKER_REPORT_LINE));
+
+    assert!(send_group_report(&app, &group).await);
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn send_group_report_ignores_a_line_that_is_not_a_report() {
+    clear_metric_api_buffer();
+    let app = make_test_apm_app();
+    let group = make_group("sgr-none", vec![], Some("not a platform report"));
+
+    assert!(send_group_report(&app, &group).await, "nothing was sent, nothing failed");
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0);
+}
+
+// ── Circuit breaker: high-tier invoke-time retries ───────────────────────────────────
+
+fn high_breaker_n() -> u32 {
+    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_HIGH).max(1)
+}
+
+async fn open_high_collector_breaker() {
+    let collector = crate::send::SendKind::ApmCollector;
+    for _ in 0..high_breaker_n() {
+        let failing: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Failure });
+        SEND_SCHEDULER.spawn(collector, failing, None).await;
+        SEND_SCHEDULER.resolve_pending(collector).await;
+    }
+}
+
+async fn close_high_collector_breaker() {
+    let collector = crate::send::SendKind::ApmCollector;
+    for _ in 0..500 {
+        if SEND_SCHEDULER.breaker_closed(collector) {
+            return;
+        }
+        let succeeding: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
+        if SEND_SCHEDULER.spawn(collector, succeeding, None).await {
+            SEND_SCHEDULER.resolve_pending(collector).await;
+        }
+    }
+    panic!("could not close the high-tier collector breaker");
+}
+
+fn push_stale_failed_payload(request_id: &str) {
+    let mut stale = make_failed_payload(request_id);
+    stale.failed_at = chrono::Utc::now() - chrono::Duration::hours(25);
+    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
+        b.clear();
+        b.push(stale);
+    }
+}
+
+async fn run_invoke_retries_without_session() {
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
+    run_invoke_retries(apm_app, crate::newrelic::tls_fallback::test_client(), String::new(), false).await;
+    // The retries are spawned and not awaited; give them time to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn high_tier_invoke_retries_are_skipped_while_the_collector_breaker_is_open() {
+    close_high_collector_breaker().await;
+    open_high_collector_breaker().await;
+    assert!(!SEND_SCHEDULER.breaker_closed(crate::send::SendKind::ApmCollector));
+    // A payload past the 24 h limit is dropped by a retry pass, so it shows whether one ran.
+    push_stale_failed_payload("brk-high-skip");
+
+    run_invoke_retries_without_session().await;
+
+    let kept = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
+    assert_eq!(kept, 1, "no retry pass ran while the breaker was open");
+
+    clear_high_tier_state();
+    close_high_collector_breaker().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn high_tier_invoke_retries_run_while_the_collector_breaker_is_closed() {
+    close_high_collector_breaker().await;
+    push_stale_failed_payload("brk-high-run");
+
+    run_invoke_retries_without_session().await;
+
+    let kept = FAILED_AGENT_PAYLOADS.lock().map(|b| b.len()).unwrap_or(0);
+    assert_eq!(kept, 0, "a retry pass ran and dropped the stale payload");
+    clear_high_tier_state();
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_does_not_upload_early_while_the_collector_breaker_is_open() {
+    use crate::send::SendKind;
+    let collector = SendKind::ApmCollector;
+    force_default_breaker_closed(collector);
+    fail_default_breaker(collector, breaker_n());
+    clear_high_tier_state();
+    if let Ok(mut b) = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER.lock() {
+        b.clear();
+    }
+
+    // The payload is already in the buffer, so the early upload would start at once if it were allowed.
+    let request_id = "brk-default-no-early-upload";
+    let config = make_config_for_serverless(false);
+    let factory = make_serverless_processor_factory(config.clone());
+    let state = create_request_processing_state(request_id, "arn:test", &factory);
+    state.agent_buffer.lock().unwrap().push(valid_agent_payload());
+    REQUEST_PROCESSORS.insert(request_id.to_string(), state);
+    run_default_invoke(request_id, config, true).await;
+
+    // An upload would leave its failed types in the telemetry buffer; a gated one buffers the whole payload.
+    let types_buffered = crate::apm::telemetry_buffer::FAILED_TELEMETRY_BUFFER
+        .lock()
+        .map(|b| b.iter().filter(|i| i.request_id == request_id).count())
+        .unwrap_or(0);
+    let payload_buffered = FAILED_AGENT_PAYLOADS
+        .lock()
+        .map(|b| b.iter().filter(|p| p.request_id == request_id).count())
+        .unwrap_or(0);
+    assert_eq!(types_buffered, 0, "nothing was uploaded");
+    assert_eq!(payload_buffered, 1, "the whole payload was buffered instead");
+
+    REQUEST_DATA.remove(request_id);
+    clear_high_tier_state();
+    force_default_breaker_closed(collector);
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_uses_one_logs_breaker_invoke_per_invoke() {
+    use crate::send::{CircuitBreaker, SendKind};
+    let logs = SendKind::Logs;
+    force_default_breaker_closed(logs);
+    fail_default_breaker(logs, breaker_n());
+
+    let request_id = "brk-default-logs-skip";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    run_default_invoke(request_id, config, false).await;
+
+    // The invoke used one of the 2N skips, so 2N-1 are left before the probe.
+    let mut skipped = 0;
+    while !DEFAULT_BREAKER.allow_send(logs) {
+        skipped += 1;
+        assert!(skipped <= 2 * breaker_n(), "the probe never came");
+    }
+    assert_eq!(skipped, 2 * breaker_n() - 1);
+
+    REQUEST_DATA.remove(request_id);
+    force_default_breaker_closed(logs);
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let logs = SendKind::Logs;
+    force_default_breaker_closed(logs);
+    fail_default_breaker(logs, breaker_n());
+    for _ in 0..(2 * breaker_n()) {
+        assert!(!DEFAULT_BREAKER.allow_send(logs));
+    }
+
+    // This invoke gets the logs probe, but it has no logs, so there is nothing to flush.
+    let request_id = "brk-default-logs-probe-unused";
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    run_default_invoke(request_id, config, false).await;
+
+    assert_eq!(DEFAULT_BREAKER.state(logs), BreakerState::Open, "not stuck half-open: the probe goes back");
+    assert!(DEFAULT_BREAKER.allow_send(logs), "the next invoke probes again");
+
+    REQUEST_DATA.remove(request_id);
+    force_default_breaker_closed(logs);
+}

@@ -1103,3 +1103,143 @@ async fn a_failed_batched_send_is_buffered_for_retry() {
     assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "the data points wait for a later retry");
     crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock().unwrap().clear();
 }
+
+// ── what a platform report send reports back (the circuit breaker reads this) ──────────────
+
+const OUTCOME_REPORT: &str = "REPORT RequestId: out-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
+
+fn clear_metric_buffer() {
+    crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock().unwrap().clear();
+}
+
+async fn app_with_metric_server(status: u16) -> (crate::apm::ApmApp, MockServer) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(status)).mount(&server).await;
+    let mut app = test_apm_app();
+    app.metric_endpoint = server.uri();
+    (app, server)
+}
+
+#[tokio::test]
+#[serial]
+async fn outcome_is_delivered_when_the_metric_api_accepts() {
+    clear_metric_buffer();
+    let (app, server) = app_with_metric_server(202).await;
+
+    let outcome = app.send_platform_report_metrics_outcome(OUTCOME_REPORT, "arn:test").await.unwrap();
+
+    assert_eq!(outcome, Some(true));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn outcome_is_failed_and_buffered_on_a_transient_error() {
+    clear_metric_buffer();
+    let (app, _server) = app_with_metric_server(503).await;
+
+    let outcome = app.send_platform_report_metrics_outcome(OUTCOME_REPORT, "arn:test").await.unwrap();
+
+    assert_eq!(outcome, Some(false));
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "kept for a later retry");
+    clear_metric_buffer();
+}
+
+#[tokio::test]
+#[serial]
+async fn outcome_is_nothing_sent_on_a_permanent_rejection() {
+    clear_metric_buffer();
+    let (app, server) = app_with_metric_server(403).await;
+
+    let outcome = app.send_platform_report_metrics_outcome(OUTCOME_REPORT, "arn:test").await.unwrap();
+
+    assert_eq!(outcome, None, "dropped, so it says nothing about the backend being down");
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0, "not retried");
+}
+
+#[tokio::test]
+#[serial]
+async fn outcome_is_nothing_sent_for_a_line_that_is_not_a_report() {
+    clear_metric_buffer();
+    let (app, server) = app_with_metric_server(202).await;
+
+    let outcome = app
+        .send_platform_report_metrics_outcome("START RequestId: x Version: $LATEST", "arn:test")
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, None);
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn outcome_is_nothing_sent_when_platform_metrics_are_disabled() {
+    clear_metric_buffer();
+    let mut types = std::collections::HashSet::new();
+    types.insert("platform_metrics".to_string());
+    crate::apm::collector::set_disabled_telemetry(types);
+    let (app, server) = app_with_metric_server(202).await;
+
+    let outcome = app.send_platform_report_metrics_outcome(OUTCOME_REPORT, "arn:test").await.unwrap();
+
+    crate::apm::collector::set_disabled_telemetry(std::collections::HashSet::new());
+    assert_eq!(outcome, None);
+    assert_eq!(server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn the_plain_send_still_returns_ok_whatever_the_outcome() {
+    clear_metric_buffer();
+    for status in [202, 503, 403] {
+        let (app, _server) = app_with_metric_server(status).await;
+        assert!(app.send_platform_report_metrics(OUTCOME_REPORT, "arn:test").await.is_ok(), "status {status}");
+    }
+    clear_metric_buffer();
+}
+
+#[tokio::test]
+#[serial]
+async fn buffering_a_report_sends_nothing_and_keeps_the_metrics() {
+    clear_metric_buffer();
+    let (app, server) = app_with_metric_server(202).await;
+
+    app.buffer_platform_report_metrics(OUTCOME_REPORT, "arn:test");
+
+    assert_eq!(server.received_requests().await.unwrap().len(), 0, "nothing is sent");
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1);
+    let buffered = crate::apm::metric_api_buffer::FAILED_METRIC_API_BUFFER.lock().unwrap();
+    assert_eq!(buffered[0].endpoint, app.metric_endpoint, "kept for the app's own Metric API endpoint");
+    assert!(!buffered[0].metrics.is_empty());
+    drop(buffered);
+    clear_metric_buffer();
+}
+
+#[tokio::test]
+#[serial]
+async fn buffering_ignores_a_line_that_is_not_a_report() {
+    clear_metric_buffer();
+    let (app, _server) = app_with_metric_server(202).await;
+
+    app.buffer_platform_report_metrics("START RequestId: x Version: $LATEST", "arn:test");
+
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn buffering_does_nothing_when_platform_metrics_are_disabled() {
+    clear_metric_buffer();
+    let mut types = std::collections::HashSet::new();
+    types.insert("platform_metrics".to_string());
+    crate::apm::collector::set_disabled_telemetry(types);
+    let (app, _server) = app_with_metric_server(202).await;
+
+    app.buffer_platform_report_metrics(OUTCOME_REPORT, "arn:test");
+
+    crate::apm::collector::set_disabled_telemetry(std::collections::HashSet::new());
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 0);
+}
