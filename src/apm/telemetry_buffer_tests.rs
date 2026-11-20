@@ -74,7 +74,7 @@ fn buffered_request_ids_are_distinct_and_sorted() {
 #[serial]
 fn caps_buffer_size_by_evicting_oldest() {
     clear();
-    for _ in 0..(MAX_BUFFERED_ITEMS + 25) {
+    for _ in 0..(max_buffered_items() + 25) {
         buffer_failed_telemetry(
             "metric_data".into(),
             vec![json!(null)],
@@ -83,8 +83,18 @@ fn caps_buffer_size_by_evicting_oldest() {
             "host".into(),
         );
     }
-    assert_eq!(get_buffer_count(), MAX_BUFFERED_ITEMS, "must never exceed cap");
+    assert_eq!(get_buffer_count(), max_buffered_items(), "must never exceed cap");
     clear();
+}
+
+#[test]
+fn the_cap_is_30_in_the_default_tier() {
+    assert_eq!(max_buffered_items_for(crate::send::SendTier::Default), 30);
+}
+
+#[test]
+fn the_cap_is_15_in_the_high_tier() {
+    assert_eq!(max_buffered_items_for(crate::send::SendTier::High), 15);
 }
 
 #[test]
@@ -172,7 +182,7 @@ fn non_collector_error_is_not_detected_as_restart() {
 fn restart_rebuffer_respects_cap() {
     clear();
     // Fill buffer to exactly the cap via the normal path.
-    for i in 0..MAX_BUFFERED_ITEMS {
+    for i in 0..max_buffered_items() {
         buffer_failed_telemetry(
             "metric_data".into(),
             vec![json!({"seq": i})],
@@ -181,7 +191,7 @@ fn restart_rebuffer_respects_cap() {
             "host".into(),
         );
     }
-    assert_eq!(get_buffer_count(), MAX_BUFFERED_ITEMS);
+    assert_eq!(get_buffer_count(), max_buffered_items());
 
     // Simulate apply_retry_decision with RestartException — mirrors the
     // is_restart re-buffer branch in retry_buffered_telemetry.
@@ -192,7 +202,7 @@ fn restart_rebuffer_respects_cap() {
 
     // Manually push through the production re-buffer path to verify the cap.
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-        if buffer.len() >= MAX_BUFFERED_ITEMS {
+        if buffer.len() >= max_buffered_items() {
             buffer.remove(0);
         }
         buffer.push(result.unwrap());
@@ -200,7 +210,7 @@ fn restart_rebuffer_respects_cap() {
 
     assert_eq!(
         get_buffer_count(),
-        MAX_BUFFERED_ITEMS,
+        max_buffered_items(),
         "buffer must not exceed cap after re-buffering a RestartException item"
     );
     clear();

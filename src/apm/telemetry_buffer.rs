@@ -21,7 +21,14 @@ pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
 
 /// Hard cap on buffered telemetry items to bound memory during a sustained
 /// collector failure on a high-traffic function. When full, the oldest is evicted.
-const MAX_BUFFERED_ITEMS: usize = 500;
+fn max_buffered_items() -> usize {
+    max_buffered_items_for(crate::send::SendTier::from_env())
+}
+
+/// 15 in the high tier, 30 otherwise.
+fn max_buffered_items_for(tier: crate::send::SendTier) -> usize {
+    if tier == crate::send::SendTier::High { 15 } else { 30 }
+}
 
 /// Failed telemetry data that needs to be retried
 #[derive(Debug, Clone)]
@@ -59,9 +66,9 @@ pub fn buffer_failed_telemetry(
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
         // Bound memory: evict oldest if at capacity (prefer keeping fresher telemetry).
-        if buffer.len() >= MAX_BUFFERED_ITEMS {
+        if buffer.len() >= max_buffered_items() {
             buffer.remove(0);
-            warn!("Telemetry buffer full ({}) - evicted oldest item", MAX_BUFFERED_ITEMS);
+            warn!("Telemetry buffer full ({}) - evicted oldest item", max_buffered_items());
         }
         buffer.push(failed_telemetry);
         debug!(
@@ -205,7 +212,7 @@ pub async fn retry_buffered_telemetry(
 
                 if is_restart {
                     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-                        if buffer.len() >= MAX_BUFFERED_ITEMS {
+                        if buffer.len() >= max_buffered_items() {
                             buffer.remove(0);
                         }
                         buffer.push(item);
