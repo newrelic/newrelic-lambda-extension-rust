@@ -24,7 +24,7 @@ const MAX_RETRY_ATTEMPTS: usize = 10;
 const MAX_AGE_MINUTES: i64 = 60;
 /// Hard cap on buffered batches to bound memory during a sustained Metric API
 /// failure on a high-traffic function. When full, the oldest batch is evicted.
-const MAX_BUFFERED_BATCHES: usize = 1000;
+const MAX_BUFFERED_BATCHES: usize = 100;
 
 /// A platform-metric batch that failed to send and must be retried.
 #[derive(Debug, Clone)]
