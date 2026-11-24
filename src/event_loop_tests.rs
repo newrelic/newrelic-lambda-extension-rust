@@ -4568,6 +4568,41 @@ fn a_stashed_report_is_taken_once_and_never_for_the_current_request() {
     clear_stashed_reports();
 }
 
+// A report stashed while a take is running must end up either taken or still in the stash.
+#[test]
+#[serial]
+fn a_report_stashed_during_a_take_is_never_lost() {
+    const STASHERS: usize = 4;
+    const PER_STASHER: usize = 20; // 80 in total: under the cap, so nothing is dropped by design
+    for round in 0..200 {
+        clear_stashed_reports();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let taker = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut taken = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    taken += take_stashed_reports("").len();
+                }
+                taken
+            })
+        };
+        let stashers: Vec<_> = (0..STASHERS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_STASHER {
+                        stash_platform_report(&format!("race-{round}-{t}-{i}"), "REPORT".to_string());
+                    }
+                })
+            })
+            .collect();
+        stashers.into_iter().for_each(|s| s.join().unwrap());
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let taken = taker.join().unwrap() + take_stashed_reports("").len();
+        assert_eq!(taken, STASHERS * PER_STASHER, "round {round}: a stashed report was lost");
+    }
+}
+
 #[test]
 #[serial]
 fn the_stash_is_capped_and_drops_the_oldest_report() {

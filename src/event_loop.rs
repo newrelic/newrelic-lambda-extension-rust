@@ -565,10 +565,12 @@ pub fn stash_platform_report(request_id: &str, report: String) {
 
 /// Take every kept report except the running request's: its own batch is still to come.
 pub(crate) fn take_stashed_reports(current_request_id: &str) -> Vec<StashedReport> {
-    let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut *stash_lock())
+    // One guard for take and write-back: a report stashed in between would be overwritten.
+    let mut stash = stash_lock();
+    let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut *stash)
         .into_iter()
         .partition(|s| s.request_id == current_request_id);
-    *stash_lock() = keep;
+    *stash = keep;
     take
 }
 
