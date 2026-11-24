@@ -832,7 +832,6 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
                     Ok(mut buffer) => {
                         buffer.push(payload_bytes);
                         AGENT_PAYLOAD_NOTIFY.notify_waiters();
-                    AGENT_PAYLOAD_NOTIFY.notify_waiters();
                         info!(
                             "LMI: agent payload received for request {} (buffer size: {})",
                             request_id,

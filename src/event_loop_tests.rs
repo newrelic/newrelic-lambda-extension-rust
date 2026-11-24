@@ -2105,13 +2105,24 @@ async fn execute_apm_mode_event_loop_processes_invoke_then_shutdown() {
     REQUEST_DATA.remove("req-apm-loop-1");
 }
 
-// The high tier waits for its sends before /next, even if pipeline_flush reaches the loop.
+// The high tier waits for its sends before /next, even if pipeline_flush reaches the loop:
+// the second /next may only arrive after the (delayed) log ingest response.
 #[tokio::test]
 #[serial]
 async fn high_tier_awaits_the_invoke_before_next_even_with_pipeline_flush() {
+    const INGEST_DELAY: Duration = Duration::from_millis(600);
+    clear_high_tier_state();
+    clear_log_flush().await;
+    // The breaker is process-wide; an earlier test may have left the logs kind open.
+    force_default_breaker_closed(crate::send::SendKind::Logs);
     let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/log/v1"))
+        .respond_with(wiremock::ResponseTemplate::new(202).set_delay(INGEST_DELAY))
+        .mount(&server)
+        .await;
     let next_calls: Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Arc::default();
-    let invoke_body = invoke_event_body("req-high-pipeline", "arn:aws:lambda:us-east-1:123456789012:function:t", deadline_ms_from_now(1_000));
+    let invoke_body = invoke_event_body("req-high-pipeline", "arn:aws:lambda:us-east-1:123456789012:function:t", deadline_ms_from_now(5_000));
     let calls = next_calls.clone();
     wiremock::Mock::given(wiremock::matchers::method("GET"))
         .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
@@ -2127,16 +2138,41 @@ async fn high_tier_awaits_the_invoke_before_next_even_with_pipeline_flush() {
     let mut cfg = config::ExtensionConfig::default();
     cfg.new_relic.extension_enabled = true;
     cfg.new_relic.license_key = Some("fake-key".to_string());
+    cfg.new_relic.log_endpoint = format!("{}/log/v1", server.uri());
+    cfg.extension.send_function_logs = true;
     cfg.extension.send_tier = crate::send::SendTier::High;
     cfg.extension.pipeline_flush = true;
-    let mut components = make_test_extension_components(Arc::new(cfg), Arc::new(Client::new()), true);
+    let cfg = Arc::new(cfg);
+    let mut components = make_test_extension_components(cfg.clone(), Arc::new(Client::new()), true);
+    components.global_log_processor = Arc::new(LogProcessor::new(
+        Arc::new(crate::newrelic::client::NewRelicClient::new(&cfg)),
+        cfg,
+        Arc::new(Mutex::new(crate::context::InvocationContext::default())),
+        None,
+    ));
+    components.global_log_processor.add_log_to_batch(crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "held for the ingest".to_string(),
+        attributes: serde_json::Map::new(),
+    });
+
+    // The handler finishes quickly, so only the ingest send keeps /next waiting.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        request::record_runtime_done_with_duration("req-high-pipeline", Some(10.0));
+    });
 
     with_runtime_api_el(&server, || async { execute_apm_mode_event_loop(&mut components).await }).await;
 
     let calls = next_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let ingests = server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/log/v1").count();
+    // Leftover logs from earlier tests can add more requests; at least ours must have gone out.
+    assert!(ingests >= 1, "the log ingest must have been sent");
     let gap = calls[1].duration_since(calls[0]);
-    assert!(gap >= Duration::from_millis(300), "/next was called before the invoke finished ({gap:?})");
+    assert!(gap >= INGEST_DELAY, "/next arrived before the delayed ingest finished ({gap:?})");
     REQUEST_DATA.remove("req-high-pipeline");
+    clear_high_tier_state();
 }
 
 #[tokio::test]
@@ -3865,7 +3901,7 @@ async fn clear_batch_state() {
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
+async fn wait_for_pending_agent_batch_is_a_noop_when_nothing_spawned() {
     clear_batch_state().await;
     let start = tokio::time::Instant::now();
     wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
@@ -3874,7 +3910,7 @@ async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_collects_a_finished_batch() {
+async fn wait_for_pending_agent_batch_collects_a_finished_batch() {
     clear_batch_state().await;
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;

@@ -258,6 +258,12 @@ pub fn parse_threshold(raw: &str, default: u32) -> u32 {
     })
 }
 
+/// Retry-buffer cap for a tier: `3N`, so the buffers match the breaker's fill/retry/slide cycle.
+/// Both the agent-payload and the telemetry buffers use this, so they cannot drift from `N`.
+pub fn buffer_cap_for(tier: super::SendTier) -> usize {
+    3 * ConsecutiveFailureBreaker::for_tier(tier).threshold() as usize
+}
+
 pub fn threshold_from_env(default: u32) -> u32 {
     std::env::var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR).map_or(default, |raw| parse_threshold(&raw, default))
 }

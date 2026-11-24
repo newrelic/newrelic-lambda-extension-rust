@@ -200,12 +200,9 @@ fn restart_rebuffer_respects_cap() {
     let result = apply_retry_decision(item, &err);
     assert!(result.is_some(), "RestartException must not drop the item");
 
-    // Manually push through the production re-buffer path to verify the cap.
+    // Re-buffer through the production helper to verify the cap.
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-        if buffer.len() >= max_buffered_items() {
-            buffer.remove(0);
-        }
-        buffer.push(result.unwrap());
+        push_capped(&mut buffer, result.unwrap(), max_buffered_items());
     }
 
     assert_eq!(
