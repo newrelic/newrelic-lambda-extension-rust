@@ -3845,7 +3845,7 @@ async fn clear_batch_state() {
 async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
     clear_batch_state().await;
     let start = tokio::time::Instant::now();
-    resolve_pending_agent_batch(1_500).await;
+    wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
     assert!(start.elapsed() < Duration::from_millis(50));
 }
 
@@ -3857,7 +3857,7 @@ async fn resolve_pending_agent_batch_collects_a_finished_batch() {
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    resolve_pending_agent_batch(1_500).await;
+    wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
 
     assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
 }
