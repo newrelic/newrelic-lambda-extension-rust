@@ -2100,6 +2100,21 @@ fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
     });
 }
 
+#[test]
+#[serial]
+fn test_high_tier_turns_pipeline_flush_off_and_default_tier_keeps_it() {
+    // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert!(!ExtensionConfig::from_env().extension.pipeline_flush, "high tier forces it off");
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "default");
+        assert!(ExtensionConfig::from_env().extension.pipeline_flush, "default tier keeps it");
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
+    });
+}
+
 // ============================================================================
 // NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
 // ============================================================================
