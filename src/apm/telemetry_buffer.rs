@@ -19,22 +19,24 @@ use tracing::{debug, error, warn};
 /// `send_apm_telemetry`. Routed specially in the retry loop.
 pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
 
-/// Hard cap on buffered telemetry items to bound memory during a sustained
-/// collector failure on a high-traffic function. When full, the oldest is evicted.
+/// Hard cap on buffered invocations (distinct request ids) to bound memory during a sustained
+/// collector failure on a high-traffic function. When full, the oldest invocation is evicted.
 fn max_buffered_items() -> usize {
     // Resolved once: from_env warns on a bad value and this runs under the buffer lock.
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| max_buffered_items_for(crate::send::SendTier::from_env()))
 }
 
-/// Push `item`, then drop the oldest (by `failed_at`) if over `cap`. Used by both the
-/// fresh-failure and re-buffer paths so a retry pass can never push the buffer past its cap.
+/// Push `item`, then, if more than `cap` request ids are buffered, drop every item of the oldest
+/// one (by `failed_at`). The cap counts invocations like the agent payload buffer, so it matches
+/// the breaker's 3N rule. Used by both the fresh-failure and re-buffer paths.
 fn push_capped(buffer: &mut Vec<FailedTelemetry>, item: FailedTelemetry, cap: usize) {
     buffer.push(item);
-    if buffer.len() > cap {
-        if let Some(i) = (0..buffer.len()).min_by_key(|&i| buffer[i].failed_at) {
-            buffer.remove(i);
-            warn!("Telemetry buffer full ({}) - evicted oldest item", cap);
+    let ids: std::collections::HashSet<&str> = buffer.iter().map(|i| i.request_id.as_str()).collect();
+    if ids.len() > cap {
+        if let Some(oldest) = buffer.iter().min_by_key(|i| i.failed_at).map(|i| i.request_id.clone()) {
+            buffer.retain(|i| i.request_id != oldest);
+            warn!("Telemetry buffer full ({} invocations) - evicted oldest invocation's items", cap);
         }
     }
 }
