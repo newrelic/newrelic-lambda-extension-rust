@@ -5419,6 +5419,51 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
     force_default_breaker_closed(collector);
 }
 
+// ── Circuit breaker: the default tier's send of a report kept for a later invoke ─────────
+
+/// One earlier request whose report was kept for retry, sent by the default tier's pending pass
+/// against a Metric API answering `status`. Returns how many requests the Metric API received.
+async fn send_kept_report(request_id: &str, status: u16) -> usize {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    let mut app = make_test_apm_app();
+    app.metric_endpoint = format!("{}/metrics", server.uri());
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    request::set_pending_report(request_id, BREAKER_REPORT_LINE.to_string());
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(app)));
+
+    process_pending_agent_payloads(&config, &log_processor, &apm_app, "kept-report-current").await;
+
+    REQUEST_DATA.remove(request_id);
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_kept_report_sends_count_and_open_the_metric_api_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let kind = SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    clear_metric_api_buffer();
+
+    for i in 0..breaker_n() {
+        assert_eq!(send_kept_report(&format!("kept-report-fail-{i}"), 503).await, 1);
+    }
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::Open, "N failed sends in a row open it");
+
+    clear_metric_api_buffer();
+    assert_eq!(send_kept_report("kept-report-while-open", 202).await, 0, "not sent while open");
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "buffered for a later retry");
+
+    clear_metric_api_buffer();
+    force_default_breaker_closed(kind);
+}
+
 // ── Circuit breaker: platform report in the high-tier batch ──────────────────────────
 
 fn clear_metric_api_buffer() {

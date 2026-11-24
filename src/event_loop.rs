@@ -2536,10 +2536,9 @@ async fn process_apm_request_default(
             // across an HTTP POST and risk blocking a reconnect's write lock.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                let _ = crate::telemetry::listener::send_report_through_breaker(&app, request_id, &report_line, invoked_function_arn).await;
             } else {
                 warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
             }
@@ -3888,10 +3887,9 @@ pub(crate) async fn process_pending_agent_payloads(
             // process_apm_request's agent-payload send fix.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                let _ = crate::telemetry::listener::send_report_through_breaker(&app, &request_id, &report_line, &invoked_function_arn).await;
             }
 
             // Remove pending report after sending
