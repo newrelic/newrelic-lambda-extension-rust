@@ -3901,7 +3901,7 @@ async fn clear_batch_state() {
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
+async fn wait_for_pending_agent_batch_is_a_noop_when_nothing_spawned() {
     clear_batch_state().await;
     let start = tokio::time::Instant::now();
     wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
@@ -3910,7 +3910,7 @@ async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_collects_a_finished_batch() {
+async fn wait_for_pending_agent_batch_collects_a_finished_batch() {
     clear_batch_state().await;
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
