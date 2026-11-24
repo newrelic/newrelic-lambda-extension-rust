@@ -2107,9 +2107,12 @@ fn test_high_tier_turns_pipeline_flush_off_and_default_tier_keeps_it() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
         env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert!(ExtensionConfig::from_env().extension.pipeline_flush, "serverless mode ignores the tier and keeps it");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
         assert!(!ExtensionConfig::from_env().extension.pipeline_flush, "high tier forces it off");
         env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "default");
         assert!(ExtensionConfig::from_env().extension.pipeline_flush, "default tier keeps it");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
         env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
         env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
     });

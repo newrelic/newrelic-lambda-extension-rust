@@ -824,8 +824,8 @@ fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
     }
 }
 
-/// The batch's outcome after the wait that ends at the function's deadline. A batch that
-/// finished needs nothing but its outcome logged. One the deadline cut off is stopped, and
+/// The batch's outcome after a bounded wait (the function's deadline, or the SHUTDOWN wait).
+/// A batch that finished needs nothing but its outcome logged. One the wait cut off is stopped, and
 /// whatever it had not delivered goes back to the normal retry buffers: groups before the
 /// cursor are done, types that already got an answer are never resent. Returns whether
 /// the batch was cut off.
@@ -842,7 +842,7 @@ fn finish_batch_outcome(outcome: &crate::send::DispatchOutcome) -> bool {
     let stopped = crate::apm::inflight::abort_owner(meta.owner);
     buffer_unresolved_groups(&meta.groups, outcome.cursor.unwrap_or(0));
     warn!(
-        "APM mode (high): batch reached the function deadline - {} POST(s) stopped, unsent data kept for the next invoke",
+        "APM mode (high): batch reached its wait deadline - {} POST(s) stopped, unsent data kept for retry",
         stopped
     );
     true
@@ -1529,10 +1529,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 if components.config.extension.send_tier == crate::send::SendTier::High {
                     // pending_task is a no-op for high (see above); only the
-                    // current request is awaited, bounded by its own send budget.
-                    if components.config.extension.pipeline_flush {
-                        pending_flush_handles.push(current_task);
-                    } else if let Err(e) = current_task.await {
+                    // current request is awaited, bounded by its own send budget. Never
+                    // pipelined: the high tier waits for its sends before /next.
+                    if let Err(e) = current_task.await {
                         error!("Error in APM request processing: {}", e);
                     }
                 } else if components.config.extension.pipeline_flush {

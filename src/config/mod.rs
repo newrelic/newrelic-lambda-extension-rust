@@ -711,7 +711,10 @@ impl ExtensionConfig {
         }
 
         // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
-        if config.extension.pipeline_flush && config.extension.send_tier == crate::send::SendTier::High {
+        if config.extension.pipeline_flush
+            && config.new_relic.apm_lambda_mode
+            && config.extension.send_tier == crate::send::SendTier::High
+        {
             warn!("NEW_RELIC_EXTENSION_PIPELINE_FLUSH=true is ignored with NEW_RELIC_EXTENSION_SEND_TIER=high");
             config.extension.pipeline_flush = false;
         }

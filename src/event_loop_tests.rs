@@ -2082,6 +2082,40 @@ async fn execute_apm_mode_event_loop_processes_invoke_then_shutdown() {
     REQUEST_DATA.remove("req-apm-loop-1");
 }
 
+// The high tier waits for its sends before /next, even if pipeline_flush reaches the loop.
+#[tokio::test]
+#[serial]
+async fn high_tier_awaits_the_invoke_before_next_even_with_pipeline_flush() {
+    let server = wiremock::MockServer::start().await;
+    let next_calls: Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let invoke_body = invoke_event_body("req-high-pipeline", "arn:aws:lambda:us-east-1:123456789012:function:t", deadline_ms_from_now(1_000));
+    let calls = next_calls.clone();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut calls = calls.lock().unwrap();
+            calls.push(std::time::Instant::now());
+            let body = if calls.len() == 1 { invoke_body.clone() } else { shutdown_event_body("spindown") };
+            wiremock::ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    cfg.new_relic.license_key = Some("fake-key".to_string());
+    cfg.extension.send_tier = crate::send::SendTier::High;
+    cfg.extension.pipeline_flush = true;
+    let mut components = make_test_extension_components(Arc::new(cfg), Arc::new(Client::new()), true);
+
+    with_runtime_api_el(&server, || async { execute_apm_mode_event_loop(&mut components).await }).await;
+
+    let calls = next_calls.lock().unwrap();
+    let gap = calls[1].duration_since(calls[0]);
+    assert!(gap >= Duration::from_millis(300), "/next was called before the invoke finished ({gap:?})");
+    REQUEST_DATA.remove("req-high-pipeline");
+}
+
 #[tokio::test]
 #[serial]
 async fn execute_apm_mode_event_loop_returns_on_immediate_shutdown() {
