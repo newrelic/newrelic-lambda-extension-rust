@@ -272,9 +272,9 @@ async fn retry_failed_platform_reports(apm_app: crate::apm::SharedApmApp) {
 
     debug!("Retrying {} buffered platform-report(s)", pending.len());
 
-    let apm_guard = apm_app.read().await;
-    let Some(ref app) = *apm_guard else {
-        drop(apm_guard);
+    // Clone out of the lock so the read guard is not held across every POST below.
+    let app_owned = apm_app.read().await.clone();
+    let Some(app) = app_owned else {
         if let Ok(mut buf) = FAILED_PLATFORM_REPORTS.lock() {
             buf.extend(pending);
         }
