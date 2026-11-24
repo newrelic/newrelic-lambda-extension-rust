@@ -88,8 +88,9 @@ impl SendScheduler {
     ///
     /// **Circuit-breaker gated.** This is the single point where the breaker's
     /// `allow_send` is consulted for the spawn/resolve callers (the
-    /// `high` tier) — the breaker lives in `SendScheduler`, not in the call
-    /// sites. Returns:
+    /// `high` tier), so they need no breaker check of their own. The breaker
+    /// itself is the shared `DEFAULT_BREAKER`; default-tier call sites consult
+    /// it directly. Returns:
     /// - `true`  → the breaker allowed the send; it was spawned and is now
     ///   tracked for a later `resolve_pending_*`.
     /// - `false` → the breaker is Open for `kind`; **nothing was spawned**. The

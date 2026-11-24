@@ -91,15 +91,15 @@ pub struct FailedAgentPayload {
 pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// Max buffered agent payloads = the circuit breaker's **3N** buffer cap, derived
-/// once from `NEW_RELIC_EXTENSION_SEND_TIER`: high tier `N=5 → 3N=15`, default tier
-/// `N=10 → 3N=30`. When full, the oldest is evicted (and counted) — FIFO
-/// drop-oldest — so a long disconnected period on a busy function can't grow
-/// unbounded. (Was a flat 500 before the invocation-count breaker model; the
-/// per-tier 3N cap replaces it so the buffer matches the breaker's
-/// fill→retry→slide lifecycle exactly.)
-static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> =
-    once_cell::sync::Lazy::new(|| crate::send::circuit_breaker::buffer_cap_for(crate::send::SendTier::from_env()));
+/// Max buffered invocations (distinct request ids, each possibly many chunks) = the circuit
+/// breaker's **3N** buffer cap, derived once from `NEW_RELIC_EXTENSION_SEND_TIER`: high tier
+/// `N=5 → 3N=15`, default tier `N=10 → 3N=30`. When full, every payload of the oldest
+/// invocation is evicted (and counted), so a long disconnected period on a busy function
+/// can't grow unbounded. (Was a flat 500 payloads before the invocation-count breaker model;
+/// the per-tier 3N cap replaces it so the buffer matches the breaker's lifecycle.)
+static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| {
+    crate::send::circuit_breaker::buffer_cap_for(crate::send::SendTier::from_env())
+});
 
 /// Count of buffered agent payloads dropped *before* shutdown (evicted when the
 /// buffer is full). Lets the shutdown summary report the true loss, since evicted
@@ -376,8 +376,9 @@ async fn wait_for_report_sends(budget: Duration) {
 const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 
 /// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
-/// log flush. `default` never touches it. The batch is never aborted (it may
-/// already be at the collector); only the log flush is, at the cap.
+/// log flush. A batch still running at the function deadline or the SHUTDOWN wait
+/// is cut off, and its undelivered groups are buffered for retry. Its breaker is
+/// `DEFAULT_BREAKER`, which the default tier's send paths consult too.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     // The one process-wide breaker, shared with the default-tier paths.
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(DEFAULT_BREAKER.clone()));

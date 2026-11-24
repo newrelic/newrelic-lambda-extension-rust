@@ -16,9 +16,8 @@ pub use scheduler::{DispatchOutcome, DispatchResult, SendScheduler};
 pub use send_target::BoxedSend;
 pub use tier::SendTier;
 
-/// Which telemetry path a send belongs to. Breakers and timeout bounds are
-/// tracked per kind, not globally, since the three endpoints fail and
-/// recover independently.
+/// Which telemetry path a send belongs to. Breaker state is tracked per kind,
+/// not globally, since the three endpoints fail and recover independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendKind {
     Logs,
