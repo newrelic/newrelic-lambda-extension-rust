@@ -385,12 +385,8 @@ const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 /// log flush. `default` never touches it. The batch is never aborted (it may
 /// already be at the collector); only the log flush is, at the cap.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
-    once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
-        crate::send::SendMode::Deferred,
-        // The one process-wide breaker, shared with the default-tier paths.
-        DEFAULT_BREAKER.clone(),
-        std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
-    ));
+    // The one process-wide breaker, shared with the default-tier paths.
+    once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(DEFAULT_BREAKER.clone()));
 
 /// The process-wide breaker, one state per endpoint, used by both tiers (`SEND_SCHEDULER` holds
 /// it too). N follows the configured tier: high 5, default 10 (open for 2N invokes).

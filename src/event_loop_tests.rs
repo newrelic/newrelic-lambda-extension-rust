@@ -4053,7 +4053,7 @@ async fn spawn_log_flush_skips_when_a_flush_is_already_pending() {
     );
 
     // Test cleanup only - fine to abort here, this task has no real data.
-    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::Logs).await;
+    let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::Logs], std::time::Duration::ZERO).await;
 }
 
 // --- Write-ahead buffering tests (shared-budget abort -> recoverable, not lost) ---
@@ -4278,7 +4278,7 @@ async fn high_tier_short_invoke_does_not_hold_next() {
 #[serial]
 async fn default_tier_never_uses_the_send_scheduler() {
     clear_high_tier_state();
-    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::ApmCollector).await;
+    let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::ApmCollector], std::time::Duration::ZERO).await;
     let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
     let request_id = "default-no-scheduler";
     let config = make_config_for_serverless(false);
@@ -5554,7 +5554,7 @@ async fn open_high_collector_breaker() {
     for _ in 0..breaker_n() {
         let failing: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Failure });
         SEND_SCHEDULER.spawn(collector, failing, None).await;
-        SEND_SCHEDULER.resolve_pending(collector).await;
+        SEND_SCHEDULER.resolve_pending_shared_budget(&[collector], std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -5566,7 +5566,7 @@ async fn close_high_collector_breaker() {
         }
         let succeeding: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
         if SEND_SCHEDULER.spawn(collector, succeeding, None).await {
-            SEND_SCHEDULER.resolve_pending(collector).await;
+            SEND_SCHEDULER.resolve_pending_shared_budget(&[collector], std::time::Duration::from_secs(1)).await;
         }
     }
     panic!("could not close the high-tier collector breaker");

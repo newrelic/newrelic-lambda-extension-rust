@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::send::circuit_breaker::BreakerState;
-use crate::send::{ConsecutiveFailureBreaker, FixedTimeoutProvider};
+use crate::send::ConsecutiveFailureBreaker;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,11 +15,7 @@ fn boxed_never() -> BoxedSend {
 }
 
 fn scheduler_with(breaker: Arc<ConsecutiveFailureBreaker>) -> SendScheduler {
-    SendScheduler::new(
-        SendMode::Deferred,
-        breaker,
-        Arc::new(FixedTimeoutProvider(Duration::from_millis(100))),
-    )
+    SendScheduler::new(breaker)
 }
 
 /// A breaker (N=1) that is half-open with its probe in flight for the collector.

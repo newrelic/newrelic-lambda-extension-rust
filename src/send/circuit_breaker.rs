@@ -21,7 +21,6 @@
 //! lives in the send path, not here — this file is only the breaker state
 //! machine: it decides *whether to attempt* a send.)
 
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -63,23 +62,6 @@ pub trait CircuitBreaker: Send + Sync {
     /// Goes back to Open with the full `2N` already skipped, so the next call retries again.
     /// A no-op unless the kind is `HalfOpen` and `permit` is the probe.
     fn release_probe(&self, _kind: SendKind, _permit: SendPermit) {}
-}
-
-/// Stub implementation: always allows sends, never opens. Kept for tests and as
-/// the default when the breaker is not in play.
-#[derive(Debug)]
-pub struct AlwaysAllowBreaker;
-
-impl CircuitBreaker for AlwaysAllowBreaker {
-    fn allow_send(&self, _kind: SendKind) -> Option<SendPermit> {
-        Some(SendPermit::Normal)
-    }
-
-    fn record_result(&self, _kind: SendKind, _permit: SendPermit, _outcome: SendOutcome) {}
-
-    fn state(&self, _kind: SendKind) -> BreakerState {
-        BreakerState::Closed
-    }
 }
 
 /// Per-`SendKind` state. Each endpoint (logs, APM collector, metric API) fails
@@ -295,15 +277,6 @@ mod tests {
         for _ in 0..n {
             b.record_result(kind, SendPermit::Normal, SendOutcome::Failure);
         }
-    }
-
-    #[test]
-    fn always_allow_breaker_always_allows_and_stays_closed() {
-        let b = AlwaysAllowBreaker;
-        assert!(b.allow_send(SendKind::Logs).is_some());
-        b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Failure);
-        assert!(b.allow_send(SendKind::Logs).is_some());
-        assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
     }
 
     // --- Closed / threshold ---
