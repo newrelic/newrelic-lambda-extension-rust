@@ -193,7 +193,8 @@ pub struct ExtensionSettings {
     /// `NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS` — `high` tier only. Longest SHUTDOWN
     /// waits for the last batch; Lambda allows external extensions 2000 ms in total.
     /// Default 2000 (the whole Shutdown phase), clamped to `[0, 2000]`. It is a ceiling, not a
-    /// delay: SHUTDOWN returns as soon as the batch finishes.
+    /// delay: SHUTDOWN returns as soon as the batch finishes. The effective wait is capped lower
+    /// (see `effective_shutdown_batch_wait` in `event_loop.rs`) so the cut-off and retry still fit.
     pub shutdown_batch_wait_ms: u64,
 }
 

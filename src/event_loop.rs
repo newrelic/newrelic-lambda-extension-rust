@@ -3081,9 +3081,16 @@ async fn shutdown_drain_high_tier(components: &ExtensionComponents) {
     if components.config.extension.send_tier != crate::send::SendTier::High {
         return;
     }
-    wait_for_pending_agent_batch(Duration::from_millis(components.config.extension.shutdown_batch_wait_ms)).await;
+    wait_for_pending_agent_batch(effective_shutdown_batch_wait(components.config.extension.shutdown_batch_wait_ms)).await;
     drain_stashed_reports_into_retry_buffer();
     retry_failed_platform_reports(components.apm_app.clone()).await;
+}
+
+/// The configured batch wait (accepted 0-2000 ms), capped at `SHUTDOWN_REPORT_WAIT_MS`: the main
+/// shutdown block only has `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`, and the cut-off and
+/// the step-4 retry must still run inside it after the wait.
+fn effective_shutdown_batch_wait(configured_ms: u64) -> Duration {
+    Duration::from_millis(configured_ms.min(SHUTDOWN_REPORT_WAIT_MS))
 }
 
 /// SHUTDOWN: flush every log. The steps share the log processor's batch, so they stay in order.

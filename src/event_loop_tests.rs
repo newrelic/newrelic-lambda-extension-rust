@@ -5775,3 +5775,13 @@ async fn waiting_for_an_agent_payload_wakes_on_the_push_and_not_before() {
     *request::CURRENT_ACTIVE_REQUEST_ID.lock().unwrap() = None;
     cleanup_request_processing_state_internal(id, false);
 }
+
+// SHUTDOWN at the default wait (2000 ms, the whole Lambda limit): the batch wait must leave
+// room in the main shutdown block for the cut-off and the step-4 retry.
+#[test]
+fn shutdown_batch_wait_is_capped_to_leave_room_for_the_retry() {
+    let main_block_ms = SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS;
+    let effective = effective_shutdown_batch_wait(2_000);
+    assert!(effective < Duration::from_millis(main_block_ms), "{:?} leaves no room for the retry", effective);
+    assert_eq!(effective_shutdown_batch_wait(50), Duration::from_millis(50), "a short wait is kept");
+}
