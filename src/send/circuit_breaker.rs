@@ -36,22 +36,33 @@ pub enum BreakerState {
     HalfOpen,
 }
 
-pub trait CircuitBreaker: Send + Sync {
-    /// Called before attempting a send. `false` → the caller skips the send
-    /// (and buffers the payload). While Open this returns `false` for `2N`
-    /// invocations, then `true` once (the retry probe).
-    fn allow_send(&self, kind: SendKind) -> bool;
+/// What `allow_send` hands out for a send it lets through. Pass it back with the result, so a
+/// late result of a send started while Closed cannot settle the single HalfOpen probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendPermit {
+    /// Allowed while Closed.
+    Normal,
+    /// The single retry after the `2N` skipped invocations.
+    Probe,
+}
 
-    /// Called after every send attempt completes (success or failure).
-    fn record_result(&self, kind: SendKind, outcome: SendOutcome);
+pub trait CircuitBreaker: Send + Sync {
+    /// Called before attempting a send. `None` → the caller skips the send
+    /// (and buffers the payload). While Open this returns `None` for `2N`
+    /// invocations, then `Some(Probe)` once (the retry probe).
+    fn allow_send(&self, kind: SendKind) -> Option<SendPermit>;
+
+    /// Called after every send attempt completes (success or failure), with the
+    /// permit `allow_send` gave that send. While HalfOpen only the probe's result counts.
+    fn record_result(&self, kind: SendKind, permit: SendPermit, outcome: SendOutcome);
 
     /// Current state per kind, for logging state transitions.
     fn state(&self, kind: SendKind) -> BreakerState;
 
     /// The retry that `allow_send` let through never ran, so there is no result to record.
     /// Goes back to Open with the full `2N` already skipped, so the next call retries again.
-    /// A no-op unless the kind is `HalfOpen`.
-    fn release_probe(&self, _kind: SendKind) {}
+    /// A no-op unless the kind is `HalfOpen` and `permit` is the probe.
+    fn release_probe(&self, _kind: SendKind, _permit: SendPermit) {}
 }
 
 /// Stub implementation: always allows sends, never opens. Kept for tests and as
@@ -60,11 +71,11 @@ pub trait CircuitBreaker: Send + Sync {
 pub struct AlwaysAllowBreaker;
 
 impl CircuitBreaker for AlwaysAllowBreaker {
-    fn allow_send(&self, _kind: SendKind) -> bool {
-        true
+    fn allow_send(&self, _kind: SendKind) -> Option<SendPermit> {
+        Some(SendPermit::Normal)
     }
 
-    fn record_result(&self, _kind: SendKind, _outcome: SendOutcome) {}
+    fn record_result(&self, _kind: SendKind, _permit: SendPermit, _outcome: SendOutcome) {}
 
     fn state(&self, _kind: SendKind) -> BreakerState {
         BreakerState::Closed
@@ -141,12 +152,12 @@ impl ConsecutiveFailureBreaker {
 }
 
 impl CircuitBreaker for ConsecutiveFailureBreaker {
-    fn allow_send(&self, kind: SendKind) -> bool {
+    fn allow_send(&self, kind: SendKind) -> Option<SendPermit> {
         let open_window = self.open_window();
         let mut map = self.lock();
         let entry = map.entry(kind).or_default();
         match entry.state {
-            BreakerState::Closed => true,
+            BreakerState::Closed => Some(SendPermit::Normal),
             BreakerState::Open => {
                 if entry.skips_while_open >= open_window {
                     // 2N invocations skipped — let exactly one retry through.
@@ -156,23 +167,25 @@ impl CircuitBreaker for ConsecutiveFailureBreaker {
                         kind,
                         entry.skips_while_open
                     );
-                    true
+                    Some(SendPermit::Probe)
                 } else {
                     entry.skips_while_open += 1;
-                    false
+                    None
                 }
             }
             // The single retry is already out for this kind — skip any other
             // send until record_result resolves it.
-            BreakerState::HalfOpen => false,
+            BreakerState::HalfOpen => None,
         }
     }
 
-    fn record_result(&self, kind: SendKind, outcome: SendOutcome) {
+    fn record_result(&self, kind: SendKind, permit: SendPermit, outcome: SendOutcome) {
         let threshold = self.threshold;
         let mut map = self.lock();
         let entry = map.entry(kind).or_default();
         match (entry.state, outcome) {
+            // A send started while Closed finished late: only the probe decides HalfOpen.
+            (BreakerState::HalfOpen, _) if permit != SendPermit::Probe => {}
             (BreakerState::Closed, SendOutcome::Success) => {
                 entry.failures = 0;
             }
@@ -212,11 +225,11 @@ impl CircuitBreaker for ConsecutiveFailureBreaker {
         self.lock().get(&kind).map_or(BreakerState::Closed, |s| s.state)
     }
 
-    fn release_probe(&self, kind: SendKind) {
+    fn release_probe(&self, kind: SendKind, permit: SendPermit) {
         let open_window = self.open_window();
         let mut map = self.lock();
         let entry = map.entry(kind).or_default();
-        if entry.state == BreakerState::HalfOpen {
+        if entry.state == BreakerState::HalfOpen && permit == SendPermit::Probe {
             entry.state = BreakerState::Open;
             entry.skips_while_open = open_window;
         }
@@ -267,16 +280,16 @@ mod tests {
 
     fn fail_n(b: &ConsecutiveFailureBreaker, kind: SendKind, n: u32) {
         for _ in 0..n {
-            b.record_result(kind, SendOutcome::Failure);
+            b.record_result(kind, SendPermit::Normal, SendOutcome::Failure);
         }
     }
 
     #[test]
     fn always_allow_breaker_always_allows_and_stays_closed() {
         let b = AlwaysAllowBreaker;
-        assert!(b.allow_send(SendKind::Logs));
-        b.record_result(SendKind::Logs, SendOutcome::Failure);
-        assert!(b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::Logs).is_some());
+        b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Failure);
+        assert!(b.allow_send(SendKind::Logs).is_some());
         assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
     }
 
@@ -286,11 +299,11 @@ mod tests {
     fn stays_closed_and_allows_below_threshold() {
         let b = breaker();
         for _ in 0..(N - 1) {
-            assert!(b.allow_send(SendKind::Logs));
-            b.record_result(SendKind::Logs, SendOutcome::Failure);
+            assert!(b.allow_send(SendKind::Logs).is_some());
+            b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Failure);
         }
         assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
-        assert!(b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::Logs).is_some());
     }
 
     #[test]
@@ -304,12 +317,12 @@ mod tests {
     fn success_resets_the_counter_even_mid_streak() {
         let b = breaker();
         fail_n(&b, SendKind::Logs, N - 1);
-        b.record_result(SendKind::Logs, SendOutcome::Success);
+        b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Success);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
         // Counting restarts: N-1 more fails stays Closed, the Nth opens.
         fail_n(&b, SendKind::Logs, N - 1);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
-        b.record_result(SendKind::Logs, SendOutcome::Failure);
+        b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Failure);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
     }
 
@@ -323,16 +336,16 @@ mod tests {
 
         // 2N skipped invocations, all refused.
         for _ in 0..(2 * N) {
-            assert!(!b.allow_send(SendKind::Logs));
+            assert!(b.allow_send(SendKind::Logs).is_none());
         }
         assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
 
         // The next invocation is the retry — allowed once, and flips HalfOpen.
-        assert!(b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::Logs).is_some());
         assert_eq!(b.state(SendKind::Logs), BreakerState::HalfOpen);
 
         // No second retry while the first is still outstanding.
-        assert!(!b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::Logs).is_none());
     }
 
     #[test]
@@ -342,8 +355,9 @@ mod tests {
         for _ in 0..(2 * N) {
             b.allow_send(SendKind::Logs);
         }
-        assert!(b.allow_send(SendKind::Logs)); // retry
-        b.record_result(SendKind::Logs, SendOutcome::Success);
+        let retry = b.allow_send(SendKind::Logs);
+        assert_eq!(retry, Some(SendPermit::Probe));
+        b.record_result(SendKind::Logs, SendPermit::Probe, SendOutcome::Success);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Closed);
         // Fully reset: needs another full N fails to reopen.
         fail_n(&b, SendKind::Logs, N - 1);
@@ -357,15 +371,16 @@ mod tests {
         for _ in 0..(2 * N) {
             b.allow_send(SendKind::Logs);
         }
-        assert!(b.allow_send(SendKind::Logs)); // retry
-        b.record_result(SendKind::Logs, SendOutcome::Failure);
+        let retry = b.allow_send(SendKind::Logs);
+        assert_eq!(retry, Some(SendPermit::Probe));
+        b.record_result(SendKind::Logs, SendPermit::Probe, SendOutcome::Failure);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
 
         // Skip count restarted: must skip a fresh 2N before the next retry.
         for _ in 0..(2 * N) {
-            assert!(!b.allow_send(SendKind::Logs));
+            assert!(b.allow_send(SendKind::Logs).is_none());
         }
-        assert!(b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::Logs).is_some());
     }
 
     // --- Per-kind independence ---
@@ -377,9 +392,9 @@ mod tests {
         assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
         assert_eq!(b.state(SendKind::ApmCollector), BreakerState::Closed);
         assert_eq!(b.state(SendKind::MetricApi), BreakerState::Closed);
-        assert!(b.allow_send(SendKind::ApmCollector));
-        assert!(b.allow_send(SendKind::MetricApi));
-        assert!(!b.allow_send(SendKind::Logs));
+        assert!(b.allow_send(SendKind::ApmCollector).is_some());
+        assert!(b.allow_send(SendKind::MetricApi).is_some());
+        assert!(b.allow_send(SendKind::Logs).is_none());
     }
 
     // --- Per-tier N (open window derives as 2N) ---
@@ -389,18 +404,18 @@ mod tests {
         let b = ConsecutiveFailureBreaker::new(DEFAULT_THRESHOLD_DEFAULT); // 10
         fail_n(&b, SendKind::ApmCollector, 9);
         assert_eq!(b.state(SendKind::ApmCollector), BreakerState::Closed);
-        b.record_result(SendKind::ApmCollector, SendOutcome::Failure); // 10th
+        b.record_result(SendKind::ApmCollector, SendPermit::Normal, SendOutcome::Failure); // 10th
         assert_eq!(b.state(SendKind::ApmCollector), BreakerState::Open);
         for _ in 0..20 {
-            assert!(!b.allow_send(SendKind::ApmCollector));
+            assert!(b.allow_send(SendKind::ApmCollector).is_none());
         }
-        assert!(b.allow_send(SendKind::ApmCollector)); // retry after 2N=20
+        assert!(b.allow_send(SendKind::ApmCollector).is_some()); // retry after 2N=20
     }
 
     #[test]
     fn zero_threshold_is_clamped_to_one() {
         let b = ConsecutiveFailureBreaker::new(0);
-        b.record_result(SendKind::Logs, SendOutcome::Failure);
+        b.record_result(SendKind::Logs, SendPermit::Normal, SendOutcome::Failure);
         assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
     }
 

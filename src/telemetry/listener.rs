@@ -66,27 +66,27 @@ pub(crate) async fn send_platform_report_in_background(request_id: String, repor
     let breaker = &crate::event_loop::DEFAULT_BREAKER;
     let app = crate::APM_APP.read().await.clone();
     let failed = if let Some(app) = app {
-        if !breaker.allow_send(SendKind::MetricApi) {
-            debug!("APM mode: circuit breaker open - buffering platform.report metrics for request: {}", request_id);
-            app.buffer_platform_report_metrics(&report_line, &arn);
-            false
-        } else {
+        if let Some(permit) = breaker.allow_send(SendKind::MetricApi) {
             match app.send_platform_report_metrics_outcome(&report_line, &arn).await {
                 Ok(outcome) => {
                     match outcome {
-                        Some(true) => breaker.record_result(SendKind::MetricApi, SendOutcome::Success),
-                        Some(false) => breaker.record_result(SendKind::MetricApi, SendOutcome::Failure),
-                        None => breaker.release_probe(SendKind::MetricApi),
+                        Some(true) => breaker.record_result(SendKind::MetricApi, permit, SendOutcome::Success),
+                        Some(false) => breaker.record_result(SendKind::MetricApi, permit, SendOutcome::Failure),
+                        None => breaker.release_probe(SendKind::MetricApi, permit),
                     }
                     debug!("APM mode: Sent platform.report metrics for request: {}", request_id);
                     false
                 }
                 Err(e) => {
-                    breaker.release_probe(SendKind::MetricApi);
+                    breaker.release_probe(SendKind::MetricApi, permit);
                     warn!("APM mode: Failed to send platform.report metrics for {}: {} - will retry", request_id, e);
                     true
                 }
             }
+        } else {
+            debug!("APM mode: circuit breaker open - buffering platform.report metrics for request: {}", request_id);
+            app.buffer_platform_report_metrics(&report_line, &arn);
+            false
         }
     } else {
         warn!("APM mode: APM app not ready - storing report for retry");

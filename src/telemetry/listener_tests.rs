@@ -2074,7 +2074,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
                 BreakerState::Open => {
                     let _ = breaker.allow_send(SendKind::MetricApi);
                 }
-                BreakerState::HalfOpen => breaker.record_result(SendKind::MetricApi, SendOutcome::Success),
+                BreakerState::HalfOpen => breaker.record_result(SendKind::MetricApi, crate::send::SendPermit::Probe, SendOutcome::Success),
             }
         }
         panic!("could not close the Metric API breaker");
@@ -2083,7 +2083,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
     fn fail_metric_breaker(times: u32) {
         use crate::send::{CircuitBreaker, SendKind, SendOutcome};
         for _ in 0..times {
-            crate::event_loop::DEFAULT_BREAKER.record_result(SendKind::MetricApi, SendOutcome::Failure);
+            crate::event_loop::DEFAULT_BREAKER.record_result(SendKind::MetricApi, crate::send::SendPermit::Normal, SendOutcome::Failure);
         }
     }
 
@@ -2145,7 +2145,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
         .await;
 
         assert_eq!(server.received_requests().await.unwrap().len(), 0, "nothing was sent");
-        assert!(!crate::event_loop::DEFAULT_BREAKER.allow_send(SendKind::MetricApi), "the call used one skip");
+        assert!(crate::event_loop::DEFAULT_BREAKER.allow_send(SendKind::MetricApi).is_none(), "the call used one skip");
 
         *crate::APM_APP.write().await = None;
         clear_metric_buffer();

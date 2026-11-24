@@ -35,7 +35,7 @@ pub mod tier;
 pub mod timeout_provider;
 
 pub use circuit_breaker::{
-    AlwaysAllowBreaker, BreakerState, CircuitBreaker, ConsecutiveFailureBreaker,
+    AlwaysAllowBreaker, BreakerState, CircuitBreaker, ConsecutiveFailureBreaker, SendPermit,
     DEFAULT_THRESHOLD_DEFAULT, DEFAULT_THRESHOLD_HIGH,
 };
 pub use scheduler::{DispatchOutcome, DispatchResult, SendMode, SendScheduler};
