@@ -178,3 +178,27 @@ fn the_default_tier_breaker_built_from_the_environment_uses_n_10_when_unset() {
         std::env::set_var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR, v);
     }
 }
+
+#[test]
+#[serial]
+fn the_tier_sets_the_default_threshold_and_the_variable_still_overrides_it() {
+    let saved = std::env::var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR).ok();
+    std::env::remove_var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR);
+
+    let high = ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::High);
+    fail_n(&high, SendKind::MetricApi, 4);
+    assert_eq!(high.state(SendKind::MetricApi), BreakerState::Closed, "high tier: 4 failures are not enough");
+    fail_n(&high, SendKind::MetricApi, 1);
+    assert_eq!(high.state(SendKind::MetricApi), BreakerState::Open, "high tier: the 5th opens it");
+
+    let default = ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::Default);
+    assert_eq!(default.threshold(), 10);
+
+    std::env::set_var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR, "3");
+    assert_eq!(ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::High).threshold(), 3);
+
+    match saved {
+        Some(v) => std::env::set_var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR, v),
+        None => std::env::remove_var(CIRCUIT_BREAKER_THRESHOLD_ENV_VAR),
+    }
+}

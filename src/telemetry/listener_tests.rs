@@ -2061,7 +2061,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
         "REPORT RequestId: lbrk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
 
     fn breaker_n() -> u32 {
-        crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+        crate::event_loop::DEFAULT_BREAKER.threshold()
     }
 
     /// Bring the default-tier Metric API breaker back to Closed with no failures counted, from

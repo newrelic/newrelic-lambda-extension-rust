@@ -139,6 +139,19 @@ impl ConsecutiveFailureBreaker {
         Self::new(threshold_from_env(default_threshold))
     }
 
+    /// Build with the tier's default `N` (high 5, default 10), overridable by the env var.
+    pub fn for_tier(tier: super::SendTier) -> Self {
+        Self::from_env(match tier {
+            super::SendTier::High => DEFAULT_THRESHOLD_HIGH,
+            super::SendTier::Default => DEFAULT_THRESHOLD_DEFAULT,
+        })
+    }
+
+    /// `N`, the consecutive failures that open a kind.
+    pub fn threshold(&self) -> u32 {
+        self.threshold
+    }
+
     /// The open window in invocations (`2N`).
     fn open_window(&self) -> u32 {
         self.threshold.saturating_mul(2)

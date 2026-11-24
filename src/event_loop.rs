@@ -380,20 +380,17 @@ const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
         crate::send::SendMode::Deferred,
-        // Real invocation-count breaker, high-tier defaults (N=5 → open 2N=10
-        // → buffer cap 3N=15). SEND_SCHEDULER is only ever used by the
-        // high-tier path (process_apm_request_high), so this does not touch the
-        // default tier's pipeline. `from_env` lets NEW_RELIC_EXTENSION_CIRCUIT_BREAKER_THRESHOLD
-        // override N; everything else derives from it.
-        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::from_env(
-            crate::send::DEFAULT_THRESHOLD_HIGH,
-        )),
+        // The one process-wide breaker, shared with the default-tier paths.
+        DEFAULT_BREAKER.clone(),
         std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
     ));
 
-/// Default tier breaker (N=10, open for 2N=20 invokes), one state per endpoint.
-pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<crate::send::ConsecutiveFailureBreaker> =
-    once_cell::sync::Lazy::new(|| crate::send::ConsecutiveFailureBreaker::from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT));
+/// The process-wide breaker, one state per endpoint, used by both tiers (`SEND_SCHEDULER` holds
+/// it too). N follows the configured tier: high 5, default 10 (open for 2N invokes).
+pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<std::sync::Arc<crate::send::ConsecutiveFailureBreaker>> =
+    once_cell::sync::Lazy::new(|| {
+        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::from_env()))
+    });
 
 /// Default tier retries for an endpoint only run while its breaker is closed.
 fn default_breaker_closed(kind: crate::send::SendKind) -> bool {

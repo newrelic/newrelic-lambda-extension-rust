@@ -5183,9 +5183,9 @@ async fn a_payload_that_arrives_early_without_an_apm_session_stays_buffered() {
 const BREAKER_REPORT_LINE: &str =
     "REPORT RequestId: brk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
 
-/// N of the default-tier breaker (the failures in a row that open it).
+/// N of the shared breaker (the failures in a row that open it).
 fn breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+    DEFAULT_BREAKER.threshold()
 }
 
 /// Bring the default-tier breaker for `kind` back to Closed with no failures counted, from any
@@ -5211,6 +5211,18 @@ fn fail_default_breaker(kind: crate::send::SendKind, times: u32) {
     for _ in 0..times {
         DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Failure);
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_high_tier_scheduler_and_the_default_tier_paths_share_one_breaker() {
+    let kind = crate::send::SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+
+    assert!(!SEND_SCHEDULER.breaker_closed(kind), "the failures counted by DEFAULT_BREAKER open it for SEND_SCHEDULER too");
+
+    force_default_breaker_closed(kind);
 }
 
 /// Register a request whose agent buffer holds one payload that cannot be parsed, so a send
@@ -5467,13 +5479,10 @@ async fn send_group_report_ignores_a_line_that_is_not_a_report() {
 
 // ── Circuit breaker: high-tier invoke-time retries ───────────────────────────────────
 
-fn high_breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_HIGH).max(1)
-}
 
 async fn open_high_collector_breaker() {
     let collector = crate::send::SendKind::ApmCollector;
-    for _ in 0..high_breaker_n() {
+    for _ in 0..breaker_n() {
         let failing: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Failure });
         SEND_SCHEDULER.spawn(collector, failing, None).await;
         SEND_SCHEDULER.resolve_pending(collector).await;
