@@ -128,6 +128,29 @@ fn failed_agent_payload_buffer_caps_and_counts_evictions() {
         .any(|p| p.request_id == format!("req-{}", *MAX_FAILED_AGENT_PAYLOADS)));
 }
 
+// The cap counts distinct request ids, not chunks; eviction drops the oldest
+// request id's chunks together.
+#[test]
+#[serial]
+fn failed_agent_payload_cap_counts_requests_not_chunks() {
+    let cap = *MAX_FAILED_AGENT_PAYLOADS;
+    let mut buf: Vec<FailedAgentPayload> = Vec::new();
+    for _ in 0..20 {
+        push_failed_payload_capped(&mut buf, make_failed_payload("req-big"));
+    }
+    for i in 1..cap {
+        push_failed_payload_capped(&mut buf, make_failed_payload(&format!("req-{i}")));
+    }
+    assert_eq!(buf.len(), 20 + cap - 1, "20 chunks of one request count as 1");
+    // One more distinct request: evicts all 20 chunks of the oldest request, nothing else.
+    push_failed_payload_capped(&mut buf, make_failed_payload("req-new"));
+    assert_eq!(buf.len(), cap);
+    assert!(buf.iter().all(|p| p.request_id != "req-big"));
+    // A further chunk of an already-buffered request evicts nothing.
+    push_failed_payload_capped(&mut buf, make_failed_payload("req-new"));
+    assert_eq!(buf.len(), cap + 1);
+}
+
 // Not in-flight (flag = false) → returns immediately without waiting.
 #[tokio::test]
 async fn test_handshake_wait_returns_immediately_when_not_in_flight() {

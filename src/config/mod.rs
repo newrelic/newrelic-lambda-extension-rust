@@ -647,12 +647,7 @@ impl ExtensionConfig {
         // Default inside SendTier::from_env itself (warns, never panics).
         config.extension.send_tier = crate::send::SendTier::from_env();
 
-        config.extension.short_invoke_threshold_ms =
-            env::var("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(10)
-                .min(1000);
+        config.extension.short_invoke_threshold_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS", 10, 0, 1000);
         config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
         config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
         config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 2_000, 0, 2_000);

@@ -134,13 +134,20 @@ pub fn buffered_agent_payload_request_ids() -> Vec<String> {
 /// is at capacity. Single choke point so both first-failure and retry re-buffer
 /// paths enforce the same cap.
 fn push_failed_payload_capped(buf: &mut Vec<FailedAgentPayload>, payload: FailedAgentPayload) {
-    if buf.len() >= *MAX_FAILED_AGENT_PAYLOADS {
-        buf.remove(0);
-        DROPPED_AGENT_PAYLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        warn!(
-            "Failed agent payload buffer full ({}) - evicted oldest invocation's data",
-            *MAX_FAILED_AGENT_PAYLOADS
-        );
+    // The cap counts distinct request ids (one invocation can span many chunks).
+    let ids: std::collections::HashSet<&str> = buf.iter().map(|p| p.request_id.as_str()).collect();
+    if !ids.contains(payload.request_id.as_str()) && ids.len() >= *MAX_FAILED_AGENT_PAYLOADS {
+        let oldest = buf.iter().min_by_key(|p| p.failed_at).map(|p| p.request_id.clone());
+        if let Some(oldest) = oldest {
+            let before = buf.len();
+            buf.retain(|p| p.request_id != oldest);
+            DROPPED_AGENT_PAYLOADS
+                .fetch_add((before - buf.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "Failed agent payload buffer full ({} invocations) - evicted oldest invocation's data",
+                *MAX_FAILED_AGENT_PAYLOADS
+            );
+        }
     }
     buf.push(payload);
 }

@@ -362,3 +362,20 @@ async fn retry_buffered_telemetry_covers_remaining_command_types() {
         clear();
     }
 }
+
+#[test]
+fn push_capped_never_exceeds_cap_and_evicts_oldest_by_failed_at() {
+    let at = |m: i64| FailedTelemetry {
+        request_id: format!("r{m}"),
+        failed_at: chrono::Utc::now() - chrono::TimeDelta::try_minutes(m).unwrap(),
+        ..fresh_item("metric_data")
+    };
+    let mut buf = vec![at(5), at(3)];
+    // A re-buffered older item lands last but must still be the one evicted.
+    push_capped(&mut buf, at(10), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.request_id != "r10"));
+    push_capped(&mut buf, at(1), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.request_id != "r5"), "oldest evicted first");
+}

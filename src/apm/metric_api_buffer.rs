@@ -60,11 +60,7 @@ pub fn buffer_failed_metric_api(metrics: Vec<Value>, endpoint: String, retry_aft
     };
     if let Ok(mut buffer) = FAILED_METRIC_API_BUFFER.lock() {
         // Bound memory: evict oldest if at capacity (prefer keeping fresher metrics).
-        if buffer.len() >= MAX_BUFFERED_BATCHES {
-            buffer.remove(0);
-            warn!("Metric API buffer full ({}) - evicted oldest batch", MAX_BUFFERED_BATCHES);
-        }
-        buffer.push(item);
+        push_capped(&mut buffer, item, MAX_BUFFERED_BATCHES);
         debug!(
             "APM mode: Buffered failed platform metrics (total buffered: {})",
             buffer.len()
@@ -262,7 +258,19 @@ fn reschedule_or_drop(mut item: FailedMetricApi, e: &super::collector::MetricApi
 
 fn re_buffer(item: FailedMetricApi) {
     if let Ok(mut buffer) = FAILED_METRIC_API_BUFFER.lock() {
-        buffer.push(item);
+        push_capped(&mut buffer, item, MAX_BUFFERED_BATCHES);
+    }
+}
+
+/// Push `item`, then drop the oldest (by `failed_at`) if over `cap`. Shared by the
+/// fresh-failure and re-buffer paths so a retry pass can never push past the cap.
+fn push_capped(buffer: &mut Vec<FailedMetricApi>, item: FailedMetricApi, cap: usize) {
+    buffer.push(item);
+    if buffer.len() > cap {
+        if let Some(i) = (0..buffer.len()).min_by_key(|&i| buffer[i].failed_at) {
+            buffer.remove(i);
+            warn!("Metric API buffer full ({}) - evicted oldest batch", cap);
+        }
     }
 }
 
