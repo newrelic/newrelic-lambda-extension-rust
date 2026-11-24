@@ -116,6 +116,10 @@ pub struct RequestData {
     pub invoked_function_arn: String,
 }
 
+/// Signalled whenever an agent payload is pushed into a request buffer, so
+/// `event_loop::wait_for_agent_payload` need not poll the buffer lock.
+pub static AGENT_PAYLOAD_NOTIFY: Lazy<Notify> = Lazy::new(Notify::new);
+
 pub static REQUEST_DATA: Lazy<Arc<DashMap<String, RequestData>>> =
     Lazy::new(|| Arc::new(DashMap::new()));
 
@@ -581,7 +585,9 @@ pub async fn cleanup_old_request_buffers(
             (Vec::new(), crate::get_global_fallback_arn())
         };
 
-        if !payloads.is_empty() {
+        // A short invoke the extension chose to drop stays dropped: its late payload is discarded.
+        let dropped_short = crate::send::short_invoke::get(request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped);
+        if !payloads.is_empty() && !dropped_short {
             if config.new_relic.apm_lambda_mode {
                 // APM mode MUST NOT touch the serverless ingest endpoint. Hand any
                 // stranded payloads to the APM retry buffer so the per-invoke retry
@@ -745,6 +751,7 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
             match entry.agent_buffer.lock() {
                 Ok(mut buffer) => {
                     buffer.push(payload_bytes);
+                    AGENT_PAYLOAD_NOTIFY.notify_waiters();
                     info!(
                         "Agent payload received for request {} (buffer size: {})",
                         request_id, buffer.len()
@@ -785,6 +792,7 @@ async fn route_payload_to_active_request(payload_bytes: Vec<u8>) {
             if let Some(entry) = REQUEST_DATA.get(&request_id) {
                 if let Ok(mut buffer) = entry.agent_buffer.lock() {
                     buffer.push(payload_bytes);
+                    AGENT_PAYLOAD_NOTIFY.notify_waiters();
                     debug!(
                         "Stored late agent payload in buffer for {} (buffer size: {})",
                         request_id, buffer.len()
@@ -823,6 +831,8 @@ fn route_payload_by_embedded_request_id(payload_bytes: Vec<u8>) {
                 match entry.agent_buffer.lock() {
                     Ok(mut buffer) => {
                         buffer.push(payload_bytes);
+                        AGENT_PAYLOAD_NOTIFY.notify_waiters();
+                    AGENT_PAYLOAD_NOTIFY.notify_waiters();
                         info!(
                             "LMI: agent payload received for request {} (buffer size: {})",
                             request_id,

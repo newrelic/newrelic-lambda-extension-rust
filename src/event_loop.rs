@@ -279,9 +279,9 @@ async fn retry_failed_platform_reports(apm_app: crate::apm::SharedApmApp) {
 
     debug!("Retrying {} buffered platform-report(s)", pending.len());
 
-    let apm_guard = apm_app.read().await;
-    let Some(ref app) = *apm_guard else {
-        drop(apm_guard);
+    // Clone out of the lock so the read guard is not held across every POST below.
+    let app_owned = apm_app.read().await.clone();
+    let Some(app) = app_owned else {
         if let Ok(mut buf) = FAILED_PLATFORM_REPORTS.lock() {
             buf.extend(pending);
         }
@@ -956,10 +956,6 @@ fn batch_exceeded_max_age(max_age: Duration) -> bool {
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
 /// Lambda's 2s limit) for the last batch. One still running after that is cut off like at
 /// the function deadline, so its unsent groups land in the retry buffer instead of nowhere.
-async fn resolve_pending_agent_batch(wait_ms: u64) {
-    wait_for_pending_agent_batch(Duration::from_millis(wait_ms)).await;
-}
-
 async fn wait_for_pending_agent_batch(wait: Duration) {
     let kind = crate::send::SendKind::ApmCollector;
     let finished = SEND_SCHEDULER.wait_finished(&[kind], wait).await.remove(&kind);
@@ -2293,17 +2289,6 @@ async fn process_apm_request_with(
     );
 }
 
-/// `SendTier::Default` — the exact pre-existing `main` code (pipeline_flush-based,
-/// pre-`SendScheduler`), moved here verbatim, not edited, per `DUAL_PATH_PLAN.md`.
-/// Zero behavior change versus `main` -- this is the whole point of the dual-path
-/// design: `default` tier's testing surface/regression risk stays exactly what it
-/// already was.
-///
-/// `#[allow(clippy::too_many_lines)]`: a function-boundary artifact of
-/// extracting this logic out of the original combined `process_apm_request`
-/// (which didn't trip this lint at its old boundary) -- the code itself is
-/// unchanged, not newly complex.
-#[allow(clippy::too_many_lines)]
 /// Default tier: send an invocation's agent payload(s) to the APM collector in the background.
 /// The handle yields (all sent, the payloads). A payload that could not be sent is buffered for
 /// retry inside the task, so nothing is lost if the caller ignores the result.
@@ -2319,13 +2304,12 @@ fn spawn_default_agent_send(
     let config_clone = config.clone();
     let global_log_processor_clone = global_log_processor.clone();
     let apm_app_clone = apm_app.clone();
-    let agent_payloads_clone = agent_payloads;
     let invoked_function_arn_clone = invoked_function_arn.to_string();
 
     tokio::spawn(async move {
         // Trace-id extraction is per-chunk (independent of telemetry-map
         // merging) — same as process_pending_agent_payloads's identical step.
-        for payload_bytes in &agent_payloads_clone {
+        for payload_bytes in &agent_payloads {
             extract_and_coordinate_trace_id(
                 payload_bytes,
                 &request_id_clone,
@@ -2346,7 +2330,7 @@ fn spawn_default_agent_send(
         let app_owned = apm_app_clone.read().await.clone();
         let send_started = chrono::Utc::now();
         let all_sent = if let Some(app) = app_owned {
-            let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
+            let send_result = app.process_merged_agent_payloads(agent_payloads.clone(), &request_id_clone, &invoked_function_arn_clone).await;
             send_result.is_ok()
         } else {
             false
@@ -2360,11 +2344,11 @@ fn spawn_default_agent_send(
             // (never silently dropped); the global retry loop resends them on a
             // later invoke / at shutdown. Mirrors process_pending_agent_payloads's
             // identical fallback when apm_app isn't ready or the merged send errors.
-            for payload_bytes in &agent_payloads_clone {
+            for payload_bytes in &agent_payloads {
                 buffer_failed_agent_payload(payload_bytes, &request_id_clone, &invoked_function_arn_clone);
             }
         }
-        (all_sent, agent_payloads_clone, delivered)
+        (all_sent, agent_payloads, delivered)
     })
 }
 
@@ -2374,13 +2358,21 @@ fn spawn_default_agent_send(
 /// comes: callers race it against `runtimeDone`.
 async fn wait_for_agent_payload(state: &request::RequestProcessingState) {
     loop {
+        // Register before checking, so a push between the check and the await is not missed.
+        let mut notified = std::pin::pin!(request::AGENT_PAYLOAD_NOTIFY.notified());
+        notified.as_mut().enable();
         if state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        notified.await;
     }
 }
 
+/// `SendTier::Default`: the pipeline_flush-based path of `main`, pre-`SendScheduler`, kept so
+/// the default tier behaves as `main` does. One addition: an agent payload that arrives before
+/// `runtimeDone` is uploaded at once (`spawn_default_agent_send`), so later chunks may go out as a
+/// second POST set.
+#[allow(clippy::too_many_lines)]
 async fn process_apm_request_default(
     request_id: &String,
     invoked_function_arn: &String,
@@ -3101,7 +3093,7 @@ async fn shutdown_drain_high_tier(components: &ExtensionComponents) {
     if components.config.extension.send_tier != crate::send::SendTier::High {
         return;
     }
-    resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
+    wait_for_pending_agent_batch(Duration::from_millis(components.config.extension.shutdown_batch_wait_ms)).await;
     drain_stashed_reports_into_retry_buffer();
     retry_failed_platform_reports(components.apm_app.clone()).await;
 }
