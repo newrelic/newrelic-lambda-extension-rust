@@ -41,7 +41,7 @@ fn push_capped(buffer: &mut Vec<FailedTelemetry>, item: FailedTelemetry, cap: us
 
 /// 15 in the high tier, 30 otherwise.
 fn max_buffered_items_for(tier: crate::send::SendTier) -> usize {
-    if tier == crate::send::SendTier::High { 15 } else { 30 }
+    crate::send::circuit_breaker::buffer_cap_for(tier)
 }
 
 /// Failed telemetry data that needs to be retried

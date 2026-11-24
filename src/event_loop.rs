@@ -99,13 +99,7 @@ pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgen
 /// per-tier 3N cap replaces it so the buffer matches the breaker's
 /// fill→retry→slide lifecycle exactly.)
 static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> =
-    once_cell::sync::Lazy::new(|| {
-        let default_n = match crate::send::SendTier::from_env() {
-            crate::send::SendTier::High => crate::send::DEFAULT_THRESHOLD_HIGH,
-            crate::send::SendTier::Default => crate::send::DEFAULT_THRESHOLD_DEFAULT,
-        };
-        3 * crate::send::circuit_breaker::threshold_from_env(default_n) as usize
-    });
+    once_cell::sync::Lazy::new(|| crate::send::circuit_breaker::buffer_cap_for(crate::send::SendTier::from_env()));
 
 /// Count of buffered agent payloads dropped *before* shutdown (evicted when the
 /// buffer is full). Lets the shutdown summary report the true loss, since evicted
