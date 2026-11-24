@@ -2367,10 +2367,13 @@ fn spawn_default_agent_send(
 /// comes: callers race it against `runtimeDone`.
 async fn wait_for_agent_payload(state: &request::RequestProcessingState) {
     loop {
+        // Register before checking, so a push between the check and the await is not missed.
+        let mut notified = std::pin::pin!(request::AGENT_PAYLOAD_NOTIFY.notified());
+        notified.as_mut().enable();
         if state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        notified.await;
     }
 }
 

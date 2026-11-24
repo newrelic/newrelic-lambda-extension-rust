@@ -5122,6 +5122,7 @@ async fn waiting_for_an_agent_payload_returns_as_soon_as_one_is_buffered() {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
         buffer.lock().unwrap().push(b"payload".to_vec());
+        request::AGENT_PAYLOAD_NOTIFY.notify_waiters();
     });
 
     let started = tokio::time::Instant::now();
@@ -5623,4 +5624,38 @@ async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
 
     REQUEST_DATA.remove(request_id);
     force_default_breaker_closed(logs);
+}
+
+// The wait is woken by the payload push itself, not by a timer: the pusher finishes within
+// microseconds, far under any poll interval, so only the push can wake the wait before then.
+#[tokio::test]
+#[serial]
+async fn waiting_for_an_agent_payload_wakes_on_the_push_and_not_before() {
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let id = "wait-payload";
+    let state = detection_state(id);
+    *request::CURRENT_ACTIVE_REQUEST_ID.lock().unwrap() = Some(id.to_string());
+    let pusher_done = AtomicBool::new(false);
+
+    let not_yet = tokio::time::timeout(Duration::from_millis(50), wait_for_agent_payload(&state)).await;
+    assert!(not_yet.is_err(), "nothing pushed, so the wait must not return");
+
+    let woke_before_pusher_done = async {
+        wait_for_agent_payload(&state).await;
+        !pusher_done.load(Ordering::SeqCst)
+    };
+    let pusher = async {
+        tokio::task::yield_now().await;
+        request::route_payload_to_request_buffer(vec![1], DeploymentContext::Normal { mode: TelemetryMode::Serverless }).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        pusher_done.store(true, Ordering::SeqCst);
+    };
+    let (woke, ()) = tokio::join!(woke_before_pusher_done, pusher);
+
+    assert!(woke, "the push must wake the wait without waiting for a timer");
+    *request::CURRENT_ACTIVE_REQUEST_ID.lock().unwrap() = None;
+    cleanup_request_processing_state_internal(id, false);
 }
