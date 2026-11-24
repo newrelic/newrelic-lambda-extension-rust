@@ -43,7 +43,7 @@
 
 #![allow(dead_code)]
 
-use super::{BoxedSend, CircuitBreaker, SendKind, SendOutcome, SendTimeoutProvider};
+use super::{BoxedSend, CircuitBreaker, SendKind, SendOutcome, SendPermit, SendTimeoutProvider};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -105,6 +105,7 @@ pub struct DispatchOutcome {
 struct PendingEntry {
     handle: JoinHandle<SendOutcome>,
     cursor: Option<Arc<AtomicUsize>>,
+    permit: SendPermit,
 }
 
 /// Cooperative poll interval used by `SendScheduler::resolve_pending_shared_budget`
@@ -151,20 +152,20 @@ impl SendScheduler {
         send: BoxedSend,
         cursor: Option<Arc<AtomicUsize>>,
     ) -> DispatchOutcome {
-        if !self.breaker.allow_send(kind) {
+        let Some(permit) = self.breaker.allow_send(kind) else {
             return DispatchOutcome {
                 result: DispatchResult::Dropped,
                 cursor: None,
             };
-        }
+        };
 
         match self.mode {
-            SendMode::Sync => self.send_now(kind, send, cursor).await,
+            SendMode::Sync => self.send_now(kind, permit, send, cursor).await,
             SendMode::Deferred => {
                 // `dispatch` already consulted the breaker above, so go
                 // straight to the un-gated inner spawn — never `spawn`, or the
                 // breaker's `allow_send` would be counted twice for one send.
-                self.spawn_inner(kind, send, cursor).await;
+                self.spawn_inner(kind, permit, send, cursor).await;
                 DispatchOutcome {
                     result: DispatchResult::Deferred,
                     cursor: None,
@@ -180,16 +181,17 @@ impl SendScheduler {
     async fn send_now(
         &self,
         kind: SendKind,
+        permit: SendPermit,
         send: BoxedSend,
         cursor: Option<Arc<AtomicUsize>>,
     ) -> DispatchOutcome {
         let timeout = self.timeout_provider.current_timeout(kind);
         let mut handle = tokio::spawn(send);
         tokio::select! {
-            res = &mut handle => self.finish(kind, res, cursor.as_deref()),
+            res = &mut handle => self.finish(kind, permit, res, cursor.as_deref()),
             () = tokio::time::sleep(timeout) => {
                 handle.abort();
-                self.breaker.record_result(kind, SendOutcome::Failure);
+                self.breaker.record_result(kind, permit, SendOutcome::Failure);
                 DispatchOutcome {
                     result: DispatchResult::TimedOut,
                     cursor: cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
@@ -223,14 +225,14 @@ impl SendScheduler {
     ///   write-ahead/metadata it staged for this send). Counts as one
     ///   Open-window invocation for `kind`.
     pub async fn spawn(&self, kind: SendKind, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) -> bool {
-        if !self.breaker.allow_send(kind) {
+        let Some(permit) = self.breaker.allow_send(kind) else {
             tracing::debug!(
                 "SendScheduler: circuit breaker open for {:?} — send skipped, caller buffers",
                 kind
             );
             return false;
-        }
-        self.spawn_inner(kind, send, cursor).await;
+        };
+        self.spawn_inner(kind, permit, send, cursor).await;
         true
     }
 
@@ -238,10 +240,10 @@ impl SendScheduler {
     /// `resolve_pending*`. Kept private and separate from [`SendScheduler::spawn`]
     /// so `dispatch` (which has already consulted the breaker) can reach it
     /// without double-counting an `allow_send`.
-    async fn spawn_inner(&self, kind: SendKind, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) {
+    async fn spawn_inner(&self, kind: SendKind, permit: SendPermit, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) {
         let handle = tokio::spawn(send);
         let mut guard = self.pending.lock().await;
-        if let Some(orphaned) = guard.insert(kind, PendingEntry { handle, cursor }) {
+        if let Some(orphaned) = guard.insert(kind, PendingEntry { handle, cursor, permit }) {
             tracing::warn!(
                 "SendScheduler: overwriting an unresolved pending send for {:?} — \
                  resolve_pending should have been called first; aborting the orphaned task",
@@ -264,19 +266,19 @@ impl SendScheduler {
             let mut guard = self.pending.lock().await;
             guard.remove(&kind)
         }?;
-        let PendingEntry { handle, cursor } = entry;
+        let PendingEntry { handle, cursor, permit } = entry;
 
         if handle.is_finished() {
-            return Some(self.finish(kind, handle.await, cursor.as_deref()));
+            return Some(self.finish(kind, permit, handle.await, cursor.as_deref()));
         }
 
         let timeout = self.timeout_provider.current_timeout(kind);
         let mut handle = handle;
         let result = tokio::select! {
-            res = &mut handle => self.finish(kind, res, cursor.as_deref()),
+            res = &mut handle => self.finish(kind, permit, res, cursor.as_deref()),
             () = tokio::time::sleep(timeout) => {
                 handle.abort();
-                self.breaker.record_result(kind, SendOutcome::Failure);
+                self.breaker.record_result(kind, permit, SendOutcome::Failure);
                 DispatchOutcome {
                     result: DispatchResult::TimedOut,
                     cursor: cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
@@ -313,9 +315,9 @@ impl SendScheduler {
         }
 
         // Finished: take it out of the map and join it for real.
-        let PendingEntry { handle, cursor } = guard.remove(&kind).expect("just checked present");
+        let PendingEntry { handle, cursor, permit } = guard.remove(&kind).expect("just checked present");
         drop(guard);
-        Some(self.finish(kind, handle.await, cursor.as_deref()))
+        Some(self.finish(kind, permit, handle.await, cursor.as_deref()))
     }
 
     /// Whether `kind` currently has a pending send (spawned, not yet
@@ -379,12 +381,12 @@ impl SendScheduler {
         }
 
         let mut results = HashMap::new();
-        let mut running: Vec<(SendKind, JoinHandle<SendOutcome>, Option<Arc<AtomicUsize>>)> = Vec::new();
-        for (kind, PendingEntry { handle, cursor }) in entries {
-            if handle.is_finished() {
-                results.insert(kind, self.finish(kind, handle.await, cursor.as_deref()));
+        let mut running: Vec<(SendKind, PendingEntry)> = Vec::new();
+        for (kind, entry) in entries {
+            if entry.handle.is_finished() {
+                results.insert(kind, self.finish(kind, entry.permit, entry.handle.await, entry.cursor.as_deref()));
             } else {
-                running.push((kind, handle, cursor));
+                running.push((kind, entry));
             }
         }
 
@@ -392,9 +394,9 @@ impl SendScheduler {
         while !running.is_empty() && tokio::time::Instant::now() < deadline {
             let mut i = 0;
             while i < running.len() {
-                if running[i].1.is_finished() {
-                    let (kind, handle, cursor) = running.remove(i);
-                    results.insert(kind, self.finish(kind, handle.await, cursor.as_deref()));
+                if running[i].1.handle.is_finished() {
+                    let (kind, entry) = running.remove(i);
+                    results.insert(kind, self.finish(kind, entry.permit, entry.handle.await, entry.cursor.as_deref()));
                 } else {
                     i += 1;
                 }
@@ -406,16 +408,16 @@ impl SendScheduler {
             tokio::time::sleep(remaining.min(SHARED_BUDGET_POLL_TICK)).await;
         }
 
-        for (kind, handle, cursor) in running {
-            handle.abort();
+        for (kind, entry) in running {
+            entry.handle.abort();
             // Cut off by the caller's own limit, not answered by the backend: no result to
             // record, and a probe cut off here is given back.
-            self.breaker.release_probe(kind);
+            self.breaker.release_probe(kind, entry.permit);
             results.insert(
                 kind,
                 DispatchOutcome {
                     result: DispatchResult::TimedOut,
-                    cursor: cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
+                    cursor: entry.cursor.as_deref().map(|c| c.load(Ordering::SeqCst)),
                 },
             );
         }
@@ -426,13 +428,14 @@ impl SendScheduler {
     fn finish(
         &self,
         kind: SendKind,
+        permit: SendPermit,
         res: Result<SendOutcome, tokio::task::JoinError>,
         cursor: Option<&AtomicUsize>,
     ) -> DispatchOutcome {
         let cursor_value = cursor.map(|c| c.load(Ordering::SeqCst));
         match res {
             Ok(outcome) => {
-                self.breaker.record_result(kind, outcome);
+                self.breaker.record_result(kind, permit, outcome);
                 let result = match outcome {
                     SendOutcome::Success => DispatchResult::Sent,
                     SendOutcome::Failure => DispatchResult::Failed,
@@ -441,7 +444,7 @@ impl SendScheduler {
             }
             Err(_join_err) => {
                 // Task panicked or was otherwise cancelled unexpectedly.
-                self.breaker.record_result(kind, SendOutcome::Failure);
+                self.breaker.record_result(kind, permit, SendOutcome::Failure);
                 DispatchOutcome {
                     result: DispatchResult::Failed,
                     cursor: cursor_value,
@@ -467,7 +470,7 @@ impl SendScheduler {
         let mut finished = HashMap::new();
         for &kind in kinds {
             let entry = self.pending.lock().await.remove(&kind);
-            let Some(PendingEntry { mut handle, cursor }) = entry else { continue };
+            let Some(PendingEntry { mut handle, cursor, permit }) = entry else { continue };
             let result = tokio::select! {
                 biased;
                 res = &mut handle => Some(res),
@@ -475,10 +478,10 @@ impl SendScheduler {
             };
             match result {
                 Some(res) => {
-                    finished.insert(kind, self.finish(kind, res, cursor.as_deref()));
+                    finished.insert(kind, self.finish(kind, permit, res, cursor.as_deref()));
                 }
                 None => {
-                    self.pending.lock().await.insert(kind, PendingEntry { handle, cursor });
+                    self.pending.lock().await.insert(kind, PendingEntry { handle, cursor, permit });
                 }
             }
         }
@@ -489,12 +492,12 @@ impl SendScheduler {
     /// life: its owner still finishes (and buffers its own failures), but a new send of
     /// the same kind may start. Returns whether anything was detached.
     pub async fn detach(&self, kind: SendKind) -> bool {
-        let detached = self.pending.lock().await.remove(&kind).is_some();
-        if detached {
+        let detached = self.pending.lock().await.remove(&kind);
+        if let Some(entry) = &detached {
             // No result will be recorded for it; a probe that was in flight is given back.
-            self.breaker.release_probe(kind);
+            self.breaker.release_probe(kind, entry.permit);
         }
-        detached
+        detached.is_some()
     }
 
     /// Whether the breaker for `kind` is closed, i.e. sends are normal. Does not count an invocation.
@@ -533,11 +536,11 @@ mod tests {
     }
 
     impl CircuitBreaker for ToggleBreaker {
-        fn allow_send(&self, _kind: SendKind) -> bool {
+        fn allow_send(&self, _kind: SendKind) -> Option<SendPermit> {
             self.allow_calls.fetch_add(1, StdOrdering::SeqCst);
-            !self.open.load(StdOrdering::SeqCst)
+            (!self.open.load(StdOrdering::SeqCst)).then_some(SendPermit::Normal)
         }
-        fn record_result(&self, _kind: SendKind, outcome: SendOutcome) {
+        fn record_result(&self, _kind: SendKind, _permit: SendPermit, outcome: SendOutcome) {
             self.record_calls.fetch_add(1, StdOrdering::SeqCst);
             *self.last_outcome.try_lock().unwrap() = Some(outcome);
         }

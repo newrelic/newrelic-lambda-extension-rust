@@ -387,20 +387,17 @@ const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
         crate::send::SendMode::Deferred,
-        // Real invocation-count breaker, high-tier defaults (N=5 → open 2N=10
-        // → buffer cap 3N=15). SEND_SCHEDULER is only ever used by the
-        // high-tier path (process_apm_request_high), so this does not touch the
-        // default tier's pipeline. `from_env` lets NEW_RELIC_EXTENSION_CIRCUIT_BREAKER_THRESHOLD
-        // override N; everything else derives from it.
-        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::from_env(
-            crate::send::DEFAULT_THRESHOLD_HIGH,
-        )),
+        // The one process-wide breaker, shared with the default-tier paths.
+        DEFAULT_BREAKER.clone(),
         std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
     ));
 
-/// Default tier breaker (N=10, open for 2N=20 invokes), one state per endpoint.
-pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<crate::send::ConsecutiveFailureBreaker> =
-    once_cell::sync::Lazy::new(|| crate::send::ConsecutiveFailureBreaker::from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT));
+/// The process-wide breaker, one state per endpoint, used by both tiers (`SEND_SCHEDULER` holds
+/// it too). N follows the configured tier: high 5, default 10 (open for 2N invokes).
+pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<std::sync::Arc<crate::send::ConsecutiveFailureBreaker>> =
+    once_cell::sync::Lazy::new(|| {
+        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::from_env()))
+    });
 
 /// Default tier retries for an endpoint only run while its breaker is closed.
 fn default_breaker_closed(kind: crate::send::SendKind) -> bool {
@@ -2385,10 +2382,10 @@ async fn process_apm_request_default(
     use crate::send::CircuitBreaker;
     let collector = crate::send::SendKind::ApmCollector;
     // One check per invocation: false while open, true for the single retry after 2N.
-    let breaker_allows = DEFAULT_BREAKER.allow_send(collector);
-    let is_probe = breaker_allows && DEFAULT_BREAKER.state(collector) == crate::send::BreakerState::HalfOpen;
+    let collector_permit = DEFAULT_BREAKER.allow_send(collector);
+    let breaker_allows = collector_permit.is_some();
     let breaker_resolved = std::sync::atomic::AtomicBool::new(false);
-    let logs_allowed = DEFAULT_BREAKER.allow_send(crate::send::SendKind::Logs);
+    let logs_permit = DEFAULT_BREAKER.allow_send(crate::send::SendKind::Logs);
 
     // Wait for the handler to actually finish (platform.runtimeDone) BEFORE deciding
     // whether the platform.report has arrived. Bounded by the invocation's own remaining
@@ -2509,14 +2506,18 @@ async fn process_apm_request_default(
             match handle.await {
                 Ok((success, payloads, delivered)) => {
                     let outcome = if delivered { crate::send::SendOutcome::Success } else { crate::send::SendOutcome::Failure };
-                    DEFAULT_BREAKER.record_result(collector, outcome);
+                    if let Some(permit) = collector_permit {
+                        DEFAULT_BREAKER.record_result(collector, permit, outcome);
+                    }
                     breaker_resolved.store(true, std::sync::atomic::Ordering::Relaxed);
                     if !success && !payloads.is_empty() {
                         debug!("APM mode: agent send had failures — unsent payloads buffered for retry (next invoke / shutdown)");
                     }
                 }
                 Err(e) => {
-                    DEFAULT_BREAKER.record_result(collector, crate::send::SendOutcome::Failure);
+                    if let Some(permit) = collector_permit {
+                        DEFAULT_BREAKER.record_result(collector, permit, crate::send::SendOutcome::Failure);
+                    }
                     breaker_resolved.store(true, std::sync::atomic::Ordering::Relaxed);
                     error!("Agent send task failed: {}", e);
                 }
@@ -2534,10 +2535,9 @@ async fn process_apm_request_default(
             // across an HTTP POST and risk blocking a reconnect's write lock.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                let _ = crate::telemetry::listener::send_report_through_breaker(&app, request_id, &report_line, invoked_function_arn).await;
             } else {
                 warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
             }
@@ -2564,19 +2564,19 @@ async fn process_apm_request_default(
         // Wait for logs and platform to complete before returning
         let log_flushing = async {
             let logs_kind = crate::send::SendKind::Logs;
-            if !logs_allowed {
+            let Some(logs_permit) = logs_permit else {
                 debug!("APM mode: circuit breaker open for logs - flush skipped, logs for {} stay batched", request_id);
                 return Ok(());
-            }
+            };
             let nothing_to_send = global_log_processor.is_drained() && global_log_processor.failed_logs_buffer_len() == 0;
             let failures_before = crate::logs::processor::log_send_failure_count();
             let result = global_log_processor.flush().await;
             if nothing_to_send {
-                DEFAULT_BREAKER.release_probe(logs_kind);
+                DEFAULT_BREAKER.release_probe(logs_kind, logs_permit);
             } else if result.is_err() || crate::logs::processor::log_send_failure_count() > failures_before {
-                DEFAULT_BREAKER.record_result(logs_kind, crate::send::SendOutcome::Failure);
+                DEFAULT_BREAKER.record_result(logs_kind, logs_permit, crate::send::SendOutcome::Failure);
             } else {
-                DEFAULT_BREAKER.record_result(logs_kind, crate::send::SendOutcome::Success);
+                DEFAULT_BREAKER.record_result(logs_kind, logs_permit, crate::send::SendOutcome::Success);
             }
             result
         };
@@ -2604,8 +2604,8 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut, reports_in_flight_fut);
 
     // The retry was allowed but nothing was sent this invocation: give it back.
-    if is_probe && !breaker_resolved.load(std::sync::atomic::Ordering::Relaxed) {
-        DEFAULT_BREAKER.release_probe(collector);
+    if let Some(permit) = collector_permit.filter(|_| !breaker_resolved.load(std::sync::atomic::Ordering::Relaxed)) {
+        DEFAULT_BREAKER.release_probe(collector, permit);
     }
 }
 
@@ -3886,10 +3886,9 @@ pub(crate) async fn process_pending_agent_payloads(
             // process_apm_request's agent-payload send fix.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                let _ = crate::telemetry::listener::send_report_through_breaker(&app, &request_id, &report_line, &invoked_function_arn).await;
             }
 
             // Remove pending report after sending

@@ -5207,21 +5207,24 @@ async fn a_payload_that_arrives_early_without_an_apm_session_stays_buffered() {
 const BREAKER_REPORT_LINE: &str =
     "REPORT RequestId: brk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
 
-/// N of the default-tier breaker (the failures in a row that open it).
+/// N of the shared breaker (the failures in a row that open it).
 fn breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+    DEFAULT_BREAKER.threshold()
 }
 
-/// Bring the default-tier breaker for `kind` back to Closed from any state.
+/// Bring the default-tier breaker for `kind` back to Closed with no failures counted, from any
+/// state. A Closed breaker can still carry an earlier test's failures; a success clears them.
 fn force_default_breaker_closed(kind: crate::send::SendKind) {
     use crate::send::{BreakerState, CircuitBreaker, SendOutcome};
     for _ in 0..500 {
         match DEFAULT_BREAKER.state(kind) {
-            BreakerState::Closed => return,
+            BreakerState::Closed => {
+                return DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Success)
+            }
             BreakerState::Open => {
                 let _ = DEFAULT_BREAKER.allow_send(kind);
             }
-            BreakerState::HalfOpen => DEFAULT_BREAKER.record_result(kind, SendOutcome::Success),
+            BreakerState::HalfOpen => DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Probe, SendOutcome::Success),
         }
     }
     panic!("could not close the default breaker for {kind:?}");
@@ -5230,8 +5233,20 @@ fn force_default_breaker_closed(kind: crate::send::SendKind) {
 fn fail_default_breaker(kind: crate::send::SendKind, times: u32) {
     use crate::send::{CircuitBreaker, SendOutcome};
     for _ in 0..times {
-        DEFAULT_BREAKER.record_result(kind, SendOutcome::Failure);
+        DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Failure);
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_high_tier_scheduler_and_the_default_tier_paths_share_one_breaker() {
+    let kind = crate::send::SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+
+    assert!(!SEND_SCHEDULER.breaker_closed(kind), "the failures counted by DEFAULT_BREAKER open it for SEND_SCHEDULER too");
+
+    force_default_breaker_closed(kind);
 }
 
 /// Register a request whose agent buffer holds one payload that cannot be parsed, so a send
@@ -5281,9 +5296,9 @@ async fn default_breaker_probes_after_2n_skipped_invocations() {
     fail_default_breaker(kind, breaker_n());
 
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(kind), "skipped while open");
+        assert!(DEFAULT_BREAKER.allow_send(kind).is_none(), "skipped while open");
     }
-    assert!(DEFAULT_BREAKER.allow_send(kind), "the probe after 2N skips");
+    assert!(DEFAULT_BREAKER.allow_send(kind).is_some(), "the probe after 2N skips");
     assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::HalfOpen);
 
     force_default_breaker_closed(kind);
@@ -5389,7 +5404,7 @@ async fn default_tier_does_not_send_while_the_collector_breaker_is_open() {
 
     // The invoke used exactly one of the 2N skips: the next 2N-1 calls are still skipped.
     let mut skipped = 0;
-    while !DEFAULT_BREAKER.allow_send(collector) {
+    while DEFAULT_BREAKER.allow_send(collector).is_none() {
         skipped += 1;
         assert!(skipped <= 2 * breaker_n(), "the probe never came");
     }
@@ -5408,7 +5423,7 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
     force_default_breaker_closed(collector);
     fail_default_breaker(collector, breaker_n());
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(collector));
+        assert!(DEFAULT_BREAKER.allow_send(collector).is_none());
     }
 
     // This invoke gets the probe, but it has no payload and no session, so nothing is sent.
@@ -5422,10 +5437,55 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
         BreakerState::Open,
         "not stuck half-open: the probe goes back"
     );
-    assert!(DEFAULT_BREAKER.allow_send(collector), "the next invoke probes again");
+    assert!(DEFAULT_BREAKER.allow_send(collector).is_some(), "the next invoke probes again");
 
     REQUEST_DATA.remove(request_id);
     force_default_breaker_closed(collector);
+}
+
+// ── Circuit breaker: the default tier's send of a report kept for a later invoke ─────────
+
+/// One earlier request whose report was kept for retry, sent by the default tier's pending pass
+/// against a Metric API answering `status`. Returns how many requests the Metric API received.
+async fn send_kept_report(request_id: &str, status: u16) -> usize {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    let mut app = make_test_apm_app();
+    app.metric_endpoint = format!("{}/metrics", server.uri());
+    let config = make_config_for_serverless(false);
+    register_request_for_serverless(request_id, config.clone());
+    request::set_pending_report(request_id, BREAKER_REPORT_LINE.to_string());
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(app)));
+
+    process_pending_agent_payloads(&config, &log_processor, &apm_app, "kept-report-current").await;
+
+    REQUEST_DATA.remove(request_id);
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_kept_report_sends_count_and_open_the_metric_api_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let kind = SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    clear_metric_api_buffer();
+
+    for i in 0..breaker_n() {
+        assert_eq!(send_kept_report(&format!("kept-report-fail-{i}"), 503).await, 1);
+    }
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::Open, "N failed sends in a row open it");
+
+    clear_metric_api_buffer();
+    assert_eq!(send_kept_report("kept-report-while-open", 202).await, 0, "not sent while open");
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "buffered for a later retry");
+
+    clear_metric_api_buffer();
+    force_default_breaker_closed(kind);
 }
 
 // ── Circuit breaker: platform report in the high-tier batch ──────────────────────────
@@ -5488,13 +5548,10 @@ async fn send_group_report_ignores_a_line_that_is_not_a_report() {
 
 // ── Circuit breaker: high-tier invoke-time retries ───────────────────────────────────
 
-fn high_breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_HIGH).max(1)
-}
 
 async fn open_high_collector_breaker() {
     let collector = crate::send::SendKind::ApmCollector;
-    for _ in 0..high_breaker_n() {
+    for _ in 0..breaker_n() {
         let failing: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Failure });
         SEND_SCHEDULER.spawn(collector, failing, None).await;
         SEND_SCHEDULER.resolve_pending(collector).await;
@@ -5615,7 +5672,7 @@ async fn default_tier_uses_one_logs_breaker_invoke_per_invoke() {
 
     // The invoke used one of the 2N skips, so 2N-1 are left before the probe.
     let mut skipped = 0;
-    while !DEFAULT_BREAKER.allow_send(logs) {
+    while DEFAULT_BREAKER.allow_send(logs).is_none() {
         skipped += 1;
         assert!(skipped <= 2 * breaker_n(), "the probe never came");
     }
@@ -5633,7 +5690,7 @@ async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
     force_default_breaker_closed(logs);
     fail_default_breaker(logs, breaker_n());
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(logs));
+        assert!(DEFAULT_BREAKER.allow_send(logs).is_none());
     }
 
     // This invoke gets the logs probe, but it has no logs, so there is nothing to flush.
@@ -5643,7 +5700,7 @@ async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
     run_default_invoke(request_id, config, false).await;
 
     assert_eq!(DEFAULT_BREAKER.state(logs), BreakerState::Open, "not stuck half-open: the probe goes back");
-    assert!(DEFAULT_BREAKER.allow_send(logs), "the next invoke probes again");
+    assert!(DEFAULT_BREAKER.allow_send(logs).is_some(), "the next invoke probes again");
 
     REQUEST_DATA.remove(request_id);
     force_default_breaker_closed(logs);
