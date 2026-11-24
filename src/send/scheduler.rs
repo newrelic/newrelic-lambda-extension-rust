@@ -91,7 +91,7 @@ impl SendScheduler {
     /// `high` tier) — the breaker lives in `SendScheduler`, not in the call
     /// sites. Returns:
     /// - `true`  → the breaker allowed the send; it was spawned and is now
-    ///   tracked for a later `resolve_pending*`.
+    ///   tracked for a later `resolve_pending_*`.
     /// - `false` → the breaker is Open for `kind`; **nothing was spawned**. The
     ///   caller must buffer the payload for a later retry (and undo any
     ///   write-ahead/metadata it staged for this send). Counts as one
@@ -109,23 +109,21 @@ impl SendScheduler {
     }
 
     /// Un-gated spawn body — stores the handle (and cursor) for a later
-    /// `resolve_pending*`. Kept private and separate from [`SendScheduler::spawn`]
-    /// so `dispatch` (which has already consulted the breaker) can reach it
-    /// without double-counting an `allow_send`.
+    /// `resolve_pending_*`. Private; [`SendScheduler::spawn`] consults the breaker first.
     async fn spawn_inner(&self, kind: SendKind, permit: SendPermit, send: BoxedSend, cursor: Option<Arc<AtomicUsize>>) {
         let handle = tokio::spawn(send);
         let mut guard = self.pending.lock().await;
         if let Some(orphaned) = guard.insert(kind, PendingEntry { handle, cursor, permit }) {
             tracing::warn!(
                 "SendScheduler: overwriting an unresolved pending send for {:?} — \
-                 resolve_pending should have been called first; aborting the orphaned task",
+                 resolve_pending_* should have been called first; aborting the orphaned task",
                 kind
             );
             orphaned.handle.abort();
         }
     }
 
-    /// Like [`SendScheduler::resolve_pending`], but **never aborts** an
+    /// Like [`SendScheduler::resolve_pending_shared_budget`], but **never aborts** an
     /// unfinished send — some sends (e.g. the log flush, which holds its
     /// chunk list in a purely local variable with no externally visible
     /// progress cursor) aren't safe to abort-and-partially-recover the way
@@ -177,8 +175,7 @@ impl SendScheduler {
     /// whichever comes first — so a fast send doesn't force everyone else
     /// to wait out the full budget. Anything still unfinished when `budget`
     /// elapses is aborted and reported as [`DispatchResult::TimedOut`];
-    /// the caller buffers it exactly like [`SendScheduler::resolve_pending`]'s
-    /// `TimedOut` case.
+    /// the caller buffers its unresolved payload(s).
     ///
     /// Kinds with nothing pending are simply absent from the returned map
     /// (including the first-invocation case).
