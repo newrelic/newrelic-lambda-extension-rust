@@ -23,9 +23,12 @@ pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// by a send timeout.
 pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The `high` tier: APM mode with `NEW_RELIC_EXTENSION_SEND_TIER=high`.
+/// The `high` tier: APM mode with `NEW_RELIC_EXTENSION_SEND_TIER=high`, not on LMI
+/// (same rule as `set_reports_ride_the_batch` in `main.rs`).
 pub(crate) fn is_high_tier(config: &ExtensionConfig) -> bool {
-    config.new_relic.apm_lambda_mode && config.extension.send_tier == crate::send::SendTier::High
+    config.extension.send_tier == crate::send::SendTier::High
+        && config.new_relic.apm_lambda_mode
+        && !config.deployment.is_lmi()
 }
 
 /// Per-request total timeout for `NewRelicClient` sends (logs, agent payload):

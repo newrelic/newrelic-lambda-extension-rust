@@ -458,3 +458,26 @@ fn gzip_shrinks_a_repetitive_metric_body() {
     let sent = gzip_bytes(&serde_json::to_vec(&build_metric_payload(&metrics)).unwrap()).unwrap();
     assert!(sent.len() * 5 < raw.len(), "{} bytes sent for {} raw", sent.len(), raw.len());
 }
+
+#[tokio::test]
+#[serial]
+async fn metric_api_send_applies_the_high_tier_timeout() {
+    // Only the Metric API takes a full URL; the collector sends are https-only and need a TLS server.
+    crate::newrelic::tls_fallback::reset_for_test();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202).set_delay(std::time::Duration::from_millis(900)))
+        .mount(&server)
+        .await;
+    let client = crate::newrelic::tls_fallback::test_client();
+    let metrics = vec![serde_json::json!({"name": "m", "value": 1.0})];
+
+    set_high_tier_sends(true);
+    let high = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await;
+    set_high_tier_sends(false);
+    let default = send_platform_metrics(&client, "test-key", &server.uri(), &metrics).await;
+    crate::newrelic::tls_fallback::reset_for_test();
+
+    assert!(matches!(high, Err(MetricApiError::Network(_))), "high tier must time out at 500 ms: {high:?}");
+    assert!(default.is_ok(), "default tier keeps main's 20 s: {default:?}");
+}
