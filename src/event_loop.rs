@@ -1129,10 +1129,8 @@ fn handle_logs_outcome(
                 );
             }
         }
-        other => {
-            // Dropped/Deferred: unreachable in practice — neither
-            // resolve_pending_no_abort nor resolve_pending_shared_budget's
-            // caller for Logs checks the breaker or produces Deferred.
+        other @ crate::send::DispatchResult::StillRunning => {
+            // Unreachable: StillRunning is handled before this match.
             warn!(
                 "APM mode: unexpected {:?} resolving log flush for {}",
                 other, request_id
