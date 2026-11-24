@@ -132,12 +132,18 @@ impl ConsecutiveFailureBreaker {
     fn open_window(&self) -> u32 {
         self.threshold.saturating_mul(2)
     }
+
+    /// The state stays usable after a panic elsewhere poisoned the lock: recover it, as
+    /// `short_invoke.rs` and `inflight.rs` do, instead of panicking on every later send.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<SendKind, KindState>> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl CircuitBreaker for ConsecutiveFailureBreaker {
     fn allow_send(&self, kind: SendKind) -> bool {
         let open_window = self.open_window();
-        let mut map = self.state.lock().unwrap();
+        let mut map = self.lock();
         let entry = map.entry(kind).or_default();
         match entry.state {
             BreakerState::Closed => true,
@@ -164,7 +170,7 @@ impl CircuitBreaker for ConsecutiveFailureBreaker {
 
     fn record_result(&self, kind: SendKind, outcome: SendOutcome) {
         let threshold = self.threshold;
-        let mut map = self.state.lock().unwrap();
+        let mut map = self.lock();
         let entry = map.entry(kind).or_default();
         match (entry.state, outcome) {
             (BreakerState::Closed, SendOutcome::Success) => {
@@ -203,12 +209,12 @@ impl CircuitBreaker for ConsecutiveFailureBreaker {
     }
 
     fn state(&self, kind: SendKind) -> BreakerState {
-        self.state.lock().unwrap().get(&kind).map_or(BreakerState::Closed, |s| s.state)
+        self.lock().get(&kind).map_or(BreakerState::Closed, |s| s.state)
     }
 
     fn release_probe(&self, kind: SendKind) {
         let open_window = self.open_window();
-        let mut map = self.state.lock().unwrap();
+        let mut map = self.lock();
         let entry = map.entry(kind).or_default();
         if entry.state == BreakerState::HalfOpen {
             entry.state = BreakerState::Open;

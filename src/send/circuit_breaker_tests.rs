@@ -72,6 +72,25 @@ fn release_probe_only_affects_the_kind_it_is_given() {
     assert!(!b.allow_send(SendKind::Logs), "Logs is still skipping");
 }
 
+// --- poisoned lock ---
+
+#[test]
+fn a_poisoned_lock_does_not_panic_the_breaker() {
+    let b = std::sync::Arc::new(ConsecutiveFailureBreaker::new(1));
+    let poisoner = b.clone();
+    let _ = std::thread::spawn(move || {
+        let _guard = poisoner.state.lock().unwrap();
+        panic!("poison the breaker lock");
+    })
+    .join();
+    assert!(b.state.is_poisoned());
+
+    assert!(b.allow_send(SendKind::Logs));
+    b.record_result(SendKind::Logs, SendOutcome::Failure);
+    assert_eq!(b.state(SendKind::Logs), BreakerState::Open);
+    b.release_probe(SendKind::Logs);
+}
+
 // --- threshold from the environment ---
 
 #[test]
