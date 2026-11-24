@@ -3888,7 +3888,12 @@ pub(crate) async fn process_pending_agent_payloads(
             if let Some(app) = app_owned {
                 // Logs its own outcome; a failed send is buffered by the Metric API path, as
                 // before. While the Metric API breaker is open the metrics are buffered unsent.
-                let _ = crate::telemetry::listener::send_report_through_breaker(&app, &request_id, &report_line, &invoked_function_arn).await;
+                // LMI has no breaker by design, so it sends directly, as on `main`.
+                if config.deployment.is_lmi() {
+                    let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                } else {
+                    let _ = crate::telemetry::listener::send_report_through_breaker(&app, &request_id, &report_line, &invoked_function_arn).await;
+                }
             }
 
             // Remove pending report after sending

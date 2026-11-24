@@ -5494,6 +5494,10 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
 /// One earlier request whose report was kept for retry, sent by the default tier's pending pass
 /// against a Metric API answering `status`. Returns how many requests the Metric API received.
 async fn send_kept_report(request_id: &str, status: u16) -> usize {
+    send_kept_report_with(request_id, status, make_config_for_serverless(false)).await
+}
+
+async fn send_kept_report_with(request_id: &str, status: u16, config: Arc<config::ExtensionConfig>) -> usize {
     let server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .respond_with(wiremock::ResponseTemplate::new(status))
@@ -5501,7 +5505,6 @@ async fn send_kept_report(request_id: &str, status: u16) -> usize {
         .await;
     let mut app = make_test_apm_app();
     app.metric_endpoint = format!("{}/metrics", server.uri());
-    let config = make_config_for_serverless(false);
     register_request_for_serverless(request_id, config.clone());
     request::set_pending_report(request_id, BREAKER_REPORT_LINE.to_string());
     let log_processor = make_noop_log_processor_serverless(config.clone());
@@ -5817,5 +5820,25 @@ async fn high_tier_empty_log_flush_does_not_settle_the_probe() {
 
     assert_ne!(DEFAULT_BREAKER.state(kind), BreakerState::Closed, "an empty flush proves nothing about log-api");
     assert!(DEFAULT_BREAKER.allow_send(kind).is_some(), "the probe is still there for the next real flush");
+    force_default_breaker_closed(kind);
+}
+
+// LMI has no breaker by design: its kept-report resend goes straight out, even while the
+// Metric API breaker (driven by other paths) is open.
+#[tokio::test]
+#[serial]
+async fn lmi_kept_report_resend_does_not_consult_the_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let kind = SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::Open);
+    clear_metric_api_buffer();
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.deployment = crate::config::deployment::DeploymentContext::Lmi;
+
+    assert_eq!(send_kept_report_with("kept-report-lmi", 202, Arc::new(cfg)).await, 1, "sent despite the open breaker");
+
+    clear_metric_api_buffer();
     force_default_breaker_closed(kind);
 }
