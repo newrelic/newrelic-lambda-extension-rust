@@ -2064,13 +2064,16 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
         crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
     }
 
-    /// Bring the default-tier Metric API breaker back to Closed from any state.
+    /// Bring the default-tier Metric API breaker back to Closed with no failures counted, from
+    /// any state. A Closed breaker can still carry an earlier test's failures; a success clears them.
     fn close_metric_breaker() {
         use crate::send::{BreakerState, CircuitBreaker, SendKind, SendOutcome};
         let breaker = &crate::event_loop::DEFAULT_BREAKER;
         for _ in 0..500 {
             match breaker.state(SendKind::MetricApi) {
-                BreakerState::Closed => return,
+                BreakerState::Closed => {
+                    return breaker.record_result(SendKind::MetricApi, crate::send::SendPermit::Normal, SendOutcome::Success)
+                }
                 BreakerState::Open => {
                     let _ = breaker.allow_send(SendKind::MetricApi);
                 }

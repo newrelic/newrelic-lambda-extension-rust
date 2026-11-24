@@ -5188,12 +5188,15 @@ fn breaker_n() -> u32 {
     crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
 }
 
-/// Bring the default-tier breaker for `kind` back to Closed from any state.
+/// Bring the default-tier breaker for `kind` back to Closed with no failures counted, from any
+/// state. A Closed breaker can still carry an earlier test's failures; a success clears them.
 fn force_default_breaker_closed(kind: crate::send::SendKind) {
     use crate::send::{BreakerState, CircuitBreaker, SendOutcome};
     for _ in 0..500 {
         match DEFAULT_BREAKER.state(kind) {
-            BreakerState::Closed => return,
+            BreakerState::Closed => {
+                return DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Success)
+            }
             BreakerState::Open => {
                 let _ = DEFAULT_BREAKER.allow_send(kind);
             }
