@@ -581,7 +581,9 @@ pub async fn cleanup_old_request_buffers(
             (Vec::new(), crate::get_global_fallback_arn())
         };
 
-        if !payloads.is_empty() {
+        // A short invoke the extension chose to drop stays dropped: its late payload is discarded.
+        let dropped_short = crate::send::short_invoke::get(request_id) == Some(crate::send::short_invoke::ShortOutcome::Dropped);
+        if !payloads.is_empty() && !dropped_short {
             if config.new_relic.apm_lambda_mode {
                 // APM mode MUST NOT touch the serverless ingest endpoint. Hand any
                 // stranded payloads to the APM retry buffer so the per-invoke retry
