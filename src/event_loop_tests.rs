@@ -4023,15 +4023,25 @@ async fn spawn_pending_batch_detaches_a_batch_older_than_the_max_age() {
 
 // --- Log flush tests (spawn_log_flush / resolve_pending_logs via SEND_SCHEDULER) ---
 
+/// One log in the batch, so `spawn_log_flush` has something to send (it skips an empty flush).
+fn add_one_log(log_processor: &LogProcessor) {
+    log_processor.add_log_to_batch(crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "hello".to_string(),
+        attributes: serde_json::Map::new(),
+    });
+}
+
 #[tokio::test]
 #[serial]
-async fn spawn_log_flush_then_resolve_round_trip_with_empty_batch() {
+async fn spawn_log_flush_then_resolve_round_trip_with_one_log() {
     // Clean slate: a previous test (or a prior run of this one) must not
     // leave SendKind::Logs occupied.
     let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
 
     let config = Arc::new(config::ExtensionConfig::default());
     let log_processor = make_noop_log_processor_serverless(config);
+    add_one_log(&log_processor);
 
     spawn_log_flush(&log_processor, "req-roundtrip").await;
     assert!(
@@ -4039,8 +4049,7 @@ async fn spawn_log_flush_then_resolve_round_trip_with_empty_batch() {
         "spawn_log_flush must register the flush with SEND_SCHEDULER"
     );
 
-    // An empty batch hits LogProcessor::flush's own fast path and returns
-    // near-instantly - no real network call happens.
+    // The noop client returns at once - no real network call happens.
     tokio::time::sleep(Duration::from_millis(20)).await;
     resolve_pending_logs(&log_processor, "req-roundtrip").await;
     assert!(
@@ -4631,6 +4640,7 @@ async fn a_not_short_invoke_starts_its_log_flush_before_runtime_done() {
     let state = Arc::new(detection_state(id));
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
     let log_processor = make_noop_log_processor_serverless(config.clone());
+    add_one_log(&log_processor);
 
     let run = {
         let (config, state, apm_app, log_processor) = (config.clone(), state.clone(), apm_app.clone(), log_processor.clone());
@@ -5784,4 +5794,28 @@ fn shutdown_batch_wait_is_capped_to_leave_room_for_the_retry() {
     let effective = effective_shutdown_batch_wait(2_000);
     assert!(effective < Duration::from_millis(main_block_ms), "{:?} leaves no room for the retry", effective);
     assert_eq!(effective_shutdown_batch_wait(50), Duration::from_millis(50), "a short wait is kept");
+}
+
+// High tier, like the default tier: a log flush with nothing to send must not settle the
+// HalfOpen probe, or an invoke without logs would close a breaker for a log-api that is down.
+#[tokio::test]
+#[serial]
+async fn high_tier_empty_log_flush_does_not_settle_the_probe() {
+    use crate::send::{BreakerState, CircuitBreaker};
+    let kind = crate::send::SendKind::Logs;
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(kind).await;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+    for _ in 0..(2 * breaker_n()) {
+        let _ = DEFAULT_BREAKER.allow_send(kind);
+    }
+    let log_processor = make_noop_log_processor_serverless(Arc::new(config::ExtensionConfig::default()));
+
+    spawn_log_flush(&log_processor, "req-empty-probe").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    resolve_pending_logs(&log_processor, "req-empty-probe").await;
+
+    assert_ne!(DEFAULT_BREAKER.state(kind), BreakerState::Closed, "an empty flush proves nothing about log-api");
+    assert!(DEFAULT_BREAKER.allow_send(kind).is_some(), "the probe is still there for the next real flush");
+    force_default_breaker_closed(kind);
 }

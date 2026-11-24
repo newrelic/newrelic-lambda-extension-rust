@@ -996,6 +996,11 @@ async fn spawn_log_flush(log_processor: &Arc<LogProcessor>, request_id: &str) {
         );
         return;
     }
+    // Nothing to send: skip before the breaker is asked, so an empty flush never settles the
+    // HalfOpen probe (the default tier releases it in the same case).
+    if log_processor.is_drained() && log_processor.failed_logs_buffer_len() == 0 {
+        return;
+    }
 
     // Write-ahead snapshot, taken *before* the send is spawned — see
     // `LogBatchWriteAhead`'s doc for why this (not `flush()`'s own internal
