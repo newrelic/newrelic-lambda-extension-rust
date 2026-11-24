@@ -2305,6 +2305,20 @@ fn test_short_invoke_threshold_defaults_to_10ms() {
 }
 
 #[test]
+#[serial]
+fn test_short_invoke_threshold_env_trims_and_bounds() {
+    with_full_clean_env(|| {
+        let var = "NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS";
+        env::set_var(var, " 20");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 20);
+        env::set_var(var, "5000");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 1000);
+        env::set_var(var, "junk");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 10);
+    });
+}
+
+#[test]
 fn test_high_tier_timing_defaults() {
     let s = ExtensionSettings::default();
     assert_eq!(
