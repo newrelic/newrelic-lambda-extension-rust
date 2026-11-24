@@ -11,10 +11,7 @@ pub mod send_target;
 pub mod short_invoke;
 pub mod tier;
 
-pub use circuit_breaker::{
-    BreakerState, CircuitBreaker, ConsecutiveFailureBreaker, SendPermit,
-    DEFAULT_THRESHOLD_DEFAULT, DEFAULT_THRESHOLD_HIGH,
-};
+pub use circuit_breaker::{BreakerState, CircuitBreaker, ConsecutiveFailureBreaker, SendPermit};
 pub use scheduler::{DispatchOutcome, DispatchResult, SendScheduler};
 pub use send_target::BoxedSend;
 pub use tier::SendTier;
