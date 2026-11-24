@@ -3828,23 +3828,34 @@ async fn resolve_pending_agent_batch_collects_a_finished_batch() {
     assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
 }
 
-// SHUTDOWN waits a bounded time, then leaves a slow batch alone: aborting it would
-// only turn a possibly-delivered request into a duplicate.
+// SHUTDOWN has no next invoke: a batch still running after the wait is cut off like at the
+// function deadline, and its unsent groups go to the retry buffer instead of nowhere.
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_leaves_a_slow_batch_running() {
+async fn shutdown_cuts_off_a_slow_batch_and_buffers_its_groups() {
     clear_batch_state().await;
-    if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
-        b.clear();
-    }
+    clear_high_tier_state();
     let send: crate::send::BoxedSend = Box::pin(std::future::pending());
-    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
+    let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, Some(cursor)).await;
+    set_in_flight_batch("b-shutdown", std::time::Instant::now());
+    if let Ok(mut meta) = BATCH_META.lock() {
+        *meta = Some(BatchMeta {
+            owner: NEXT_BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            groups: Arc::new(vec![make_group("sd-1", vec![vec![1]], None), make_group("sd-2", vec![vec![2]], None)]),
+        });
+    }
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.extension.send_tier = crate::send::SendTier::High;
+    cfg.extension.shutdown_batch_wait_ms = 50;
+    let components = make_test_extension_components(Arc::new(cfg), Arc::new(Client::new()), true);
 
-    wait_for_pending_agent_batch(Duration::from_millis(50)).await;
+    shutdown_drain_high_tier(&components).await;
 
-    assert!(SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
-    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 0, "nothing is re-buffered");
+    assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await, "the batch was cut off");
+    assert_eq!(FAILED_AGENT_PAYLOADS.lock().unwrap().len(), 2, "both unsent groups are in the retry buffer");
     clear_batch_state().await;
+    clear_high_tier_state();
 }
 
 fn set_in_flight_batch(id: &str, started_at: std::time::Instant) {

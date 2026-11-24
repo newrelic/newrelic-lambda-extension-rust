@@ -947,17 +947,24 @@ fn batch_exceeded_max_age(max_age: Duration) -> bool {
 }
 
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
-/// Lambda's 2s limit) for the last batch, and leave it running if it is slow.
+/// Lambda's 2s limit) for the last batch. One still running after that is cut off like at
+/// the function deadline, so its unsent groups land in the retry buffer instead of nowhere.
 async fn resolve_pending_agent_batch(wait_ms: u64) {
     wait_for_pending_agent_batch(Duration::from_millis(wait_ms)).await;
 }
 
 async fn wait_for_pending_agent_batch(wait: Duration) {
-    let done = SEND_SCHEDULER
-        .wait_finished(&[crate::send::SendKind::ApmCollector], wait)
-        .await;
-    if let Some(outcome) = done.get(&crate::send::SendKind::ApmCollector) {
-        log_batch_outcome(outcome);
+    let kind = crate::send::SendKind::ApmCollector;
+    let finished = SEND_SCHEDULER.wait_finished(&[kind], wait).await.remove(&kind);
+    let outcome = match finished {
+        Some(outcome) => Some(outcome),
+        None => SEND_SCHEDULER
+            .resolve_pending_shared_budget(&[kind], Duration::ZERO)
+            .await
+            .remove(&kind),
+    };
+    if let Some(outcome) = outcome {
+        finish_batch_outcome(&outcome);
     }
 }
 
