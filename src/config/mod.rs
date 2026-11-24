@@ -27,7 +27,7 @@ const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
-const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
+pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
 
 /// Extension-controlled shutdown error classes, lowercased. These are the only
 /// classes `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`

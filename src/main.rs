@@ -467,6 +467,7 @@ async fn perform_one_time_initialization(
     // Mirror the disabled-telemetry set into the apm module so code paths without
     // ExtensionConfig in scope (telemetry listener) can honor the customer's exclusions.
     apm::collector::set_disabled_telemetry(config.new_relic.apm_disabled_telemetry.clone());
+    apm::collector::set_high_tier_sends(newrelic::client::is_high_tier(&config));
 
     let (apm_app, processor_factory, temp_log_processor, telemetry_listener_address) =
         if config.new_relic.apm_lambda_mode {

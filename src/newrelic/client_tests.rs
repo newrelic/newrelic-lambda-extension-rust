@@ -733,3 +733,44 @@ fn test_get_or_build_common_json_with_version_tags() {
         json
     );
 }
+
+fn tier_config(apm: bool, tier: crate::send::SendTier) -> crate::config::ExtensionConfig {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.apm_lambda_mode = apm;
+    config.extension.send_tier = tier;
+    config
+}
+
+#[test]
+fn send_timeout_is_500ms_in_the_high_tier() {
+    let mut config = tier_config(true, crate::send::SendTier::High);
+    assert_eq!(client_send_timeout(&config), std::time::Duration::from_millis(500));
+    // NEW_RELIC_HTTP_TIMEOUT does not loosen the high-tier bound.
+    config.new_relic.http_timeout = Some(std::time::Duration::from_secs(7));
+    assert_eq!(client_send_timeout(&config), SEND_TIMEOUT);
+    assert_eq!(crate::apm::collector::send_timeout_for(true), SEND_TIMEOUT);
+}
+
+#[test]
+fn send_timeout_keeps_mains_values_in_the_default_tier_and_serverless_mode() {
+    for config in [
+        tier_config(true, crate::send::SendTier::Default),
+        tier_config(false, crate::send::SendTier::Default),
+        tier_config(false, crate::send::SendTier::High), // serverless ignores the tier
+    ] {
+        assert_eq!(client_send_timeout(&config), std::time::Duration::from_millis(2400));
+    }
+    assert_eq!(crate::apm::collector::send_timeout_for(false), std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn send_timeout_honors_new_relic_http_timeout_outside_the_high_tier() {
+    let mut config = tier_config(true, crate::send::SendTier::Default);
+    config.new_relic.http_timeout = Some(std::time::Duration::from_secs(7));
+    assert_eq!(client_send_timeout(&config), std::time::Duration::from_secs(7));
+}
+
+#[test]
+fn connect_timeout_is_mains_10s() {
+    assert_eq!(CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+}
