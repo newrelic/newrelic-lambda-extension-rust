@@ -22,7 +22,21 @@ pub const SYNTHESIZED_ERROR_EVENTS: &str = "__synthesized_error_event_data";
 /// Hard cap on buffered telemetry items to bound memory during a sustained
 /// collector failure on a high-traffic function. When full, the oldest is evicted.
 fn max_buffered_items() -> usize {
-    max_buffered_items_for(crate::send::SendTier::from_env())
+    // Resolved once: from_env warns on a bad value and this runs under the buffer lock.
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| max_buffered_items_for(crate::send::SendTier::from_env()))
+}
+
+/// Push `item`, then drop the oldest (by `failed_at`) if over `cap`. Used by both the
+/// fresh-failure and re-buffer paths so a retry pass can never push the buffer past its cap.
+fn push_capped(buffer: &mut Vec<FailedTelemetry>, item: FailedTelemetry, cap: usize) {
+    buffer.push(item);
+    if buffer.len() > cap {
+        if let Some(i) = (0..buffer.len()).min_by_key(|&i| buffer[i].failed_at) {
+            buffer.remove(i);
+            warn!("Telemetry buffer full ({}) - evicted oldest item", cap);
+        }
+    }
 }
 
 /// 15 in the high tier, 30 otherwise.
@@ -66,11 +80,7 @@ pub fn buffer_failed_telemetry(
 
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
         // Bound memory: evict oldest if at capacity (prefer keeping fresher telemetry).
-        if buffer.len() >= max_buffered_items() {
-            buffer.remove(0);
-            warn!("Telemetry buffer full ({}) - evicted oldest item", max_buffered_items());
-        }
-        buffer.push(failed_telemetry);
+        push_capped(&mut buffer, failed_telemetry, max_buffered_items());
         debug!(
             "APM mode: Buffered failed {} for request {} (total buffered: {})",
             telemetry_type,
@@ -212,16 +222,13 @@ pub async fn retry_buffered_telemetry(
 
                 if is_restart {
                     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-                        if buffer.len() >= max_buffered_items() {
-                            buffer.remove(0);
-                        }
-                        buffer.push(item);
+                        push_capped(&mut buffer, item, max_buffered_items());
                     }
                 } else {
                     item.retry_count += 1;
                     if item.retry_count < 10 {
                         if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-                            buffer.push(item);
+                            push_capped(&mut buffer, item, max_buffered_items());
                         }
                     } else {
                         error!(
