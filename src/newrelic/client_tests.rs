@@ -764,7 +764,7 @@ fn send_timeout_keeps_mains_values_in_the_default_tier_and_serverless_mode() {
     ] {
         assert_eq!(client_send_timeout(&config), std::time::Duration::from_millis(2400));
     }
-    assert_eq!(crate::apm::collector::send_timeout_for(false), std::time::Duration::from_secs(20));
+    assert_eq!(crate::apm::collector::send_timeout_for(false), crate::config::DEFAULT_HTTP_TIMEOUT);
 }
 
 #[test]

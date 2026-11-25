@@ -113,12 +113,12 @@ pub fn set_high_tier_sends(high_tier: bool) {
 }
 
 /// Per-request total timeout for collector and Metric API sends: `SEND_TIMEOUT` in
-/// the high tier, else `main`'s 20 s.
+/// the high tier, else the fixed `DEFAULT_HTTP_TIMEOUT`.
 pub(crate) fn send_timeout_for(high_tier: bool) -> std::time::Duration {
     if high_tier {
         crate::newrelic::client::SEND_TIMEOUT
     } else {
-        std::time::Duration::from_secs(20)
+        crate::config::DEFAULT_HTTP_TIMEOUT
     }
 }
 
