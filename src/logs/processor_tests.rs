@@ -2810,11 +2810,42 @@ mod coverage_tests {
 
     #[tokio::test]
     async fn a_batch_the_flush_takes_is_not_cut_by_the_cap() {
-        let p = fast_fail_processor_with_context("arn:aws:lambda:us-east-1:123:function:f", "req-take");
+        use std::io::Read;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(202))
+            .mount(&server)
+            .await;
+        let mut config = ExtensionConfig::default();
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.log_endpoint = format!("{}/log/v1", server.uri());
+        config.extension.send_function_logs = true;
+        let config = Arc::new(config);
+        let ctx = Arc::new(Mutex::new(InvocationContext {
+            request_id: "req-take".to_string(),
+            invoked_function_arn: "arn:aws:lambda:us-east-1:123:function:f".to_string(),
+            trace_id: None,
+        }));
+        let p = LogProcessor::new(Arc::new(NewRelicClient::new(&config)), config, ctx, None);
         push_typed(&p, "function", 130);
+
         p.try_spawn_auto_flush();
-        // The current-thread runtime has not run the spawned send yet, so an empty batch means all 130 were taken.
-        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+
+        let mut sent = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let requests = server.received_requests().await.unwrap();
+            if !requests.is_empty() {
+                let body = &requests[0].body;
+                let mut text = String::new();
+                if flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut text).is_err() {
+                    text = String::from_utf8_lossy(body).into_owned();
+                }
+                sent = text.matches("function-").count();
+                break;
+            }
+        }
+        assert_eq!(sent, 130, "every log the flush took reaches the endpoint");
     }
 
     #[tokio::test]
