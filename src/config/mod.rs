@@ -706,6 +706,20 @@ impl ExtensionConfig {
             );
         }
 
+        // The high tier is APM-only: elsewhere it is the default tier.
+        if config.extension.send_tier == crate::send::SendTier::High && !config.new_relic.apm_lambda_mode {
+            warn!("NEW_RELIC_EXTENSION_SEND_TIER=high is APM-only and is ignored outside NEW_RELIC_APM_LAMBDA_MODE");
+            config.extension.send_tier = crate::send::SendTier::Default;
+        }
+
+        // High-tier sends are single bounded attempts, so the collection budget has no effect there.
+        if config.extension.send_tier == crate::send::SendTier::High
+            && !config.deployment.is_lmi()
+            && config.new_relic.data_collection_timeout.take().is_some()
+        {
+            warn!("NEW_RELIC_DATA_COLLECTION_TIMEOUT is ignored with NEW_RELIC_EXTENSION_SEND_TIER=high");
+        }
+
         // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
         if config.extension.pipeline_flush
             && config.new_relic.apm_lambda_mode

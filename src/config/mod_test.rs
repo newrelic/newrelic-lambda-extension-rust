@@ -2118,6 +2118,35 @@ fn test_high_tier_turns_pipeline_flush_off_and_default_tier_keeps_it() {
     });
 }
 
+#[test]
+#[serial]
+fn test_high_tier_is_apm_only() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert_eq!(ExtensionConfig::from_env().extension.send_tier, crate::send::SendTier::Default, "serverless ignores high");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        assert_eq!(ExtensionConfig::from_env().extension.send_tier, crate::send::SendTier::High, "APM keeps high");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+    });
+}
+
+#[test]
+#[serial]
+fn test_high_tier_clears_data_collection_timeout_and_default_tier_keeps_it() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert_eq!(ExtensionConfig::from_env().new_relic.data_collection_timeout, None);
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "default");
+        assert!(ExtensionConfig::from_env().new_relic.data_collection_timeout.is_some());
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT");
+    });
+}
+
 // ============================================================================
 // NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
 // ============================================================================
