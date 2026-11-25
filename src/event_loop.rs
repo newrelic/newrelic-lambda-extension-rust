@@ -376,8 +376,9 @@ async fn wait_for_report_sends(budget: Duration) {
 const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 
 /// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
-/// log flush. A batch still running at the function deadline or the SHUTDOWN wait
-/// is cut off, and its undelivered groups are buffered for retry. Its breaker is
+/// log flush. A batch still running at the function deadline
+/// is cut off, and its undelivered groups are buffered for retry; one still running after the
+/// SHUTDOWN wait is left running. Its breaker is
 /// `DEFAULT_BREAKER`, which the default tier's send paths consult too.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
     // The one process-wide breaker, shared with the default-tier paths.
@@ -942,20 +943,13 @@ fn batch_exceeded_max_age(max_age: Duration) -> bool {
 }
 
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
-/// Lambda's 2s limit) for the last batch. One still running after that is cut off like at
-/// the function deadline, so its unsent groups land in the retry buffer instead of nowhere.
+/// Lambda's 2s limit) for the last batch, and leave it running if it is slow.
 async fn wait_for_pending_agent_batch(wait: Duration) {
-    let kind = crate::send::SendKind::ApmCollector;
-    let finished = SEND_SCHEDULER.wait_finished(&[kind], wait).await.remove(&kind);
-    let outcome = match finished {
-        Some(outcome) => Some(outcome),
-        None => SEND_SCHEDULER
-            .resolve_pending_shared_budget(&[kind], Duration::ZERO)
-            .await
-            .remove(&kind),
-    };
-    if let Some(outcome) = outcome {
-        finish_batch_outcome(&outcome);
+    let done = SEND_SCHEDULER
+        .wait_finished(&[crate::send::SendKind::ApmCollector], wait)
+        .await;
+    if let Some(outcome) = done.get(&crate::send::SendKind::ApmCollector) {
+        log_batch_outcome(outcome);
     }
 }
 
@@ -3087,16 +3081,9 @@ async fn shutdown_drain_high_tier(components: &ExtensionComponents) {
     if components.config.extension.send_tier != crate::send::SendTier::High {
         return;
     }
-    wait_for_pending_agent_batch(effective_shutdown_batch_wait(components.config.extension.shutdown_batch_wait_ms)).await;
+    wait_for_pending_agent_batch(Duration::from_millis(components.config.extension.shutdown_batch_wait_ms)).await;
     drain_stashed_reports_into_retry_buffer();
     retry_failed_platform_reports(components.apm_app.clone()).await;
-}
-
-/// The configured batch wait (accepted 0-2000 ms), capped at `SHUTDOWN_REPORT_WAIT_MS`: the main
-/// shutdown block only has `SHUTDOWN_TIMEOUT_MS - SHUTDOWN_DIAG_RESERVE_MS`, and the cut-off and
-/// the step-4 retry must still run inside it after the wait.
-fn effective_shutdown_batch_wait(configured_ms: u64) -> Duration {
-    Duration::from_millis(configured_ms.min(SHUTDOWN_REPORT_WAIT_MS))
 }
 
 /// SHUTDOWN: flush every log. The steps share the log processor's batch, so they stay in order.
