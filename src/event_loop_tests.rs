@@ -3925,7 +3925,7 @@ async fn wait_for_pending_agent_batch_collects_a_finished_batch() {
 // only turn a possibly-delivered request into a duplicate.
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_leaves_a_slow_batch_running() {
+async fn wait_for_pending_agent_batch_leaves_a_slow_batch_running() {
     clear_batch_state().await;
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();

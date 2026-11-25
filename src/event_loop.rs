@@ -820,7 +820,7 @@ fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
     }
 }
 
-/// The batch's outcome after a bounded wait (the function's deadline, or the SHUTDOWN wait).
+/// The batch's outcome after a bounded wait (the function's deadline).
 /// A batch that finished needs nothing but its outcome logged. One the wait cut off is stopped, and
 /// whatever it had not delivered goes back to the normal retry buffers: groups before the
 /// cursor are done, types that already got an answer are never resent. Returns whether
