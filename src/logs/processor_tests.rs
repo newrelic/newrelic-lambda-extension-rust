@@ -2202,7 +2202,7 @@ mod lmi_process_record_tests {
 mod coverage_tests {
     use super::super::LogProcessor;
     use crate::config::{ExtensionConfig, ExtensionSettings};
-    use crate::config::deployment::DeploymentContext;
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
     use crate::context::InvocationContext;
     use crate::newrelic::client::NewRelicClient;
     use crate::newrelic::flush::Flush;
@@ -2769,19 +2769,96 @@ mod coverage_tests {
         assert!(p.log_batch.lock().unwrap().len() >= 25, "25 logs do not trigger a flush in the high tier");
     }
 
-    #[test]
-    fn high_tier_keeps_the_unsent_batch_bounded() {
-        let p = high_tier_processor("arn:aws:lambda:us-east-1:123:function:f", "req-hi-cap");
-        {
-            let mut batch = p.log_batch.lock().unwrap();
-            for i in 0..(super::super::HIGH_TIER_LOG_BATCH_MAX + 10) {
-                batch.push(make_log(&format!("log-{i}")));
-            }
+    fn typed_log(log_type: &str, i: usize) -> LogMessage {
+        let mut log = make_log(&format!("{log_type}-{i}"));
+        log.attributes.insert("_nr.logType".to_string(), serde_json::json!(log_type));
+        log
+    }
+
+    fn push_typed(p: &LogProcessor, log_type: &str, n: usize) {
+        let mut batch = p.log_batch.lock().unwrap();
+        for i in 0..n {
+            batch.push(typed_log(log_type, i));
         }
+    }
+
+    fn count_of(p: &LogProcessor, log_type: &str) -> usize {
+        p.log_batch.lock().unwrap().iter().filter(|l| l.message.starts_with(log_type)).count()
+    }
+
+    #[test]
+    fn high_tier_caps_each_log_type_at_the_per_type_limit() {
+        let p = high_tier_processor("arn:aws:lambda:us-east-1:123:function:f", "req-hi-cap");
+        push_typed(&p, "function", 110);
         p.try_spawn_auto_flush();
         let batch = p.log_batch.lock().unwrap();
-        assert_eq!(batch.len(), super::super::HIGH_TIER_LOG_BATCH_MAX);
-        assert_eq!(batch[0].message, "log-10", "the oldest were dropped");
+        assert_eq!(batch.len(), 100);
+        assert_eq!(batch[0].message, "function-10", "the oldest were dropped");
+    }
+
+    #[tokio::test]
+    async fn default_tier_keeps_the_newest_per_type_when_the_flush_cannot_run() {
+        let p = fast_fail_processor();
+        push_typed(&p, "function", 130);
+        p.is_auto_flushing.store(true, std::sync::atomic::Ordering::Release); // a flush is running, so none starts
+        p.try_spawn_auto_flush();
+        let batch = p.log_batch.lock().unwrap();
+        assert_eq!(batch.len(), 100);
+        assert_eq!(batch[0].message, "function-30");
+        assert_eq!(batch[99].message, "function-129");
+    }
+
+    #[tokio::test]
+    async fn log_types_are_capped_independently_to_three_times_the_limit() {
+        let p = fast_fail_processor();
+        push_typed(&p, "function", 120);
+        push_typed(&p, "platform", 150);
+        push_typed(&p, "extension", 105);
+        p.is_auto_flushing.store(true, std::sync::atomic::Ordering::Release); // a flush is running, so none starts
+        p.try_spawn_auto_flush();
+        assert_eq!(count_of(&p, "function"), 100);
+        assert_eq!(count_of(&p, "platform"), 100);
+        assert_eq!(count_of(&p, "extension"), 100);
+        assert_eq!(p.log_batch.lock().unwrap().len(), 300);
+    }
+
+    #[tokio::test]
+    async fn a_type_over_the_limit_leaves_the_other_types_untouched() {
+        let p = fast_fail_processor();
+        push_typed(&p, "platform", 7);
+        push_typed(&p, "function", 120);
+        p.is_auto_flushing.store(true, std::sync::atomic::Ordering::Release); // a flush is running, so none starts
+        p.try_spawn_auto_flush();
+        assert_eq!(count_of(&p, "platform"), 7);
+        assert_eq!(count_of(&p, "function"), 100);
+    }
+
+    #[tokio::test]
+    async fn serverless_caps_the_batch_per_type_too() {
+        let mut config = ExtensionConfig::default();
+        config.new_relic.log_endpoint = "http://127.0.0.1:1/log/v1".to_string();
+        config.deployment = DeploymentContext::Normal { mode: TelemetryMode::Serverless };
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        let p = LogProcessor::new(client, config, ctx, None);
+        push_typed(&p, "function", 120);
+        p.is_auto_flushing.store(true, std::sync::atomic::Ordering::Release); // a flush is running, so none starts
+        p.try_spawn_auto_flush();
+        assert_eq!(count_of(&p, "function"), 100);
+    }
+
+    #[tokio::test]
+    async fn lmi_batch_is_not_capped() {
+        let mut config = ExtensionConfig::default();
+        config.deployment = DeploymentContext::Lmi;
+        let config = Arc::new(config);
+        let client = Arc::new(NewRelicClient::new(&config));
+        let ctx = Arc::new(Mutex::new(InvocationContext::default()));
+        let p = LogProcessor::new(client, config, ctx, None);
+        push_typed(&p, "function", 150);
+        p.try_spawn_auto_flush();
+        assert_eq!(p.log_batch.lock().unwrap().len(), 150);
     }
 
     #[test]
