@@ -106,7 +106,8 @@ pub struct NewRelicConfig {
     /// Total wall-clock budget for retrying a send, set via
     /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. Serverless-only: always `None` in APM
     /// mode. `None` (the default, env var unset) preserves the existing
-    /// fixed-retry-count behavior unchanged. `Some(d)` switches to retrying until `d` has elapsed instead of a fixed count.
+    /// fixed-retry-count behavior unchanged. `Some(d)` switches to retrying until `d`
+    /// has elapsed instead of a fixed count.
     pub data_collection_timeout: Option<Duration>,
     /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in and
     /// serverless-only, same as data_collection_timeout.
