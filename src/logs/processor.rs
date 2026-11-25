@@ -543,30 +543,33 @@ impl LogProcessor {
     /// Keep the unsent batch to `MAX_FAILED_BUFFER_PER_TYPE` logs per log type (so three times
     /// that in total): past it, the oldest logs of that type are dropped. Not used in LMI,
     /// whose batch is flushed by size and would lose logs in normal operation.
-    fn cap_batch_per_type(&self) {
-        let mut batch = self.log_batch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn cap_batch_per_type(batch: &mut Vec<payload::LogMessage>) {
         if batch.len() <= MAX_FAILED_BUFFER_PER_TYPE {
             return;
         }
-        for log_type in [LogType::Function, LogType::Platform, LogType::Extension] {
-            let count = batch.iter().filter(|m| Self::log_type_from_message(m) == log_type).count();
-            if count > MAX_FAILED_BUFFER_PER_TYPE {
-                let mut to_drop = count - MAX_FAILED_BUFFER_PER_TYPE;
-                batch.retain(|m| {
-                    let drop_it = to_drop > 0 && Self::log_type_from_message(m) == log_type;
-                    if drop_it {
-                        to_drop -= 1;
-                    }
-                    !drop_it
-                });
+        const TYPES: [LogType; 3] = [LogType::Function, LogType::Platform, LogType::Extension];
+        let index = |m: &payload::LogMessage| TYPES.iter().position(|t| *t == Self::log_type_from_message(m)).unwrap_or(0);
+        let mut over = [0usize; 3];
+        for m in batch.iter() {
+            over[index(m)] += 1;
+        }
+        for (i, count) in over.iter_mut().enumerate() {
+            *count = count.saturating_sub(MAX_FAILED_BUFFER_PER_TYPE);
+            if *count > 0 {
                 warn!(
                     "Log batch over {} {:?} logs - dropped the {} oldest",
-                    MAX_FAILED_BUFFER_PER_TYPE,
-                    log_type,
-                    count - MAX_FAILED_BUFFER_PER_TYPE
+                    MAX_FAILED_BUFFER_PER_TYPE, TYPES[i], count
                 );
             }
         }
+        batch.retain(|m| {
+            let i = index(m);
+            let drop_it = over[i] > 0;
+            if drop_it {
+                over[i] -= 1;
+            }
+            !drop_it
+        });
     }
 
     /// Whether any log of `request_id` that is still unsent (batched or held for its
@@ -626,14 +629,12 @@ impl LogProcessor {
         const FLUSH_THRESHOLD: usize = 25;
         const LMI_FLUSH_THRESHOLD_BYTES: usize = 1_000_000;
 
-        // Every mode but LMI keeps the unsent batch to a fixed number of logs per type.
-        if !self.config.deployment.is_lmi() {
-            self.cap_batch_per_type();
-        }
+        let is_lmi = self.config.deployment.is_lmi();
 
         // High tier: logs are never flushed on a count. They go out only with the batch an
         // invoke starts once it is known to be long, so here the batch just stays bounded.
-        if self.config.extension.send_tier == crate::send::SendTier::High && !self.config.deployment.is_lmi() {
+        if self.config.extension.send_tier == crate::send::SendTier::High && !is_lmi {
+            Self::cap_batch_per_type(&mut self.log_batch.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
             return;
         }
 
@@ -645,12 +646,19 @@ impl LogProcessor {
             } else {
                 batch.len() >= FLUSH_THRESHOLD
             };
+            // Every mode but LMI caps the logs that stay unsent; a batch the flush takes is never cut.
             if !should_flush {
+                if !is_lmi {
+                    Self::cap_batch_per_type(&mut batch);
+                }
                 return;
             }
             // Atomically claim the flush slot; abort if another flush is already running.
             if self.is_auto_flushing.swap(true, Ordering::AcqRel) {
                 debug!("Auto-flush already in progress - skipping to prevent infinite loop");
+                if !is_lmi {
+                    Self::cap_batch_per_type(&mut batch);
+                }
                 return;
             }
             std::mem::take(&mut *batch)
@@ -685,6 +693,9 @@ impl LogProcessor {
                 );
                 if let Ok(mut batch) = self.log_batch.lock() {
                     batch.extend(logs_to_send);
+                    if !is_lmi {
+                        Self::cap_batch_per_type(&mut batch);
+                    }
                 }
                 self.is_auto_flushing.store(false, Ordering::Release);
                 return;

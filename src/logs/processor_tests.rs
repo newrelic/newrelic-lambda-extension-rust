@@ -2809,6 +2809,15 @@ mod coverage_tests {
     }
 
     #[tokio::test]
+    async fn a_batch_the_flush_takes_is_not_cut_by_the_cap() {
+        let p = fast_fail_processor_with_context("arn:aws:lambda:us-east-1:123:function:f", "req-take");
+        push_typed(&p, "function", 130);
+        p.try_spawn_auto_flush();
+        // The current-thread runtime has not run the spawned send yet, so an empty batch means all 130 were taken.
+        assert_eq!(p.log_batch.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn log_types_are_capped_independently_to_three_times_the_limit() {
         let p = fast_fail_processor();
         push_typed(&p, "function", 120);
