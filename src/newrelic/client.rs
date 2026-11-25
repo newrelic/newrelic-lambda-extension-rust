@@ -32,7 +32,7 @@ pub(crate) fn is_high_tier(config: &ExtensionConfig) -> bool {
 }
 
 /// Per-request total timeout for `NewRelicClient` sends (logs, agent payload):
-/// `SEND_TIMEOUT` in the high tier, else `NEW_RELIC_HTTP_TIMEOUT` or 2400 ms as in `main`.
+/// `SEND_TIMEOUT` in the high tier, else `NEW_RELIC_HTTP_TIMEOUT` (serverless only) or 2400 ms as in `main`.
 pub(crate) fn client_send_timeout(config: &ExtensionConfig) -> std::time::Duration {
     if is_high_tier(config) {
         SEND_TIMEOUT

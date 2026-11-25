@@ -2133,17 +2133,47 @@ fn test_high_tier_is_apm_only() {
 
 #[test]
 #[serial]
-fn test_high_tier_clears_data_collection_timeout_and_default_tier_keeps_it() {
+fn test_apm_mode_ignores_http_and_data_collection_timeouts_in_both_tiers() {
     with_full_clean_env(|| {
         env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3000");
         env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
-        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
-        assert_eq!(ExtensionConfig::from_env().new_relic.data_collection_timeout, None);
-        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "default");
-        assert!(ExtensionConfig::from_env().new_relic.data_collection_timeout.is_some());
+        for tier in ["default", "high"] {
+            env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", tier);
+            let config = ExtensionConfig::from_env();
+            assert_eq!(config.new_relic.data_collection_timeout, None, "{tier}");
+            assert_eq!(config.new_relic.http_timeout, None, "{tier}");
+        }
         env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
         env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_HTTP_TIMEOUT");
         env::remove_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT");
+    });
+}
+
+#[test]
+#[serial]
+fn test_serverless_keeps_http_and_data_collection_timeouts() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3000");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.data_collection_timeout.is_some());
+        assert!(config.new_relic.http_timeout.is_some());
+        env::remove_var("NEW_RELIC_HTTP_TIMEOUT");
+        env::remove_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_mode_leaves_unset_timeouts_none() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, None);
+        assert_eq!(config.new_relic.http_timeout, None);
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
     });
 }
 

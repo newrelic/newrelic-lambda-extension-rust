@@ -768,8 +768,8 @@ fn send_timeout_keeps_mains_values_in_the_default_tier_and_serverless_mode() {
 }
 
 #[test]
-fn send_timeout_honors_new_relic_http_timeout_outside_the_high_tier() {
-    let mut config = tier_config(true, crate::send::SendTier::Default);
+fn send_timeout_honors_new_relic_http_timeout_in_serverless_mode() {
+    let mut config = tier_config(false, crate::send::SendTier::Default);
     config.new_relic.http_timeout = Some(std::time::Duration::from_secs(7));
     assert_eq!(client_send_timeout(&config), std::time::Duration::from_secs(7));
 }

@@ -104,12 +104,12 @@ pub struct NewRelicConfig {
     /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
     pub synchronous_flush: bool,
     /// Total wall-clock budget for retrying a send, set via
-    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
-    /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
-    /// switches to retrying until `d` has elapsed instead of a fixed count.
+    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. Serverless-only: always `None` in APM
+    /// mode. `None` (the default, env var unset) preserves the existing
+    /// fixed-retry-count behavior unchanged. `Some(d)` switches to retrying until `d` has elapsed instead of a fixed count.
     pub data_collection_timeout: Option<Duration>,
-    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in, same as
-    /// data_collection_timeout.
+    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in and
+    /// serverless-only, same as data_collection_timeout.
     pub http_timeout: Option<Duration>,
 }
 
@@ -711,12 +711,14 @@ impl ExtensionConfig {
             config.extension.send_tier = crate::send::SendTier::Default;
         }
 
-        // High-tier sends are single bounded attempts, so the collection budget has no effect there.
-        if config.extension.send_tier == crate::send::SendTier::High
-            && !config.deployment.is_lmi()
-            && config.new_relic.data_collection_timeout.take().is_some()
-        {
-            warn!("NEW_RELIC_DATA_COLLECTION_TIMEOUT is ignored with NEW_RELIC_EXTENSION_SEND_TIER=high");
+        // Both timeouts are serverless-only: APM mode uses the fixed send timeouts and retry counts.
+        if config.new_relic.apm_lambda_mode {
+            if config.new_relic.data_collection_timeout.take().is_some() {
+                warn!("NEW_RELIC_DATA_COLLECTION_TIMEOUT is serverless-only and is ignored in APM mode");
+            }
+            if config.new_relic.http_timeout.take().is_some() {
+                warn!("NEW_RELIC_HTTP_TIMEOUT is serverless-only and is ignored in APM mode");
+            }
         }
 
         // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
