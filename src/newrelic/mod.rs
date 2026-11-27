@@ -5,6 +5,7 @@
 //! including the client for sending data, payload definitions, and the harvesting logic.
 
 pub mod client;
+pub(crate) mod conn_reuse;
 pub mod payload;
 pub mod flush;
 pub mod send_error;

@@ -469,6 +469,7 @@ impl NewRelicClient {
 
             match res {
                 Ok(response) => {
+                    crate::newrelic::conn_reuse::note_connection("agent-payload", &response);
                     let status = response.status();
                     
                     if status.is_success() {
@@ -593,6 +594,7 @@ impl NewRelicClient {
 
             match res {
                 Ok(response) => {
+                    crate::newrelic::conn_reuse::note_connection("logs", &response);
                     let status = response.status();
                     if status.is_success() {
                         let duration = start_time.elapsed();

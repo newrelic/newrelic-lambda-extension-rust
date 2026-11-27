@@ -274,6 +274,7 @@ pub async fn preconnect(
             sanitized
         })?;
 
+    crate::newrelic::conn_reuse::note_connection("apm-preconnect", &response);
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();
@@ -380,6 +381,7 @@ pub async fn connect(
             sanitized
         })?;
 
+    crate::newrelic::conn_reuse::note_connection("apm-connect", &response);
     let status = response.status();
     if !status.is_success() {
         let code = status.as_u16();

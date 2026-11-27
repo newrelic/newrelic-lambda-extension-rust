@@ -373,6 +373,7 @@ pub async fn send_error_events(
         })?;
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("apm-error-events", &response);
     let status = response.status();
     let status_code = status.as_u16();
 
@@ -473,6 +474,7 @@ pub async fn send_apm_telemetry(
         })?;
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("apm-agent-data", &response);
     let status = response.status();
     let status_code = status.as_u16();
 
@@ -575,6 +577,7 @@ pub async fn send_platform_metrics(
     };
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("metric-api", &response);
     let status = response.status();
     let status_code = status.as_u16();
 
