@@ -327,3 +327,57 @@ async fn connect_timeout_covers_is_timeout_branch() {
         "unexpected reason: {reason}"
     );
 }
+
+/// Accepts one TCP connection, holds it silent for `stall`, then closes it.
+async fn stalling_server(stall: std::time::Duration) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            tokio::time::sleep(stall).await;
+            drop(stream);
+        }
+    });
+    port
+}
+
+#[tokio::test]
+#[serial]
+async fn preconnect_handshake_is_not_capped_by_the_send_timeout() {
+    // The TLS handshake stalls 900 ms (> SEND_TIMEOUT) then the server hangs up. With
+    // only `apm_handshake_timeout_secs` (5 s) bounding it, preconnect waits for the
+    // server instead of timing out at 500 ms.
+    reset_connect_stats();
+    crate::newrelic::tls_fallback::reset_for_test();
+    let port = stalling_server(std::time::Duration::from_millis(900)).await;
+    let client = crate::newrelic::client::build_outbound_client(None);
+    let start = std::time::Instant::now();
+    let result = preconnect(&client, "test-key", &format!("127.0.0.1:{port}"), 5).await;
+    let elapsed = start.elapsed();
+    crate::newrelic::tls_fallback::reset_for_test();
+
+    assert!(result.is_err(), "the stub server speaks no TLS");
+    let reason = last_failure_reason().expect("failure reason must be recorded");
+    assert!(!reason.contains("timeout"), "handshake was cut off by a timeout: {reason} after {elapsed:?}");
+    assert!(elapsed >= std::time::Duration::from_millis(800), "handshake gave up after {elapsed:?}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_send_with_the_high_tier_timeout_times_out_against_a_slow_server() {
+    crate::newrelic::tls_fallback::reset_for_test();
+    let port = stalling_server(std::time::Duration::from_millis(900)).await;
+    let client = crate::newrelic::client::build_outbound_client(None);
+    let start = std::time::Instant::now();
+    let err = client
+        .active()
+        .post(format!("http://127.0.0.1:{port}/"))
+        .timeout(crate::apm::collector::send_timeout_for(true))
+        .send()
+        .await
+        .expect_err("a server silent for 900 ms must exceed the 500 ms send timeout");
+    crate::newrelic::tls_fallback::reset_for_test();
+
+    assert!(err.is_timeout(), "expected a timeout, got {err:?}");
+    assert!(start.elapsed() < std::time::Duration::from_millis(800));
+}

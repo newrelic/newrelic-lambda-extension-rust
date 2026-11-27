@@ -91,21 +91,15 @@ pub struct FailedAgentPayload {
 pub static FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<Arc<Mutex<Vec<FailedAgentPayload>>>> =
     once_cell::sync::Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-/// Max buffered agent payloads = the circuit breaker's **3N** buffer cap, derived
-/// once from `NEW_RELIC_EXTENSION_SEND_TIER`: high tier `N=5 → 3N=15`, default tier
-/// `N=10 → 3N=30`. When full, the oldest is evicted (and counted) — FIFO
-/// drop-oldest — so a long disconnected period on a busy function can't grow
-/// unbounded. (Was a flat 500 before the invocation-count breaker model; the
-/// per-tier 3N cap replaces it so the buffer matches the breaker's
-/// fill→retry→slide lifecycle exactly.)
-static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> =
-    once_cell::sync::Lazy::new(|| {
-        let default_n = match crate::send::SendTier::from_env() {
-            crate::send::SendTier::High => crate::send::DEFAULT_THRESHOLD_HIGH,
-            crate::send::SendTier::Default => crate::send::DEFAULT_THRESHOLD_DEFAULT,
-        };
-        3 * crate::send::circuit_breaker::threshold_from_env(default_n) as usize
-    });
+/// Max buffered invocations (distinct request ids, each possibly many chunks) = the circuit
+/// breaker's **3N** buffer cap, derived once from `NEW_RELIC_EXTENSION_SEND_TIER`: high tier
+/// `N=5 → 3N=15`, default tier `N=10 → 3N=30`. When full, every payload of the oldest
+/// invocation is evicted (and counted), so a long disconnected period on a busy function
+/// can't grow unbounded. (Was a flat 500 payloads before the invocation-count breaker model;
+/// the per-tier 3N cap replaces it so the buffer matches the breaker's lifecycle.)
+static MAX_FAILED_AGENT_PAYLOADS: once_cell::sync::Lazy<usize> = once_cell::sync::Lazy::new(|| {
+    crate::send::circuit_breaker::buffer_cap_for(crate::send::SendTier::from_env())
+});
 
 /// Count of buffered agent payloads dropped *before* shutdown (evicted when the
 /// buffer is full). Lets the shutdown summary report the true loss, since evicted
@@ -134,13 +128,20 @@ pub fn buffered_agent_payload_request_ids() -> Vec<String> {
 /// is at capacity. Single choke point so both first-failure and retry re-buffer
 /// paths enforce the same cap.
 fn push_failed_payload_capped(buf: &mut Vec<FailedAgentPayload>, payload: FailedAgentPayload) {
-    if buf.len() >= *MAX_FAILED_AGENT_PAYLOADS {
-        buf.remove(0);
-        DROPPED_AGENT_PAYLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        warn!(
-            "Failed agent payload buffer full ({}) - evicted oldest invocation's data",
-            *MAX_FAILED_AGENT_PAYLOADS
-        );
+    // The cap counts distinct request ids (one invocation can span many chunks).
+    let ids: std::collections::HashSet<&str> = buf.iter().map(|p| p.request_id.as_str()).collect();
+    if !ids.contains(payload.request_id.as_str()) && ids.len() >= *MAX_FAILED_AGENT_PAYLOADS {
+        let oldest = buf.iter().min_by_key(|p| p.failed_at).map(|p| p.request_id.clone());
+        if let Some(oldest) = oldest {
+            let before = buf.len();
+            buf.retain(|p| p.request_id != oldest);
+            DROPPED_AGENT_PAYLOADS
+                .fetch_add((before - buf.len()) as u64, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "Failed agent payload buffer full ({} invocations) - evicted oldest invocation's data",
+                *MAX_FAILED_AGENT_PAYLOADS
+            );
+        }
     }
     buf.push(payload);
 }
@@ -272,9 +273,9 @@ async fn retry_failed_platform_reports(apm_app: crate::apm::SharedApmApp) {
 
     debug!("Retrying {} buffered platform-report(s)", pending.len());
 
-    let apm_guard = apm_app.read().await;
-    let Some(ref app) = *apm_guard else {
-        drop(apm_guard);
+    // Clone out of the lock so the read guard is not held across every POST below.
+    let app_owned = apm_app.read().await.clone();
+    let Some(app) = app_owned else {
         if let Ok(mut buf) = FAILED_PLATFORM_REPORTS.lock() {
             buf.extend(pending);
         }
@@ -375,25 +376,20 @@ async fn wait_for_report_sends(budget: Duration) {
 const SHUTDOWN_REPORT_WAIT_MS: u64 = 1_000;
 
 /// Tracks the two in-flight `high`-tier sends: the INVOKE-time batch and the
-/// log flush. `default` never touches it. The batch is never aborted (it may
-/// already be at the collector); only the log flush is, at the cap.
+/// log flush. A batch still running at the function deadline
+/// is cut off, and its undelivered groups are buffered for retry; one still running after the
+/// SHUTDOWN wait is left running. Its breaker is
+/// `DEFAULT_BREAKER`, which the default tier's send paths consult too.
 static SEND_SCHEDULER: once_cell::sync::Lazy<crate::send::SendScheduler> =
-    once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(
-        crate::send::SendMode::Deferred,
-        // Real invocation-count breaker, high-tier defaults (N=5 → open 2N=10
-        // → buffer cap 3N=15). SEND_SCHEDULER is only ever used by the
-        // high-tier path (process_apm_request_high), so this does not touch the
-        // default tier's pipeline. `from_env` lets NEW_RELIC_EXTENSION_CIRCUIT_BREAKER_THRESHOLD
-        // override N; everything else derives from it.
-        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::from_env(
-            crate::send::DEFAULT_THRESHOLD_HIGH,
-        )),
-        std::sync::Arc::new(crate::send::FixedTimeoutProvider(std::time::Duration::from_millis(crate::send::tier::DEFAULT_SEND_TIMEOUT_MS))),
-    ));
+    // The one process-wide breaker, shared with the default-tier paths.
+    once_cell::sync::Lazy::new(|| crate::send::SendScheduler::new(DEFAULT_BREAKER.clone()));
 
-/// Default tier breaker (N=10, open for 2N=20 invokes), one state per endpoint.
-pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<crate::send::ConsecutiveFailureBreaker> =
-    once_cell::sync::Lazy::new(|| crate::send::ConsecutiveFailureBreaker::from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT));
+/// The process-wide breaker, one state per endpoint, used by both tiers (`SEND_SCHEDULER` holds
+/// it too). N follows the configured tier: high 5, default 10 (open for 2N invokes).
+pub(crate) static DEFAULT_BREAKER: once_cell::sync::Lazy<std::sync::Arc<crate::send::ConsecutiveFailureBreaker>> =
+    once_cell::sync::Lazy::new(|| {
+        std::sync::Arc::new(crate::send::ConsecutiveFailureBreaker::for_tier(crate::send::SendTier::from_env()))
+    });
 
 /// Default tier retries for an endpoint only run while its breaker is closed.
 fn default_breaker_closed(kind: crate::send::SendKind) -> bool {
@@ -565,10 +561,12 @@ pub fn stash_platform_report(request_id: &str, report: String) {
 
 /// Take every kept report except the running request's: its own batch is still to come.
 pub(crate) fn take_stashed_reports(current_request_id: &str) -> Vec<StashedReport> {
-    let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut *stash_lock())
+    // One guard for take and write-back: a report stashed in between would be overwritten.
+    let mut stash = stash_lock();
+    let (keep, take): (Vec<_>, Vec<_>) = std::mem::take(&mut *stash)
         .into_iter()
         .partition(|s| s.request_id == current_request_id);
-    *stash_lock() = keep;
+    *stash = keep;
     take
 }
 
@@ -822,8 +820,8 @@ fn buffer_unresolved_groups(groups: &[PendingGroup], resolved_cursor: usize) {
     }
 }
 
-/// The batch's outcome after the wait that ends at the function's deadline. A batch that
-/// finished needs nothing but its outcome logged. One the deadline cut off is stopped, and
+/// The batch's outcome after a bounded wait (the function's deadline).
+/// A batch that finished needs nothing but its outcome logged. One the wait cut off is stopped, and
 /// whatever it had not delivered goes back to the normal retry buffers: groups before the
 /// cursor are done, types that already got an answer are never resent. Returns whether
 /// the batch was cut off.
@@ -840,7 +838,7 @@ fn finish_batch_outcome(outcome: &crate::send::DispatchOutcome) -> bool {
     let stopped = crate::apm::inflight::abort_owner(meta.owner);
     buffer_unresolved_groups(&meta.groups, outcome.cursor.unwrap_or(0));
     warn!(
-        "APM mode (high): batch reached the function deadline - {} POST(s) stopped, unsent data kept for the next invoke",
+        "APM mode (high): batch reached its wait deadline - {} POST(s) stopped, unsent data kept for retry",
         stopped
     );
     true
@@ -946,10 +944,6 @@ fn batch_exceeded_max_age(max_age: Duration) -> bool {
 
 /// SHUTDOWN: there is no next invocation to defer to, so wait (bounded by
 /// Lambda's 2s limit) for the last batch, and leave it running if it is slow.
-async fn resolve_pending_agent_batch(wait_ms: u64) {
-    wait_for_pending_agent_batch(Duration::from_millis(wait_ms)).await;
-}
-
 async fn wait_for_pending_agent_batch(wait: Duration) {
     let done = SEND_SCHEDULER
         .wait_finished(&[crate::send::SendKind::ApmCollector], wait)
@@ -995,6 +989,11 @@ async fn spawn_log_flush(log_processor: &Arc<LogProcessor>, request_id: &str) {
             "APM mode: previous log flush still running — new logs for {} stay batched for the next flush",
             request_id
         );
+        return;
+    }
+    // Nothing to send: skip before the breaker is asked, so an empty flush never settles the
+    // HalfOpen probe (the default tier releases it in the same case).
+    if log_processor.is_drained() && log_processor.failed_logs_buffer_len() == 0 {
         return;
     }
 
@@ -1124,10 +1123,8 @@ fn handle_logs_outcome(
                 );
             }
         }
-        other => {
-            // Dropped/Deferred: unreachable in practice — neither
-            // resolve_pending_no_abort nor resolve_pending_shared_budget's
-            // caller for Logs checks the breaker or produces Deferred.
+        other @ crate::send::DispatchResult::StillRunning => {
+            // Unreachable: StillRunning is handled before this match.
             warn!(
                 "APM mode: unexpected {:?} resolving log flush for {}",
                 other, request_id
@@ -1520,10 +1517,9 @@ pub async fn execute_apm_mode_event_loop(components: &mut ExtensionComponents) -
 
                 if components.config.extension.send_tier == crate::send::SendTier::High {
                     // pending_task is a no-op for high (see above); only the
-                    // current request is awaited, bounded by its own send budget.
-                    if components.config.extension.pipeline_flush {
-                        pending_flush_handles.push(current_task);
-                    } else if let Err(e) = current_task.await {
+                    // current request is awaited, bounded by its own send budget. Never
+                    // pipelined: the high tier waits for its sends before /next.
+                    if let Err(e) = current_task.await {
                         error!("Error in APM request processing: {}", e);
                     }
                 } else if components.config.extension.pipeline_flush {
@@ -2278,17 +2274,6 @@ async fn process_apm_request_with(
     );
 }
 
-/// `SendTier::Default` — the exact pre-existing `main` code (pipeline_flush-based,
-/// pre-`SendScheduler`), moved here verbatim, not edited, per `DUAL_PATH_PLAN.md`.
-/// Zero behavior change versus `main` -- this is the whole point of the dual-path
-/// design: `default` tier's testing surface/regression risk stays exactly what it
-/// already was.
-///
-/// `#[allow(clippy::too_many_lines)]`: a function-boundary artifact of
-/// extracting this logic out of the original combined `process_apm_request`
-/// (which didn't trip this lint at its old boundary) -- the code itself is
-/// unchanged, not newly complex.
-#[allow(clippy::too_many_lines)]
 /// Default tier: send an invocation's agent payload(s) to the APM collector in the background.
 /// The handle yields (all sent, the payloads). A payload that could not be sent is buffered for
 /// retry inside the task, so nothing is lost if the caller ignores the result.
@@ -2304,13 +2289,12 @@ fn spawn_default_agent_send(
     let config_clone = config.clone();
     let global_log_processor_clone = global_log_processor.clone();
     let apm_app_clone = apm_app.clone();
-    let agent_payloads_clone = agent_payloads;
     let invoked_function_arn_clone = invoked_function_arn.to_string();
 
     tokio::spawn(async move {
         // Trace-id extraction is per-chunk (independent of telemetry-map
         // merging) — same as process_pending_agent_payloads's identical step.
-        for payload_bytes in &agent_payloads_clone {
+        for payload_bytes in &agent_payloads {
             extract_and_coordinate_trace_id(
                 payload_bytes,
                 &request_id_clone,
@@ -2331,7 +2315,7 @@ fn spawn_default_agent_send(
         let app_owned = apm_app_clone.read().await.clone();
         let send_started = chrono::Utc::now();
         let all_sent = if let Some(app) = app_owned {
-            let send_result = app.process_merged_agent_payloads(agent_payloads_clone.clone(), &request_id_clone, &invoked_function_arn_clone).await;
+            let send_result = app.process_merged_agent_payloads(agent_payloads.clone(), &request_id_clone, &invoked_function_arn_clone).await;
             send_result.is_ok()
         } else {
             false
@@ -2345,11 +2329,11 @@ fn spawn_default_agent_send(
             // (never silently dropped); the global retry loop resends them on a
             // later invoke / at shutdown. Mirrors process_pending_agent_payloads's
             // identical fallback when apm_app isn't ready or the merged send errors.
-            for payload_bytes in &agent_payloads_clone {
+            for payload_bytes in &agent_payloads {
                 buffer_failed_agent_payload(payload_bytes, &request_id_clone, &invoked_function_arn_clone);
             }
         }
-        (all_sent, agent_payloads_clone, delivered)
+        (all_sent, agent_payloads, delivered)
     })
 }
 
@@ -2359,13 +2343,21 @@ fn spawn_default_agent_send(
 /// comes: callers race it against `runtimeDone`.
 async fn wait_for_agent_payload(state: &request::RequestProcessingState) {
     loop {
+        // Register before checking, so a push between the check and the await is not missed.
+        let mut notified = std::pin::pin!(request::AGENT_PAYLOAD_NOTIFY.notified());
+        notified.as_mut().enable();
         if state.agent_buffer.lock().map(|b| !b.is_empty()).unwrap_or(false) {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        notified.await;
     }
 }
 
+/// `SendTier::Default`: the pipeline_flush-based path of `main`, pre-`SendScheduler`, kept so
+/// the default tier behaves as `main` does. One addition: an agent payload that arrives before
+/// `runtimeDone` is uploaded at once (`spawn_default_agent_send`), so later chunks may go out as a
+/// second POST set.
+#[allow(clippy::too_many_lines)]
 async fn process_apm_request_default(
     request_id: &String,
     invoked_function_arn: &String,
@@ -2378,10 +2370,10 @@ async fn process_apm_request_default(
     use crate::send::CircuitBreaker;
     let collector = crate::send::SendKind::ApmCollector;
     // One check per invocation: false while open, true for the single retry after 2N.
-    let breaker_allows = DEFAULT_BREAKER.allow_send(collector);
-    let is_probe = breaker_allows && DEFAULT_BREAKER.state(collector) == crate::send::BreakerState::HalfOpen;
+    let collector_permit = DEFAULT_BREAKER.allow_send(collector);
+    let breaker_allows = collector_permit.is_some();
     let breaker_resolved = std::sync::atomic::AtomicBool::new(false);
-    let logs_allowed = DEFAULT_BREAKER.allow_send(crate::send::SendKind::Logs);
+    let logs_permit = DEFAULT_BREAKER.allow_send(crate::send::SendKind::Logs);
 
     // Wait for the handler to actually finish (platform.runtimeDone) BEFORE deciding
     // whether the platform.report has arrived. Bounded by the invocation's own remaining
@@ -2502,14 +2494,18 @@ async fn process_apm_request_default(
             match handle.await {
                 Ok((success, payloads, delivered)) => {
                     let outcome = if delivered { crate::send::SendOutcome::Success } else { crate::send::SendOutcome::Failure };
-                    DEFAULT_BREAKER.record_result(collector, outcome);
+                    if let Some(permit) = collector_permit {
+                        DEFAULT_BREAKER.record_result(collector, permit, outcome);
+                    }
                     breaker_resolved.store(true, std::sync::atomic::Ordering::Relaxed);
                     if !success && !payloads.is_empty() {
                         debug!("APM mode: agent send had failures — unsent payloads buffered for retry (next invoke / shutdown)");
                     }
                 }
                 Err(e) => {
-                    DEFAULT_BREAKER.record_result(collector, crate::send::SendOutcome::Failure);
+                    if let Some(permit) = collector_permit {
+                        DEFAULT_BREAKER.record_result(collector, permit, crate::send::SendOutcome::Failure);
+                    }
                     breaker_resolved.store(true, std::sync::atomic::Ordering::Relaxed);
                     error!("Agent send task failed: {}", e);
                 }
@@ -2527,10 +2523,9 @@ async fn process_apm_request_default(
             // across an HTTP POST and risk blocking a reconnect's write lock.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                let _ = crate::telemetry::listener::send_report_through_breaker(&app, request_id, &report_line, invoked_function_arn).await;
             } else {
                 warn!("APM mode: APM app not ready - cannot send platform metrics for {}", request_id);
             }
@@ -2557,19 +2552,19 @@ async fn process_apm_request_default(
         // Wait for logs and platform to complete before returning
         let log_flushing = async {
             let logs_kind = crate::send::SendKind::Logs;
-            if !logs_allowed {
+            let Some(logs_permit) = logs_permit else {
                 debug!("APM mode: circuit breaker open for logs - flush skipped, logs for {} stay batched", request_id);
                 return Ok(());
-            }
+            };
             let nothing_to_send = global_log_processor.is_drained() && global_log_processor.failed_logs_buffer_len() == 0;
             let failures_before = crate::logs::processor::log_send_failure_count();
             let result = global_log_processor.flush().await;
             if nothing_to_send {
-                DEFAULT_BREAKER.release_probe(logs_kind);
+                DEFAULT_BREAKER.release_probe(logs_kind, logs_permit);
             } else if result.is_err() || crate::logs::processor::log_send_failure_count() > failures_before {
-                DEFAULT_BREAKER.record_result(logs_kind, crate::send::SendOutcome::Failure);
+                DEFAULT_BREAKER.record_result(logs_kind, logs_permit, crate::send::SendOutcome::Failure);
             } else {
-                DEFAULT_BREAKER.record_result(logs_kind, crate::send::SendOutcome::Success);
+                DEFAULT_BREAKER.record_result(logs_kind, logs_permit, crate::send::SendOutcome::Success);
             }
             result
         };
@@ -2597,8 +2592,8 @@ async fn process_apm_request_default(
     tokio::join!(agent_send_fut, report_send_fut, log_flush_fut, reports_in_flight_fut);
 
     // The retry was allowed but nothing was sent this invocation: give it back.
-    if is_probe && !breaker_resolved.load(std::sync::atomic::Ordering::Relaxed) {
-        DEFAULT_BREAKER.release_probe(collector);
+    if let Some(permit) = collector_permit.filter(|_| !breaker_resolved.load(std::sync::atomic::Ordering::Relaxed)) {
+        DEFAULT_BREAKER.release_probe(collector, permit);
     }
 }
 
@@ -3086,7 +3081,7 @@ async fn shutdown_drain_high_tier(components: &ExtensionComponents) {
     if components.config.extension.send_tier != crate::send::SendTier::High {
         return;
     }
-    resolve_pending_agent_batch(components.config.extension.shutdown_batch_wait_ms).await;
+    wait_for_pending_agent_batch(Duration::from_millis(components.config.extension.shutdown_batch_wait_ms)).await;
     drain_stashed_reports_into_retry_buffer();
     retry_failed_platform_reports(components.apm_app.clone()).await;
 }
@@ -3879,10 +3874,14 @@ pub(crate) async fn process_pending_agent_payloads(
             // process_apm_request's agent-payload send fix.
             let app_owned = apm_app.read().await.clone();
             if let Some(app) = app_owned {
-                // send_platform_report_metrics always returns Ok (permanent-drop and
-                // buffered-for-retry are Ok too, by design) and already logs its own
-                // accurate outcome internally — don't re-log here.
-                let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                // Logs its own outcome; a failed send is buffered by the Metric API path, as
+                // before. While the Metric API breaker is open the metrics are buffered unsent.
+                // LMI has no breaker by design, so it sends directly, as on `main`.
+                if config.deployment.is_lmi() {
+                    let _ = app.send_platform_report_metrics(&report_line, &invoked_function_arn).await;
+                } else {
+                    let _ = crate::telemetry::listener::send_report_through_breaker(&app, &request_id, &report_line, &invoked_function_arn).await;
+                }
             }
 
             // Remove pending report after sending

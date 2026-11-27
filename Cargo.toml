@@ -45,7 +45,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Hyper - use v1 to match AWS SDK (eliminates duplicate hyper 0.14)
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server", "service"] }
+hyper-util = { version = "0.1", features = ["server", "service", "client-legacy"] }
 # Use http v1 to match AWS SDK
 http-body-util = "0.1"
 flate2 = "1.0"

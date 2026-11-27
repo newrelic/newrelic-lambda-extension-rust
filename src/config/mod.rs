@@ -27,7 +27,7 @@ const MAX_TRACE_ID_LOG_BUFFER_MAX: usize = 100_000;
 const DEFAULT_DATA_COLLECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fallback used when `NEW_RELIC_HTTP_TIMEOUT` is set but not a valid duration string.
-const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
+pub(crate) const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_millis(2400);
 
 /// Extension-controlled shutdown error classes, lowercased. These are the only
 /// classes `NEW_RELIC_EXTENSION_IGNORE_ERRORS`/`NEW_RELIC_EXTENSION_EXPECTED_ERRORS`
@@ -104,12 +104,13 @@ pub struct NewRelicConfig {
     /// `NEW_RELIC_APM_BLOCKING_AGENT_PAYLOAD`, which is APM-mode-only.
     pub synchronous_flush: bool,
     /// Total wall-clock budget for retrying a send, set via
-    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. `None` (the default, env var unset)
-    /// preserves the existing fixed-retry-count behavior unchanged. `Some(d)`
-    /// switches to retrying until `d` has elapsed instead of a fixed count.
+    /// `NEW_RELIC_DATA_COLLECTION_TIMEOUT`. Serverless-only: always `None` in APM
+    /// mode. `None` (the default, env var unset) preserves the existing
+    /// fixed-retry-count behavior unchanged. `Some(d)` switches to retrying until `d`
+    /// has elapsed instead of a fixed count.
     pub data_collection_timeout: Option<Duration>,
-    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in, same as
-    /// data_collection_timeout.
+    /// Per-request timeout, set via `NEW_RELIC_HTTP_TIMEOUT`. Opt-in and
+    /// serverless-only, same as data_collection_timeout.
     pub http_timeout: Option<Duration>,
 }
 
@@ -647,12 +648,7 @@ impl ExtensionConfig {
         // Default inside SendTier::from_env itself (warns, never panics).
         config.extension.send_tier = crate::send::SendTier::from_env();
 
-        config.extension.short_invoke_threshold_ms =
-            env::var("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(10)
-                .min(1000);
+        config.extension.short_invoke_threshold_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS", 10, 0, 1000);
         config.extension.payload_window_ms = env_ms("NEW_RELIC_EXTENSION_APM_PAYLOAD_WINDOW_MS", 25, 0, 250);
         config.extension.batch_max_age_ms = env_ms("NEW_RELIC_EXTENSION_APM_BATCH_MAX_AGE_MS", 30_000, 1_000, 300_000);
         config.extension.shutdown_batch_wait_ms = env_ms("NEW_RELIC_EXTENSION_APM_SHUTDOWN_WAIT_MS", 2_000, 0, 2_000);
@@ -708,6 +704,31 @@ impl ExtensionConfig {
                  will not get pipeline_flush's billed-duration savings on those invocations. This is \
                  intentional: the delivery guarantee takes precedence over the throughput optimization."
             );
+        }
+
+        // The high tier is APM-only: elsewhere it is the default tier.
+        if config.extension.send_tier == crate::send::SendTier::High && !config.new_relic.apm_lambda_mode {
+            warn!("NEW_RELIC_EXTENSION_SEND_TIER=high is APM-only and is ignored outside NEW_RELIC_APM_LAMBDA_MODE");
+            config.extension.send_tier = crate::send::SendTier::Default;
+        }
+
+        // Both timeouts are serverless-only: APM mode uses the fixed send timeouts and retry counts.
+        if config.new_relic.apm_lambda_mode {
+            if config.new_relic.data_collection_timeout.take().is_some() {
+                warn!("NEW_RELIC_DATA_COLLECTION_TIMEOUT is serverless-only and is ignored in APM mode");
+            }
+            if config.new_relic.http_timeout.take().is_some() {
+                warn!("NEW_RELIC_HTTP_TIMEOUT is serverless-only and is ignored in APM mode");
+            }
+        }
+
+        // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
+        if config.extension.pipeline_flush
+            && config.new_relic.apm_lambda_mode
+            && config.extension.send_tier == crate::send::SendTier::High
+        {
+            warn!("NEW_RELIC_EXTENSION_PIPELINE_FLUSH=true is ignored with NEW_RELIC_EXTENSION_SEND_TIER=high");
+            config.extension.pipeline_flush = false;
         }
 
         config

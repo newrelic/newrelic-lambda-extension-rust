@@ -733,3 +733,83 @@ fn test_get_or_build_common_json_with_version_tags() {
         json
     );
 }
+
+fn tier_config(apm: bool, tier: crate::send::SendTier) -> crate::config::ExtensionConfig {
+    let mut config = crate::config::ExtensionConfig::default();
+    config.new_relic.apm_lambda_mode = apm;
+    config.extension.send_tier = tier;
+    config
+}
+
+#[test]
+fn send_timeout_is_500ms_in_the_high_tier() {
+    let mut config = tier_config(true, crate::send::SendTier::High);
+    assert_eq!(client_send_timeout(&config), std::time::Duration::from_millis(500));
+    // NEW_RELIC_HTTP_TIMEOUT does not loosen the high-tier bound.
+    config.new_relic.http_timeout = Some(std::time::Duration::from_secs(7));
+    assert_eq!(client_send_timeout(&config), SEND_TIMEOUT);
+    assert_eq!(crate::apm::collector::send_timeout_for(true), SEND_TIMEOUT);
+}
+
+#[test]
+fn send_timeout_keeps_mains_values_in_the_default_tier_and_serverless_mode() {
+    for config in [
+        tier_config(true, crate::send::SendTier::Default),
+        tier_config(false, crate::send::SendTier::Default),
+        tier_config(false, crate::send::SendTier::High), // serverless ignores the tier
+        crate::config::ExtensionConfig {
+            deployment: crate::config::deployment::DeploymentContext::Lmi, // LMI has no high tier
+            ..tier_config(true, crate::send::SendTier::High)
+        },
+    ] {
+        assert_eq!(client_send_timeout(&config), std::time::Duration::from_millis(2400));
+    }
+    assert_eq!(crate::apm::collector::send_timeout_for(false), crate::config::DEFAULT_HTTP_TIMEOUT);
+}
+
+#[test]
+fn send_timeout_honors_new_relic_http_timeout_in_serverless_mode() {
+    let mut config = tier_config(false, crate::send::SendTier::Default);
+    config.new_relic.http_timeout = Some(std::time::Duration::from_secs(7));
+    assert_eq!(client_send_timeout(&config), std::time::Duration::from_secs(7));
+}
+
+#[test]
+fn connect_timeout_is_mains_10s() {
+    assert_eq!(CONNECT_TIMEOUT, std::time::Duration::from_secs(10));
+}
+
+/// 200 OK after 900 ms: longer than the high-tier SEND_TIMEOUT, far under main's values.
+async fn slow_ok_server() -> wiremock::MockServer {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_delay(std::time::Duration::from_millis(900)))
+        .mount(&mock)
+        .await;
+    mock
+}
+
+#[tokio::test]
+#[serial]
+async fn log_and_agent_payload_sends_apply_the_tier_timeout() {
+    crate::newrelic::tls_fallback::reset_for_test();
+    let mock = slow_ok_server().await;
+    let batch = vec![crate::newrelic::payload::LogMessage {
+        timestamp: 1000,
+        message: "hi".to_string(),
+        attributes: serde_json::Map::new(),
+    }];
+    let arn = "arn:aws:lambda:us-east-1:123456789012:function:f";
+    for (tier, expect_ok) in [(crate::send::SendTier::Default, true), (crate::send::SendTier::High, false)] {
+        let mut config = tier_config(true, tier);
+        config.new_relic.license_key = Some("test-key".to_string());
+        config.new_relic.log_endpoint = mock.uri();
+        config.new_relic.telemetry_endpoint = mock.uri();
+        let client = NewRelicClient::new(&config);
+        let logs = client.send_logs_once(&config, &batch, arn).await;
+        assert_eq!(logs.is_ok(), expect_ok, "{tier:?} logs: {logs:?}");
+        let agent = client.send_agent_payload(&config, "{}").await;
+        assert_eq!(agent.is_ok(), expect_ok, "{tier:?} agent payload: {agent:?}");
+    }
+    crate::newrelic::tls_fallback::reset_for_test();
+}

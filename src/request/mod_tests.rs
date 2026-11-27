@@ -783,6 +783,41 @@ mod tests {
         clear_request_state();
     }
 
+    // A short invoke marked Dropped must stay dropped: its late payload is not moved
+    // to the failed buffer, where a later long invoke would send it.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn test_cleanup_old_request_buffers_does_not_requeue_a_dropped_short_invoke() {
+        use crate::send::short_invoke::{mark, ShortOutcome};
+        clear_request_state();
+        let id = "old-dropped-short";
+        REQUEST_DATA.insert(id.to_string(), RequestData {
+            context: Arc::new(Mutex::new(InvocationContext::default())),
+            agent_buffer: Arc::new(Mutex::new(vec![vec![1, 2, 3]])),
+            pending_report: None,
+            creation_invocation: 0,
+            runtime_done_notify: Arc::new(tokio::sync::Notify::new()),
+            runtime_done_at_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            pending_send_handles: Arc::new(Mutex::new(Vec::new())),
+            invoked_function_arn: "arn:test".to_string(),
+        });
+        for _ in 0..10 {
+            increment_invocation_counter();
+        }
+        mark(id, ShortOutcome::Dropped);
+        let mut config = crate::config::ExtensionConfig::default();
+        config.new_relic.apm_lambda_mode = true;
+        let client = Arc::new(crate::newrelic::client::NewRelicClient::new_noop());
+
+        cleanup_old_request_buffers(client, Arc::new(config)).await;
+
+        let requeued = crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap().iter().any(|p| p.request_id == id);
+        assert!(!requeued, "a dropped short invoke's late payload must not be buffered for resend");
+        assert!(REQUEST_DATA.get(id).is_none(), "the stale entry is still evicted");
+        crate::event_loop::FAILED_AGENT_PAYLOADS.lock().unwrap().retain(|p| p.request_id != id);
+        clear_request_state();
+    }
+
     // cleanup_old_request_buffers is the only production path that removes a
     // REQUEST_DATA entry outright — a NEW_RELIC_EXTENSION_SYNCHRONOUS_FLUSH send still
     // outstanding for a request that's about to be evicted as stale must be drained

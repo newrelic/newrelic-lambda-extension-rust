@@ -2100,6 +2100,83 @@ fn test_synchronous_flush_and_pipeline_flush_both_enabled_is_representable() {
     });
 }
 
+#[test]
+#[serial]
+fn test_high_tier_turns_pipeline_flush_off_and_default_tier_keeps_it() {
+    // The high tier waits for its sends before /next; a pipelined flush would skip that wait.
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH", "true");
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert!(ExtensionConfig::from_env().extension.pipeline_flush, "serverless mode ignores the tier and keeps it");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        assert!(!ExtensionConfig::from_env().extension.pipeline_flush, "high tier forces it off");
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "default");
+        assert!(ExtensionConfig::from_env().extension.pipeline_flush, "default tier keeps it");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+        env::remove_var("NEW_RELIC_EXTENSION_PIPELINE_FLUSH");
+    });
+}
+
+#[test]
+#[serial]
+fn test_high_tier_is_apm_only() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", "high");
+        assert_eq!(ExtensionConfig::from_env().extension.send_tier, crate::send::SendTier::Default, "serverless ignores high");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        assert_eq!(ExtensionConfig::from_env().extension.send_tier, crate::send::SendTier::High, "APM keeps high");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_mode_ignores_http_and_data_collection_timeouts_in_both_tiers() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        for tier in ["default", "high"] {
+            env::set_var("NEW_RELIC_EXTENSION_SEND_TIER", tier);
+            let config = ExtensionConfig::from_env();
+            assert_eq!(config.new_relic.data_collection_timeout, None, "{tier}");
+            assert_eq!(config.new_relic.http_timeout, None, "{tier}");
+        }
+        env::remove_var("NEW_RELIC_EXTENSION_SEND_TIER");
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+        env::remove_var("NEW_RELIC_HTTP_TIMEOUT");
+        env::remove_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT");
+    });
+}
+
+#[test]
+#[serial]
+fn test_serverless_keeps_http_and_data_collection_timeouts() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT", "3000");
+        env::set_var("NEW_RELIC_HTTP_TIMEOUT", "3000");
+        let config = ExtensionConfig::from_env();
+        assert!(config.new_relic.data_collection_timeout.is_some());
+        assert!(config.new_relic.http_timeout.is_some());
+        env::remove_var("NEW_RELIC_HTTP_TIMEOUT");
+        env::remove_var("NEW_RELIC_DATA_COLLECTION_TIMEOUT");
+    });
+}
+
+#[test]
+#[serial]
+fn test_apm_mode_leaves_unset_timeouts_none() {
+    with_full_clean_env(|| {
+        env::set_var("NEW_RELIC_APM_LAMBDA_MODE", "true");
+        let config = ExtensionConfig::from_env();
+        assert_eq!(config.new_relic.data_collection_timeout, None);
+        assert_eq!(config.new_relic.http_timeout, None);
+        env::remove_var("NEW_RELIC_APM_LAMBDA_MODE");
+    });
+}
+
 // ============================================================================
 // NEW_RELIC_DATA_COLLECTION_TIMEOUT / NEW_RELIC_HTTP_TIMEOUT
 // ============================================================================
@@ -2284,6 +2361,20 @@ fn test_from_env_http_timeout_invalid_value_falls_back_to_default() {
 #[test]
 fn test_short_invoke_threshold_defaults_to_10ms() {
     assert_eq!(ExtensionSettings::default().short_invoke_threshold_ms, 10);
+}
+
+#[test]
+#[serial]
+fn test_short_invoke_threshold_env_trims_and_bounds() {
+    with_full_clean_env(|| {
+        let var = "NEW_RELIC_EXTENSION_APM_SHORT_INVOKE_THRESHOLD_MS";
+        env::set_var(var, " 20");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 20);
+        env::set_var(var, "5000");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 1000);
+        env::set_var(var, "junk");
+        assert_eq!(ExtensionConfig::from_env().extension.short_invoke_threshold_ms, 10);
+    });
 }
 
 #[test]

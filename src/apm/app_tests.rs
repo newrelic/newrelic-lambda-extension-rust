@@ -754,7 +754,9 @@ async fn send_platform_report_metrics_permanent_4xx_is_dropped() {
     assert!(result.is_ok()); // permanent errors are logged and dropped, not propagated
 }
 
+// Serial: it buffers into the global Metric API buffer that the serial outcome tests count.
 #[tokio::test]
+#[serial]
 async fn send_platform_report_metrics_transient_5xx_is_buffered() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -772,6 +774,7 @@ async fn send_platform_report_metrics_transient_5xx_is_buffered() {
         )
         .await;
     assert!(result.is_ok()); // transient errors are buffered, not propagated
+    clear_metric_buffer();
 }
 
 // ── send_error_events_buffered ────────────────────────────────────────────────

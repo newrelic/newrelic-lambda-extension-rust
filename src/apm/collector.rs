@@ -103,6 +103,29 @@ pub fn is_telemetry_disabled(telemetry_type: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether collector/Metric API sends use the high-tier timeout; set once at startup
+/// (same pattern as `set_disabled_telemetry`, so callers need no config).
+static HIGH_TIER_SENDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether the extension runs in the high tier (called once at startup).
+pub fn set_high_tier_sends(high_tier: bool) {
+    HIGH_TIER_SENDS.store(high_tier, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Per-request total timeout for collector and Metric API sends: `SEND_TIMEOUT` in
+/// the high tier, else the fixed `DEFAULT_HTTP_TIMEOUT`.
+pub(crate) fn send_timeout_for(high_tier: bool) -> std::time::Duration {
+    if high_tier {
+        crate::newrelic::client::SEND_TIMEOUT
+    } else {
+        crate::config::DEFAULT_HTTP_TIMEOUT
+    }
+}
+
+fn send_timeout() -> std::time::Duration {
+    send_timeout_for(HIGH_TIER_SENDS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 /// HTTP status codes worth retrying — transient server/throttle conditions.
 /// 401/409 (restart) and 410 (disconnect) are handled separately and are NOT here.
 pub fn is_retryable_status(status: u16) -> bool {
@@ -338,6 +361,7 @@ pub async fn send_error_events(
         .header("Content-Type", "application/octet-stream")
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
+        .timeout(send_timeout())
         .body(compressed)
         .send()
         .await
@@ -349,6 +373,7 @@ pub async fn send_error_events(
         })?;
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("apm-error-events", &response);
     let status = response.status();
     let status_code = status.as_u16();
 
@@ -437,6 +462,7 @@ pub async fn send_apm_telemetry(
         .header("Content-Type", "application/octet-stream")
         .header("User-Agent", get_user_agent())
         .header("Content-Encoding", "gzip")
+        .timeout(send_timeout())
         .body(compressed)
         .send()
         .await
@@ -448,6 +474,7 @@ pub async fn send_apm_telemetry(
         })?;
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("apm-agent-data", &response);
     let status = response.status();
     let status_code = status.as_u16();
 
@@ -533,6 +560,7 @@ pub async fn send_platform_metrics(
         .header("Api-Key", license_key)
         .header("Content-Type", "application/json")
         .header("Content-Encoding", "gzip")
+        .timeout(send_timeout())
         .body(body)
         .send()
         .await
@@ -549,6 +577,7 @@ pub async fn send_platform_metrics(
     };
     let duration = start_time.elapsed();
 
+    crate::newrelic::conn_reuse::note_connection("metric-api", &response);
     let status = response.status();
     let status_code = status.as_u16();
 

@@ -128,6 +128,29 @@ fn failed_agent_payload_buffer_caps_and_counts_evictions() {
         .any(|p| p.request_id == format!("req-{}", *MAX_FAILED_AGENT_PAYLOADS)));
 }
 
+// The cap counts distinct request ids, not chunks; eviction drops the oldest
+// request id's chunks together.
+#[test]
+#[serial]
+fn failed_agent_payload_cap_counts_requests_not_chunks() {
+    let cap = *MAX_FAILED_AGENT_PAYLOADS;
+    let mut buf: Vec<FailedAgentPayload> = Vec::new();
+    for _ in 0..20 {
+        push_failed_payload_capped(&mut buf, make_failed_payload("req-big"));
+    }
+    for i in 1..cap {
+        push_failed_payload_capped(&mut buf, make_failed_payload(&format!("req-{i}")));
+    }
+    assert_eq!(buf.len(), 20 + cap - 1, "20 chunks of one request count as 1");
+    // One more distinct request: evicts all 20 chunks of the oldest request, nothing else.
+    push_failed_payload_capped(&mut buf, make_failed_payload("req-new"));
+    assert_eq!(buf.len(), cap);
+    assert!(buf.iter().all(|p| p.request_id != "req-big"));
+    // A further chunk of an already-buffered request evicts nothing.
+    push_failed_payload_capped(&mut buf, make_failed_payload("req-new"));
+    assert_eq!(buf.len(), cap + 1);
+}
+
 // Not in-flight (flag = false) → returns immediately without waiting.
 #[tokio::test]
 async fn test_handshake_wait_returns_immediately_when_not_in_flight() {
@@ -2082,6 +2105,76 @@ async fn execute_apm_mode_event_loop_processes_invoke_then_shutdown() {
     REQUEST_DATA.remove("req-apm-loop-1");
 }
 
+// The high tier waits for its sends before /next, even if pipeline_flush reaches the loop:
+// the second /next may only arrive after the (delayed) log ingest response.
+#[tokio::test]
+#[serial]
+async fn high_tier_awaits_the_invoke_before_next_even_with_pipeline_flush() {
+    const INGEST_DELAY: Duration = Duration::from_millis(600);
+    clear_high_tier_state();
+    clear_log_flush().await;
+    // The breaker is process-wide; an earlier test may have left the logs kind open.
+    force_default_breaker_closed(crate::send::SendKind::Logs);
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/log/v1"))
+        .respond_with(wiremock::ResponseTemplate::new(202).set_delay(INGEST_DELAY))
+        .mount(&server)
+        .await;
+    let next_calls: Arc<std::sync::Mutex<Vec<std::time::Instant>>> = Arc::default();
+    let invoke_body = invoke_event_body("req-high-pipeline", "arn:aws:lambda:us-east-1:123456789012:function:t", deadline_ms_from_now(5_000));
+    let calls = next_calls.clone();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/2020-01-01/extension/event/next"))
+        .respond_with(move |_: &wiremock::Request| {
+            let mut calls = calls.lock().unwrap();
+            calls.push(std::time::Instant::now());
+            let body = if calls.len() == 1 { invoke_body.clone() } else { shutdown_event_body("spindown") };
+            wiremock::ResponseTemplate::new(200).set_body_json(body)
+        })
+        .mount(&server)
+        .await;
+
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.new_relic.extension_enabled = true;
+    cfg.new_relic.license_key = Some("fake-key".to_string());
+    cfg.new_relic.log_endpoint = format!("{}/log/v1", server.uri());
+    cfg.extension.send_function_logs = true;
+    cfg.extension.send_tier = crate::send::SendTier::High;
+    cfg.extension.pipeline_flush = true;
+    let cfg = Arc::new(cfg);
+    let mut components = make_test_extension_components(cfg.clone(), Arc::new(Client::new()), true);
+    components.global_log_processor = Arc::new(LogProcessor::new(
+        Arc::new(crate::newrelic::client::NewRelicClient::new(&cfg)),
+        cfg,
+        Arc::new(Mutex::new(crate::context::InvocationContext::default())),
+        None,
+    ));
+    components.global_log_processor.add_log_to_batch(crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "held for the ingest".to_string(),
+        attributes: serde_json::Map::new(),
+    });
+
+    // The handler finishes quickly, so only the ingest send keeps /next waiting.
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        request::record_runtime_done_with_duration("req-high-pipeline", Some(10.0));
+    });
+
+    with_runtime_api_el(&server, || async { execute_apm_mode_event_loop(&mut components).await }).await;
+
+    let calls = next_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let ingests = server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/log/v1").count();
+    // Leftover logs from earlier tests can add more requests; at least ours must have gone out.
+    assert!(ingests >= 1, "the log ingest must have been sent");
+    let gap = calls[1].duration_since(calls[0]);
+    assert!(gap >= INGEST_DELAY, "/next arrived before the delayed ingest finished ({gap:?})");
+    REQUEST_DATA.remove("req-high-pipeline");
+    clear_high_tier_state();
+}
+
 #[tokio::test]
 #[serial]
 async fn execute_apm_mode_event_loop_returns_on_immediate_shutdown() {
@@ -3808,22 +3901,22 @@ async fn clear_batch_state() {
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_is_a_noop_when_nothing_spawned() {
+async fn wait_for_pending_agent_batch_is_a_noop_when_nothing_spawned() {
     clear_batch_state().await;
     let start = tokio::time::Instant::now();
-    resolve_pending_agent_batch(1_500).await;
+    wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
     assert!(start.elapsed() < Duration::from_millis(50));
 }
 
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_collects_a_finished_batch() {
+async fn wait_for_pending_agent_batch_collects_a_finished_batch() {
     clear_batch_state().await;
     let send: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
     SEND_SCHEDULER.spawn(crate::send::SendKind::ApmCollector, send, None).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
-    resolve_pending_agent_batch(1_500).await;
+    wait_for_pending_agent_batch(Duration::from_millis(1_500)).await;
 
     assert!(!SEND_SCHEDULER.has_pending(crate::send::SendKind::ApmCollector).await);
 }
@@ -3832,7 +3925,7 @@ async fn resolve_pending_agent_batch_collects_a_finished_batch() {
 // only turn a possibly-delivered request into a duplicate.
 #[tokio::test]
 #[serial]
-async fn resolve_pending_agent_batch_leaves_a_slow_batch_running() {
+async fn wait_for_pending_agent_batch_leaves_a_slow_batch_running() {
     clear_batch_state().await;
     if let Ok(mut b) = FAILED_AGENT_PAYLOADS.lock() {
         b.clear();
@@ -3919,15 +4012,25 @@ async fn spawn_pending_batch_detaches_a_batch_older_than_the_max_age() {
 
 // --- Log flush tests (spawn_log_flush / resolve_pending_logs via SEND_SCHEDULER) ---
 
+/// One log in the batch, so `spawn_log_flush` has something to send (it skips an empty flush).
+fn add_one_log(log_processor: &LogProcessor) {
+    log_processor.add_log_to_batch(crate::newrelic::payload::LogMessage {
+        timestamp: 0,
+        message: "hello".to_string(),
+        attributes: serde_json::Map::new(),
+    });
+}
+
 #[tokio::test]
 #[serial]
-async fn spawn_log_flush_then_resolve_round_trip_with_empty_batch() {
+async fn spawn_log_flush_then_resolve_round_trip_with_one_log() {
     // Clean slate: a previous test (or a prior run of this one) must not
     // leave SendKind::Logs occupied.
     let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
 
     let config = Arc::new(config::ExtensionConfig::default());
     let log_processor = make_noop_log_processor_serverless(config);
+    add_one_log(&log_processor);
 
     spawn_log_flush(&log_processor, "req-roundtrip").await;
     assert!(
@@ -3935,8 +4038,7 @@ async fn spawn_log_flush_then_resolve_round_trip_with_empty_batch() {
         "spawn_log_flush must register the flush with SEND_SCHEDULER"
     );
 
-    // An empty batch hits LogProcessor::flush's own fast path and returns
-    // near-instantly - no real network call happens.
+    // The noop client returns at once - no real network call happens.
     tokio::time::sleep(Duration::from_millis(20)).await;
     resolve_pending_logs(&log_processor, "req-roundtrip").await;
     assert!(
@@ -3985,7 +4087,7 @@ async fn spawn_log_flush_skips_when_a_flush_is_already_pending() {
     );
 
     // Test cleanup only - fine to abort here, this task has no real data.
-    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::Logs).await;
+    let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::Logs], std::time::Duration::ZERO).await;
 }
 
 // --- Write-ahead buffering tests (shared-budget abort -> recoverable, not lost) ---
@@ -4210,7 +4312,7 @@ async fn high_tier_short_invoke_does_not_hold_next() {
 #[serial]
 async fn default_tier_never_uses_the_send_scheduler() {
     clear_high_tier_state();
-    let _ = SEND_SCHEDULER.resolve_pending(crate::send::SendKind::ApmCollector).await;
+    let _ = SEND_SCHEDULER.resolve_pending_shared_budget(&[crate::send::SendKind::ApmCollector], std::time::Duration::ZERO).await;
     let _ = SEND_SCHEDULER.resolve_pending_no_abort(crate::send::SendKind::Logs).await;
     let request_id = "default-no-scheduler";
     let config = make_config_for_serverless(false);
@@ -4527,6 +4629,7 @@ async fn a_not_short_invoke_starts_its_log_flush_before_runtime_done() {
     let state = Arc::new(detection_state(id));
     let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(None));
     let log_processor = make_noop_log_processor_serverless(config.clone());
+    add_one_log(&log_processor);
 
     let run = {
         let (config, state, apm_app, log_processor) = (config.clone(), state.clone(), apm_app.clone(), log_processor.clone());
@@ -4566,6 +4669,41 @@ fn a_stashed_report_is_taken_once_and_never_for_the_current_request() {
     assert!(take_stashed_reports("stash-current").is_empty(), "taken means gone");
     assert_eq!(take_stashed_reports("").len(), 1, "the current request's report is still waiting");
     clear_stashed_reports();
+}
+
+// A report stashed while a take is running must end up either taken or still in the stash.
+#[test]
+#[serial]
+fn a_report_stashed_during_a_take_is_never_lost() {
+    const STASHERS: usize = 4;
+    const PER_STASHER: usize = 20; // 80 in total: under the cap, so nothing is dropped by design
+    for round in 0..200 {
+        clear_stashed_reports();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let taker = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                let mut taken = 0;
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    taken += take_stashed_reports("").len();
+                }
+                taken
+            })
+        };
+        let stashers: Vec<_> = (0..STASHERS)
+            .map(|t| {
+                std::thread::spawn(move || {
+                    for i in 0..PER_STASHER {
+                        stash_platform_report(&format!("race-{round}-{t}-{i}"), "REPORT".to_string());
+                    }
+                })
+            })
+            .collect();
+        stashers.into_iter().for_each(|s| s.join().unwrap());
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let taken = taker.join().unwrap() + take_stashed_reports("").len();
+        assert_eq!(taken, STASHERS * PER_STASHER, "round {round}: a stashed report was lost");
+    }
 }
 
 #[test]
@@ -5042,6 +5180,7 @@ async fn waiting_for_an_agent_payload_returns_as_soon_as_one_is_buffered() {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(60)).await;
         buffer.lock().unwrap().push(b"payload".to_vec());
+        request::AGENT_PAYLOAD_NOTIFY.notify_waiters();
     });
 
     let started = tokio::time::Instant::now();
@@ -5103,21 +5242,24 @@ async fn a_payload_that_arrives_early_without_an_apm_session_stays_buffered() {
 const BREAKER_REPORT_LINE: &str =
     "REPORT RequestId: brk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
 
-/// N of the default-tier breaker (the failures in a row that open it).
+/// N of the shared breaker (the failures in a row that open it).
 fn breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+    DEFAULT_BREAKER.threshold()
 }
 
-/// Bring the default-tier breaker for `kind` back to Closed from any state.
+/// Bring the default-tier breaker for `kind` back to Closed with no failures counted, from any
+/// state. A Closed breaker can still carry an earlier test's failures; a success clears them.
 fn force_default_breaker_closed(kind: crate::send::SendKind) {
     use crate::send::{BreakerState, CircuitBreaker, SendOutcome};
     for _ in 0..500 {
         match DEFAULT_BREAKER.state(kind) {
-            BreakerState::Closed => return,
+            BreakerState::Closed => {
+                return DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Success)
+            }
             BreakerState::Open => {
                 let _ = DEFAULT_BREAKER.allow_send(kind);
             }
-            BreakerState::HalfOpen => DEFAULT_BREAKER.record_result(kind, SendOutcome::Success),
+            BreakerState::HalfOpen => DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Probe, SendOutcome::Success),
         }
     }
     panic!("could not close the default breaker for {kind:?}");
@@ -5126,8 +5268,20 @@ fn force_default_breaker_closed(kind: crate::send::SendKind) {
 fn fail_default_breaker(kind: crate::send::SendKind, times: u32) {
     use crate::send::{CircuitBreaker, SendOutcome};
     for _ in 0..times {
-        DEFAULT_BREAKER.record_result(kind, SendOutcome::Failure);
+        DEFAULT_BREAKER.record_result(kind, crate::send::SendPermit::Normal, SendOutcome::Failure);
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn the_high_tier_scheduler_and_the_default_tier_paths_share_one_breaker() {
+    let kind = crate::send::SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+
+    assert!(!SEND_SCHEDULER.breaker_closed(kind), "the failures counted by DEFAULT_BREAKER open it for SEND_SCHEDULER too");
+
+    force_default_breaker_closed(kind);
 }
 
 /// Register a request whose agent buffer holds one payload that cannot be parsed, so a send
@@ -5177,9 +5331,9 @@ async fn default_breaker_probes_after_2n_skipped_invocations() {
     fail_default_breaker(kind, breaker_n());
 
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(kind), "skipped while open");
+        assert!(DEFAULT_BREAKER.allow_send(kind).is_none(), "skipped while open");
     }
-    assert!(DEFAULT_BREAKER.allow_send(kind), "the probe after 2N skips");
+    assert!(DEFAULT_BREAKER.allow_send(kind).is_some(), "the probe after 2N skips");
     assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::HalfOpen);
 
     force_default_breaker_closed(kind);
@@ -5285,7 +5439,7 @@ async fn default_tier_does_not_send_while_the_collector_breaker_is_open() {
 
     // The invoke used exactly one of the 2N skips: the next 2N-1 calls are still skipped.
     let mut skipped = 0;
-    while !DEFAULT_BREAKER.allow_send(collector) {
+    while DEFAULT_BREAKER.allow_send(collector).is_none() {
         skipped += 1;
         assert!(skipped <= 2 * breaker_n(), "the probe never came");
     }
@@ -5304,7 +5458,7 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
     force_default_breaker_closed(collector);
     fail_default_breaker(collector, breaker_n());
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(collector));
+        assert!(DEFAULT_BREAKER.allow_send(collector).is_none());
     }
 
     // This invoke gets the probe, but it has no payload and no session, so nothing is sent.
@@ -5318,10 +5472,58 @@ async fn default_tier_gives_back_a_probe_when_nothing_is_sent() {
         BreakerState::Open,
         "not stuck half-open: the probe goes back"
     );
-    assert!(DEFAULT_BREAKER.allow_send(collector), "the next invoke probes again");
+    assert!(DEFAULT_BREAKER.allow_send(collector).is_some(), "the next invoke probes again");
 
     REQUEST_DATA.remove(request_id);
     force_default_breaker_closed(collector);
+}
+
+// ── Circuit breaker: the default tier's send of a report kept for a later invoke ─────────
+
+/// One earlier request whose report was kept for retry, sent by the default tier's pending pass
+/// against a Metric API answering `status`. Returns how many requests the Metric API received.
+async fn send_kept_report(request_id: &str, status: u16) -> usize {
+    send_kept_report_with(request_id, status, make_config_for_serverless(false)).await
+}
+
+async fn send_kept_report_with(request_id: &str, status: u16, config: Arc<config::ExtensionConfig>) -> usize {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(status))
+        .mount(&server)
+        .await;
+    let mut app = make_test_apm_app();
+    app.metric_endpoint = format!("{}/metrics", server.uri());
+    register_request_for_serverless(request_id, config.clone());
+    request::set_pending_report(request_id, BREAKER_REPORT_LINE.to_string());
+    let log_processor = make_noop_log_processor_serverless(config.clone());
+    let apm_app: crate::apm::SharedApmApp = Arc::new(tokio::sync::RwLock::new(Some(app)));
+
+    process_pending_agent_payloads(&config, &log_processor, &apm_app, "kept-report-current").await;
+
+    REQUEST_DATA.remove(request_id);
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+#[serial]
+async fn default_tier_kept_report_sends_count_and_open_the_metric_api_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let kind = SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    clear_metric_api_buffer();
+
+    for i in 0..breaker_n() {
+        assert_eq!(send_kept_report(&format!("kept-report-fail-{i}"), 503).await, 1);
+    }
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::Open, "N failed sends in a row open it");
+
+    clear_metric_api_buffer();
+    assert_eq!(send_kept_report("kept-report-while-open", 202).await, 0, "not sent while open");
+    assert_eq!(crate::apm::metric_api_buffer::get_metric_api_buffer_count(), 1, "buffered for a later retry");
+
+    clear_metric_api_buffer();
+    force_default_breaker_closed(kind);
 }
 
 // ── Circuit breaker: platform report in the high-tier batch ──────────────────────────
@@ -5384,16 +5586,13 @@ async fn send_group_report_ignores_a_line_that_is_not_a_report() {
 
 // ── Circuit breaker: high-tier invoke-time retries ───────────────────────────────────
 
-fn high_breaker_n() -> u32 {
-    crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_HIGH).max(1)
-}
 
 async fn open_high_collector_breaker() {
     let collector = crate::send::SendKind::ApmCollector;
-    for _ in 0..high_breaker_n() {
+    for _ in 0..breaker_n() {
         let failing: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Failure });
         SEND_SCHEDULER.spawn(collector, failing, None).await;
-        SEND_SCHEDULER.resolve_pending(collector).await;
+        SEND_SCHEDULER.resolve_pending_shared_budget(&[collector], std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -5405,7 +5604,7 @@ async fn close_high_collector_breaker() {
         }
         let succeeding: crate::send::BoxedSend = Box::pin(async { crate::send::SendOutcome::Success });
         if SEND_SCHEDULER.spawn(collector, succeeding, None).await {
-            SEND_SCHEDULER.resolve_pending(collector).await;
+            SEND_SCHEDULER.resolve_pending_shared_budget(&[collector], std::time::Duration::from_secs(1)).await;
         }
     }
     panic!("could not close the high-tier collector breaker");
@@ -5511,7 +5710,7 @@ async fn default_tier_uses_one_logs_breaker_invoke_per_invoke() {
 
     // The invoke used one of the 2N skips, so 2N-1 are left before the probe.
     let mut skipped = 0;
-    while !DEFAULT_BREAKER.allow_send(logs) {
+    while DEFAULT_BREAKER.allow_send(logs).is_none() {
         skipped += 1;
         assert!(skipped <= 2 * breaker_n(), "the probe never came");
     }
@@ -5529,7 +5728,7 @@ async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
     force_default_breaker_closed(logs);
     fail_default_breaker(logs, breaker_n());
     for _ in 0..(2 * breaker_n()) {
-        assert!(!DEFAULT_BREAKER.allow_send(logs));
+        assert!(DEFAULT_BREAKER.allow_send(logs).is_none());
     }
 
     // This invoke gets the logs probe, but it has no logs, so there is nothing to flush.
@@ -5539,8 +5738,86 @@ async fn default_tier_gives_back_a_logs_probe_when_there_is_nothing_to_flush() {
     run_default_invoke(request_id, config, false).await;
 
     assert_eq!(DEFAULT_BREAKER.state(logs), BreakerState::Open, "not stuck half-open: the probe goes back");
-    assert!(DEFAULT_BREAKER.allow_send(logs), "the next invoke probes again");
+    assert!(DEFAULT_BREAKER.allow_send(logs).is_some(), "the next invoke probes again");
 
     REQUEST_DATA.remove(request_id);
     force_default_breaker_closed(logs);
+}
+
+// The wait is woken by the payload push itself, not by a timer: the pusher finishes within
+// microseconds, far under any poll interval, so only the push can wake the wait before then.
+#[tokio::test]
+#[serial]
+async fn waiting_for_an_agent_payload_wakes_on_the_push_and_not_before() {
+    use crate::config::deployment::{DeploymentContext, TelemetryMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let id = "wait-payload";
+    let state = detection_state(id);
+    *request::CURRENT_ACTIVE_REQUEST_ID.lock().unwrap() = Some(id.to_string());
+    let pusher_done = AtomicBool::new(false);
+
+    let not_yet = tokio::time::timeout(Duration::from_millis(50), wait_for_agent_payload(&state)).await;
+    assert!(not_yet.is_err(), "nothing pushed, so the wait must not return");
+
+    let woke_before_pusher_done = async {
+        wait_for_agent_payload(&state).await;
+        !pusher_done.load(Ordering::SeqCst)
+    };
+    let pusher = async {
+        tokio::task::yield_now().await;
+        request::route_payload_to_request_buffer(vec![1], DeploymentContext::Normal { mode: TelemetryMode::Serverless }).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        pusher_done.store(true, Ordering::SeqCst);
+    };
+    let (woke, ()) = tokio::join!(woke_before_pusher_done, pusher);
+
+    assert!(woke, "the push must wake the wait without waiting for a timer");
+    *request::CURRENT_ACTIVE_REQUEST_ID.lock().unwrap() = None;
+    cleanup_request_processing_state_internal(id, false);
+}
+
+// High tier, like the default tier: a log flush with nothing to send must not settle the
+// HalfOpen probe, or an invoke without logs would close a breaker for a log-api that is down.
+#[tokio::test]
+#[serial]
+async fn high_tier_empty_log_flush_does_not_settle_the_probe() {
+    use crate::send::{BreakerState, CircuitBreaker};
+    let kind = crate::send::SendKind::Logs;
+    let _ = SEND_SCHEDULER.resolve_pending_no_abort(kind).await;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+    for _ in 0..(2 * breaker_n()) {
+        let _ = DEFAULT_BREAKER.allow_send(kind);
+    }
+    let log_processor = make_noop_log_processor_serverless(Arc::new(config::ExtensionConfig::default()));
+
+    spawn_log_flush(&log_processor, "req-empty-probe").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    resolve_pending_logs(&log_processor, "req-empty-probe").await;
+
+    assert_ne!(DEFAULT_BREAKER.state(kind), BreakerState::Closed, "an empty flush proves nothing about log-api");
+    assert!(DEFAULT_BREAKER.allow_send(kind).is_some(), "the probe is still there for the next real flush");
+    force_default_breaker_closed(kind);
+}
+
+// LMI has no breaker by design: its kept-report resend goes straight out, even while the
+// Metric API breaker (driven by other paths) is open.
+#[tokio::test]
+#[serial]
+async fn lmi_kept_report_resend_does_not_consult_the_breaker() {
+    use crate::send::{BreakerState, CircuitBreaker, SendKind};
+    let kind = SendKind::MetricApi;
+    force_default_breaker_closed(kind);
+    fail_default_breaker(kind, breaker_n());
+    assert_eq!(DEFAULT_BREAKER.state(kind), BreakerState::Open);
+    clear_metric_api_buffer();
+    let mut cfg = config::ExtensionConfig::default();
+    cfg.deployment = crate::config::deployment::DeploymentContext::Lmi;
+
+    assert_eq!(send_kept_report_with("kept-report-lmi", 202, Arc::new(cfg)).await, 1, "sent despite the open breaker");
+
+    clear_metric_api_buffer();
+    force_default_breaker_closed(kind);
 }

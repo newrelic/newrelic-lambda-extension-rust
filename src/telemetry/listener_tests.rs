@@ -2061,20 +2061,23 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
         "REPORT RequestId: lbrk-1 Duration: 150.5 ms Billed Duration: 200 ms Memory Size: 128 MB Max Memory Used: 64 MB";
 
     fn breaker_n() -> u32 {
-        crate::send::circuit_breaker::threshold_from_env(crate::send::DEFAULT_THRESHOLD_DEFAULT).max(1)
+        crate::event_loop::DEFAULT_BREAKER.threshold()
     }
 
-    /// Bring the default-tier Metric API breaker back to Closed from any state.
+    /// Bring the default-tier Metric API breaker back to Closed with no failures counted, from
+    /// any state. A Closed breaker can still carry an earlier test's failures; a success clears them.
     fn close_metric_breaker() {
         use crate::send::{BreakerState, CircuitBreaker, SendKind, SendOutcome};
         let breaker = &crate::event_loop::DEFAULT_BREAKER;
         for _ in 0..500 {
             match breaker.state(SendKind::MetricApi) {
-                BreakerState::Closed => return,
+                BreakerState::Closed => {
+                    return breaker.record_result(SendKind::MetricApi, crate::send::SendPermit::Normal, SendOutcome::Success)
+                }
                 BreakerState::Open => {
                     let _ = breaker.allow_send(SendKind::MetricApi);
                 }
-                BreakerState::HalfOpen => breaker.record_result(SendKind::MetricApi, SendOutcome::Success),
+                BreakerState::HalfOpen => breaker.record_result(SendKind::MetricApi, crate::send::SendPermit::Probe, SendOutcome::Success),
             }
         }
         panic!("could not close the Metric API breaker");
@@ -2083,7 +2086,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
     fn fail_metric_breaker(times: u32) {
         use crate::send::{CircuitBreaker, SendKind, SendOutcome};
         for _ in 0..times {
-            crate::event_loop::DEFAULT_BREAKER.record_result(SendKind::MetricApi, SendOutcome::Failure);
+            crate::event_loop::DEFAULT_BREAKER.record_result(SendKind::MetricApi, crate::send::SendPermit::Normal, SendOutcome::Failure);
         }
     }
 
@@ -2145,7 +2148,7 @@ async fn a_report_whose_background_send_cannot_run_is_kept_for_retry() {
         .await;
 
         assert_eq!(server.received_requests().await.unwrap().len(), 0, "nothing was sent");
-        assert!(!crate::event_loop::DEFAULT_BREAKER.allow_send(SendKind::MetricApi), "the call used one skip");
+        assert!(crate::event_loop::DEFAULT_BREAKER.allow_send(SendKind::MetricApi).is_none(), "the call used one skip");
 
         *crate::APM_APP.write().await = None;
         clear_metric_buffer();

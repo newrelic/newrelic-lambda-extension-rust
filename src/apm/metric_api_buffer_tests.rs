@@ -494,3 +494,22 @@ async fn a_transient_failure_rebuffers_every_batch_separately() {
     assert_eq!(counts, vec![1, 1, 1], "the attempt counts for each");
     clear();
 }
+
+#[test]
+fn push_capped_never_exceeds_cap_and_evicts_oldest_by_failed_at() {
+    let at = |m: i64| FailedMetricApi {
+        metrics: vec![json!({"id": m})],
+        endpoint: "http://x".to_string(),
+        failed_at: Utc::now() - chrono::Duration::minutes(m),
+        retry_count: 0,
+        next_retry_at: None,
+    };
+    let mut buf = vec![at(5), at(3)];
+    // A re-buffered older batch lands last but must still be the one evicted.
+    push_capped(&mut buf, at(10), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.metrics[0]["id"] != 10));
+    push_capped(&mut buf, at(1), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.metrics[0]["id"] != 5), "oldest evicted first");
+}

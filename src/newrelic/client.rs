@@ -12,17 +12,34 @@ use tracing::{debug, info, warn};
 pub(crate) const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 pub(crate) const EXTENSION_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Single send timeout for every outbound send to New Relic. Applied to
-/// **both** `connect_timeout` and the total `.timeout()`, so it bounds the
-/// whole request — **connect + send + ack** — for all three telemetry streams:
-///   - agent payload / metrics  → APM collector
-///   - logs                     → log-api
-///   - platform.report metrics  → Metric API
-///
-/// 500ms = backend p99 placeholder; **not env-configurable by design** — it's a
-/// structural default, swap this one constant when the real measured p99 is
-/// available. Replaces the old 20s per-request / 2.4s client defaults.
+/// Per-request total timeout for every send in the `high` tier (agent payload,
+/// collector telemetry, logs, Metric API). Not used by the APM preconnect/connect
+/// handshake, which keeps its own `apm_handshake_timeout_secs`.
+/// shortcut: fixed per-tier value with no body-size scaling; scale it if large payloads time out.
 pub(crate) const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// TCP + TLS connect bound, the only client-level timeout (same as `main`). Each
+/// request sets its own total `.timeout()`, so the APM handshake is never capped
+/// by a send timeout.
+pub(crate) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `high` tier: APM mode with `NEW_RELIC_EXTENSION_SEND_TIER=high`, not on LMI
+/// (same rule as `set_reports_ride_the_batch` in `main.rs`).
+pub(crate) fn is_high_tier(config: &ExtensionConfig) -> bool {
+    config.extension.send_tier == crate::send::SendTier::High
+        && config.new_relic.apm_lambda_mode
+        && !config.deployment.is_lmi()
+}
+
+/// Per-request total timeout for `NewRelicClient` sends (logs, agent payload):
+/// `SEND_TIMEOUT` in the high tier, else `NEW_RELIC_HTTP_TIMEOUT` (serverless only) or 2400 ms as in `main`.
+pub(crate) fn client_send_timeout(config: &ExtensionConfig) -> std::time::Duration {
+    if is_high_tier(config) {
+        SEND_TIMEOUT
+    } else {
+        config.new_relic.http_timeout.unwrap_or(crate::config::DEFAULT_HTTP_TIMEOUT)
+    }
+}
 
 /// Error type for outbound telemetry sends.
 /// Distinguishes network failures from server-side exhaustion so callers
@@ -157,8 +174,7 @@ pub fn build_outbound_client(proxy_url: Option<&str>) -> DualTlsClient {
     let proxy_url = proxy_url.map(str::to_string);
     DualTlsClient::build(move || {
         let mut builder = Client::builder()
-            .timeout(SEND_TIMEOUT)
-            .connect_timeout(SEND_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(10)
             .tcp_keepalive(std::time::Duration::from_secs(30));
@@ -176,6 +192,8 @@ pub fn build_outbound_client(proxy_url: Option<&str>) -> DualTlsClient {
 #[derive(Debug)]
 pub struct NewRelicClient {
     client: DualTlsClient,
+    /// Per-request total timeout, from `client_send_timeout`.
+    send_timeout: std::time::Duration,
     cached_version_attrs: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>>,
     /// Static log common-attributes: plugin name, faas.name, aws.logGroup, NR_TAGS,
     /// and version tags. faas.arn and aws.logStream are per-call and inserted
@@ -212,8 +230,7 @@ impl NewRelicClient {
         let client = DualTlsClient::build(move || {
             let mut builder = Client::builder()
                 .default_headers(headers.clone())
-                .timeout(SEND_TIMEOUT)
-                .connect_timeout(SEND_TIMEOUT)
+                .connect_timeout(CONNECT_TIMEOUT)
                 .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .pool_max_idle_per_host(10)
                 .tcp_keepalive(std::time::Duration::from_secs(30));
@@ -232,6 +249,7 @@ impl NewRelicClient {
 
         Self {
             client,
+            send_timeout: client_send_timeout(config),
             cached_version_attrs: std::sync::OnceLock::new(),
             cached_static_log_attrs: std::sync::OnceLock::new(),
             cached_common_json_by_arn: dashmap::DashMap::new(),
@@ -248,6 +266,7 @@ impl NewRelicClient {
 
         Self {
             client,
+            send_timeout: std::time::Duration::from_millis(100),
             cached_version_attrs: std::sync::OnceLock::new(),
             cached_static_log_attrs: std::sync::OnceLock::new(),
             cached_common_json_by_arn: dashmap::DashMap::new(),
@@ -443,12 +462,14 @@ impl NewRelicClient {
                 .post(&config.new_relic.telemetry_endpoint)
                 .header("X-License-Key", config.new_relic.license_key.as_deref().unwrap_or_default())
                 .header(header::CONTENT_TYPE, "application/json")
+                .timeout(self.send_timeout)
                 .body(payload_json.to_string())
                 .send()
                 .await;
 
             match res {
                 Ok(response) => {
+                    crate::newrelic::conn_reuse::note_connection("agent-payload", &response);
                     let status = response.status();
                     
                     if status.is_success() {
@@ -488,7 +509,7 @@ impl NewRelicClient {
                         if error_msg.contains("BrokenPipe") || error_msg.contains("ConnectionReset") {
                             warn!("[agentsend] Connection issue (will retry): {}", e);
                         } else if e.is_timeout() {
-                            warn!("[agentsend] Request timeout after {:?} (will retry): {}", SEND_TIMEOUT, e);
+                            warn!("[agentsend] Request timeout after {:?} (will retry): {}", self.send_timeout, e);
                         } else {
                             warn!("[agentsend] Network error: {}", e);
                         }
@@ -566,12 +587,14 @@ impl NewRelicClient {
                 request = request.header("Content-Encoding", "gzip");
             }
             let res = request
+                .timeout(self.send_timeout)
                 .body(send_bytes.clone())
                 .send()
                 .await;
 
             match res {
                 Ok(response) => {
+                    crate::newrelic::conn_reuse::note_connection("logs", &response);
                     let status = response.status();
                     if status.is_success() {
                         let duration = start_time.elapsed();

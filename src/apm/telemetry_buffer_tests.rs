@@ -74,11 +74,11 @@ fn buffered_request_ids_are_distinct_and_sorted() {
 #[serial]
 fn caps_buffer_size_by_evicting_oldest() {
     clear();
-    for _ in 0..(max_buffered_items() + 25) {
+    for i in 0..(max_buffered_items() + 25) {
         buffer_failed_telemetry(
             "metric_data".into(),
             vec![json!(null)],
-            "req".into(),
+            format!("req-{i}"),
             "run".into(),
             "host".into(),
         );
@@ -196,16 +196,14 @@ fn restart_rebuffer_respects_cap() {
     // Simulate apply_retry_decision with RestartException — mirrors the
     // is_restart re-buffer branch in retry_buffered_telemetry.
     let err = anyhow::Error::new(CollectorError::RestartException);
-    let item = make_item();
+    // A request id not yet buffered, so the push is a new invocation over the cap.
+    let item = FailedTelemetry { request_id: "req-new".into(), ..make_item() };
     let result = apply_retry_decision(item, &err);
     assert!(result.is_some(), "RestartException must not drop the item");
 
-    // Manually push through the production re-buffer path to verify the cap.
+    // Re-buffer through the production helper to verify the cap.
     if let Ok(mut buffer) = FAILED_TELEMETRY_BUFFER.lock() {
-        if buffer.len() >= max_buffered_items() {
-            buffer.remove(0);
-        }
-        buffer.push(result.unwrap());
+        push_capped(&mut buffer, result.unwrap(), max_buffered_items());
     }
 
     assert_eq!(
@@ -361,4 +359,64 @@ async fn retry_buffered_telemetry_covers_remaining_command_types() {
         assert_eq!(get_buffer_count(), 1, "type '{telemetry_type}' should re-buffer on failure");
         clear();
     }
+}
+
+#[test]
+fn push_capped_never_exceeds_cap_and_evicts_oldest_by_failed_at() {
+    let at = |m: i64| FailedTelemetry {
+        request_id: format!("r{m}"),
+        failed_at: chrono::Utc::now() - chrono::TimeDelta::try_minutes(m).unwrap(),
+        ..fresh_item("metric_data")
+    };
+    let mut buf = vec![at(5), at(3)];
+    // A re-buffered older item lands last but must still be the one evicted.
+    push_capped(&mut buf, at(10), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.request_id != "r10"));
+    push_capped(&mut buf, at(1), 2);
+    assert_eq!(buf.len(), 2);
+    assert!(buf.iter().all(|i| i.request_id != "r5"), "oldest evicted first");
+}
+
+// The cap counts invocations (request ids), like the agent payload buffer, so it matches the
+// breaker's 3N rule: one invoke buffers one item per telemetry type.
+fn item_of(request_id: &str, telemetry_type: &str, minutes_ago: i64) -> FailedTelemetry {
+    FailedTelemetry {
+        request_id: request_id.into(),
+        failed_at: chrono::Utc::now() - chrono::TimeDelta::try_minutes(minutes_ago).unwrap(),
+        ..fresh_item(telemetry_type)
+    }
+}
+
+const SIX_TYPES: [&str; 6] =
+    ["metric_data", "analytic_event_data", "span_event_data", "error_event_data", "error_data", "transaction_sample_data"];
+
+#[test]
+fn push_capped_counts_one_request_with_six_types_as_one() {
+    let mut buf = Vec::new();
+    for ty in SIX_TYPES {
+        push_capped(&mut buf, item_of("r1", ty, 1), 1);
+    }
+    assert_eq!(buf.len(), 6, "all six types of one request fit a cap of 1");
+}
+
+#[test]
+fn push_capped_evicts_all_items_of_the_oldest_request_together() {
+    let mut buf = Vec::new();
+    for ty in SIX_TYPES {
+        push_capped(&mut buf, item_of("old", ty, 10), 2);
+    }
+    push_capped(&mut buf, item_of("mid", "metric_data", 5), 2);
+    assert_eq!(buf.len(), 7, "two requests fit a cap of 2");
+    push_capped(&mut buf, item_of("new", "metric_data", 1), 2);
+    let ids: std::collections::BTreeSet<&str> = buf.iter().map(|i| i.request_id.as_str()).collect();
+    assert_eq!(ids, ["mid", "new"].into_iter().collect(), "every item of the oldest request goes");
+    assert_eq!(buf.len(), 2);
+}
+
+#[test]
+fn push_capped_rebuffering_a_known_request_evicts_nothing() {
+    let mut buf = vec![item_of("a", "metric_data", 5), item_of("b", "metric_data", 3)];
+    push_capped(&mut buf, item_of("a", "span_event_data", 1), 2);
+    assert_eq!(buf.len(), 3, "a known request id does not add an invocation");
 }

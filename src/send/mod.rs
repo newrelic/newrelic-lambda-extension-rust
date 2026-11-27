@@ -1,51 +1,23 @@
 // Copyright New Relic, Inc. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared send-path primitives for the `NEW_RELIC_EXTENSION_SEND_TIER` redesign.
-//!
-//! `circuit_breaker` and `timeout_provider` define the two trait contracts
-//! that let the scheduler (added in a later phase) and their real
-//! implementations be built independently and in parallel: the scheduler
-//! depends only on the trait + the stub impls below; the real
-//! `CircuitBreaker`/`SendTimeoutProvider` implementations are developed and
-//! unit-tested against the same trait without needing the scheduler to
-//! exist. See `TEAM_COLLAB_PLAN.md` for the collaboration contract this
-//! module implements.
-//!
-//!
-//! `SendScheduler` has a real caller (`event_loop.rs`'s `SEND_SCHEDULER`) for
-//! `ApmCollector` (the INVOKE-time batch, which carries platform-report
-//! metrics too) and `Logs`. `MetricApi` currently has none: reports ride
-//! inside the batch. `BreakerState` and `DispatchOutcome` remain unused *by name*
-//! outside this module today (accessed via `.state()`/`.result`/`.cursor`
-//! rather than the type name) but are kept exported for Sashwat's real
-//! `CircuitBreaker` work and for callers who want to pattern-match on the
-//! outcome directly.
-
-#![allow(dead_code, unused_imports)]
+//! Shared send-path primitives: the process-wide circuit breaker and `SendScheduler`,
+//! which tracks the in-flight `high`-tier sends (`event_loop.rs`'s `SEND_SCHEDULER`).
 
 pub mod circuit_breaker;
 pub(crate) mod concurrent;
 pub mod scheduler;
-#[cfg(test)]
-mod scheduler_integration_tests;
 pub mod send_target;
 pub mod short_invoke;
 pub mod tier;
-pub mod timeout_provider;
 
-pub use circuit_breaker::{
-    AlwaysAllowBreaker, BreakerState, CircuitBreaker, ConsecutiveFailureBreaker,
-    DEFAULT_THRESHOLD_DEFAULT, DEFAULT_THRESHOLD_HIGH,
-};
-pub use scheduler::{DispatchOutcome, DispatchResult, SendMode, SendScheduler};
-pub use send_target::{from_collector_result, BoxedSend};
+pub use circuit_breaker::{BreakerState, CircuitBreaker, ConsecutiveFailureBreaker, SendPermit};
+pub use scheduler::{DispatchOutcome, DispatchResult, SendScheduler};
+pub use send_target::BoxedSend;
 pub use tier::SendTier;
-pub use timeout_provider::{FixedTimeoutProvider, SendTimeoutProvider};
 
-/// Which telemetry path a send belongs to. Breakers and timeout bounds are
-/// tracked per kind, not globally, since the three endpoints fail and
-/// recover independently.
+/// Which telemetry path a send belongs to. Breaker state is tracked per kind,
+/// not globally, since the three endpoints fail and recover independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SendKind {
     Logs,
